@@ -2,6 +2,7 @@
 node_modules/
 dist/
 coverage/
+*.local
 
 # rust
 src-tauri/target/
@@ -9,8 +10,21 @@ src-tauri/target/
 # tauri 自动生成
 src-tauri/gen/schemas/
 
-# 日志
+# 日志与调试
 *.log
+pnpm-debug.log*
+
+# 环境与密钥（永不入库）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+credentials.json
+secrets.*
 
 # 图标生成中间产物
 src-tauri/app-icon.png
@@ -19,4 +33,5 @@ src-tauri/icons/ios/
 
 # 系统 / IDE
 .DS_Store
+Thumbs.db
 .idea/
