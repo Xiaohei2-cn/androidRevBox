@@ -329,7 +329,9 @@ mod tests {
     }
     #[cfg(windows)]
     fn slow_spec() -> CommandSpec {
-        spec("cmd.exe", &["/C", "ping -n 30 127.0.0.1 > nul"], None)
+        // 直接跑 ping.exe：若经 `cmd /C "… > nul"`，命令串含 `>` 时 cmd 不剥离外层
+        // 引号，会把整串当作带引号的程序名而秒退，拿不到 TimedOut/Cancelled 终态
+        spec("ping", &["-n", "30", "127.0.0.1"], None)
     }
 
     #[cfg(unix)]

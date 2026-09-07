@@ -303,6 +303,7 @@ P0 完成后进入 **P1 核心运行时**：把 P0 的 localStorage 设置迁入
 - 超时终态记 `failed`（退出码不可得），取消记 `cancelled`；`timeout 100ms–1h` 命令层校验。
 - 行数上限双保险：单行 8KB 截断 + 前端缓冲 2000 行 + logs limit≤5000（P7 再上虚拟滚动）。
 - 任务输出 `Sink` 回调里**禁止** async/阻塞（泵任务单线程语义），落库用同步 rusqlite 快速写。
+- **Windows 测试坑**：`cmd.exe /C "ping … > nul"` 里命令含 `>`（属 cmd 特殊集 `&<>()@^|`）时 cmd **不剥离外层引号**，把整串当带引号的可执行名 → 进程秒退 → timeout/cancel 测试拿不到预期终态（CI 表现：仅 Windows 的 cargo test 红）。慢任务直接用 PATH 上的 `ping.exe -n 30`，别套 cmd。`echo`/`exit` 无特殊字符，套 cmd 正常。
 - migration 002 是首个非幂等 SQL（ALTER ADD COLUMN 无 IF NOT EXISTS），重复执行安全完全依赖 rusqlite_migration 的 user_version——这正是 §1.3「只走 migration」的意义；`PRAGMA user_version` 已验证为 2。
 
 ### 5.4 回测
