@@ -214,7 +214,8 @@ impl AdbRunner for RealAdbRunner {
             .kill_on_drop(true);
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
+            // tokio::process::Command 在 Windows 自带 inherent creation_flags，
+            // 不要 std 的 CommandExt（对 tokio Command 无效 → unused import）
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW); // 防止闪黑窗
         }
