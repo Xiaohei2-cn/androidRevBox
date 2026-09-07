@@ -1,6 +1,11 @@
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
-import { MIN_OPACITY, useSettings, type ThemePref } from "@/app/providers";
+import {
+  MIN_OPACITY,
+  useSettings,
+  type LogLevel,
+  type ThemePref,
+} from "@/app/providers";
 import { cn } from "@/lib/utils";
 
 const THEME_OPTIONS: { value: ThemePref; label: string }[] = [
@@ -9,15 +14,28 @@ const THEME_OPTIONS: { value: ThemePref; label: string }[] = [
   { value: "system", label: "跟随系统" },
 ];
 
-/** 设置页：P0 唯一真正可用的页面（主题 + 背景透明度） */
+const LOG_LEVEL_OPTIONS: { value: LogLevel; label: string }[] = [
+  { value: "trace", label: "trace" },
+  { value: "debug", label: "debug" },
+  { value: "info", label: "info" },
+  { value: "warn", label: "warn" },
+  { value: "error", label: "error" },
+];
+
+/** 设置页：主题、背景透明度、日志级别（P1 起全部持久化到 SQLite） */
 export function SettingsPage() {
-  const { theme, setTheme, opacity, setOpacity } = useSettings();
+  const { theme, setTheme, opacity, setOpacity, logLevel, setLogLevel, hydrated } =
+    useSettings();
 
   return (
     <div className="mx-auto flex h-full max-w-xl flex-col gap-8 overflow-auto pt-4">
       <section className="flex flex-col gap-3">
         <Label>外观主题</Label>
-        <div className="inline-flex w-fit rounded-lg bg-muted p-1" role="radiogroup" aria-label="外观主题">
+        <div
+          className="inline-flex w-fit rounded-lg bg-muted p-1"
+          role="radiogroup"
+          aria-label="外观主题"
+        >
           {THEME_OPTIONS.map((option) => (
             <button
               key={option.value}
@@ -57,8 +75,35 @@ export function SettingsPage() {
           onValueChange={(values) => setOpacity(values[0])}
         />
         <p className="text-xs text-muted-foreground">
-          调节窗口背景透明度，并叠加系统毛玻璃效果（macOS Vibrancy / Windows
+          调节窗口背景透明度，并叠加毛玻璃效果（macOS Vibrancy / Windows
           Acrylic；Linux 无合成器时自动降级为纯透明度）。最低 20%，保证内容可读。
+        </p>
+      </section>
+
+      <section className="flex flex-col gap-3">
+        <Label>日志级别</Label>
+        <div className="inline-flex w-fit gap-1">
+          {LOG_LEVEL_OPTIONS.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              role="radio"
+              aria-checked={logLevel === option.value}
+              onClick={() => setLogLevel(option.value)}
+              className={cn(
+                "rounded-md border px-3 py-1.5 font-mono text-xs transition-colors",
+                logLevel === option.value
+                  ? "border-primary bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
+              )}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          运行时生效并持久化（SQLite app_settings），重启自动恢复。
+          {!hydrated && " 配置同步中…"}
         </p>
       </section>
     </div>

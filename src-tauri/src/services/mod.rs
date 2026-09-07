@@ -1,3 +1,5 @@
-//! 业务服务层（P1 核心运行时起逐个填充）：
-//! device_service / process_service / plugin_service / crypto_service /
-//! task_service / config_service / log_service。
+//! 业务服务层：Command 只转发，业务规则在这里。
+//! 阶段规划：P1 config/log → P2 task/process → P3 device → P4 plugin → P5 crypto。
+
+pub mod config_service;
+pub mod log_service;

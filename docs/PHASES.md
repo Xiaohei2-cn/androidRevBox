@@ -81,9 +81,9 @@
 
 | 阶段 | 名称 | 状态 | 完成日期 | 备注 |
 |---|---|---|---|---|
-| **P0** | 基础骨架（前后端主体 + 窗口壳） | ✅ | 2026-09-07 | CI run 34117843818 三平台全绿；视觉规范经用户三轮反馈定稿（见 §3.4.1） |
-| P1 | 核心运行时（分层 + SQLite + 日志） | 🔵 | — | 当前阶段 |
-| P2 | 任务系统（统一命令执行） | ⬜ | — | |
+| P0 | 基础骨架（前后端主体 + 窗口壳） | ✅ | 2026-09-07 | CI run 34117843818 三平台全绿；视觉规范经用户三轮反馈定稿（见 §3.4.1） |
+| **P1** | 核心运行时（分层 + SQLite + 日志） | ✅ | 2026-09-07 | migration/Config/Log 全链路 + dev 真机回测通过；偏差与坑见 §4.3.1 |
+| P2 | 任务系统（统一命令执行） | 🔵 | — | 当前阶段 |
 | P3 | ADB 能力 | ⬜ | — | |
 | P4 | 插件 SDK（C ABI v1） | ⬜ | — | |
 | P5 | 算法中心（首批算法） | ⬜ | — | |
@@ -93,7 +93,7 @@
 
 ---
 
-## 3. P0 基础骨架（🔵 当前阶段）
+## 3. P0 基础骨架（✅ 已完成）
 
 ### 3.1 目标
 
@@ -230,7 +230,7 @@ P0 完成后进入 **P1 核心运行时**：把 P0 的 localStorage 设置迁入
 
 ---
 
-## 4. P1 核心运行时
+## 4. P1 核心运行时（✅ 已完成）
 
 ### 4.1 目标
 
@@ -247,6 +247,15 @@ P0 完成后进入 **P1 核心运行时**：把 P0 的 localStorage 设置迁入
 - 数据库文件放 app data 目录；连接用 `r2d2` 或 tokio 侧互斥管理，避免 rusqlite 跨线程误用。
 - DTO 与 Domain Model 分开定义，serde 命名统一 `camelCase`。
 
+### 4.3.1 实现记录与偏差（P1 执行期回填）
+
+- 连接模型最终选择 `Db = Arc<Mutex<Connection>>` + `with()` 闭包（P1 读写量足够），P2 task_logs 高频写入若成瓶颈再升级 r2d2。rusqlite 用 `bundled` 特性，三端无需系统 sqlite 开发包。
+- migration 用 `rusqlite_migration` v2.3：API 是 `M::up(sql)` 单参数 + `to_latest(&mut conn)`（网上大量旧例子的 `to_current`/双参数 `up(sql, None)` 已不存在，别照抄）。
+- 键名定稿 `app.settings.log_level`（文档原写 `app.log_level`，前缀统一原则优先）；日志级别走专用命令 `log_set_level`，落库同时 reload EnvFilter。
+- 前端持久化：SQLite 为事实源，localStorage 保留为同步启动缓存（消除 FOUC 且 vitest 无需模拟 Tauri 主路径）；启动 snapshot 水合 + DB 缺键一次性回写，实现 P0→P1 迁移。
+- tracing-subscriber 的 `reload` 是内置模块不是 feature（P0 曾在 Cargo.toml 写 `features=["reload"]` 导致解析失败）；`Registry` 的 `.with()` 需要 `use tracing_subscriber::prelude::*`，P0/P1 都踩过这一条。
+- clippy 两条硬规则：模块文件不与父模块同名（db/db.rs → db/connection.rs）；`&[(&str, fn(&str)->bool)]` 这类复杂类型必须提取 type 别名。
+
 ### 4.4 回测
 
 - `cargo test`：migration 从 0 升级与重复执行单测；ConfigService 读写单测。
@@ -255,11 +264,11 @@ P0 完成后进入 **P1 核心运行时**：把 P0 的 localStorage 设置迁入
 
 ### 4.5 完成标记
 
-- [ ] 8 张表 migration 齐备且幂等，启动自动升级
-- [ ] 设置持久化迁入 SQLite，localStorage 键做一次性迁移兼容
-- [ ] LogService 文件滚动 + 级别配置生效
-- [ ] 统一 DTO / 事件 / 错误映射规范落地并有文档（docs/ 下补 `ipc-conventions.md`）
-- [ ] 回测全绿，状态表更新
+- [x] 8 张表 migration 齐备且幂等，启动自动升级（连接 + 测试双验证；删库重建经真机验证）
+- [x] 设置持久化迁入 SQLite，localStorage 键做一次性迁移兼容（水合+回写经 Tauri 环境 vitest 与 dev 真机双验证）
+- [x] LogService 文件滚动 + 级别配置生效（daily 滚动 + reload 运行时调级 + 重启恢复 debug，dev 验证）
+- [x] 统一 DTO / 事件 / 错误映射规范落地并有文档（docs/ipc-conventions.md）
+- [x] 回测全绿（cargo test 19 / vitest 16 / fmt / clippy / build），CI 见状态表
 
 ### 4.6 下一步
 
