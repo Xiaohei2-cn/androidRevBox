@@ -12,7 +12,7 @@ mod commands;
 mod core;
 mod db;
 mod models;
-mod plugins;
+pub mod plugins; // pub 供集成测试（tests/plugin_abi_e2e.rs）访问
 mod services;
 
 use std::sync::Arc;
@@ -23,6 +23,7 @@ use crate::db::Db;
 use crate::services::config_service::ConfigService;
 use crate::services::device_service::{DeviceService, RealAdbRunner};
 use crate::services::log_service::{self, LogService};
+use crate::services::plugin_service::PluginService;
 use crate::services::task_service::TaskService;
 
 /// 全局共享状态：Service 实例（Arc 化，供各 command 经 tauri::State 取用）
@@ -31,6 +32,7 @@ pub struct AppState {
     pub log: Arc<LogService>,
     pub task: Arc<TaskService>,
     pub device: Arc<DeviceService>,
+    pub plugins: Arc<PluginService>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -61,11 +63,29 @@ pub fn run() {
             ));
             device.clone().start_watch();
 
+            // 5) PluginService：受控目录 app_data/plugins，启动即扫描加载（P4）
+            let plugin_root = data_dir.join("plugins");
+            let plugins = Arc::new(PluginService::new(db.clone(), plugin_root));
+            match plugins.scan() {
+                Ok(report) => {
+                    tracing::info!(
+                        loaded = ?report.loaded,
+                        failed = report.errors.len(),
+                        "plugin scan finished"
+                    );
+                    for e in &report.errors {
+                        tracing::warn!(dir = %e.dir, error = %e.error, "插件加载失败");
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "插件扫描异常"),
+            }
+
             app.manage(AppState {
                 config: config.clone(),
                 log,
                 task: task_service,
                 device,
+                plugins,
             });
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -98,8 +118,19 @@ pub fn run() {
             commands::device::device_force_stop,
             commands::device::device_push,
             commands::device::device_pull,
-            commands::device::device_logcat
+            commands::device::device_logcat,
+            commands::plugins::plugins_list,
+            commands::plugins::plugins_scan,
+            commands::plugins::plugins_call
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // 插件 shutdown 先于动态库关闭（loaded 表随 state drop 也兜底）
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.plugins.unload_all();
+                }
+            }
+        });
 }

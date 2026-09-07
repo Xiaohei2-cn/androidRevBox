@@ -1,0 +1,15 @@
+[package]
+name = "plugin-crypto-base64"
+description = "示例 crypto 插件：Base64 编解码（C ABI v1，经 at-plugin-sdk）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "crypto_base64"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+at-plugin-sdk = { path = "../../plugin-sdk/rust" }
+base64 = "0.22"
+serde_json = "1"

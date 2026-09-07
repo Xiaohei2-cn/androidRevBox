@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = [
+    "src-tauri",
+    "plugin-sdk/rust",
+    "plugins/crypto-base64",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+# 统一 release 配置（原 src-tauri 内 profile 对 workspace 成员无效）
+[profile.release]
+strip = true
+lto = true

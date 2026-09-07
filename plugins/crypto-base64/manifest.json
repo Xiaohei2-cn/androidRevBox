@@ -1,0 +1,14 @@
+{
+  "id": "crypto.base64",
+  "name": "Base64",
+  "version": "1.0.0",
+  "abi": 1,
+  "type": "crypto",
+  "entry": {
+    "macos-arm64": "macos-arm64/libcrypto_base64.dylib",
+    "macos-x64": "macos-x64/libcrypto_base64.dylib",
+    "windows-x64": "windows-x64/crypto_base64.dll",
+    "linux-x64": "linux-x64/libcrypto_base64.so"
+  },
+  "capabilities": ["encode", "decode"]
+}

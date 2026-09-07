@@ -1,0 +1,11 @@
+[package]
+name = "at-plugin-sdk"
+description = "Android Local Toolbox 插件 Rust SDK：export_plugin! 宏实现 C ABI v1 契约"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lib]
+path = "src/lib.rs"

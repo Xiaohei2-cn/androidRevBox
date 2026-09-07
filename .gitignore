@@ -5,7 +5,8 @@ coverage/
 *.local
 
 # rust
-src-tauri/target/
+/target/
+/src-tauri/target/
 
 # tauri 自动生成
 src-tauri/gen/schemas/

@@ -20,14 +20,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "regist
 tracing-appender = "0.2"
 thiserror = "2"
 anyhow = "1"
+libloading = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }
 rusqlite_migration = "2"
 uuid = { version = "1.26.0", features = ["v4"] }
 async-trait = "0.1.92"
 
-[profile.release]
-strip = true
-lto = true
+[dev-dependencies]
+tempfile = "3"
+# 集成测试需要真实 cdylib 产物：依赖保证 cargo 先构建插件（同时产出 cdylib 与 rlib）
+plugin-crypto-base64 = { path = "../plugins/crypto-base64" }
 
 [target."cfg(unix)".dependencies]
 libc = "0.2"

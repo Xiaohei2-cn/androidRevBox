@@ -410,15 +410,34 @@ DeviceService + ADB Adapter 完成 Android 基础能力：设备发现/信息/sh
 
 - cargo test：manifest 校验矩阵（合法/缺字段/ABI 不符/缺平台产物）；示例插件 load→info→call→free→shutdown 全链路。
 - 手动：放入示例插件目录，重启或刷新后插件可见、base64 编解码结果正确；破坏 manifest 后错误提示明确。
-- 三平台 `cargo build -p plugin-crypto-base64` 产物命名符合 manifest entry 规则。
+- `cargo build -p plugin-crypto-base64 --lib`（mac）产物命名符合 manifest.entry 规则；Win/Linux 产物命名仅设计预留（`[未完成-预留]`，不测试）。
 
 ### 7.5 完成标记
 
-- [ ] plugin_api.h v1 冻结并文档化
-- [ ] 加载器 + manifest 校验 + 生命周期管理可用
-- [ ] Rust SDK 发布到 plugin-sdk/rust，示例插件用它实现
-- [ ] 示例插件三端构建脚本 + 测试齐备
-- [ ] 回测全绿，状态表更新
+> §1.5（用户确认）：只测 macOS；Windows/Linux 仅设计预留，不测试、不阻塞关闭。
+
+- [x] `plugin_api.h` v1 冻结并文档化（所有权/串行化/错误码约定全部写进头文件注释）
+- [x] Rust SDK 发布到 `plugin-sdk/rust`：`AtPlugin` trait + `export_plugin!` 宏（panic 捕获 → -99；输出 Box<[u8]> 协议对齐 free）
+- [x] 示例插件 `crypto-base64`（manifest + README + 3 单测）使用 SDK 实现；构建产物命名 = manifest.entry 键
+- [x] 加载器 `plugins/loader.rs`：libloading + 五符号校验 + abi 门禁 + 自报 id 与 manifest 交叉验证 + 防目录逃逸
+- [x] manifest 校验矩阵单测（合法/缺字段/坏 id/abi 不符/缺平台产物/路径逃逸/总案示例）
+- [x] 集成测试 `src-tauri/tests/plugin_abi_e2e.rs`：真实 cdylib 全链路 load→info→call→free→shutdown + 拒绝矩阵（5 用例）
+- [x] PluginService + plugins 表注册表（启动 scan；目录消失清行；enabled 保留）
+- [x] 命令层 plugins_list/scan/call；lib.rs 接线（RunEvent::Exit → unload_all 先 shutdown 再卸载）
+- [x] dev 真机验证：放入受控目录重启 → 日志 `plugin scan loaded=["crypto.base64"]`，DB 行实证
+- [x] 跨平台产物命名规则与 loader 抽象预留（dll/so 路径、符号名一致）——**仅预留（不测试）**
+- [x] 回测全绿（workspace：lib 65 + 集成 5 + 插件 3 + sdk，含 1 ignored 真机；clippy/fmt）
+
+### 7.5.1 实现记录与坑（P4 执行期回填）
+
+- **workspace 化**：新增插件 crate 必须建根 `Cargo.toml`（members: src-tauri + plugin-sdk/rust + plugins/*）。副作用：① profile 只能在根定义（成员级 `[profile.*]` 无效并报 warning 丢失）；② `Cargo.lock` 移到仓库根（删 src-tauri/Cargo.lock）；③ CI 的 cargo 步骤全部改 `cargo test --workspace`，rust-cache workspaces 改 `.`。
+- **edition 2024**：`#[no_mangle]` 必须写 `#[unsafe(no_mangle)]`（宏展开同样生效），否则硬错误。
+- **libloading 借用死结**：`Symbol<T>` 借用 `Library`，直接在 `Ok(结构体)` 里 move `lib` 同时 `*sym` 拷贝符号 → E0505。解法：符号提取收进块作用域，先拷成裸 `fn` 指针（Copy）再 move 出 lib。
+- **dev-dependency 编插件 ≠ 产出 cdylib**：dev-dep 只构建 `--lib`（rlib 满足 link），`.dylib` 不一定存在。集成测试用 `current_exe()` 反推 target 目录 + 缺失时 `Command::new(cargo).args(["build","-p",plugin,"--lib"])` 嵌套构建（外层构建已结束不持锁，安全）。
+- **dyn 兼容**：trait 方法带泛型会破坏 `dyn Trait`；本 SDK 全部非泛型。
+- **C 字符串元信息**：`into_raw()` 泄漏是故意的（进程生命周期常量）；`Serialize for AtPluginInfoC` 不可行，转 `AbiInfo` 结构（`cstr_to_string`）。
+- **free 协议**：SDK 用 `Box<[u8]>`（into_raw/from_raw slice），host 必须传**精确 len** 才能正确归还；host 侧 `call()` 复制后立即 free，避免跨库持有。
+- manifest.entry 键命名与总案 §5.3 对齐：`macos-arm64`/`windows-x64`/`linux-x64`（aarch64→arm64、x86_64→x64 归一）。
 
 ### 7.6 下一步
 

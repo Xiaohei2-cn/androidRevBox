@@ -1,2 +1,5 @@
-//! 插件运行时（P4 插件 SDK 起填充）：
-//! 发现、Manifest 校验、C ABI 动态加载、生命周期、资源回收。
+//! 插件发现、加载、ABI、生命周期（P4）。
+
+pub mod loader;
+pub mod manifest;
+pub mod plugin_repo;
