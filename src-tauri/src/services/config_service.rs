@@ -9,6 +9,8 @@ use crate::db::{Db, config_repo};
 pub const KEY_THEME: &str = "app.settings.theme";
 pub const KEY_OPACITY: &str = "app.settings.opacity";
 pub const KEY_LOG_LEVEL: &str = "app.settings.log_level";
+/// 手动指定的 adb 路径（P3）；空 = 走环境变量自动探测
+pub const KEY_ADB_PATH: &str = "app.adb.path";
 
 fn is_valid_theme(v: &str) -> bool {
     matches!(v, "light" | "dark" | "system")
@@ -25,6 +27,11 @@ fn is_valid_log_level(v: &str) -> bool {
     matches!(v, "trace" | "debug" | "info" | "warn" | "error")
 }
 
+/// adb 路径：允许空串（清空=回到自动探测），限制长度防误贴大文本
+fn is_valid_path(v: &str) -> bool {
+    v.len() < 1000 && !v.chars().any(|c| c == '\n' || c == '\0')
+}
+
 type ValueValidator = fn(&str) -> bool;
 
 /// 允许前端读写的键白名单（防止任意键写入）
@@ -32,6 +39,7 @@ const ALLOWED_KEYS: &[(&str, ValueValidator)] = &[
     (KEY_THEME, is_valid_theme),
     (KEY_OPACITY, is_valid_opacity),
     (KEY_LOG_LEVEL, is_valid_log_level),
+    (KEY_ADB_PATH, is_valid_path),
 ];
 
 #[derive(Clone)]

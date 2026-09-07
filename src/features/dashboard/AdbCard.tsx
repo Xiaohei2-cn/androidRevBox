@@ -1,0 +1,137 @@
+import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { CheckCircle2, XCircle, Usb, TerminalSquare } from "lucide-react";
+import {
+  deviceApi,
+  type AdbEnvironment,
+  type DeviceEntry,
+} from "@/api/device";
+import { cn } from "@/lib/utils";
+
+/**
+ * 仪表盘 adb 卡片：环境指示（含未配置提示）、版本查看、设备连接轮询。
+ * 后端 watch 线程经 device://changed 事件推热插拔；本卡片同时保留 10s 兜底轮询。
+ */
+export function AdbCard() {
+  const [events, setEvents] = useState(0);
+
+  const { data: env } = useQuery<AdbEnvironment>({
+    queryKey: ["adb", "environment", events],
+    queryFn: deviceApi.environment,
+    staleTime: 5_000,
+  });
+
+  const { data: devices = [], isError: devicesError } = useQuery<DeviceEntry[]>({
+    queryKey: ["adb", "devices", events],
+    queryFn: () => deviceApi.list(),
+    enabled: !!env?.installed,
+    // 有事件时立即刷新，否则 10s 兜底轮询
+    refetchInterval: 10_000,
+  });
+
+  // 热插拔事件：bump queryKey 触发列表刷新（watch 线程在 Rust 侧，天然独立于渲染）
+  useEffect(() => {
+    let alive = true;
+    const unsubs: Array<() => void> = [];
+    deviceApi
+      .onChanged(() => alive && setEvents((n) => n + 1))
+      .then((un) => alive && unsubs.push(un))
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+      unsubs.forEach((un) => un());
+    };
+  }, []);
+
+  const ready = devices.filter((d) => d.state === "device");
+  const others = devices.filter((d) => d.state !== "device");
+
+  return (
+    <div className="rounded-xl border bg-card p-4">
+      <div className="flex items-center gap-2">
+        <TerminalSquare className="h-4 w-4 text-muted-foreground" />
+        <span className="text-sm font-semibold">ADB 环境</span>
+        <span
+          data-testid="adb-status"
+          className={cn(
+            "ml-auto flex items-center gap-1 text-xs",
+            env?.installed ? "text-emerald-500" : "text-destructive",
+          )}
+        >
+          {env === undefined ? (
+            "检测中…"
+          ) : env.installed ? (
+            <>
+              <CheckCircle2 className="h-3.5 w-3.5" />
+              已就绪
+            </>
+          ) : (
+            <>
+              <XCircle className="h-3.5 w-3.5" />
+              未检测到
+            </>
+          )}
+        </span>
+      </div>
+
+      {env?.installed ? (
+        <div className="mt-2 space-y-1 text-xs text-muted-foreground">
+          <p data-testid="adb-version" className="font-mono">
+            adb {env.version}
+            {env.build ? ` · ${env.build}` : ""}
+          </p>
+          <p className="truncate font-mono" title={env.path}>
+            {env.path}
+            <span className="ml-1 rounded bg-muted px-1 py-px text-[10px]">
+              {SOURCE_LABEL[env.source ?? "unknown"] ?? env.source}
+            </span>
+          </p>
+          {env.probeError && (
+            <p className="text-amber-500">探测异常：{env.probeError}</p>
+          )}
+        </div>
+      ) : (
+        <p data-testid="adb-hint" className="mt-2 text-xs text-amber-500">
+          {env?.hint ?? "正在检测 adb 环境变量…"}
+        </p>
+      )}
+
+      <div className="mt-3 border-t pt-3">
+        <div className="flex items-center gap-1.5 text-xs">
+          <Usb className="h-3.5 w-3.5 text-muted-foreground" />
+          <span data-testid="adb-device-count" className="font-medium">
+            {env?.installed ? `已连接设备 ${ready.length}` : "设备监听暂停"}
+          </span>
+          {others.length > 0 && (
+            <span className="text-amber-500">（另有 {others.length} 台未授权/离线）</span>
+          )}
+        </div>
+        {devicesError && (
+          <p className="mt-1 text-xs text-destructive">设备列表获取失败</p>
+        )}
+        {ready.length > 0 && (
+          <ul className="mt-2 space-y-1">
+            {ready.slice(0, 4).map((d) => (
+              <li key={d.serial} className="flex items-center gap-2 text-xs">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                <span className="font-mono">{d.model || d.serial}</span>
+                <span className="text-muted-foreground">{d.serial}</span>
+                <span className="ml-auto rounded bg-muted px-1 text-[10px] text-muted-foreground">
+                  {d.transport}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const SOURCE_LABEL: Record<string, string> = {
+  config: "手动配置",
+  android_home: "ANDROID_HOME",
+  sdk_root: "ANDROID_SDK_ROOT",
+  path_env: "PATH",
+  mock: "mock",
+};

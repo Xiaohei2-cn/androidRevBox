@@ -1,11 +1,16 @@
+import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   MIN_OPACITY,
   useSettings,
   type LogLevel,
   type ThemePref,
 } from "@/app/providers";
+import { deviceApi, type AdbEnvironment } from "@/api/device";
 import { cn } from "@/lib/utils";
 
 const THEME_OPTIONS: { value: ThemePref; label: string }[] = [
@@ -26,6 +31,7 @@ const LOG_LEVEL_OPTIONS: { value: LogLevel; label: string }[] = [
 export function SettingsPage() {
   const { theme, setTheme, opacity, setOpacity, logLevel, setLogLevel, hydrated } =
     useSettings();
+  const queryClient = useQueryClient();
 
   return (
     <div className="mx-auto flex h-full max-w-xl flex-col gap-8 overflow-auto pt-4">
@@ -81,6 +87,15 @@ export function SettingsPage() {
       </section>
 
       <section className="flex flex-col gap-3">
+        <Label>ADB 路径（P3）</Label>
+        <AdbPathSection onProbed={() => {
+          // adb 环境变了：仪表盘/设备页的查询立即失效重取
+          void queryClient.invalidateQueries({ queryKey: ["adb"] });
+          void queryClient.invalidateQueries({ queryKey: ["devices"] });
+        }} />
+      </section>
+
+      <section className="flex flex-col gap-3">
         <Label>日志级别</Label>
         <div className="inline-flex w-fit gap-1">
           {LOG_LEVEL_OPTIONS.map((option) => (
@@ -106,6 +121,56 @@ export function SettingsPage() {
           {!hydrated && " 配置同步中…"}
         </p>
       </section>
+    </div>
+  );
+}
+
+
+/** ADB 路径设置：空=自动探测（ANDROID_HOME/SDK_ROOT/PATH），手动配置优先 */
+function AdbPathSection({ onProbed }: { onProbed: () => void }) {
+  const [env, setEnv] = useState<AdbEnvironment | null>(null);
+  const [path, setPath] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const apply = async (value: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await deviceApi.setPath(value.trim());
+      setEnv(next);
+      onProbed();
+    } catch (e) {
+      setError(String((e as { message?: string }).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <Input
+          value={path}
+          placeholder="留空自动探测；或填 adb 可执行文件完整路径"
+          onChange={(e) => setPath(e.target.value)}
+          className="font-mono"
+        />
+        <Button size="sm" variant="outline" disabled={busy} onClick={() => void apply(path)}>
+          应用
+        </Button>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={() => void apply("")}>
+          自动
+        </Button>
+      </div>
+      {error && <p className="text-xs text-destructive">{error}</p>}
+      {env && (
+        <p className={cn("text-xs", env.installed ? "text-emerald-500" : "text-amber-500")}>
+          {env.installed
+            ? `✓ adb ${env.version} · ${env.path}`
+            : env.hint ?? "未检测到 adb"}
+        </p>
+      )}
     </div>
   );
 }

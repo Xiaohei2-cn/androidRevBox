@@ -73,6 +73,13 @@
 - 当前仓库根目录有一个 hello-world Rust crate（`Cargo.toml` + `src/main.rs`，edition 2024）。P0 将把它重组为总案 §4 的目录结构：根下 `src/`（React）+ `src-tauri/`（Rust crate），**删除根级 Cargo.toml/target**。
 - `.gitignore` 需重建，覆盖 `node_modules/`、`dist/`、`src-tauri/target/`、`.idea/`、系统垃圾文件。
 
+### 1.5 三平台测试约束（2026-09-07 用户新增，P3 起所有模块强制）
+
+- **所有模块接入都必须做三平台（macOS / Windows / Linux）测试**，两层执行：
+  1. **自动层**：CI 三平台矩阵跑编译 + 单测（已具备）。因此**可测逻辑必须抽象成接口（Rust trait）+ Mock 实现**，让无 Windows/Linux 真机也能在 CI 覆盖行为分支；平台差异（进程终止、路径解析、换行符）写 cfg 分支并由 CI 编译把关。
+  2. **人工层**：真机手动验证。**当前开发环境只有 macOS**——各阶段完成标记里，Windows/Linux 的人工验证项一律标 `[未完成-预留]`，不得标完成；验证清单照常写清测什么，等设备/系统就绪补测。
+- 设计上预留：涉及平台差异的接口（如 adb 路径解析、进程树终止、文件换行）在 trait 签名与 DTO 上保持三平台一致，差异只进 Adapter。
+
 ---
 
 ## 2. 阶段总览与状态表
@@ -325,16 +332,18 @@ P0 完成后进入 **P1 核心运行时**：把 P0 的 localStorage 设置迁入
 
 ---
 
-## 6. P3 ADB 能力
+## 6. P3 ADB 能力（🔵 当前阶段）
 
 ### 6.1 目标
 
 DeviceService + ADB Adapter 完成 Android 基础能力：设备发现/信息/shell/文件/应用/logcat/端口转发，前端设备页从占位变可用。
 
+**（P3 执行期用户追加）** 仪表盘新增 **ADB 卡片**：环境指示（是否检测到 adb）、版本查看（底层 `adb version` 解析）、设备连接轮询（后端独立线程 diff + `device://changed` 事件）；adb 未配置/未安装要明确提示文案。所有 adb 基础指令（version/devices/getprop/shell/install/push/pull/logcat/ls/packages/forward/reverse/reboot）封装为统一 **Rust trait 接口 `AdbRunner`**（非网络接口），可 Mock 实现，满足 §1.5 三平台可测约束。
+
 ### 6.2 边界
 
-**做：** adb 路径配置与探测、`list_devices`/`watch_devices`（事件推送插拔变化）、设备信息、`exec_shell`（走 P2 任务系统）、push/pull、install/uninstall/launch/force-stop、logcat 流（可过滤）、forward/reverse、设备页 UI（列表/信息/Shell/文件/应用/Logcat 分 tab 落地）。
-**不做：** 无线 ADB 配对、多模拟器厂商适配（记录 TODO）；任何插件化改造（P4 起 ADB 能力才逐步插件化）。
+**做：** adb 路径配置与探测（用户环境变量优先：手动配置 `app.adb.path` → ANDROID_HOME → ANDROID_SDK_ROOT → PATH）、`list_devices`/`watch_devices`（独立 tokio 任务轮询，事件推送插拔变化）、设备信息、`exec_shell`（走 P2 任务系统）、push/pull、install/uninstall/launch/force-stop、logcat 流（可过滤）、forward/reverse 构造器（协议先行）、设备页 UI（列表/信息/Shell/文件/应用/Logcat 六个分 tab）、仪表盘 AdbCard、设置页 adb 路径配置。
+**不做：** 无线 ADB 配对、多模拟器厂商适配（记录 TODO）；任何插件化改造（P4 起 ADB 能力才逐步插件化）；push/pull 按钮的原生文件选择器（接口已就绪，UI 按钮留 P7 接 Tauri dialog）。
 
 ### 6.3 注意点
 
@@ -344,16 +353,32 @@ DeviceService + ADB Adapter 完成 Android 基础能力：设备发现/信息/sh
 
 ### 6.4 回测
 
-- cargo test：MockAdapter 全接口单测；命令参数构造单测。
+- cargo test：MockAdapter 全接口单测；命令参数构造单测；路径解析优先级单测（纯逻辑，CI 三平台跑）。
+- 真机自动化：`adb_environment`/`adb version` 解析走 `#[ignore]` 真机测试（`cargo test -- --ignored`），本机已验证 PATH 探测。
 - 手动（需真机/模拟器）：插拔设备列表实时刷新；shell 执行输出实时；push/pull 单文件成功；logcat 过滤生效；两个设备同时执行互不阻塞；拔线后 UI 不卡死。
 
 ### 6.5 完成标记
 
-- [ ] 设备发现/热插拔事件流可用
-- [ ] shell/push/pull/install/logcat/端口转发全通（真机验证）
-- [ ] MockAdapter 支撑无设备回测与 CI
-- [ ] 设备页 6 个分 tab 可用
-- [ ] 回测全绿，状态表更新
+> §1.5：mac 人工已验证；Windows/Linux 人工验证标 `[未完成-预留]`，CI 自动层三平台已覆盖编译+单测。
+
+- [x] 设备发现/热插拔事件流可用（后端 watch 独立任务 + `device://changed`；mac 无设备降级不崩已验证）
+- [x] adb 基础指令全部封装为 Rust trait `AdbRunner`（Real + Mock 双实现）
+- [x] adb 走用户环境变量（PATH/ANDROID_HOME），未配置给出提示文案（AdbCard hint + 设备页空状态）
+- [x] 仪表盘 ADB 卡片：环境指示 + `adb version` 解析版本 + 连接轮询
+- [x] 设备页 6 个分 tab（列表/信息/Shell/文件/应用/Logcat）
+- [x] MockAdapter 支撑无设备回测与 CI（trait + scripts）
+- [x] shell/install/uninstall/logcat 长操作走 TaskService 事件流 + 内联输出 + 取消
+- [ ] **[未完成-预留]** shell/push/pull/install/logcat/端口转发真机全通 —— 需接真机/模拟器手动验证
+- [ ] **[未完成-预留]** Windows/Linux 平台人工验证（adb.exe/路径分隔符/taskkill 杀进程树/换行）
+- [x] 回测全绿（cargo test 53 + 1 ignored / vitest 27 / clippy / fmt / build）
+
+### 6.5.1 实现记录与坑（P3 执行期回填）
+
+- 设备热插拔：`device://changed` payload = `{serial, transport, present, state, lastSeen}`；watch 线程 3s 轮询 `adb devices -l` 与内存 known 快照 diff；adb 未就绪时清空 known 不刷事件噪音。
+- 一次性 adb 短命令用 `RealAdbRunner::run`（tokio 进程 capture，独立于 P2 流式泵，避免每行 `task://output` 噪音）；长操作用 `adb_task → TaskService.start` 生成任务。
+- Windows adb 进程用 `CREATE_NO_WINDOW`（0x08000000）防闪黑窗；路径候选用 `MAIN_SEPARATOR` + `adb_exe_names()`（Windows 含 adb.exe/.bat/.cmd）。
+- 仪表盘/设备页查询在 `!env.installed` 时 `enabled:false`，不发无意义 device 调用。
+- AdbCard 单测需 `waitFor` 二次等 devices 查询（它 enabled 依赖 env 先 resolve）。
 
 ### 6.6 下一步
 

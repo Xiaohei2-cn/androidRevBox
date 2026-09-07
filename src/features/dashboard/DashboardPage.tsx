@@ -1,8 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import { CheckCircle2, XCircle } from "lucide-react";
 import { systemApi } from "@/api/system";
+import { AdbCard } from "./AdbCard";
 
-/** 仪表盘：P0 用 system_ping 验证前端 → Tauri Command 通路 */
+/** 仪表盘：system_ping 验证通路；AdbCard 展示 adb 环境/版本/设备连接轮询（P3） */
 export function DashboardPage() {
   const { data, isLoading, error } = useQuery({
     queryKey: ["system", "ping"],
@@ -10,7 +11,7 @@ export function DashboardPage() {
   });
 
   return (
-    <div className="flex h-full flex-col gap-4">
+    <div className="flex h-full flex-col gap-4 overflow-auto">
       <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
         <StatusCard
           title="后端连接"
@@ -25,8 +26,11 @@ export function DashboardPage() {
           value={data ? `${data.os} · ${data.arch}` : "—"}
         />
       </div>
-      <div className="rounded-xl border border-dashed p-6 text-center text-xs text-muted-foreground">
-        最近命令 / 常用工具 / 插件状态等聚合信息将在 P7 UX 阶段补全
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+        <AdbCard />
+        <div className="rounded-xl border border-dashed p-6 text-center text-xs text-muted-foreground">
+          最近命令 / 常用工具 / 插件状态等聚合信息将在 P7 UX 阶段补全
+        </div>
       </div>
     </div>
   );

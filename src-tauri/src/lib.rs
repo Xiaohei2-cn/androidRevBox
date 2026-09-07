@@ -21,6 +21,7 @@ use tauri::Manager;
 
 use crate::db::Db;
 use crate::services::config_service::ConfigService;
+use crate::services::device_service::{DeviceService, RealAdbRunner};
 use crate::services::log_service::{self, LogService};
 use crate::services::task_service::TaskService;
 
@@ -29,6 +30,7 @@ pub struct AppState {
     pub config: Arc<ConfigService>,
     pub log: Arc<LogService>,
     pub task: Arc<TaskService>,
+    pub device: Arc<DeviceService>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -47,10 +49,23 @@ pub fn run() {
             let initial_level = LogService::resolve_startup_level(&config);
             let log = log_service::init(&log_dir, &initial_level, config.clone())?;
 
+            let task_service = Arc::new(TaskService::new(db.clone(), app.handle().clone()));
+
+            // 4) DeviceService：adb 能力（P3）。runner 单独构造以便先预热环境缓存
+            let runner = Arc::new(RealAdbRunner::new(config.clone()));
+            let device = Arc::new(DeviceService::new(
+                runner,
+                task_service.clone(),
+                db.clone(),
+                app.handle().clone(),
+            ));
+            device.clone().start_watch();
+
             app.manage(AppState {
                 config: config.clone(),
                 log,
-                task: Arc::new(TaskService::new(db.clone(), app.handle().clone())),
+                task: task_service,
+                device,
             });
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -68,7 +83,22 @@ pub fn run() {
             commands::task::task_run,
             commands::task::task_cancel,
             commands::task::task_list,
-            commands::task::task_logs
+            commands::task::task_logs,
+            commands::device::adb_environment,
+            commands::device::adb_set_path,
+            commands::device::devices_list,
+            commands::device::devices_watch_now,
+            commands::device::device_info,
+            commands::device::device_ls,
+            commands::device::device_packages,
+            commands::device::device_shell,
+            commands::device::device_install,
+            commands::device::device_uninstall,
+            commands::device::device_launch,
+            commands::device::device_force_stop,
+            commands::device::device_push,
+            commands::device::device_pull,
+            commands::device::device_logcat
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
