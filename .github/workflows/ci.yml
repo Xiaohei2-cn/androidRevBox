@@ -13,8 +13,10 @@ jobs:
   check:
     strategy:
       fail-fast: false
+      # 2026-09-07 用户确认（PHASES §1.5）：Windows/Linux 暂不做测试，仅要求设计预留
+      # （trait/cfg 分支/DTO 三端同形）。恢复三平台矩阵时把 os 列表加回即可。
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-22.04]
+        os: [macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

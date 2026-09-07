@@ -73,12 +73,14 @@
 - 当前仓库根目录有一个 hello-world Rust crate（`Cargo.toml` + `src/main.rs`，edition 2024）。P0 将把它重组为总案 §4 的目录结构：根下 `src/`（React）+ `src-tauri/`（Rust crate），**删除根级 Cargo.toml/target**。
 - `.gitignore` 需重建，覆盖 `node_modules/`、`dist/`、`src-tauri/target/`、`.idea/`、系统垃圾文件。
 
-### 1.5 三平台测试约束（2026-09-07 用户新增，P3 起所有模块强制）
+### 1.5 三平台约束（2026-09-07 用户最终确认：只预留，不测试）
 
-- **所有模块接入都必须做三平台（macOS / Windows / Linux）测试**，两层执行：
-  1. **自动层**：CI 三平台矩阵跑编译 + 单测（已具备）。因此**可测逻辑必须抽象成接口（Rust trait）+ Mock 实现**，让无 Windows/Linux 真机也能在 CI 覆盖行为分支；平台差异（进程终止、路径解析、换行符）写 cfg 分支并由 CI 编译把关。
-  2. **人工层**：真机手动验证。**当前开发环境只有 macOS**——各阶段完成标记里，Windows/Linux 的人工验证项一律标 `[未完成-预留]`，不得标完成；验证清单照常写清测什么，等设备/系统就绪补测。
-- 设计上预留：涉及平台差异的接口（如 adb 路径解析、进程树终止、文件换行）在 trait 签名与 DTO 上保持三平台一致，差异只进 Adapter。
+- **当前阶段只测 macOS**。Windows / Linux **不做任何测试（含 CI 矩阵）**，但**设计上必须预留**：
+  1. 平台差异（进程终止、路径分隔符、exe 后缀、换行符、窗口效果）全部隔离进 cfg 分支或 Adapter 内部，trait 签名与 DTO 三端同形；
+  2. 代码不得出现「只有 mac 能跑通」的隐性假设（如硬编码 `/`、依赖 SIGTERM）；
+  3. CI workflow 目前只跑 macos-latest；恢复三平台矩阵时把 `os` 列表加回即可（Linux 系统依赖步骤已写好 if 条件）。
+- 各阶段完成标记中涉及 Windows/Linux 的验证项一律写「仅预留（不测试）」，不得标完成，也不得因它们阻塞阶段关闭。
+- 可测逻辑仍要求抽象成接口（Rust trait）+ Mock 实现——这是架构纪律（无 adb/无设备也能单测），与三平台无关。
 
 ---
 
@@ -228,7 +230,7 @@ cargo test
 - [ ] 前端 `api/` 层 + TanStack Query + ping 端到端验证（代码与 DTO 已对齐，真窗口仪表盘应显示「正常 + 版本号」，待目视确认）
 - [x] vitest 10 个用例、cargo test 3 个用例，全部通过
 - [x] typecheck / lint / fmt / clippy 全绿
-- [ ] GitHub Actions 三平台矩阵全绿（待推送远端）
+- [x] GitHub Actions 全绿（P0/P1/P2 时期三平台矩阵均跑绿；此后按 §1.5 收敛为 mac 单平台）
 - [x] 本文档 §2 状态表与完成标记已同步
 
 ### 3.7 下一步
@@ -353,13 +355,13 @@ DeviceService + ADB Adapter 完成 Android 基础能力：设备发现/信息/sh
 
 ### 6.4 回测
 
-- cargo test：MockAdapter 全接口单测；命令参数构造单测；路径解析优先级单测（纯逻辑，CI 三平台跑）。
+- cargo test：MockAdapter 全接口单测；命令参数构造单测；路径解析优先级单测（纯逻辑，mac CI 跑；Windows/Linux 分支仅设计预留）。
 - 真机自动化：`adb_environment`/`adb version` 解析走 `#[ignore]` 真机测试（`cargo test -- --ignored`），本机已验证 PATH 探测。
 - 手动（需真机/模拟器）：插拔设备列表实时刷新；shell 执行输出实时；push/pull 单文件成功；logcat 过滤生效；两个设备同时执行互不阻塞；拔线后 UI 不卡死。
 
 ### 6.5 完成标记
 
-> §1.5：mac 人工已验证；Windows/Linux 人工验证标 `[未完成-预留]`，CI 自动层三平台已覆盖编译+单测。
+> §1.5（用户确认）：只测 macOS；Windows/Linux 仅设计预留，不测试、不阻塞关闭。
 
 - [x] 设备发现/热插拔事件流可用（后端 watch 独立任务 + `device://changed`；mac 无设备降级不崩已验证）
 - [x] adb 基础指令全部封装为 Rust trait `AdbRunner`（Real + Mock 双实现）
@@ -368,9 +370,9 @@ DeviceService + ADB Adapter 完成 Android 基础能力：设备发现/信息/sh
 - [x] 设备页 6 个分 tab（列表/信息/Shell/文件/应用/Logcat）
 - [x] MockAdapter 支撑无设备回测与 CI（trait + scripts）
 - [x] shell/install/uninstall/logcat 长操作走 TaskService 事件流 + 内联输出 + 取消
-- [ ] **[未完成-预留]** shell/push/pull/install/logcat/端口转发真机全通 —— 需接真机/模拟器手动验证
-- [ ] **[未完成-预留]** Windows/Linux 平台人工验证（adb.exe/路径分隔符/taskkill 杀进程树/换行）
-- [x] 回测全绿（cargo test 53 + 1 ignored / vitest 27 / clippy / fmt / build）
+- [x] 跨平台差异全部隔离进 cfg/Adapter（adb.exe 后缀、MAIN_SEPARATOR、CREATE_NO_WINDOW）——**仅预留（不测试）**
+- [ ] 接真机/模拟器后手动过一遍 §6.4 设备操作清单（用户侧验证，不阻塞阶段关闭）
+- [x] 回测全绿（cargo test 53 + 1 ignored 真机 / vitest 27 / clippy / fmt / build，mac）
 
 ### 6.5.1 实现记录与坑（P3 执行期回填）
 
