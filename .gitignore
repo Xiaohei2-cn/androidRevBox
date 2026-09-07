@@ -1,0 +1,22 @@
+# node / 前端
+node_modules/
+dist/
+coverage/
+
+# rust
+src-tauri/target/
+
+# tauri 自动生成
+src-tauri/gen/schemas/
+
+# 日志
+*.log
+
+# 图标生成中间产物
+src-tauri/app-icon.png
+src-tauri/icons/android/
+src-tauri/icons/ios/
+
+# 系统 / IDE
+.DS_Store
+.idea/
