@@ -3,5 +3,6 @@
 
 pub mod config_repo;
 pub mod connection;
+pub mod task_repo;
 
 pub use connection::Db;

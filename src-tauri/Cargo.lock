@@ -52,6 +52,7 @@ name = "app-reverse-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "rusqlite",
  "rusqlite_migration",
  "serde",
@@ -63,6 +64,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

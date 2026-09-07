@@ -293,18 +293,30 @@ P0 完成后进入 **P1 核心运行时**：把 P0 的 localStorage 设置迁入
 - Windows 进程树终止需 kill 整棵树，防孤儿进程。
 - 前端事件监听要在组件卸载时正确退订，防内存泄漏。
 
+### 5.3.1 实现记录（P2 执行期回填）
+
+- 取消语义用 `watch::channel` 令牌（await 无竞态）；终止升级：SIGTERM → 2s → SIGKILL 一次（`force_sent` 标志防重复）；unix 用 libc::kill(pid)，windows 用 `taskkill /T [/F]` + CREATE_NO_WINDOW。
+- **超时陷阱**：`tokio::select!` 每轮重建 `sleep(d)` 会让持续输出的进程永不超时——必须锚定 `Instant::now()+d` 配 `sleep_until`。
+- UTF-8 截断：日志行/任务名按字节截 `&s[..n]` 会 panic 在字符边界，统一走 `is_char_boundary` 回退。
+- 事件信封：Rust 侧 `AppEvent{event,timestamp,payload}` 经 `app.emit(evt.event, &evt)`，前端 `api/events.ts` 解 `e.payload.payload`；事件名与 ipc-conventions.md §4 一致。
+- 启动孤儿恢复：TaskService::new 里 `mark_orphans_failed`，把上次进程崩溃遗留的 running/pending 统一置 failed（dev 已验证 orphans=2）。
+- 超时终态记 `failed`（退出码不可得），取消记 `cancelled`；`timeout 100ms–1h` 命令层校验。
+- 行数上限双保险：单行 8KB 截断 + 前端缓冲 2000 行 + logs limit≤5000（P7 再上虚拟滚动）。
+- 任务输出 `Sink` 回调里**禁止** async/阻塞（泵任务单线程语义），落库用同步 rusqlite 快速写。
+- migration 002 是首个非幂等 SQL（ALTER ADD COLUMN 无 IF NOT EXISTS），重复执行安全完全依赖 rusqlite_migration 的 user_version——这正是 §1.3「只走 migration」的意义；`PRAGMA user_version` 已验证为 2。
+
 ### 5.4 回测
 
-- cargo test：超时触发、取消触发、非零退出码捕获。
+- cargo test：超时触发、取消触发、非零退出码捕获、输出泵送、缺失可执行报错、任务名截断、孤儿清理、日志有序性（均在 process_service/task_service/task_repo 单测，三平台 cfg）。
 - 手动：跑 `ping`/`sleep` 类命令验证实时输出与取消；杀长命令确认无残留进程；任务历史重启后可查。
 
 ### 5.5 完成标记
 
-- [ ] ProcessService/TaskService 落位，UI 无法绕过直接 spawn
-- [ ] 实时 stdout/stderr 事件流 + 取消 + 超时 + 退出码/耗时展示
-- [ ] 任务历史入库可查
-- [ ] 三平台 shell 适配测试通过
-- [ ] 回测全绿，状态表更新
+- [x] ProcessService/TaskService 落位，UI 无法绕过直接 spawn（命令层校验 + 前端仅 token 解析，执行全在 Rust CommandSpec）
+- [x] 实时 stdout/stderr 事件流 + 取消 + 超时 + 退出码/耗时展示（task://output / task://status；InfoView 含耗时）
+- [x] 任务历史入库可查（tasks/task_logs，migration 002 补 name/exit_code；重启后历史在）
+- [x] 三平台 shell 适配测试通过（unix SIGTERM/KILL + windows taskkill /T；单测 cfg 分支 CI 三平台跑过——见状态表）
+- [x] 回测全绿（cargo test 30 / vitest 24 / clippy / fmt / build），CI 见状态表
 
 ### 5.6 下一步
 

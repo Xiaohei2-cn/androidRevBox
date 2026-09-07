@@ -22,7 +22,11 @@ thiserror = "2"
 anyhow = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 rusqlite_migration = "2"
+uuid = { version = "1.26.0", features = ["v4"] }
 
 [profile.release]
 strip = true
 lto = true
+
+[target."cfg(unix)".dependencies]
+libc = "0.2"

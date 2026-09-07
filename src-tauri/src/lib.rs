@@ -22,11 +22,13 @@ use tauri::Manager;
 use crate::db::Db;
 use crate::services::config_service::ConfigService;
 use crate::services::log_service::{self, LogService};
+use crate::services::task_service::TaskService;
 
 /// 全局共享状态：Service 实例（Arc 化，供各 command 经 tauri::State 取用）
 pub struct AppState {
     pub config: Arc<ConfigService>,
     pub log: Arc<LogService>,
+    pub task: Arc<TaskService>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -45,7 +47,11 @@ pub fn run() {
             let initial_level = LogService::resolve_startup_level(&config);
             let log = log_service::init(&log_dir, &initial_level, config.clone())?;
 
-            app.manage(AppState { config, log });
+            app.manage(AppState {
+                config: config.clone(),
+                log,
+                task: Arc::new(TaskService::new(db.clone(), app.handle().clone())),
+            });
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
                 log_level = initial_level.as_str(),
@@ -58,7 +64,11 @@ pub fn run() {
             commands::config::config_snapshot,
             commands::config::config_get,
             commands::config::config_set,
-            commands::config::log_set_level
+            commands::config::log_set_level,
+            commands::task::task_run,
+            commands::task::task_cancel,
+            commands::task::task_list,
+            commands::task::task_logs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
