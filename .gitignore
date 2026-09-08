@@ -36,3 +36,14 @@ src-tauri/icons/ios/
 .DS_Store
 Thumbs.db
 .idea/
+
+# 文档仅本地保留，不入远端（用户要求 2026-09-07）
+/docs/
+*.md
+
+# 个人配置预防性忽略
+.vscode/
+.claude/
+.zcode/
+AGENTS.md
+CLAUDE.md
