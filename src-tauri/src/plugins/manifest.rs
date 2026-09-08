@@ -11,6 +11,11 @@ pub const HOST_ABI_VERSION: u32 = 1;
 /// 插件类型白名单（总案 §5.1）
 pub const PLUGIN_TYPES: [&str; 5] = ["device", "tool", "crypto", "parser", "workflow"];
 
+/// 传输方式（P6 新增可选字段 `transport`；缺省 = in-process C ABI 动态库）。
+/// process = 独立进程 + stdio JSON-RPC（协议见 docs/plugin-process-protocol.md），崩溃不拖垮主程序。
+pub const TRANSPORT_IN_PROCESS: &str = "in-process";
+pub const TRANSPORT_PROCESS: &str = "process";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginManifest {
@@ -21,9 +26,16 @@ pub struct PluginManifest {
     #[serde(rename = "type")]
     pub plugin_type: String,
     /// 平台键 → 相对插件目录的产物路径，如 "macos-arm64" -> "macos-arm64/libx.dylib"
+    /// （process 插件：指向相对插件目录的可执行文件）
     pub entry: BTreeMap<String, String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// P6 可选：缺省视为 in-process；显式声明只允许这两个取值
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// P6 可选：平台键 → 产物 sha256（hex 小写）。安装时若声明则强校验，未声明跳过。
+    #[serde(default)]
+    pub integrity: BTreeMap<String, String>,
 }
 
 /// manifest 校验错误（前端展示文案在命令层拼装）
@@ -33,6 +45,7 @@ pub enum ManifestError {
     BadId(String),
     AbiMismatch { got: u32, want: u32 },
     UnknownType(String),
+    UnknownTransport(String),
     MissingPlatformEntry(String),
     PathEscape,
 }
@@ -53,6 +66,10 @@ impl std::fmt::Display for ManifestError {
             Self::UnknownType(t) => {
                 write!(f, "未知插件类型: {t}（允许 {}）", PLUGIN_TYPES.join("/"))
             }
+            Self::UnknownTransport(t) => write!(
+                f,
+                "未知 transport: {t}（允许 {TRANSPORT_IN_PROCESS}/{TRANSPORT_PROCESS}）"
+            ),
             Self::MissingPlatformEntry(p) => write!(f, "manifest 缺少当前平台产物: {p}"),
             Self::PathEscape => write!(f, "manifest 产物路径越出插件目录"),
         }
@@ -112,6 +129,11 @@ impl PluginManifest {
         if !PLUGIN_TYPES.contains(&self.plugin_type.as_str()) {
             return Err(ManifestError::UnknownType(self.plugin_type.clone()));
         }
+        if let Some(t) = &self.transport {
+            if t != TRANSPORT_IN_PROCESS && t != TRANSPORT_PROCESS {
+                return Err(ManifestError::UnknownTransport(t.clone()));
+            }
+        }
         let entry = self
             .entry
             .get(platform_key)
@@ -130,6 +152,18 @@ impl PluginManifest {
 
     pub fn entry_for(&self, platform_key: &str) -> Option<&str> {
         self.entry.get(platform_key).map(String::as_str)
+    }
+
+    /// 传输方式；未声明字段时视为 in-process
+    pub fn transport(&self) -> &'static str {
+        match self.transport.as_deref() {
+            Some(TRANSPORT_PROCESS) => TRANSPORT_PROCESS,
+            _ => TRANSPORT_IN_PROCESS,
+        }
+    }
+
+    pub fn is_process(&self) -> bool {
+        self.transport() == TRANSPORT_PROCESS
     }
 }
 
@@ -152,6 +186,8 @@ mod tests {
             plugin_type: "crypto".into(),
             entry,
             capabilities: vec!["encode".into(), "decode".into()],
+            transport: None,
+            integrity: BTreeMap::new(),
         }
     }
 
@@ -241,6 +277,53 @@ mod tests {
         assert_eq!(
             m.entry_for("windows-x64"),
             Some("windows-x64/crypto_sm4.dll")
+        );
+    }
+
+    #[test]
+    fn transport_defaults_to_in_process_and_accepts_process() {
+        let m = valid();
+        assert_eq!(m.transport(), TRANSPORT_IN_PROCESS);
+        assert!(!m.is_process());
+
+        let mut p = valid();
+        p.transport = Some(TRANSPORT_PROCESS.into());
+        assert_eq!(p.validate("macos-arm64"), Ok(()));
+        assert!(p.is_process());
+    }
+
+    #[test]
+    fn rejects_unknown_transport() {
+        let mut m = valid();
+        m.transport = Some("rpc-over-carrier-pigeon".into());
+        assert_eq!(
+            m.validate("macos-arm64"),
+            Err(ManifestError::UnknownTransport(
+                "rpc-over-carrier-pigeon".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_p6_optional_fields() {
+        // P4 时期无 transport/integrity 字段的 manifest 必须继续可用（只加不改）；
+        // P6 新字段可缺省，也可显式声明
+        let text = r#"{
+          "id": "tool.echo",
+          "name": "Echo",
+          "version": "0.2.0",
+          "abi": 1,
+          "type": "tool",
+          "entry": { "macos-arm64": "macos-arm64/echo" },
+          "transport": "process",
+          "integrity": { "macos-arm64": "abc123" }
+        }"#;
+        let m = PluginManifest::parse(text).unwrap();
+        assert_eq!(m.validate("macos-arm64"), Ok(()));
+        assert!(m.is_process());
+        assert_eq!(
+            m.integrity.get("macos-arm64").map(String::as_str),
+            Some("abc123")
         );
     }
 

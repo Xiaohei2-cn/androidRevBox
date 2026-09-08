@@ -11,6 +11,10 @@ pub const KEY_OPACITY: &str = "app.settings.opacity";
 pub const KEY_LOG_LEVEL: &str = "app.settings.log_level";
 /// 手动指定的 adb 路径（P3）；空 = 走环境变量自动探测
 pub const KEY_ADB_PATH: &str = "app.adb.path";
+/// 插件单次调用超时（毫秒，P6）；100–600000
+pub const KEY_PLUGIN_CALL_TIMEOUT_MS: &str = "app.plugins.call_timeout_ms";
+/// 插件输入/输出载荷上限（KB，P6）；1–65536
+pub const KEY_PLUGIN_MAX_PAYLOAD_KB: &str = "app.plugins.max_payload_kb";
 
 fn is_valid_theme(v: &str) -> bool {
     matches!(v, "light" | "dark" | "system")
@@ -32,6 +36,20 @@ fn is_valid_path(v: &str) -> bool {
     v.len() < 1000 && !v.chars().any(|c| c == '\n' || c == '\0')
 }
 
+/// 插件调用超时：100ms–10min
+fn is_valid_timeout_ms(v: &str) -> bool {
+    v.parse::<u64>()
+        .map(|n| (100..=600_000).contains(&n))
+        .unwrap_or(false)
+}
+
+/// 插件载荷上限：1KB–64MB
+fn is_valid_payload_kb(v: &str) -> bool {
+    v.parse::<u64>()
+        .map(|n| (1..=65_536).contains(&n))
+        .unwrap_or(false)
+}
+
 type ValueValidator = fn(&str) -> bool;
 
 /// 允许前端读写的键白名单（防止任意键写入）
@@ -40,6 +58,8 @@ const ALLOWED_KEYS: &[(&str, ValueValidator)] = &[
     (KEY_OPACITY, is_valid_opacity),
     (KEY_LOG_LEVEL, is_valid_log_level),
     (KEY_ADB_PATH, is_valid_path),
+    (KEY_PLUGIN_CALL_TIMEOUT_MS, is_valid_timeout_ms),
+    (KEY_PLUGIN_MAX_PAYLOAD_KB, is_valid_payload_kb),
 ];
 
 #[derive(Clone)]

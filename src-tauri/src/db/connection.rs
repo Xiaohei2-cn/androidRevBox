@@ -12,9 +12,10 @@ use crate::core::error::{CoreError, CoreResult};
 
 /// 迁移版本从 1 递增；001 建表 SQL 自身幂等（IF NOT EXISTS），
 /// 002 起为版本化 ALTER——重复执行安全由 rusqlite_migration 的 user_version 保证。
-const MIGRATIONS: [&str; 2] = [
+const MIGRATIONS: [&str; 3] = [
     include_str!("../../../migrations/001_init.sql"),
     include_str!("../../../migrations/002_tasks_display.sql"),
+    include_str!("../../../migrations/003_plugins_transport.sql"),
 ];
 
 fn build_migrations() -> Migrations<'static> {

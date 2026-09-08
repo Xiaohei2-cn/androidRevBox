@@ -63,9 +63,16 @@ pub fn run() {
             ));
             device.clone().start_watch();
 
-            // 5) PluginService：受控目录 app_data/plugins，启动即扫描加载（P4）
+            // 5) PluginService：受控目录 app_data/plugins，启动即扫描加载（P4/P6）
             let plugin_root = data_dir.join("plugins");
-            let plugins = Arc::new(PluginService::new(db.clone(), plugin_root));
+            let plugins = Arc::new(PluginService::new(
+                db.clone(),
+                config.clone(),
+                plugin_root,
+                Arc::new(services::plugin_service::TauriPluginEventSink(
+                    app.handle().clone(),
+                )),
+            ));
             match plugins.scan() {
                 Ok(report) => {
                     tracing::info!(
@@ -121,7 +128,11 @@ pub fn run() {
             commands::device::device_logcat,
             commands::plugins::plugins_list,
             commands::plugins::plugins_scan,
-            commands::plugins::plugins_call
+            commands::plugins::plugins_call,
+            commands::plugins::plugins_install,
+            commands::plugins::plugins_rollback,
+            commands::plugins::plugins_uninstall,
+            commands::plugins::plugins_set_enabled
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

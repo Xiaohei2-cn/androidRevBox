@@ -1,11 +1,13 @@
 //! crypto-base64：示例插件，演示用 at-plugin-sdk 实现 C ABI v1。
 //!
 //! payload 协议（UTF-8 JSON，业务错误走 payload 而非 C 错误码）：
-//!   请求  {"op":"encode"|"decode", "data":"..."}
+//!   请求  {"op":"encode"|"decode"|"sleep"|"panic", "data":"...", "ms":500}
 //!   成功  {"ok":true, "data":"..."}
 //!   失败  {"ok":false, "code":<正整数>, "err":"..."}
 //! 错误码：1=非法 JSON，2=未知 op，3=base64 解码失败。
 //! C ABI 返回值仅承载框架级错误（SDK 保证：panic=-99，参数非法=-1）。
+//! P6 追加（只加不改）：`sleep` 睡眠 ms 毫秒后返回（超时测试用）、
+//! `panic` 故意 panic（SDK 捕获 → C 返回 -99，宿主不退出，崩溃兜底测试用）。
 
 use at_plugin_sdk::{AtPlugin, PluginDescriptor, export_plugin};
 use base64::Engine as _;
@@ -46,6 +48,12 @@ impl AtPlugin for Base64Plugin {
                     "ok": false, "code": 3, "err": "invalid base64",
                 }),
             },
+            "sleep" => {
+                let ms = req.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                serde_json::json!({"ok": true, "data": "slept"})
+            }
+            "panic" => panic!("intentional panic (P6 crash-baseline test)"),
             _ => serde_json::json!({
                 "ok": false, "code": 2, "err": "unknown op",
             }),

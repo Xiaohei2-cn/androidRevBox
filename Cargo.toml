@@ -4,6 +4,7 @@ members = [
     "src-tauri",
     "plugin-sdk/rust",
     "plugins/crypto-base64",
+    "plugins/process-echo",
 ]
 
 [workspace.package]
