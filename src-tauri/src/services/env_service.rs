@@ -1,0 +1,937 @@
+//! EnvService（P7）：仪表盘环境/工具探测中心。
+//! 卡片：Python / Node / Frida / IDA MCP / jadx MCP / 安卓前台应用。
+//! 原则（PHASES §10）：
+//! - 全部探测并发执行；有依赖的按前置状态剪枝（Python 未配置不探 Frida、
+//!   adb 不可用不发起任何前台探测 shell 调用），减少无谓开销；
+//! - 解析逻辑纯函数化（dumpsys window/package、pidof、--version 输出），可无设备单测；
+//! - 单卡探测失败/超时只影响该卡，不拖垮整版；端口探活失败是常态（显示「未检测到」）。
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::Serialize;
+use serde_json::Value;
+use tokio::process::Command;
+
+use crate::adapters::adb as adb_adapter;
+use crate::core::error::CoreResult;
+use crate::services::config_service::{
+    ConfigService, KEY_IDA_MCP_PORT, KEY_JADX_MCP_PORT, KEY_NODE_PATH, KEY_PYTHON_PATH,
+};
+use crate::services::device_service::{AdbEnvironment, AdbRunOutput, AdbRunner};
+
+/// 单个外部探测命令的超时
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// MCP 端口探活超时
+const MCP_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
+/// 前台应用相关 adb shell 的超时
+const FG_SHELL_TIMEOUT: Duration = Duration::from_secs(8);
+
+pub const DEFAULT_IDA_MCP_PORT: u16 = 13_337;
+pub const DEFAULT_JADX_MCP_PORT: u16 = 8_650;
+
+/// frida 探测脚本：一条子进程同时查 frida 与 frida-tools，未安装输出 null
+const FRIDA_PROBE_SCRIPT: &str = "import json\nfrom importlib.metadata import version\nout = {}\nfor pkg in ('frida', 'frida-tools'):\n    try:\n        out[pkg] = version(pkg)\n    except Exception:\n        out[pkg] = None\nprint(json.dumps(out))";
+
+/// 解析 FRIDA_PROBE_SCRIPT 的输出 → (frida 版本, frida-tools 版本)
+pub fn parse_frida_versions(stdout: &str) -> (Option<String>, Option<String>) {
+    let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) else {
+        return (None, None);
+    };
+    let get = |k: &str| v.get(k).and_then(Value::as_str).map(String::from);
+    (get("frida"), get("frida-tools"))
+}
+
+#[derive(Clone)]
+pub struct EnvService {
+    config: Arc<ConfigService>,
+    adb: Arc<dyn AdbRunner>,
+}
+
+impl EnvService {
+    pub fn new(config: Arc<ConfigService>, adb: Arc<dyn AdbRunner>) -> Self {
+        Self { config, adb }
+    }
+
+    fn u16_config(&self, key: &str, default: u16) -> u16 {
+        self.config
+            .get(key, &default.to_string())
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(default)
+    }
+
+    // ===== 各卡探测 =====
+
+    /// ADB 环境（复用 P3 的 runner；前台应用卡的剪枝前置）
+    pub async fn adb(&self) -> AdbEnvironment {
+        self.adb.environment().await
+    }
+
+    /// Python：用户在设置中指定的解释器（空 = 未配置，不做 PATH 自动探测，
+    /// 按 §10 规范「未配置时提示去设置」）。
+    pub async fn python(&self) -> PythonEnv {
+        let path = self
+            .config
+            .get(KEY_PYTHON_PATH, "")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if path.is_empty() {
+            return PythonEnv {
+                configured: false,
+                ready: false,
+                path: None,
+                version: None,
+                hint: Some("未配置 Python 解释器：请在 设置 → 工具环境 中指定。".into()),
+            };
+        }
+        match run_probe(&path, &["--version"]).await {
+            Ok(out) => match parse_python_version(&out.stdout) {
+                Some(version) => PythonEnv {
+                    configured: true,
+                    ready: true,
+                    path: Some(path),
+                    version: Some(version),
+                    hint: None,
+                },
+                None => PythonEnv {
+                    configured: true,
+                    ready: false,
+                    path: Some(path),
+                    version: None,
+                    hint: Some(format!(
+                        "执行 --version 成功但输出无法解析: {}",
+                        first_line(&out.stdout)
+                    )),
+                },
+            },
+            Err(e) => PythonEnv {
+                configured: true,
+                ready: false,
+                path: Some(path),
+                version: None,
+                hint: Some(format!("解释器执行失败: {e}")),
+            },
+        }
+    }
+
+    /// Node：配置路径优先，否则 PATH 上的 node。
+    pub async fn node(&self) -> NodeEnv {
+        let configured = self
+            .config
+            .get(KEY_NODE_PATH, "")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let has_config = !configured.is_empty();
+        let path = if has_config {
+            configured.clone()
+        } else {
+            "node".to_string()
+        };
+        match run_probe(&path, &["--version"]).await {
+            Ok(out) => match parse_node_version(&out.stdout) {
+                Some(version) => {
+                    let npm_global_root = probe_npm_root(&path).await;
+                    NodeEnv {
+                        ready: true,
+                        path: Some(path),
+                        version: Some(version),
+                        npm_global_root,
+                        hint: None,
+                    }
+                }
+                None => NodeEnv {
+                    ready: false,
+                    path: Some(path),
+                    version: None,
+                    npm_global_root: None,
+                    hint: Some(format!(
+                        "node --version 输出无法解析: {}",
+                        first_line(&out.stdout)
+                    )),
+                },
+            },
+            Err(_) => NodeEnv {
+                ready: false,
+                path: non_empty(configured.clone()),
+                version: None,
+                npm_global_root: None,
+                hint: Some(if has_config {
+                    format!("配置的 node 无法执行: {configured}")
+                } else {
+                    "未检测到 node：请安装 Node.js 并加入 PATH，或在 设置 → 工具环境 指定路径。"
+                        .into()
+                }),
+            },
+        }
+    }
+
+    /// Frida：指定 Python 环境下 frida / frida-tools 的安装与版本。
+    /// 剪枝：Python 未配置/不可用时直接返回 not_probed，不发起子进程。
+    pub async fn frida(&self) -> FridaEnv {
+        let py = self.python().await;
+        self.frida_after(py).await
+    }
+
+    /// frida 探测（复用已探测的 Python 环境，避免 overview 里重复起子进程）
+    async fn frida_after(&self, py: PythonEnv) -> FridaEnv {
+        if !py.ready {
+            return FridaEnv {
+                python_ready: false,
+                installed: false,
+                frida_version: None,
+                frida_tools_version: None,
+                hint: Some(match py.hint {
+                    Some(h) => h,
+                    None => "Python 环境未就绪，无法检测 Frida。".into(),
+                }),
+            };
+        }
+        let python_path = py.path.clone().unwrap_or_default();
+        // 一条子进程同时查两个包（importlib.metadata），失败=未安装
+        let script = FRIDA_PROBE_SCRIPT;
+        match run_probe(&python_path, &["-c", script]).await {
+            Ok(out) => {
+                let (frida, tools) = parse_frida_versions(&out.stdout);
+                let installed = frida.is_some() || tools.is_some();
+                FridaEnv {
+                    python_ready: true,
+                    installed,
+                    frida_version: frida,
+                    frida_tools_version: tools,
+                    hint: if installed {
+                        None
+                    } else {
+                        Some(
+                            "该 Python 环境未安装 frida / frida-tools（pip install frida-tools）。"
+                                .into(),
+                        )
+                    },
+                }
+            }
+            Err(e) => FridaEnv {
+                python_ready: true,
+                installed: false,
+                frida_version: None,
+                frida_tools_version: None,
+                hint: Some(format!("Frida 检测执行失败: {e}")),
+            },
+        }
+    }
+
+    /// IDA MCP 状态：端口探活
+    pub async fn ida_mcp(&self) -> McpEnv {
+        let port = self.u16_config(KEY_IDA_MCP_PORT, DEFAULT_IDA_MCP_PORT);
+        probe_mcp("IDA MCP", port).await
+    }
+
+    /// jadx-gui MCP 状态：端口探活
+    pub async fn jadx_mcp(&self) -> McpEnv {
+        let port = self.u16_config(KEY_JADX_MCP_PORT, DEFAULT_JADX_MCP_PORT);
+        probe_mcp("jadx MCP", port).await
+    }
+
+    /// 安卓前台应用（§10 探测链）。剪枝：adb 不可用 → 0 次 shell 调用；
+    /// 无在线设备 → 只调 devices；解析不出前台窗口 → 空态提示。
+    pub async fn foreground(&self) -> ForegroundApp {
+        let env = self.adb.environment().await;
+        if !env.installed {
+            return ForegroundApp {
+                state: FgState::AdbUnavailable.as_str().into(),
+                hint: Some("adb 不可用，前台应用检测暂停。".into()),
+                ..ForegroundApp::default()
+            };
+        }
+        let adb_path = env.path.clone().unwrap_or_default();
+        // 1) 设备在线检查（唯一无条件的 shell 级调用）
+        let devices_args = adb_adapter::build_args(None, &adb_adapter::cmd_devices());
+        let devices_out = match self
+            .adb
+            .run(&adb_path, &devices_args, FG_SHELL_TIMEOUT)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                return ForegroundApp {
+                    state: FgState::Error.as_str().into(),
+                    error: Some(format!("adb devices 失败: {e}")),
+                    ..ForegroundApp::default()
+                };
+            }
+        };
+        let serial = adb_adapter::parse_devices(&devices_out.stdout)
+            .into_iter()
+            .find(|d| d.is_ready())
+            .map(|d| d.serial);
+        let Some(serial) = serial else {
+            return ForegroundApp {
+                state: FgState::NoDevice.as_str().into(),
+                hint: Some("无在线设备：连接设备/模拟器后自动开始检测。".into()),
+                ..ForegroundApp::default()
+            };
+        };
+
+        // 2) 前台窗口
+        let win_out = match self.shell(&adb_path, &serial, "dumpsys window").await {
+            Ok(o) => o,
+            Err(e) => {
+                return ForegroundApp {
+                    state: FgState::Error.as_str().into(),
+                    serial: Some(serial),
+                    error: Some(format!("dumpsys window 失败: {e}")),
+                    ..ForegroundApp::default()
+                };
+            }
+        };
+        let Some((package, activity)) = parse_foreground_window(&win_out.stdout) else {
+            return ForegroundApp {
+                state: FgState::NoForeground.as_str().into(),
+                serial: Some(serial),
+                hint: Some("未解析到前台窗口（可能锁屏、弹窗或系统版本输出差异）。".into()),
+                ..ForegroundApp::default()
+            };
+        };
+
+        // 3) 包详情（pidof + legacyNativeLibraryDir）与 4) /proc 探测并发
+        let pid_cmd = format!("pidof {package}");
+        let lib_cmd = format!("dumpsys package {package} | grep legacyNativeLibraryDir");
+        let (pid_res, lib_res) = tokio::join!(
+            self.shell(&adb_path, &serial, &pid_cmd),
+            self.shell(&adb_path, &serial, &lib_cmd),
+        );
+        let pid = pid_res
+            .ok()
+            .and_then(|o| parse_pidof(&o.stdout))
+            .unwrap_or_default();
+        let native_lib_dir = lib_res
+            .ok()
+            .and_then(|o| parse_legacy_native_lib(&o.stdout));
+
+        let proc_paths = if pid.is_empty() {
+            Vec::new()
+        } else {
+            self.probe_proc_paths(&adb_path, &serial, &pid).await
+        };
+
+        ForegroundApp {
+            state: FgState::Ready.as_str().into(),
+            serial: Some(serial),
+            package: Some(package),
+            activity: Some(activity),
+            pid: non_empty(pid),
+            native_lib_dir,
+            proc_paths,
+            hint: None,
+            error: None,
+        }
+    }
+
+    /// /proc/<pid> 关键路径摘要（maps 行数、cmdline、status 头几行）。
+    /// 全部尽力而为：读不到（需 root / 进程已退）标 readable=false。
+    async fn probe_proc_paths(&self, adb_path: &str, serial: &str, pid: &str) -> Vec<ProcPath> {
+        let base = format!("/proc/{pid}");
+        let maps_f = format!("{base}/maps");
+        let cmdline_f = format!("{base}/cmdline");
+        let status_f = format!("{base}/status");
+
+        let maps_cmd = format!("wc -l {maps_f}");
+        let cmdline_cmd = format!("cat {cmdline_f}");
+        let status_cmd = format!("head -4 {status_f}");
+        let (maps, cmdline, status) = tokio::join!(
+            self.shell(adb_path, serial, &maps_cmd),
+            self.shell(adb_path, serial, &cmdline_cmd),
+            self.shell(adb_path, serial, &status_cmd),
+        );
+        let maps_readable = maps.is_ok();
+        let cmdline_readable = cmdline.is_ok();
+        let status_readable = status.is_ok();
+        vec![
+            ProcPath {
+                name: "maps".into(),
+                path: maps_f,
+                summary: maps.ok().map(|o| {
+                    let t = o.stdout.trim();
+                    // toybox wc 输出 "123 /proc/x/maps"，取行数段
+                    t.split_whitespace().next().unwrap_or(t).to_string()
+                }),
+                readable: maps_readable,
+            },
+            ProcPath {
+                name: "cmdline".into(),
+                path: cmdline_f,
+                summary: cmdline.ok().map(|o| {
+                    let s = o.stdout.replace('\0', " ");
+                    let s = s.trim().to_string();
+                    if s.chars().count() > 120 {
+                        s.chars().take(120).collect::<String>() + "…"
+                    } else {
+                        s
+                    }
+                }),
+                readable: cmdline_readable,
+            },
+            ProcPath {
+                name: "status".into(),
+                path: status_f,
+                summary: status.ok().map(|o| o.stdout.trim().to_string()),
+                readable: status_readable,
+            },
+        ]
+    }
+
+    async fn shell(&self, adb_path: &str, serial: &str, command: &str) -> CoreResult<AdbRunOutput> {
+        let args = adb_adapter::build_args(Some(serial), &adb_adapter::cmd_shell(command));
+        self.adb.run(adb_path, &args, FG_SHELL_TIMEOUT).await
+    }
+
+    /// 仪表盘聚合：全部环境卡并发探测（Frida 复用 Python 结果，未就绪即剪枝）。
+    pub async fn overview(&self) -> EnvOverview {
+        let (python, node, ida, jadx) =
+            tokio::join!(self.python(), self.node(), self.ida_mcp(), self.jadx_mcp());
+        let frida = self.frida_after(python.clone()).await;
+        EnvOverview {
+            python,
+            node,
+            frida,
+            ida_mcp: ida,
+            jadx_mcp: jadx,
+        }
+    }
+}
+
+// ===== 探测工具 =====
+
+/// 运行外部探测命令（capture，短超时）。Windows 防 CREATE_NO_WINDOW 闪窗（仅预留）。
+async fn run_probe(program: &str, args: &[&str]) -> Result<ProbeOutput, String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let fut = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(PROBE_TIMEOUT, fut)
+        .await
+        .map_err(|_| format!("超时（{PROBE_TIMEOUT:?}）"))?
+        .map_err(|e| e.to_string())?;
+    Ok(ProbeOutput {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        exit_code: out.status.code(),
+    })
+}
+
+/// MCP 端口探活：TCP 可连 = 服务在跑；连不上是常态（未启动），不算错误。
+async fn probe_mcp(name: &str, port: u16) -> McpEnv {
+    use tokio::net::TcpStream;
+    let addr = format!("127.0.0.1:{port}");
+    match tokio::time::timeout(MCP_CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
+        Ok(Ok(_)) => McpEnv {
+            reachable: true,
+            port,
+            hint: Some(format!("{name} 服务在线（{addr}）")),
+        },
+        Ok(Err(e)) => McpEnv {
+            reachable: false,
+            port,
+            hint: Some(format!(
+                "{name} 未检测到（{addr} 连接失败: {e}）。启动工具后点刷新。"
+            )),
+        },
+        Err(_) => McpEnv {
+            reachable: false,
+            port,
+            hint: Some(format!("{name} 未检测到（{addr} 连接超时）。")),
+        },
+    }
+}
+
+/// npm 全局包根目录（`npm root -g`）；失败返回 None
+async fn probe_npm_root(node_path: &str) -> Option<String> {
+    let npm = if node_path.ends_with("node.exe") {
+        node_path.replace("node.exe", "npm.cmd")
+    } else {
+        "npm".to_string()
+    };
+    let out = run_probe(&npm, &["root", "-g"]).await.ok()?;
+    let s = out.stdout.trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+struct ProbeOutput {
+    stdout: String,
+    #[allow(dead_code)]
+    stderr: String,
+    #[allow(dead_code)]
+    exit_code: Option<i32>,
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").trim().to_string()
+}
+
+fn non_empty(s: String) -> Option<String> {
+    if s.is_empty() { None } else { Some(s) }
+}
+
+// ===== 纯解析函数（无 IO，单测覆盖多格式） =====
+
+/// dumpsys window → (包名, Activity)。
+/// 兼容 mCurrentFocus / mFocusedWindow；null → None。
+pub fn parse_foreground_window(stdout: &str) -> Option<(String, String)> {
+    for line in stdout.lines() {
+        let t = line.trim();
+        if !(t.starts_with("mCurrentFocus") || t.starts_with("mFocusedWindow")) {
+            continue;
+        }
+        if t.contains("null") {
+            return None;
+        }
+        // Window{7a4c1de u0 com.pkg/com.pkg.Activity}
+        if let Some(brace) = t.find('{') {
+            let inner = &t[brace + 1..].trim_end_matches('}');
+            if let Some(activity_part) = inner.split_whitespace().find(|s| s.contains('/')) {
+                let mut it = activity_part.splitn(2, '/');
+                let package = it.next()?.to_string();
+                let activity = it.next()?.to_string();
+                if !package.is_empty() && !activity.is_empty() {
+                    return Some((package, activity));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `dumpsys package <pkg> | grep legacyNativeLibraryDir` → 目录路径
+pub fn parse_legacy_native_lib(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        if let Some(idx) = line.find("legacyNativeLibraryDir=") {
+            let v = line[idx + "legacyNativeLibraryDir=".len()..].trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// pidof 输出 → 首个 PID（可能多列 "123 456"）
+pub fn parse_pidof(stdout: &str) -> Option<String> {
+    stdout
+        .split_whitespace()
+        .next()
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .map(String::from)
+}
+
+/// `python --version`（stdout 或 stderr）→ "3.12.4"
+pub fn parse_python_version(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("Python ") {
+            let v = rest.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// `node --version` → "20.11.1"（剥掉 v 前缀）
+pub fn parse_node_version(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix('v') {
+            let v = rest.trim();
+            if v.split('.')
+                .next()
+                .map(|m| m.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or(false)
+            {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+// ===== DTO =====
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PythonEnv {
+    /// 用户配置了解释器路径
+    pub configured: bool,
+    /// 探测成功（能执行 --version 且输出可解析）
+    pub ready: bool,
+    pub path: Option<String>,
+    pub version: Option<String>,
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeEnv {
+    pub ready: bool,
+    pub path: Option<String>,
+    pub version: Option<String>,
+    /// npm 全局包根目录（npm root -g）
+    pub npm_global_root: Option<String>,
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FridaEnv {
+    pub python_ready: bool,
+    /// frida 或 frida-tools 任一安装即 true
+    pub installed: bool,
+    pub frida_version: Option<String>,
+    pub frida_tools_version: Option<String>,
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpEnv {
+    pub reachable: bool,
+    pub port: u16,
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FgState {
+    Ready,
+    AdbUnavailable,
+    NoDevice,
+    NoForeground,
+    Error,
+}
+
+impl FgState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FgState::Ready => "ready",
+            FgState::AdbUnavailable => "adb_unavailable",
+            FgState::NoDevice => "no_device",
+            FgState::NoForeground => "no_foreground",
+            FgState::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcPath {
+    /// maps | cmdline | status
+    pub name: String,
+    pub path: String,
+    /// 摘要（maps=行数、cmdline=命令行截断、status=头几行）；不可读为 None
+    pub summary: Option<String>,
+    pub readable: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForegroundApp {
+    /// ready | adb_unavailable | no_device | no_foreground | error
+    pub state: String,
+    pub serial: Option<String>,
+    pub package: Option<String>,
+    pub activity: Option<String>,
+    pub pid: Option<String>,
+    /// legacyNativeLibraryDir
+    pub native_lib_dir: Option<String>,
+    pub proc_paths: Vec<ProcPath>,
+    pub hint: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvOverview {
+    pub python: PythonEnv,
+    pub node: NodeEnv,
+    pub frida: FridaEnv,
+    pub ida_mcp: McpEnv,
+    pub jadx_mcp: McpEnv,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ===== 解析纯函数 =====
+
+    #[test]
+    fn parse_foreground_window_extracts_package_and_activity() {
+        let out = "Devices: false\n  mCurrentFocus: Window{7a4c1de u0 com.example.app/com.example.app.MainActivity}\n";
+        let r = parse_foreground_window(out).expect("解析成功");
+        assert_eq!(r.0, "com.example.app");
+        assert_eq!(r.1, "com.example.app.MainActivity");
+    }
+
+    #[test]
+    fn parse_foreground_window_falls_back_to_focused_window() {
+        let out = "  mFocusedWindow: Window{bf4b5b4 u0 com.android.launcher3/com.android.launcher3.uioverrides.QuickstepLauncher}\n";
+        let (pkg, act) = parse_foreground_window(out).unwrap();
+        assert_eq!(pkg, "com.android.launcher3");
+        assert!(act.contains("Launcher"));
+    }
+
+    #[test]
+    fn parse_foreground_window_null_and_garbage() {
+        assert!(parse_foreground_window("  mCurrentFocus: null\n").is_none());
+        assert!(parse_foreground_window("nothing useful here").is_none());
+        assert!(parse_foreground_window("").is_none());
+    }
+
+    #[test]
+    fn parse_legacy_native_lib_extracts_dir() {
+        let out = "    legacyNativeLibraryDir=/data/app/~~aBc==/com.example.app-xYz==/lib/arm64\n    primaryCpuAbi=arm64-v8a\n";
+        assert_eq!(
+            parse_legacy_native_lib(out).as_deref(),
+            Some("/data/app/~~aBc==/com.example.app-xYz==/lib/arm64")
+        );
+        assert!(parse_legacy_native_lib("no match").is_none());
+        assert!(parse_legacy_native_lib("legacyNativeLibraryDir=\n").is_none());
+    }
+
+    #[test]
+    fn parse_pidof_takes_first_and_validates_digits() {
+        assert_eq!(parse_pidof("12345\n").as_deref(), Some("12345"));
+        assert_eq!(parse_pidof(" 123 456\n").as_deref(), Some("123"));
+        assert_eq!(parse_pidof(""), None);
+        assert_eq!(parse_pidof("not-a-pid"), None);
+    }
+
+    #[test]
+    fn parse_python_and_node_versions() {
+        // 旧版 python 把 --version 打到 stderr，前端已合并读取
+        assert_eq!(
+            parse_python_version("Python 3.12.4\n"),
+            Some("3.12.4".into())
+        );
+        assert_eq!(
+            parse_python_version("Python 3.13.0rc1"),
+            Some("3.13.0rc1".into())
+        );
+        assert_eq!(parse_python_version("command not found"), None);
+        assert_eq!(parse_node_version("v20.11.1\n"), Some("20.11.1".into()));
+        assert_eq!(parse_node_version("v22.0.0"), Some("22.0.0".into()));
+        assert_eq!(parse_node_version("node: command not found"), None);
+    }
+
+    // ===== 前台探测链（Mock runner：可脚本化输出 + 调用计数） =====
+
+    struct ScriptedAdb {
+        installed: bool,
+        path: Option<String>,
+        /// 命令关键词 → 返回 stdout（按顺序 pop，默认空）
+        script: std::sync::Mutex<Vec<(&'static str, String)>>,
+        /// 每次实际 run() 调用的命令关键词记录
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedAdb {
+        fn new(installed: bool) -> Self {
+            Self {
+                installed,
+                path: installed.then(|| "/fake/adb".to_string()),
+                script: std::sync::Mutex::new(Vec::new()),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn expect(&self, keyword: &'static str, stdout: &str) -> &Self {
+            self.script
+                .lock()
+                .unwrap()
+                .push((keyword, stdout.to_string()));
+            self
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AdbRunner for ScriptedAdb {
+        async fn run(
+            &self,
+            _adb_path: &str,
+            args: &[String],
+            _timeout: Duration,
+        ) -> CoreResult<AdbRunOutput> {
+            let joined = args.join(" ");
+            self.calls.lock().unwrap().push(joined.clone());
+            let mut script = self.script.lock().unwrap();
+            let out = script
+                .iter()
+                .position(|(kw, _)| joined.contains(kw))
+                .map(|idx| {
+                    let (_, s) = script.remove(idx);
+                    s
+                })
+                .unwrap_or_default();
+            Ok(AdbRunOutput {
+                stdout: out,
+                stderr: String::new(),
+                exit_code: Some(0),
+            })
+        }
+
+        async fn environment(&self) -> AdbEnvironment {
+            if self.installed {
+                AdbEnvironment {
+                    installed: true,
+                    path: self.path.clone(),
+                    source: Some("path_env".into()),
+                    version: None,
+                    hint: None,
+                    probe_error: None,
+                }
+            } else {
+                AdbEnvironment::not_found()
+            }
+        }
+
+        fn invalidate_cache(&self) {}
+    }
+
+    fn svc_with(mock: Arc<ScriptedAdb>) -> EnvService {
+        let db = Arc::new(crate::db::Db::in_memory().unwrap());
+        let config = Arc::new(ConfigService::new(db));
+        EnvService::new(config, mock)
+    }
+
+    const FIXTURE_WINDOW: &str =
+        "  mCurrentFocus: Window{abc u0 com.target.app/com.target.app.ui.HomeActivity}\n";
+    const FIXTURE_LIB: &str =
+        "    legacyNativeLibraryDir=/data/app/~~x/com.target.app-y/lib/arm64\n";
+    const FIXTURE_STATUS: &str =
+        "Name:\tcom.target.app\nState:\tS (sleeping)\nTgid:\t4321\nPid:\t4321\n";
+
+    #[tokio::test]
+    async fn foreground_full_chain_parses_all_fields() {
+        let mock = Arc::new(ScriptedAdb::new(true));
+        mock.expect("devices", "ABC123\tdevice product:foo\n");
+        mock.expect("dumpsys window", FIXTURE_WINDOW);
+        mock.expect("pidof", "4321\n");
+        mock.expect("legacyNativeLibraryDir", FIXTURE_LIB);
+        mock.expect("wc -l", "512 /proc/4321/maps\n");
+        mock.expect("cmdline", "com.target.app\0--flag\0");
+        mock.expect("status", FIXTURE_STATUS);
+        let svc = svc_with(mock.clone());
+
+        let fg = svc.foreground().await;
+        assert_eq!(fg.state, "ready", "{fg:?}");
+        assert_eq!(fg.serial.as_deref(), Some("ABC123"));
+        assert_eq!(fg.package.as_deref(), Some("com.target.app"));
+        assert_eq!(
+            fg.activity.as_deref(),
+            Some("com.target.app.ui.HomeActivity")
+        );
+        assert_eq!(fg.pid.as_deref(), Some("4321"));
+        assert_eq!(
+            fg.native_lib_dir.as_deref(),
+            Some("/data/app/~~x/com.target.app-y/lib/arm64")
+        );
+        assert_eq!(fg.proc_paths.len(), 3);
+        let maps = fg.proc_paths.iter().find(|p| p.name == "maps").unwrap();
+        assert_eq!(maps.summary.as_deref(), Some("512"));
+        assert!(maps.readable);
+        let cmdline = fg.proc_paths.iter().find(|p| p.name == "cmdline").unwrap();
+        assert_eq!(cmdline.summary.as_deref(), Some("com.target.app --flag"));
+        assert!(fg.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn foreground_prunes_to_zero_calls_when_adb_missing() {
+        // §10 回测核心：adb 不存在 → 前台探测 0 次 shell 调用
+        let mock = Arc::new(ScriptedAdb::new(false));
+        let svc = svc_with(mock.clone());
+        let fg = svc.foreground().await;
+        assert_eq!(fg.state, "adb_unavailable");
+        assert_eq!(mock.call_count(), 0, "剪枝后不应有任何 adb 调用");
+        assert!(fg.package.is_none());
+    }
+
+    #[tokio::test]
+    async fn foreground_stops_at_no_device() {
+        let mock = Arc::new(ScriptedAdb::new(true));
+        mock.expect("devices", "\n"); // 空列表
+        let svc = svc_with(mock.clone());
+        let fg = svc.foreground().await;
+        assert_eq!(fg.state, "no_device");
+        assert_eq!(mock.call_count(), 1, "无设备时只调了 devices，不再继续");
+    }
+
+    #[tokio::test]
+    async fn foreground_lock_screen_is_empty_state_not_error() {
+        let mock = Arc::new(ScriptedAdb::new(true));
+        mock.expect("devices", "ABC123\tdevice\n");
+        mock.expect("dumpsys window", "  mCurrentFocus: null\n");
+        let svc = svc_with(mock);
+        let fg = svc.foreground().await;
+        assert_eq!(fg.state, "no_foreground");
+        assert!(fg.hint.is_some());
+        assert!(fg.error.is_none(), "空态不是错误");
+    }
+
+    #[test]
+    fn parse_frida_versions_handles_all_shapes() {
+        let (f, t) = parse_frida_versions(r#"{"frida": "16.5.9", "frida-tools": "13.6.1"}"#);
+        assert_eq!(f.as_deref(), Some("16.5.9"));
+        assert_eq!(t.as_deref(), Some("13.6.1"));
+        // 只装了其中一个
+        let (f, t) = parse_frida_versions(r#"{"frida": "16.5.9", "frida-tools": null}"#);
+        assert_eq!(f.as_deref(), Some("16.5.9"));
+        assert_eq!(t, None);
+        // 全未安装 / 输出损坏
+        let (f, t) = parse_frida_versions(r#"{"frida": null, "frida-tools": null}"#);
+        assert_eq!((f, t), (None, None));
+        let (f, t) = parse_frida_versions("Traceback (most recent call last): ...");
+        assert_eq!((f, t), (None, None));
+    }
+
+    #[tokio::test]
+    async fn frida_probe_is_pruned_without_python() {
+        // §10 剪枝：Python 未配置 → frida 不发起任何子进程，直接返回剪枝态
+        let db = Arc::new(crate::db::Db::in_memory().unwrap());
+        let config = Arc::new(ConfigService::new(db));
+        let svc = EnvService::new(config, Arc::new(ScriptedAdb::new(false)));
+        let frida = svc.frida().await;
+        assert!(!frida.python_ready);
+        assert!(!frida.installed);
+        assert!(frida.hint.unwrap().contains("未配置"));
+    }
+
+    #[tokio::test]
+    async fn mcp_port_probe_reports_unreachable_without_panic() {
+        // 用一个大概率没人监听的端口
+        let svc = {
+            let db = Arc::new(crate::db::Db::in_memory().unwrap());
+            let config = Arc::new(ConfigService::new(db));
+            EnvService::new(config, Arc::new(ScriptedAdb::new(false)))
+        };
+        let env = svc.jadx_mcp().await;
+        // 端口默认值来自配置默认
+        assert_eq!(env.port, DEFAULT_JADX_MCP_PORT);
+        // 连不上是常态：reachable=false 且有可读 hint
+        if !env.reachable {
+            assert!(env.hint.unwrap().contains("未检测到"));
+        }
+    }
+}

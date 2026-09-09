@@ -1,78 +1,40 @@
 import { useQuery } from "@tanstack/react-query";
-import { CheckCircle2, XCircle } from "lucide-react";
-import { systemApi } from "@/api/system";
+import { envApi } from "@/api/env";
 import { AdbCard } from "./AdbCard";
+import { FridaCard, McpCard, NodeCard, PythonCard } from "./EnvCards";
+import { ForegroundCard } from "./ForegroundCard";
 
-/** 仪表盘：system_ping 验证通路；AdbCard 展示 adb 环境/版本/设备连接轮询（P3） */
+/**
+ * 仪表盘（P7）：环境/工具探测中心。
+ * 布局契约（PHASES §10）：左右两列网格；任何卡片不得独占一行；
+ * 唯一例外「安卓前台应用」整行且排最底。卡片顺序 = 先系统、再环境、再工具、安卓前台最后。
+ * 系统状态四卡（后端连接/应用版本/Tauri 版本/平台）已迁至 设置 → 关于。
+ */
 export function DashboardPage() {
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["system", "ping"],
-    queryFn: systemApi.ping,
+  return (
+    <div
+      data-testid="dashboard-grid"
+      className="grid h-full grid-cols-2 content-start gap-4 overflow-auto"
+    >
+      <AdbCard />
+      <PythonCard />
+      <NodeCard />
+      <FridaCardWrapper />
+      <McpCard testid="env-ida" title="IDA MCP" queryFn={envApi.idaMcp} />
+      <McpCard testid="env-jadx" title="jadx-gui MCP" queryFn={envApi.jadxMcp} />
+      {/* 唯一整行卡：安卓前台应用，置于最底 */}
+      <ForegroundCard />
+    </div>
+  );
+}
+
+/** Frida 卡依赖 Python 就绪：先探 Python，ready 才启用 Frida 查询（§10 剪枝） */
+function FridaCardWrapper() {
+  const { data: python } = useQuery({
+    queryKey: ["env", "python"],
+    queryFn: envApi.python,
+    staleTime: 30_000,
+    retry: false,
   });
-
-  return (
-    <div className="flex h-full flex-col gap-4 overflow-auto">
-      <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
-        <StatusCard
-          title="后端连接"
-          loading={isLoading}
-          ok={!error}
-          value={error ? "未连接" : "正常"}
-        />
-        <InfoCard title="应用版本" value={data?.appVersion ?? "—"} />
-        <InfoCard title="Tauri 版本" value={data?.tauriVersion ?? "—"} />
-        <InfoCard
-          title="运行平台"
-          value={data ? `${data.os} · ${data.arch}` : "—"}
-        />
-      </div>
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-        <AdbCard />
-        <div className="rounded-xl border border-dashed p-6 text-center text-xs text-muted-foreground">
-          最近命令 / 常用工具 / 插件状态等聚合信息将在 P7 UX 阶段补全
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function StatusCard({
-  title,
-  value,
-  ok,
-  loading,
-}: {
-  title: string;
-  value: string;
-  ok: boolean;
-  loading: boolean;
-}) {
-  return (
-    <div className="rounded-xl border bg-card p-4">
-      <p className="text-xs text-muted-foreground">{title}</p>
-      <div className="mt-2 flex items-center gap-1.5 text-lg font-semibold">
-        {loading ? (
-          <span className="text-sm text-muted-foreground">检测中…</span>
-        ) : (
-          <>
-            {ok ? (
-              <CheckCircle2 className="h-4 w-4 text-emerald-500" />
-            ) : (
-              <XCircle className="h-4 w-4 text-red-500" />
-            )}
-            {value}
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function InfoCard({ title, value }: { title: string; value: string }) {
-  return (
-    <div className="rounded-xl border bg-card p-4">
-      <p className="text-xs text-muted-foreground">{title}</p>
-      <p className="mt-2 text-lg font-semibold">{value}</p>
-    </div>
-  );
+  return <FridaCard pythonReady={python?.ready} />;
 }

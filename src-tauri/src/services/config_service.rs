@@ -15,6 +15,14 @@ pub const KEY_ADB_PATH: &str = "app.adb.path";
 pub const KEY_PLUGIN_CALL_TIMEOUT_MS: &str = "app.plugins.call_timeout_ms";
 /// 插件输入/输出载荷上限（KB，P6）；1–65536
 pub const KEY_PLUGIN_MAX_PAYLOAD_KB: &str = "app.plugins.max_payload_kb";
+/// Python 解释器路径（P7）；空 = 未配置（Python 卡与 Frida 卡据此剪枝）
+pub const KEY_PYTHON_PATH: &str = "app.python.path";
+/// Node 可执行路径（P7）；空 = 走系统 PATH 探测
+pub const KEY_NODE_PATH: &str = "app.node.path";
+/// IDA MCP 服务端口（P7）；1–65535
+pub const KEY_IDA_MCP_PORT: &str = "app.tools.ida_mcp_port";
+/// jadx-gui MCP 服务端口（P7）；1–65535
+pub const KEY_JADX_MCP_PORT: &str = "app.tools.jadx_mcp_port";
 
 fn is_valid_theme(v: &str) -> bool {
     matches!(v, "light" | "dark" | "system")
@@ -50,6 +58,11 @@ fn is_valid_payload_kb(v: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// MCP 服务端口：1–65535
+fn is_valid_port(v: &str) -> bool {
+    v.parse::<u16>().is_ok()
+}
+
 type ValueValidator = fn(&str) -> bool;
 
 /// 允许前端读写的键白名单（防止任意键写入）
@@ -60,6 +73,10 @@ const ALLOWED_KEYS: &[(&str, ValueValidator)] = &[
     (KEY_ADB_PATH, is_valid_path),
     (KEY_PLUGIN_CALL_TIMEOUT_MS, is_valid_timeout_ms),
     (KEY_PLUGIN_MAX_PAYLOAD_KB, is_valid_payload_kb),
+    (KEY_PYTHON_PATH, is_valid_path),
+    (KEY_NODE_PATH, is_valid_path),
+    (KEY_IDA_MCP_PORT, is_valid_port),
+    (KEY_JADX_MCP_PORT, is_valid_port),
 ];
 
 #[derive(Clone)]

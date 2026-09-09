@@ -228,14 +228,14 @@ impl PluginService {
                 }
             }
         }
-        // 目录里消失的插件：清库、移出内存（drop → shutdown）
+        // 整表替换：被替换/消失插件的 LoadedPlugin 必须在全局调用锁内 drop
+        // （shutdown + dlclose 期间不允许任何线程在插件代码内执行）
         {
             let mut guard = self.loaded.lock().expect("plugin map lock");
             loader::with_call_lock(|| {
-                guard.retain(|id, _| ok_ids.contains(id));
+                *guard = loaded_new;
             });
         }
-        *self.loaded.lock().expect("plugin map lock") = loaded_new;
         plugin_repo::remove_except(&self.db, &ok_ids)?;
 
         let errors = errors
@@ -412,10 +412,7 @@ impl PluginService {
                         transport: manifest.transport().to_string(),
                     },
                 )?;
-                self.loaded
-                    .lock()
-                    .expect("plugin map lock")
-                    .insert(id.clone(), kind);
+                self.put_loaded(id.clone(), kind);
                 self.set_last_error(&id, None);
                 // 只保留最新一份备份供回滚
                 let keep = backup.clone();
@@ -434,10 +431,7 @@ impl PluginService {
                     if std::fs::rename(b, &target).is_ok() {
                         match self.load_dir(&target) {
                             Ok((_, kind)) => {
-                                self.loaded
-                                    .lock()
-                                    .expect("plugin map lock")
-                                    .insert(id.clone(), kind);
+                                self.put_loaded(id.clone(), kind);
                                 install::prune_backups(&self.root, &id, None).ok();
                                 format!("已自动回滚到旧版本 {}", old_version_of(&self.root, &id))
                             }
@@ -486,10 +480,7 @@ impl PluginService {
                         transport: manifest.transport().to_string(),
                     },
                 )?;
-                self.loaded
-                    .lock()
-                    .expect("plugin map lock")
-                    .insert(id.to_string(), kind);
+                self.put_loaded(id.to_string(), kind);
                 self.set_last_error(id, None);
                 self.emit(id, "rolled-back", Some(&version));
             }
@@ -526,10 +517,7 @@ impl PluginService {
             match self.load_dir(&dir) {
                 Ok((_, kind)) => {
                     plugin_repo::set_enabled(&self.db, id, true)?;
-                    self.loaded
-                        .lock()
-                        .expect("plugin map lock")
-                        .insert(id.to_string(), kind);
+                    self.put_loaded(id.to_string(), kind);
                     self.set_last_error(id, None);
                     self.emit(id, "enabled", Some(&row.version));
                 }
@@ -561,6 +549,14 @@ impl PluginService {
                     LoadedKind::Process(p, _) => p.stop(),
                 }
             }
+        });
+    }
+
+    /// 写入已加载句柄；被替换的旧句柄在全局调用锁内 drop（shutdown + dlclose 安全）
+    fn put_loaded(&self, id: String, kind: LoadedKind) {
+        let mut guard = self.loaded.lock().expect("plugin map lock");
+        loader::with_call_lock(|| {
+            guard.insert(id, kind);
         });
     }
 
@@ -679,7 +675,17 @@ mod tests {
         assert!(status.success(), "嵌套构建失败: {args:?}");
     }
 
-    /// 确保示例 cdylib 存在（dev-dep 只编 rlib，cdylib 需显式 build）
+    /// 每个测试进程强制重建一次插件夹具：
+    /// 「产物存在」≠「产物新鲜」——源码更新后旧 cdylib 会导致协议操作码缺失类假失败。
+    fn rebuild_fixtures_once() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            nested_build(&["build", "-p", "plugin-crypto-base64", "--lib"]);
+            nested_build(&["build", "-p", "process-echo", "--bin", "process-echo"]);
+        });
+    }
+
+    /// 确保示例 cdylib 存在且新鲜（dev-dep 只编 rlib，cdylib 需显式 build）
     fn ensure_cdylib() -> PathBuf {
         let (prefix, suffix) = if cfg!(windows) {
             ("", ".dll")
@@ -688,20 +694,16 @@ mod tests {
         } else {
             ("lib", ".so")
         };
+        rebuild_fixtures_once();
         let path = profile_dir().join(format!("{prefix}crypto_base64{suffix}"));
-        if !path.exists() {
-            nested_build(&["build", "-p", "plugin-crypto-base64", "--lib"]);
-        }
         assert!(path.exists(), "cdylib 缺失: {}", path.display());
         path
     }
 
-    /// 确保 process-echo 可执行文件存在（P6 进程插件夹具）
+    /// 确保 process-echo 可执行文件存在且新鲜（P6 进程插件夹具）
     fn ensure_echo_bin() -> PathBuf {
+        rebuild_fixtures_once();
         let path = profile_dir().join("process-echo");
-        if !path.exists() {
-            nested_build(&["build", "-p", "process-echo", "--bin", "process-echo"]);
-        }
         assert!(path.exists(), "process-echo 缺失: {}", path.display());
         path
     }
@@ -922,18 +924,18 @@ mod tests {
         );
         svc.install(&s1).unwrap();
 
-        // 通过校验但加载必然失败：产物是垃圾字节（合法文件、非法动态库）
-        let bad_manifest = inproc_manifest("crypto.base64", "1.1.0", 1);
+        // 通过校验但加载必然失败：产物是垃圾字节。
+        // ⚠️ 必须用「从未加载过的新文件名」——macOS dyld 按路径缓存镜像且 dlclose
+        // 不真正卸载，同名路径 dlopen 会直接返回旧镜像（见 §10.5.1 平台局限）。
+        let bad_rel = format!("{}/libcrypto_base64_broken.dylib", platform_key());
+        let bad_manifest = inproc_manifest("crypto.base64", "1.1.0", 1).replace(
+            &artifact.file_name().unwrap().to_string_lossy().to_string(),
+            "libcrypto_base64_broken.dylib",
+        );
         let bad_dir = src_root.join("bad");
         std::fs::create_dir_all(bad_dir.join(platform_key())).unwrap();
         std::fs::write(bad_dir.join("manifest.json"), bad_manifest).unwrap();
-        std::fs::write(
-            bad_dir
-                .join(platform_key())
-                .join(artifact.file_name().unwrap()),
-            b"not a dylib",
-        )
-        .unwrap();
+        std::fs::write(bad_dir.join(&bad_rel), b"not a dylib").unwrap();
 
         let err = svc.install(&bad_dir).unwrap_err().to_string();
         assert!(err.contains("回滚"), "{err}");
@@ -1008,10 +1010,11 @@ mod tests {
         let src_root = tmp.path().join("src");
         let db = Arc::new(Db::in_memory().unwrap());
         let config = Arc::new(ConfigService::new(db.clone()));
+        // 校验器下限是 100ms；配 100ms 超时，插件睡 500ms 必超时
         config
             .set(
                 crate::services::config_service::KEY_PLUGIN_CALL_TIMEOUT_MS,
-                "50",
+                "100",
             )
             .unwrap();
         let svc = PluginService::new(db, config, root.clone(), Arc::new(RecordingSink::default()));
@@ -1026,9 +1029,9 @@ mod tests {
         );
         svc.install(&s1).unwrap();
 
-        // 睡 400ms > 超时 50ms → 超时错误
+        // 睡 500ms > 超时 100ms → 超时错误
         let err = svc
-            .call("crypto.base64", br#"{"op":"sleep","ms":400}"#)
+            .call("crypto.base64", br#"{"op":"sleep","ms":500}"#)
             .unwrap_err()
             .to_string();
         assert!(err.contains("超时"), "{err}");
@@ -1042,7 +1045,7 @@ mod tests {
                 .contains("超时")
         );
         // 等工作线程真正退出（in-process 无法抢占），宿主仍存活
-        std::thread::sleep(std::time::Duration::from_millis(600));
+        std::thread::sleep(std::time::Duration::from_millis(700));
         // 重新启用后恢复可用
         svc.set_enabled("crypto.base64", true).unwrap();
         let resp = call_json(

@@ -335,7 +335,7 @@ mod tests {
     fn manifest_for(exe_name: &str) -> (PluginManifest, PathBuf) {
         let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
             "id": "tool.echo", "name": "Echo", "version": "0.2.0",
-            "abi": 1, "type": "tool",
+            "abi": 1, "type": "tool", "transport": "process",
             "entry": { "macos-arm64": exe_name }
         }))
         .unwrap();

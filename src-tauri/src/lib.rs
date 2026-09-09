@@ -21,7 +21,8 @@ use tauri::Manager;
 
 use crate::db::Db;
 use crate::services::config_service::ConfigService;
-use crate::services::device_service::{DeviceService, RealAdbRunner};
+use crate::services::device_service::{AdbRunner, DeviceService, RealAdbRunner};
+use crate::services::env_service::EnvService;
 use crate::services::log_service::{self, LogService};
 use crate::services::plugin_service::PluginService;
 use crate::services::task_service::TaskService;
@@ -33,6 +34,7 @@ pub struct AppState {
     pub task: Arc<TaskService>,
     pub device: Arc<DeviceService>,
     pub plugins: Arc<PluginService>,
+    pub env: Arc<EnvService>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -53,15 +55,19 @@ pub fn run() {
 
             let task_service = Arc::new(TaskService::new(db.clone(), app.handle().clone()));
 
-            // 4) DeviceService：adb 能力（P3）。runner 单独构造以便先预热环境缓存
-            let runner = Arc::new(RealAdbRunner::new(config.clone()));
+            // 4) DeviceService：adb 能力（P3）。runner 为 trait 对象，DeviceService 与
+            //    EnvService（P7）共享同一实例（环境缓存只解析一次）
+            let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
             let device = Arc::new(DeviceService::new(
-                runner,
+                runner.clone(),
                 task_service.clone(),
                 db.clone(),
                 app.handle().clone(),
             ));
             device.clone().start_watch();
+
+            // 4.5) EnvService：仪表盘环境/工具探测（P7），复用同一 adb runner
+            let env = Arc::new(EnvService::new(config.clone(), runner.clone()));
 
             // 5) PluginService：受控目录 app_data/plugins，启动即扫描加载（P4/P6）
             let plugin_root = data_dir.join("plugins");
@@ -93,6 +99,7 @@ pub fn run() {
                 task: task_service,
                 device,
                 plugins,
+                env,
             });
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -126,6 +133,13 @@ pub fn run() {
             commands::device::device_push,
             commands::device::device_pull,
             commands::device::device_logcat,
+            commands::env::env_python,
+            commands::env::env_node,
+            commands::env::env_frida,
+            commands::env::env_ida_mcp,
+            commands::env::env_jadx_mcp,
+            commands::env::env_foreground,
+            commands::env::env_overview,
             commands::plugins::plugins_list,
             commands::plugins::plugins_scan,
             commands::plugins::plugins_call,

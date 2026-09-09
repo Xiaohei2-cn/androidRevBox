@@ -17,23 +17,26 @@ fn profile_dir() -> PathBuf {
 
 /// 确保插件 cdylib 已构建：dev-dependency 只编 rlib，需显式 build 出 .dylib/.dll/.so。
 /// （测试运行期外层 cargo 已完成构建、不持 target 锁，嵌套 cargo 安全——escargot 同款做法）
+/// 每个测试进程强制重建一次：「产物存在」≠「产物新鲜」，旧 dylib 会导致协议假失败。
 fn ensure_cdylib() -> PathBuf {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let ws = profile_dir()
+            .parent()
+            .expect("workspace root")
+            .to_path_buf();
+        let status = std::process::Command::new(&cargo)
+            .args(["build", "-p", "plugin-crypto-base64", "--lib"])
+            .current_dir(&ws)
+            .status()
+            .expect("spawn cargo build");
+        assert!(status.success(), "构建插件 cdylib 失败");
+    });
     let path = cdylib_path();
-    if path.exists() {
-        return path;
-    }
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let profile = profile_dir();
-    let ws = profile
-        .parent() // target/.. = workspace root
-        .expect("workspace root");
-    let status = std::process::Command::new(&cargo)
-        .args(["build", "-p", "plugin-crypto-base64", "--lib"])
-        .current_dir(ws)
-        .status()
-        .expect("spawn cargo build");
     assert!(
-        status.success() && path.exists(),
+        path.exists(),
         "构建插件 cdylib 失败，期望产物 {}",
         path.display()
     );

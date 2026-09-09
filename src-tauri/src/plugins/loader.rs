@@ -142,8 +142,11 @@ unsafe impl Sync for LoadedPlugin {}
 
 impl Drop for LoadedPlugin {
     fn drop(&mut self) {
-        // shutdown 是安全 extern fn（SDK 宏内部已 catch_unwind）；仍持锁防与其它 call 竞争
-        let _g = LOADED_CALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // ⚠️ 这里不再获取 LOADED_CALL_LOCK：std Mutex 不可重入，
+        // 所有显式卸载路径（unload_handle/scan/unload_all）已在 with_call_lock 内
+        // 执行 drop，若在此处再次拿锁 = 线程自死锁（P7 全量回测踩过，见 PHASES §10.5.1）。
+        // 契约：调用方必须保证 drop 时没有其它线程正在该插件代码内执行
+        // （要么持全局调用锁，要么无并发，如测试结束的 map 整体 drop）。
         (self.shutdown)();
     }
 }

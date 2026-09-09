@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,8 @@ import {
   type ThemePref,
 } from "@/app/providers";
 import { deviceApi, type AdbEnvironment } from "@/api/device";
+import { systemApi } from "@/api/system";
+import { configApi } from "@/api/config";
 import { cn } from "@/lib/utils";
 
 const THEME_OPTIONS: { value: ThemePref; label: string }[] = [
@@ -27,7 +29,7 @@ const LOG_LEVEL_OPTIONS: { value: LogLevel; label: string }[] = [
   { value: "error", label: "error" },
 ];
 
-/** 设置页：主题、背景透明度、日志级别（P1 起全部持久化到 SQLite） */
+/** 设置页：外观、ADB、工具环境（P7）、日志级别、关于（P7 自仪表盘迁入） */
 export function SettingsPage() {
   const { theme, setTheme, opacity, setOpacity, logLevel, setLogLevel, hydrated } =
     useSettings();
@@ -87,12 +89,45 @@ export function SettingsPage() {
       </section>
 
       <section className="flex flex-col gap-3">
-        <Label>ADB 路径（P3）</Label>
+        <Label>ADB 路径</Label>
         <AdbPathSection onProbed={() => {
           // adb 环境变了：仪表盘/设备页的查询立即失效重取
           void queryClient.invalidateQueries({ queryKey: ["adb"] });
           void queryClient.invalidateQueries({ queryKey: ["devices"] });
         }} />
+      </section>
+
+      <section className="flex flex-col gap-3">
+        <Label>工具环境</Label>
+        <p className="text-xs text-muted-foreground">
+          仪表盘环境卡片使用；改动保存后自动重新探测。
+        </p>
+        <ConfigInputRow
+          label="Python 解释器路径"
+          configKey="app.python.path"
+          placeholder="留空 = 未配置（Frida 检测将暂停）；如 /usr/bin/python3"
+          mono
+          onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
+        />
+        <ConfigInputRow
+          label="Node 路径"
+          configKey="app.node.path"
+          placeholder="留空 = 自动探测系统 PATH 上的 node"
+          mono
+          onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
+        />
+        <ConfigInputRow
+          label="IDA MCP 端口"
+          configKey="app.tools.ida_mcp_port"
+          placeholder="默认 13337"
+          onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
+        />
+        <ConfigInputRow
+          label="jadx-gui MCP 端口"
+          configKey="app.tools.jadx_mcp_port"
+          placeholder="默认 8650"
+          onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
+        />
       </section>
 
       <section className="flex flex-col gap-3">
@@ -121,10 +156,124 @@ export function SettingsPage() {
           {!hydrated && " 配置同步中…"}
         </p>
       </section>
+
+      <AboutSection />
     </div>
   );
 }
 
+/** 通用配置行：从后端 snapshot 回显初值，点「应用」落库（后端做键白名单 + 值校验） */
+function ConfigInputRow({
+  label,
+  configKey,
+  placeholder,
+  mono,
+  onSaved,
+}: {
+  label: string;
+  configKey: string;
+  placeholder?: string;
+  mono?: boolean;
+  onSaved: () => void;
+}) {
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  // 初值回显：从 snapshot 里找当前键（缺失 = 用默认）
+  const { data: snapshot } = useQuery({
+    queryKey: ["config", "snapshot"],
+    queryFn: configApi.snapshot,
+    staleTime: 60_000,
+  });
+  useEffect(() => {
+    const row = snapshot?.find((s) => s.key === configKey);
+    if (row !== undefined) setValue(row.value);
+  }, [snapshot, configKey]);
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await configApi.set(configKey, value.trim());
+      setSaved(true);
+      onSaved();
+      window.setTimeout(() => setSaved(false), 1500);
+    } catch (e) {
+      setError(String((e as { message?: string }).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-2">
+        <Label className="w-36 shrink-0 text-xs font-normal text-muted-foreground">
+          {label}
+        </Label>
+        <Input
+          value={value}
+          placeholder={placeholder}
+          onChange={(e) => setValue(e.target.value)}
+          className={cn("h-8 flex-1 text-xs", mono && "font-mono")}
+          data-testid={`config-${configKey}`}
+        />
+        <Button size="sm" variant="outline" disabled={busy} onClick={() => void save()}>
+          应用
+        </Button>
+      </div>
+      {error && <p className="pl-36 text-xs text-destructive">{error}</p>}
+      {saved && !error && (
+        <p className="pl-36 text-xs text-emerald-500">已保存，环境卡重新检测中</p>
+      )}
+    </div>
+  );
+}
+
+/** 关于（P7）：应用版本 / Tauri 版本 / 运行平台，自仪表盘系统四卡迁入 */
+function AboutSection() {
+  const { data } = useQuery({
+    queryKey: ["system", "ping"],
+    queryFn: systemApi.ping,
+    staleTime: Infinity,
+  });
+
+  return (
+    <section className="flex flex-col gap-3">
+      <Label>关于</Label>
+      <dl data-testid="about-section" className="space-y-1.5 text-xs">
+        <AboutRow label="应用版本" value={data?.appVersion} testid="about-app-version" />
+        <AboutRow label="Tauri 版本" value={data?.tauriVersion} testid="about-tauri-version" />
+        <AboutRow
+          label="运行平台"
+          value={data ? `${data.os} · ${data.arch}` : undefined}
+          testid="about-platform"
+        />
+      </dl>
+    </section>
+  );
+}
+
+function AboutRow({
+  label,
+  value,
+  testid,
+}: {
+  label: string;
+  value?: string;
+  testid: string;
+}) {
+  return (
+    <div className="flex items-center gap-3">
+      <dt className="w-36 shrink-0 text-muted-foreground">{label}</dt>
+      <dd data-testid={testid} className="font-mono">
+        {value ?? "—"}
+      </dd>
+    </div>
+  );
+}
 
 /** ADB 路径设置：空=自动探测（ANDROID_HOME/SDK_ROOT/PATH），手动配置优先 */
 function AdbPathSection({ onProbed }: { onProbed: () => void }) {

@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod device;
+pub mod env;
 pub mod plugins;
 pub mod system;
 pub mod task;
