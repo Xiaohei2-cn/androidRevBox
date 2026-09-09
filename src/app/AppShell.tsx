@@ -1,4 +1,4 @@
-import { useMemo, type CSSProperties } from "react";
+import { useEffect, useMemo, type CSSProperties } from "react";
 import { useSettings } from "@/app/providers";
 import { AppNavProvider, useAppNav } from "@/app/nav";
 import { MainTabRail } from "@/components/nav/MainTabRail";
@@ -10,6 +10,7 @@ import { CryptoPage } from "@/features/crypto/CryptoPage";
 import { PluginsPage } from "@/features/plugins/PluginsPage";
 import { TasksPage } from "@/features/tasks/TasksPage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
+import { cn } from "@/lib/utils";
 
 /** 窗口主体背景 RGB（与 globals.css 的色板保持一致） */
 const BODY_BG_RGB: Record<"light" | "dark", string> = {
@@ -29,6 +30,17 @@ function ShellBody() {
   const { tab } = useAppNav();
   const { effectiveTheme, opacity } = useSettings();
 
+  // 首帧预涂装层（index.html #boot-bg）：应用完成首帧绘制后移除，
+  // 之后窗口恢复真实透明渲染（锯齿边距透桌面依赖 body 透明，不能常驻背景）。
+  useEffect(() => {
+    const raf = requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        document.getElementById("boot-bg")?.remove();
+      }),
+    );
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
   // CSS 变量供 .app-surface（主体 + 锯齿齿块）共用：同色、同透明度、同毛玻璃
   const shellStyle = useMemo(
     () =>
@@ -47,9 +59,11 @@ function ShellBody() {
         className="app-surface relative flex h-full min-w-0 flex-1 flex-col overflow-hidden rounded-r-xl border border-l-0 border-border/60 shadow-[0_8px_40px_rgba(0,0,0,0.35)]"
       >
         <TitleBar />
-        {/* keep-mounted 切页：7 个页面常驻，非激活 hidden。
-            切换时不卸载/重挂子树 → 毛玻璃层零重采样（修「闪一下」），
-            查询状态与任务会话跨 tab 保活，隐藏页轮询由 useActiveTab 暂停。 */}
+        {/* keep-mounted 切页（P7 闪烁二次修复）：
+            - 七页常驻，非激活用 visibility:hidden 而非 display:none——后者会触发
+              主体 .app-surface 合成层的失效重合成，透明窗口上表现为「闪成桌面」一帧；
+              visibility 只改绘制，不失效祖先合成层。
+            - 查询状态与任务会话跨 tab 保活，隐藏页轮询由 useActiveTab 暂停。 */}
         <main className="relative min-h-0 flex-1 overflow-hidden">
           <PageHost active={tab === "dashboard"}>
             <DashboardPage />
@@ -87,7 +101,10 @@ function PageHost({
 }) {
   return (
     <div
-      className={active ? "h-full overflow-hidden p-4" : "hidden"}
+      className={cn(
+        "absolute inset-0 overflow-hidden p-4",
+        active ? "z-10" : "invisible",
+      )}
       aria-hidden={!active}
     >
       {children}

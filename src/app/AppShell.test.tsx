@@ -104,15 +104,15 @@ describe("AppShell（P7 交互）", () => {
     vi.restoreAllMocks();
   });
 
-  it("keep-mounted：非激活页面在 DOM 中但 hidden（aria-hidden）", () => {
+  it("keep-mounted：非激活页面在 DOM 中但不可见（visibility:hidden + aria-hidden）", () => {
     renderShell();
-    // 设置页的滑杆仍在 DOM（aria-hidden 子树，byRole 需显式 hidden:true）
+    // 设置页的滑杆仍在 DOM（visibility:hidden 不触发合成层失效，故用 invisible 类）
     const slider = screen.getByRole("slider", { hidden: true });
     expect(slider).toBeInTheDocument();
-    expect(slider.closest(".hidden")).not.toBeNull();
-    // 仪表盘内容可见（无 .hidden 祖先）
+    expect(slider.closest(".invisible")).not.toBeNull();
+    // 仪表盘内容可见（无 .invisible 祖先）
     const grid = screen.getByTestId("dashboard-grid");
-    expect(grid.closest(".hidden")).toBeNull();
+    expect(grid.closest(".invisible")).toBeNull();
   });
 
   it("卡片「去配置」→ 设置页 python 输入框获得焦点并蓝框闪烁", async () => {
@@ -126,8 +126,8 @@ describe("AppShell（P7 交互）", () => {
       return el;
     });
     expect(input.className).toContain("config-flash");
-    // 设置页已激活：滑杆祖先不再是 hidden
-    expect(screen.getByRole("slider").closest(".hidden")).toBeNull();
+    // 设置页已激活：滑杆祖先不再是 invisible
+    expect(screen.getByRole("slider").closest(".invisible")).toBeNull();
   });
 });
 

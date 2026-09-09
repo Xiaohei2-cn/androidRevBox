@@ -8,7 +8,6 @@ import {
   SquareTerminal,
   type LucideIcon,
 } from "lucide-react";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useAppNav } from "@/app/nav";
 import { cn } from "@/lib/utils";
 
@@ -57,6 +56,15 @@ export function MainTabRail() {
   );
 }
 
+/**
+ * 齿块（P7 闪烁二次修复）：
+ * - `.app-surface`（毛玻璃层）恒挂在所有齿块上，选中态只叠加不透明 bg-primary 盖住它。
+ *   此前选中/未选中靠增删 app-surface 类切换——在 macOS 透明窗口上意味着
+ *   backdrop-filter 合成层的销毁/重建，每次切 tab 整窗闪一下（快照空帧）。
+ * - 不做宽度 transition：backdrop-filter 区域逐帧变化同样触发重采样；
+ *   悬停/选中的增宽即时生效。
+ * - 不使用气泡提示（用户反馈：选中态本身就是中文标签）。
+ */
 function MainTabButton({
   tab,
   active,
@@ -68,30 +76,25 @@ function MainTabButton({
 }) {
   const Icon = tab.icon;
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          aria-label={tab.label}
-          aria-current={active ? "true" : undefined}
-          onClick={onClick}
-          className={cn(
-            "group relative flex h-12 items-center justify-center rounded-l-xl border border-r-0 border-border/60 transition-all",
-            active
-              ? "w-14 bg-primary px-1 text-primary-foreground shadow-sm"
-              : "app-surface w-6 text-muted-foreground hover:w-7 hover:text-foreground",
-          )}
-        >
-          {active ? (
-            <span className="whitespace-nowrap text-[11px] font-medium leading-none">
-              {tab.label}
-            </span>
-          ) : (
-            <Icon className="h-3.5 w-3.5" />
-          )}
-        </button>
-      </TooltipTrigger>
-      {!active && <TooltipContent side="right">{tab.label}</TooltipContent>}
-    </Tooltip>
+    <button
+      type="button"
+      aria-label={tab.label}
+      aria-current={active ? "true" : undefined}
+      onClick={onClick}
+      className={cn(
+        "app-surface group relative flex h-12 items-center justify-center rounded-l-xl border border-r-0 border-border/60",
+        active
+          ? "w-14 bg-primary px-1 text-primary-foreground shadow-sm"
+          : "w-6 text-muted-foreground hover:w-7 hover:text-foreground",
+      )}
+    >
+      {active ? (
+        <span className="whitespace-nowrap text-[11px] font-medium leading-none">
+          {tab.label}
+        </span>
+      ) : (
+        <Icon className="h-3.5 w-3.5" />
+      )}
+    </button>
   );
 }

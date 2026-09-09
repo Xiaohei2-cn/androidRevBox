@@ -4,8 +4,48 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AppReverseTools</title>
+    <!-- 首帧预涂装（P7 启动闪烁修复）：透明窗口在 React 挂载前 #root 为空，
+         会透出桌面「闪一下、像加载配置」。做法：
+         1) 主题 bootstrap 脚本在 CSS/React 之前按 localStorage/系统偏好定 .dark，
+            消除首帧浅→深二次重绘；
+         2) #boot-bg 铺一层不透明底色盖住空窗体，React 首帧后由 AppShell 移除
+            （不能用 body/html 常驻背景，否则锯齿外凸的透明边距永远不透桌面）。 -->
+    <style>
+      html,
+      body,
+      #root {
+        height: 100%;
+        margin: 0;
+      }
+      #boot-bg {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        pointer-events: none;
+        background: #ffffff;
+      }
+      html.dark #boot-bg {
+        background: #18181b;
+      }
+    </style>
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("app.settings.theme");
+          var dark =
+            t === "dark" ||
+            ((t === "system" || !t) &&
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.toggle("dark", dark);
+        } catch (e) {
+          /* localStorage 不可用时保持浅色首帧 */
+        }
+      })();
+    </script>
   </head>
   <body>
+    <div id="boot-bg" aria-hidden="true"></div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
