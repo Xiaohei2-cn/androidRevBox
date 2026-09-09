@@ -70,10 +70,37 @@
     user-select: text;
   }
 
-  /* 窗口表面：主体与锯齿齿块共用，保证颜色/毛玻璃完全一致 */
+  /* 窗口表面：主体与锯齿齿块共用，保证颜色/毛玻璃完全一致。
+     translateZ(0) 强制独立合成层：macOS 透明窗口上 backdrop-filter 的重采样
+     在子树切换/悬停变换时会整层快照失效，表现为「闪一下」（P7 用户反馈修复）。 */
   .app-surface {
     background-color: rgb(var(--app-bg-rgb) / var(--app-bg-alpha));
     -webkit-backdrop-filter: blur(24px) saturate(1.4);
     backdrop-filter: blur(24px) saturate(1.4);
+    transform: translateZ(0);
+  }
+
+  /* 路径/信息文本：允许选择与双击全选（全局 user-select:none 的例外，P7） */
+  .path-selectable {
+    user-select: all;
+    -webkit-user-select: all;
+    cursor: text;
+  }
+
+  /* 配置跳转高亮：蓝框闪烁两下（P7「去配置」按钮） */
+  @keyframes config-flash {
+    0%,
+    100% {
+      box-shadow: none;
+      border-color: var(--border);
+    }
+    50% {
+      box-shadow: 0 0 0 2px hsl(var(--ring));
+      border-color: hsl(var(--ring));
+    }
+  }
+
+  .config-flash {
+    animation: config-flash 0.6s ease-in-out 2;
   }
 }

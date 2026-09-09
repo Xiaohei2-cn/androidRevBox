@@ -92,7 +92,7 @@ function ControlDot({
       aria-label={label}
       title={label}
       onClick={onClick}
-      className={`h-3 w-3 rounded-full ring-1 ring-black/10 transition-transform hover:scale-110 ${color}`}
+      className={`h-3 w-3 rounded-full ring-1 ring-black/10 transition-[filter] hover:brightness-90 ${color}`}
     />
   );
 }

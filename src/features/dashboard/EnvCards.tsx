@@ -6,17 +6,21 @@ import {
   Hexagon,
   Plug,
   RefreshCw,
+  Settings2,
   TerminalSquare,
   XCircle,
   type LucideIcon,
 } from "lucide-react";
 import { envApi, type McpEnv } from "@/api/env";
+import { useAppNav } from "@/app/nav";
+import { PathText } from "@/components/ui/PathText";
 import { cn } from "@/lib/utils";
 
 /**
  * 仪表盘环境/工具卡片（P7）：Python / Node / Frida / IDA MCP / jadx MCP。
  * 布局契约：左右两列网格，任何卡不得独占一行；状态三色——
  * 绿=就绪、琥珀=未配置/未检测到（常态，不算错误）、红=探测异常。
+ * Python/Node 未配置时提供「去配置」按钮，跳转设置页并蓝框闪烁定位。
  */
 
 export function PythonCard() {
@@ -28,6 +32,7 @@ export function PythonCard() {
       title="Python 环境"
       refresh={() => void refetch()}
       refreshing={isFetching}
+      configKey="app.python.path"
       status={
         data === undefined
           ? { tone: "muted", label: "检测中…" }
@@ -39,9 +44,11 @@ export function PythonCard() {
       }
     >
       {data === undefined ? null : data.ready ? (
-        <CardLine mono>{data.path}</CardLine>
+        <PathLine>
+          <PathText value={data.path} testid="env-python-path" className="font-mono" />
+        </PathLine>
       ) : (
-        <CardLine>{data.hint}</CardLine>
+        <PathLine>{data.hint}</PathLine>
       )}
     </EnvCard>
   );
@@ -56,6 +63,7 @@ export function NodeCard() {
       title="Node 环境"
       refresh={() => void refetch()}
       refreshing={isFetching}
+      configKey="app.node.path"
       status={
         data === undefined
           ? { tone: "muted", label: "检测中…" }
@@ -66,21 +74,25 @@ export function NodeCard() {
     >
       {data === undefined ? null : data.ready ? (
         <>
-          <CardLine mono>{data.path}</CardLine>
-          {data.npmGlobalRoot && (
-            <CardLine mono>
-              npm 全局包：{data.npmGlobalRoot}
-            </CardLine>
-          )}
+          <PathLine label="node">
+            <PathText value={data.path} testid="env-node-path" className="font-mono" />
+          </PathLine>
+          <PathLine label="全局包">
+            <PathText
+              value={data.npmGlobalRoot}
+              testid="env-node-npmroot"
+              className="font-mono"
+            />
+          </PathLine>
         </>
       ) : (
-        <CardLine>{data.hint}</CardLine>
+        <PathLine>{data.hint}</PathLine>
       )}
     </EnvCard>
   );
 }
 
-/** Frida 卡依赖 Python 就绪（§10 剪枝：未就绪不发起检测查询） */
+/** Frida 卡依赖 Python 就绪（§10 剪枝：未就绪不发起 env_frida 查询） */
 export function FridaCard({ pythonReady }: { pythonReady: boolean | undefined }) {
   const enabled = pythonReady === true;
   const { data, isFetching, refetch } = useEnvQuery(["env", "frida"], envApi.frida, enabled);
@@ -92,6 +104,7 @@ export function FridaCard({ pythonReady }: { pythonReady: boolean | undefined })
       refresh={() => void refetch()}
       refreshing={isFetching}
       disabled={!enabled}
+      configKey={enabled ? undefined : "app.python.path"}
       status={
         !enabled
           ? { tone: "muted", label: "待 Python 就绪" }
@@ -103,14 +116,16 @@ export function FridaCard({ pythonReady }: { pythonReady: boolean | undefined })
       }
     >
       {!enabled ? (
-        <CardLine>先在 设置 → 工具环境 配置可用的 Python 解释器</CardLine>
+        <PathLine>先在 设置 → 工具环境 配置可用的 Python 解释器</PathLine>
       ) : data === undefined ? null : data.installed ? (
-        <CardLine mono>
-          frida {data.fridaVersion ?? "—"}
-          {data.fridaToolsVersion ? ` · frida-tools ${data.fridaToolsVersion}` : ""}
-        </CardLine>
+        <PathLine mono>
+          frida <PathText value={data.fridaVersion} testid="env-frida-version" className="font-mono" />
+          {data.fridaToolsVersion
+            ? ` · frida-tools ${data.fridaToolsVersion}`
+            : ""}
+        </PathLine>
       ) : (
-        <CardLine>{data.hint}</CardLine>
+        <PathLine>{data.hint}</PathLine>
       )}
     </EnvCard>
   );
@@ -121,10 +136,12 @@ export function McpCard({
   testid,
   title,
   queryFn,
+  configKey,
 }: {
   testid: string;
   title: string;
   queryFn: () => Promise<McpEnv>;
+  configKey: string;
 }) {
   const { data, isFetching, refetch } = useEnvQuery(["env", testid], queryFn);
   return (
@@ -134,6 +151,7 @@ export function McpCard({
       title={title}
       refresh={() => void refetch()}
       refreshing={isFetching}
+      configKey={configKey}
       status={
         data === undefined
           ? { tone: "muted", label: "检测中…" }
@@ -143,9 +161,15 @@ export function McpCard({
       }
     >
       {data === undefined ? null : data.reachable ? (
-        <CardLine mono>127.0.0.1:{data.port}</CardLine>
+        <PathLine>
+          <PathText
+            value={`127.0.0.1:${data.port}`}
+            testid={`${testid}-addr`}
+            className="font-mono"
+          />
+        </PathLine>
       ) : (
-        <CardLine>{data.hint}</CardLine>
+        <PathLine>{data.hint}</PathLine>
       )}
     </EnvCard>
   );
@@ -163,6 +187,7 @@ export function EnvCard({
   refresh,
   refreshing,
   disabled,
+  configKey,
   children,
 }: {
   testid: string;
@@ -172,13 +197,28 @@ export function EnvCard({
   refresh: () => void;
   refreshing: boolean;
   disabled?: boolean;
+  /** 提供后，标题行出现「去配置」按钮，点击跳转设置页并高亮该配置项 */
+  configKey?: string;
   children?: React.ReactNode;
 }) {
+  const { gotoConfig } = useAppNav();
   return (
     <div data-testid={testid} className="rounded-xl border bg-card p-4" aria-disabled={disabled}>
       <div className="flex items-center gap-2">
         <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
         <span className="truncate text-sm font-semibold">{title}</span>
+        {configKey && (
+          <button
+            type="button"
+            aria-label={`配置 ${title}`}
+            title="前往设置"
+            onClick={() => gotoConfig(configKey)}
+            className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+            data-testid={`${testid}-goto-config`}
+          >
+            <Settings2 className="h-3.5 w-3.5" />
+          </button>
+        )}
         <button
           type="button"
           aria-label={`刷新 ${title}`}
@@ -204,15 +244,24 @@ function StatusMark({ tone }: { tone: StatusTone }) {
   return <CircleSlash className="h-3.5 w-3.5 text-muted-foreground" />;
 }
 
-function CardLine({ mono, children }: { mono?: boolean; children?: React.ReactNode }) {
+function PathLine({
+  label,
+  mono,
+  children,
+}: {
+  label?: string;
+  mono?: boolean;
+  children?: React.ReactNode;
+}) {
   return (
     <p
       className={cn(
-        "break-all text-xs leading-relaxed text-muted-foreground",
+        "flex items-baseline gap-1.5 text-xs leading-relaxed text-muted-foreground",
         mono && "font-mono",
       )}
     >
-      {children}
+      {label && <span className="shrink-0">{label}</span>}
+      <span className="min-w-0 flex-1 truncate">{children}</span>
     </p>
   );
 }

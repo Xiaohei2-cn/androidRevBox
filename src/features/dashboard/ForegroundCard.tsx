@@ -2,19 +2,23 @@ import { useQuery } from "@tanstack/react-query";
 import { Smartphone } from "lucide-react";
 import { deviceApi } from "@/api/device";
 import { envApi, type ForegroundApp } from "@/api/env";
+import { useActiveTab } from "@/app/nav";
+import { PathText } from "@/components/ui/PathText";
 import { EnvCard } from "./EnvCards";
 import { cn } from "@/lib/utils";
 
 /**
  * 安卓前台应用卡（P7）——仪表盘唯一允许独占一整行的卡，且必须排在最底。
  * 数据链：env_foreground（后端 adb 不可用 → 0 次 shell 调用直接剪枝）。
- * 轮询前置：adb 就绪才轮询；无在线设备降频为慢轮询兜底（拔线即停密集刷新）。
+ * 轮询前置：adb 就绪才轮询；无在线设备降频为慢轮询兜底（拔线即停密集刷新）；
+ * keep-mounted 后仅仪表盘激活时轮询（§10 减少后台开销）。
  */
 
 const FAST_POLL_MS = 5_000;
 const SLOW_POLL_MS = 30_000;
 
 export function ForegroundCard() {
+  const active = useActiveTab("dashboard");
   const { data: adbEnv } = useQuery({
     queryKey: ["adb", "environment"],
     queryFn: deviceApi.environment,
@@ -24,8 +28,8 @@ export function ForegroundCard() {
   const { data: devices } = useQuery({
     queryKey: ["devices"],
     queryFn: () => deviceApi.list(),
-    enabled: !!adbEnv?.installed,
-    refetchInterval: SLOW_POLL_MS,
+    enabled: !!adbEnv?.installed && active,
+    refetchInterval: active ? SLOW_POLL_MS : false,
   });
 
   const deviceOnline = !!devices?.some((d) => d.state === "device");
@@ -33,9 +37,9 @@ export function ForegroundCard() {
   const { data, isFetching, refetch, dataUpdatedAt } = useQuery({
     queryKey: ["env", "foreground", adbEnv?.installed ?? false, deviceOnline],
     queryFn: envApi.foreground,
-    // 剪枝：adb 未就绪不发起前台探测；有设备 5s 轮询，无设备 30s 兜底
-    enabled: !!adbEnv?.installed,
-    refetchInterval: deviceOnline ? FAST_POLL_MS : SLOW_POLL_MS,
+    // 剪枝：adb 未就绪不发起前台探测；有设备 5s 轮询，无设备 30s 兜底（均仅激活时）
+    enabled: !!adbEnv?.installed && active,
+    refetchInterval: active ? (deviceOnline ? FAST_POLL_MS : SLOW_POLL_MS) : false,
     staleTime: 4_000,
     retry: false,
   });
@@ -90,7 +94,7 @@ function ForegroundBody({
       <Field label="包名" value={app.package} testid="fg-package" />
       <Field label="Activity" value={app.activity} testid="fg-activity" />
       <Field label="PID" value={app.pid} testid="fg-pid" mono />
-      <Field label="native lib 目录" value={app.nativeLibDir} testid="fg-libdir" mono />
+      <Field label="native lib" value={app.nativeLibDir} testid="fg-libdir" mono />
       <div className="md:col-span-2">
         <p className="mb-1 text-muted-foreground">/proc 关键路径</p>
         <ul className="space-y-1" data-testid="fg-proc-paths">
@@ -99,24 +103,23 @@ function ForegroundBody({
           )}
           {app.procPaths.map((p) => (
             <li key={p.path} className="flex items-baseline gap-2 font-mono">
-              <span className="shrink-0 text-foreground">{p.path}</span>
+              <PathText value={p.path} className="shrink-0 text-foreground" />
               <span
                 className={cn(
-                  "truncate",
+                  "min-w-0 flex-1 truncate",
                   p.readable ? "text-muted-foreground" : "text-amber-500",
                 )}
                 title={p.summary ?? undefined}
               >
-                {p.readable
-                  ? p.summary || "（空）"
-                  : "不可读（可能需要 root）"}
+                {p.readable ? p.summary || "（空）" : "不可读（可能需要 root）"}
               </span>
             </li>
           ))}
         </ul>
       </div>
       <p className="md:col-span-2 text-right text-[10px] text-muted-foreground">
-        设备 {app.serial} · 更新于 {new Date(lastUpdated).toLocaleTimeString()}
+        设备 <PathText value={app.serial} className="font-mono" /> · 更新于{" "}
+        {new Date(lastUpdated).toLocaleTimeString()}
       </p>
     </div>
   );
@@ -134,15 +137,13 @@ function Field({
   testid: string;
 }) {
   return (
-    <p className="flex items-baseline gap-2">
+    <p className="flex min-w-0 items-baseline gap-2">
       <span className="shrink-0 text-muted-foreground">{label}</span>
-      <span
-        data-testid={testid}
-        className={cn("truncate", mono ? "font-mono" : "font-medium")}
-        title={value ?? undefined}
-      >
-        {value || "—"}
-      </span>
+      <PathText
+        value={value}
+        testid={testid}
+        className={cn("min-w-0 flex-1", mono ? "font-mono" : "font-medium")}
+      />
     </p>
   );
 }

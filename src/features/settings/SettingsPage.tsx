@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
@@ -10,6 +10,7 @@ import {
   type LogLevel,
   type ThemePref,
 } from "@/app/providers";
+import { useAppNav } from "@/app/nav";
 import { deviceApi, type AdbEnvironment } from "@/api/device";
 import { systemApi } from "@/api/system";
 import { configApi } from "@/api/config";
@@ -162,7 +163,8 @@ export function SettingsPage() {
   );
 }
 
-/** 通用配置行：从后端 snapshot 回显初值，点「应用」落库（后端做键白名单 + 值校验） */
+/** 通用配置行：从后端 snapshot 回显初值，点「应用」落库（后端做键白名单 + 值校验）。
+ *  从卡片「去配置」跳转进来时：自动滚动到位、聚焦输入框、蓝框闪烁两下。 */
 function ConfigInputRow({
   label,
   configKey,
@@ -180,6 +182,9 @@ function ConfigInputRow({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [flash, setFlash] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const { pendingConfigKey, clearPendingConfig } = useAppNav();
 
   // 初值回显：从 snapshot 里找当前键（缺失 = 用默认）
   const { data: snapshot } = useQuery({
@@ -191,6 +196,20 @@ function ConfigInputRow({
     const row = snapshot?.find((s) => s.key === configKey);
     if (row !== undefined) setValue(row.value);
   }, [snapshot, configKey]);
+
+  useEffect(() => {
+    if (pendingConfigKey !== configKey) return;
+    const el = inputRef.current;
+    if (!el) return;
+    el.closest("div")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.focus();
+    setFlash(true);
+    const timer = window.setTimeout(() => {
+      setFlash(false);
+      clearPendingConfig();
+    }, 1300); // 动画 0.6s × 2 遍
+    return () => window.clearTimeout(timer);
+  }, [pendingConfigKey, configKey, clearPendingConfig]);
 
   const save = async () => {
     setBusy(true);
@@ -214,10 +233,15 @@ function ConfigInputRow({
           {label}
         </Label>
         <Input
+          ref={inputRef}
           value={value}
           placeholder={placeholder}
           onChange={(e) => setValue(e.target.value)}
-          className={cn("h-8 flex-1 text-xs", mono && "font-mono")}
+          className={cn(
+            "h-8 flex-1 text-xs",
+            mono && "font-mono",
+            flash && "config-flash",
+          )}
           data-testid={`config-${configKey}`}
         />
         <Button size="sm" variant="outline" disabled={busy} onClick={() => void save()}>

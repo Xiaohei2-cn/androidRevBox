@@ -6,14 +6,18 @@ import {
   type AdbEnvironment,
   type DeviceEntry,
 } from "@/api/device";
+import { useActiveTab } from "@/app/nav";
+import { PathText } from "@/components/ui/PathText";
 import { cn } from "@/lib/utils";
 
 /**
  * 仪表盘 adb 卡片：环境指示（含未配置提示）、版本查看、设备连接轮询。
  * 后端 watch 线程经 device://changed 事件推热插拔；本卡片同时保留 10s 兜底轮询。
+ * keep-mounted 后仅在仪表盘激活时轮询（§10 减少后台开销）。
  */
 export function AdbCard() {
   const [events, setEvents] = useState(0);
+  const active = useActiveTab("dashboard");
 
   const { data: env } = useQuery<AdbEnvironment>({
     queryKey: ["adb", "environment", events],
@@ -24,9 +28,9 @@ export function AdbCard() {
   const { data: devices = [], isError: devicesError } = useQuery<DeviceEntry[]>({
     queryKey: ["adb", "devices", events],
     queryFn: () => deviceApi.list(),
-    enabled: !!env?.installed,
-    // 有事件时立即刷新，否则 10s 兜底轮询
-    refetchInterval: 10_000,
+    enabled: !!env?.installed && active,
+    // 有事件时立即刷新，否则 10s 兜底轮询（仅激活时）
+    refetchInterval: active ? 10_000 : false,
   });
 
   // 热插拔事件：bump queryKey 触发列表刷新（watch 线程在 Rust 侧，天然独立于渲染）
@@ -80,9 +84,9 @@ export function AdbCard() {
             adb {env.version}
             {env.build ? ` · ${env.build}` : ""}
           </p>
-          <p className="truncate font-mono" title={env.path}>
-            {env.path}
-            <span className="ml-1 rounded bg-muted px-1 py-px text-[10px]">
+          <p className="flex items-center gap-1 font-mono text-xs">
+            <PathText value={env.path} className="min-w-0 flex-1" />
+            <span className="shrink-0 rounded bg-muted px-1 py-px text-[10px]">
               {SOURCE_LABEL[env.source ?? "unknown"] ?? env.source}
             </span>
           </p>

@@ -9,6 +9,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useAppNav } from "@/app/nav";
 import { cn } from "@/lib/utils";
 
 export type TabId =
@@ -37,23 +38,19 @@ export const MAIN_TABS: readonly TabDef[] = [
   { id: "settings", label: "设置", icon: Settings },
 ] as const;
 
-interface MainTabRailProps {
-  active: TabId;
-  onChange: (tab: TabId) => void;
-}
-
-export function MainTabRail({ active, onChange }: MainTabRailProps) {
+export function MainTabRail() {
+  const { tab, setTab } = useAppNav();
   return (
     <nav
       aria-label="主导航"
       className="flex w-14 shrink-0 flex-col items-end gap-2 pt-14"
     >
-      {MAIN_TABS.map((tab) => (
+      {MAIN_TABS.map((item) => (
         <MainTabButton
-          key={tab.id}
-          tab={tab}
-          active={tab.id === active}
-          onClick={() => onChange(tab.id)}
+          key={item.id}
+          tab={item}
+          active={item.id === tab}
+          onClick={() => setTab(item.id)}
         />
       ))}
     </nav>

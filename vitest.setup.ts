@@ -51,3 +51,8 @@ if (typeof globalThis.ResizeObserver !== "function") {
     disconnect() {}
   } as unknown as typeof ResizeObserver;
 }
+
+// jsdom 未实现 scrollIntoView（P7 设置页跳转定位使用），stub 掉
+if (typeof Element.prototype.scrollIntoView !== "function") {
+  Element.prototype.scrollIntoView = () => {};
+}

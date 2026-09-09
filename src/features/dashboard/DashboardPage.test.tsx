@@ -182,7 +182,7 @@ describe("DashboardPage（P7 布局契约）", () => {
     await waitFor(() =>
       expect(screen.getByTestId("env-frida-status")).toHaveTextContent("已安装"),
     );
-    expect(screen.getByText(/frida 16\.5\.9/)).toBeInTheDocument();
+    expect(screen.getByTestId("env-frida-version")).toHaveTextContent("16.5.9");
     expect(envMocks.frida).toHaveBeenCalled();
   });
 
