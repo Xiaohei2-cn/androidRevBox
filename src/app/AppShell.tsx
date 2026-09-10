@@ -1,4 +1,4 @@
-import { useEffect, useMemo, type CSSProperties } from "react";
+import { useMemo, type CSSProperties } from "react";
 import { useSettings } from "@/app/providers";
 import { AppNavProvider, useAppNav } from "@/app/nav";
 import { MainTabRail } from "@/components/nav/MainTabRail";
@@ -30,16 +30,10 @@ function ShellBody() {
   const { tab } = useAppNav();
   const { effectiveTheme, opacity } = useSettings();
 
-  // 首帧预涂装层（index.html #boot-bg）：应用完成首帧绘制后移除，
-  // 之后窗口恢复真实透明渲染（锯齿边距透桌面依赖 body 透明，不能常驻背景）。
-  useEffect(() => {
-    const raf = requestAnimationFrame(() =>
-      requestAnimationFrame(() => {
-        document.getElementById("boot-bg")?.remove();
-      }),
-    );
-    return () => cancelAnimationFrame(raf);
-  }, []);
+  // CSS 变量供 .app-surface（主体 + 锯齿齿块）共用：同色、同透明度。
+  // ⚠️ 不要给 .app-surface 加回 backdrop-filter/transform：WKWebView 合成层
+  // 在重绘/悬停/前后台切换时销毁重建，透明窗口上表现为满 alpha 实色闪一帧
+  // （P7 三轮闪烁反馈的根因，详见 PHASES §10.5.1）。
 
   // CSS 变量供 .app-surface（主体 + 锯齿齿块）共用：同色、同透明度、同毛玻璃
   const shellStyle = useMemo(

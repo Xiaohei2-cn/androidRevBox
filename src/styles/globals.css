@@ -75,14 +75,16 @@
     user-select: text;
   }
 
-  /* 窗口表面：主体与锯齿齿块共用，保证颜色/毛玻璃完全一致。
-     translateZ(0) 强制独立合成层：macOS 透明窗口上 backdrop-filter 的重采样
-     在子树切换/悬停变换时会整层快照失效，表现为「闪一下」（P7 用户反馈修复）。 */
+  /* 窗口表面：主体与锯齿齿块共用，保证颜色一致。
+     第三轮闪烁修复——彻底移除 backdrop-filter：
+     WKWebView 的 backdrop-filter 无法模糊透明窗口「背后」的桌面（它只看得到
+     同一 webview 内的 DOM，这里元素背后是透明的 → 模糊 = 空操作），
+     却会强制一个独立合成层；任何子树重绘/悬停/前后台切换都会让 WebKit 销毁重建
+     该层，重建的当帧以满 alpha 实色打底 → 用户看到的「先不透明再变透明」闪烁。
+     透明效果由下面的半透明背景色（--app-bg-alpha）承担，视觉上与原「毛玻璃」一致
+     （本就只是半透明着色），且不再有重合成空帧。 */
   .app-surface {
     background-color: rgb(var(--app-bg-rgb) / var(--app-bg-alpha));
-    -webkit-backdrop-filter: blur(24px) saturate(1.4);
-    backdrop-filter: blur(24px) saturate(1.4);
-    transform: translateZ(0);
   }
 
   /* 路径/信息文本：允许选择与双击全选（全局 user-select:none 的例外，P7） */
