@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { CheckCircle2, XCircle, Usb, TerminalSquare } from "lucide-react";
+import { CheckCircle2, XCircle, Usb } from "lucide-react";
 import {
   deviceApi,
   type AdbEnvironment,
   type DeviceEntry,
 } from "@/api/device";
 import { useActiveTab } from "@/app/nav";
+import { BrandIcon } from "@/components/ui/BrandIcon";
 import { PathText } from "@/components/ui/PathText";
 import { cn } from "@/lib/utils";
 
@@ -53,7 +54,7 @@ export function AdbCard() {
   return (
     <div className="rounded-xl border bg-card p-4">
       <div className="flex items-center gap-2">
-        <TerminalSquare className="h-4 w-4 text-muted-foreground" />
+        <BrandIcon name="android" />
         <span className="text-sm font-semibold">ADB 环境</span>
         <span
           data-testid="adb-status"
