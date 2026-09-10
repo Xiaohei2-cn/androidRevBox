@@ -10,25 +10,28 @@ function getWindow(): ReturnType<typeof getCurrentWindow> | null {
   }
 }
 
-/** macOS 用红黄绿圆点，Windows/Linux 用最小化/最大化/关闭 */
+/** macOS 用红黄绿圆点（左侧），Windows/Linux 用最小化/最大化/关闭（右侧） */
 const isMacLike = navigator.userAgent.includes("Macintosh");
 
 export function TitleBar() {
   return (
     <header
       data-tauri-drag-region
-      className="flex h-10 shrink-0 items-center justify-between border-b border-border/60 pl-4"
+      className="flex h-10 shrink-0 items-center gap-3 border-b border-border/60"
     >
+      {/* macOS：控制按钮在左（对齐系统习惯，红黄绿顺序）；拖拽区在其右 */}
+      {isMacLike && <WindowControls />}
       <div
         data-tauri-drag-region
-        className="pointer-events-none flex items-baseline gap-2"
+        className="pointer-events-none flex flex-1 items-baseline gap-2 pl-4"
       >
         <span className="text-sm font-semibold tracking-tight">
           AppReverseTools
         </span>
         <span className="text-xs text-muted-foreground">Android 本地工具平台</span>
       </div>
-      <WindowControls />
+      {/* Windows/Linux：控制按钮在右（关闭最右，符合平台习惯） */}
+      {!isMacLike && <WindowControls />}
     </header>
   );
 }
@@ -36,7 +39,8 @@ export function TitleBar() {
 function WindowControls() {
   if (isMacLike) {
     return (
-      <div className="flex items-center gap-2 pl-4 pr-3">
+      <div className="flex shrink-0 items-center gap-2 pl-4 pr-1">
+        {/* 红黄绿顺序与系统一致；关闭在最左 */}
         <ControlDot
           label="关闭窗口"
           color="bg-[#ff5f57]"
@@ -56,7 +60,7 @@ function WindowControls() {
     );
   }
   return (
-    <div className="flex h-full items-stretch">
+    <div className="flex h-full shrink-0 items-stretch">
       <ControlButton label="最小化窗口" onClick={() => void getWindow()?.minimize()}>
         <Minus className="h-3.5 w-3.5" />
       </ControlButton>
