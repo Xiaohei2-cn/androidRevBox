@@ -1,4 +1,5 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useI18n } from "@/i18n";
 import { Minus, Square, X } from "lucide-react";
 
 /** 浏览器直开 dev server 时无 Tauri internals，惰性获取避免整页崩溃 */
@@ -14,6 +15,7 @@ function getWindow(): ReturnType<typeof getCurrentWindow> | null {
 const isMacLike = navigator.userAgent.includes("Macintosh");
 
 export function TitleBar() {
+  const { t } = useI18n();
   return (
     <header
       data-tauri-drag-region
@@ -26,9 +28,9 @@ export function TitleBar() {
         className="pointer-events-none flex flex-1 items-baseline gap-2 pl-4"
       >
         <span className="text-sm font-semibold tracking-tight">
-          AppReverseTools
+          {t("app.name")}
         </span>
-        <span className="text-xs text-muted-foreground">Android 本地工具平台</span>
+        <span className="text-xs text-muted-foreground">{t("app.tagline")}</span>
       </div>
       {/* Windows/Linux：控制按钮在右（关闭最右，符合平台习惯） */}
       {!isMacLike && <WindowControls />}

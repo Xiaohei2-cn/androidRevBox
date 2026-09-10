@@ -7,10 +7,11 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "pnpm i18n:check && tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "i18n:check": "node scripts/i18n-check.mjs"
   },
   "dependencies": {
     "@radix-ui/react-label": "^2.1.1",

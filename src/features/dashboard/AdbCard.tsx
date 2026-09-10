@@ -7,6 +7,7 @@ import {
   type DeviceEntry,
 } from "@/api/device";
 import { useActiveTab } from "@/app/nav";
+import { useI18n } from "@/i18n";
 import { BrandIcon } from "@/components/ui/BrandIcon";
 import { PathText } from "@/components/ui/PathText";
 import { cn } from "@/lib/utils";
@@ -19,6 +20,7 @@ import { cn } from "@/lib/utils";
 export function AdbCard() {
   const [events, setEvents] = useState(0);
   const active = useActiveTab("dashboard");
+  const { t } = useI18n();
 
   const { data: env } = useQuery<AdbEnvironment>({
     queryKey: ["adb", "environment", events],
@@ -55,7 +57,7 @@ export function AdbCard() {
     <div className="rounded-xl border bg-card p-4">
       <div className="flex items-center gap-2">
         <BrandIcon name="android" />
-        <span className="text-sm font-semibold">ADB 环境</span>
+        <span className="text-sm font-semibold">{t("dashboard.adb.title")}</span>
         <span
           data-testid="adb-status"
           className={cn(
@@ -64,16 +66,16 @@ export function AdbCard() {
           )}
         >
           {env === undefined ? (
-            "检测中…"
+            t("common.loading")
           ) : env.installed ? (
             <>
               <CheckCircle2 className="h-3.5 w-3.5" />
-              已就绪
+              {t("common.ready")}
             </>
           ) : (
             <>
               <XCircle className="h-3.5 w-3.5" />
-              未检测到
+              {t("common.notDetected")}
             </>
           )}
         </span>
@@ -105,14 +107,18 @@ export function AdbCard() {
         <div className="flex items-center gap-1.5 text-xs">
           <Usb className="h-3.5 w-3.5 text-muted-foreground" />
           <span data-testid="adb-device-count" className="font-medium">
-            {env?.installed ? `已连接设备 ${ready.length}` : "设备监听暂停"}
+            {env?.installed
+            ? t("dashboard.adb.connected", { count: ready.length })
+            : t("dashboard.adb.paused")}
           </span>
           {others.length > 0 && (
-            <span className="text-amber-500">（另有 {others.length} 台未授权/离线）</span>
+            <span className="text-amber-500">
+              {t("dashboard.adb.others", { count: others.length })}
+            </span>
           )}
         </div>
         {devicesError && (
-          <p className="mt-1 text-xs text-destructive">设备列表获取失败</p>
+          <p className="mt-1 text-xs text-destructive">{t("dashboard.adb.listFailed")}</p>
         )}
         {ready.length > 0 && (
           <ul className="mt-2 space-y-1">

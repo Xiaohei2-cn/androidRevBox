@@ -2,6 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, CircleSlash, RefreshCw, Settings2, XCircle } from "lucide-react";
 import { envApi, type McpEnv } from "@/api/env";
 import { useAppNav } from "@/app/nav";
+import { useI18n } from "@/i18n";
 import { BrandIcon } from "@/components/ui/BrandIcon";
 import { PathText } from "@/components/ui/PathText";
 import { cn } from "@/lib/utils";
@@ -14,23 +15,24 @@ import { cn } from "@/lib/utils";
  */
 
 export function PythonCard() {
+  const { t } = useI18n();
   const { data, isFetching, refetch } = useEnvQuery(["env", "python"], envApi.python);
   return (
     <EnvCard
       testid="env-python"
       icon={<BrandIcon name="python" />}
-      title="Python 环境"
+      title={t("dashboard.python.title")}
       refresh={() => void refetch()}
       refreshing={isFetching}
       configKey="app.python.path"
       status={
         data === undefined
-          ? { tone: "muted", label: "检测中…" }
+          ? { tone: "muted", label: t("common.loading") }
           : data.ready
-            ? { tone: "ok", label: `Python ${data.version}` }
+            ? { tone: "ok", label: t("dashboard.python.version", { version: data.version ?? "" }) }
             : data.configured
-              ? { tone: "warn", label: "不可用" }
-              : { tone: "warn", label: "未配置" }
+              ? { tone: "warn", label: t("common.unavailable") }
+              : { tone: "warn", label: t("common.notConfigured") }
       }
     >
       {data === undefined ? null : data.ready ? (
@@ -45,29 +47,30 @@ export function PythonCard() {
 }
 
 export function NodeCard() {
+  const { t } = useI18n();
   const { data, isFetching, refetch } = useEnvQuery(["env", "node"], envApi.node);
   return (
     <EnvCard
       testid="env-node"
       icon={<BrandIcon name="node" />}
-      title="Node 环境"
+      title={t("dashboard.node.title")}
       refresh={() => void refetch()}
       refreshing={isFetching}
       configKey="app.node.path"
       status={
         data === undefined
-          ? { tone: "muted", label: "检测中…" }
+          ? { tone: "muted", label: t("common.loading") }
           : data.ready
-            ? { tone: "ok", label: `Node ${data.version}` }
-            : { tone: "warn", label: "未检测到" }
+            ? { tone: "ok", label: t("dashboard.node.version", { version: data.version ?? "" }) }
+            : { tone: "warn", label: t("common.notDetected") }
       }
     >
       {data === undefined ? null : data.ready ? (
         <>
-          <PathLine label="node">
+          <PathLine label={t("dashboard.node.nodeLabel")}>
             <PathText value={data.path} testid="env-node-path" className="font-mono" />
           </PathLine>
-          <PathLine label="全局包">
+          <PathLine label={t("dashboard.node.globalRoot")}>
             <PathText
               value={data.npmGlobalRoot}
               testid="env-node-npmroot"
@@ -84,29 +87,30 @@ export function NodeCard() {
 
 /** Frida 卡依赖 Python 就绪（§10 剪枝：未就绪不发起 env_frida 查询） */
 export function FridaCard({ pythonReady }: { pythonReady: boolean | undefined }) {
+  const { t } = useI18n();
   const enabled = pythonReady === true;
   const { data, isFetching, refetch } = useEnvQuery(["env", "frida"], envApi.frida, enabled);
   return (
     <EnvCard
       testid="env-frida"
       icon={<BrandIcon name="frida" />}
-      title="Frida"
+      title={t("dashboard.frida.title")}
       refresh={() => void refetch()}
       refreshing={isFetching}
       disabled={!enabled}
       configKey={enabled ? undefined : "app.python.path"}
       status={
         !enabled
-          ? { tone: "muted", label: "待 Python 就绪" }
+          ? { tone: "muted", label: t("dashboard.frida.waitPython") }
           : data === undefined
-            ? { tone: "muted", label: "检测中…" }
+            ? { tone: "muted", label: t("common.loading") }
             : data.installed
-              ? { tone: "ok", label: "已安装" }
-              : { tone: "warn", label: "未安装" }
+              ? { tone: "ok", label: t("common.installed") }
+              : { tone: "warn", label: t("common.notInstalled") }
       }
     >
       {!enabled ? (
-        <PathLine>先在 设置 → 工具环境 配置可用的 Python 解释器</PathLine>
+        <PathLine>{t("dashboard.frida.hintConfig")}</PathLine>
       ) : data === undefined ? null : data.installed ? (
         <PathLine mono>
           frida <PathText value={data.fridaVersion} testid="env-frida-version" className="font-mono" />
@@ -136,6 +140,7 @@ export function McpCard({
   /** 用哪个官方图标标识该工具 */
   brand: "ida" | "jadx";
 }) {
+  const { t } = useI18n();
   const { data, isFetching, refetch } = useEnvQuery(["env", testid], queryFn);
   return (
     <EnvCard
@@ -147,10 +152,10 @@ export function McpCard({
       configKey={configKey}
       status={
         data === undefined
-          ? { tone: "muted", label: "检测中…" }
+          ? { tone: "muted", label: t("common.loading") }
           : data.reachable
-            ? { tone: "ok", label: `在线 · ${data.port}` }
-            : { tone: "warn", label: "未检测到" }
+            ? { tone: "ok", label: t("dashboard.mcp.online", { port: data.port }) }
+            : { tone: "warn", label: t("common.notDetected") }
       }
     >
       {data === undefined ? null : data.reachable ? (
@@ -196,6 +201,7 @@ export function EnvCard({
   children?: React.ReactNode;
 }) {
   const { gotoConfig } = useAppNav();
+  const { t } = useI18n();
   return (
     <div data-testid={testid} className="rounded-xl border bg-card p-4" aria-disabled={disabled}>
       <div className="flex items-center gap-2">
@@ -206,8 +212,8 @@ export function EnvCard({
         {configKey && (
           <button
             type="button"
-            aria-label={`配置 ${title}`}
-            title="前往设置"
+            aria-label={t("common.configure", { name: title })}
+            title={t("common.gotoSettings")}
             onClick={() => gotoConfig(configKey)}
             className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
             data-testid={`${testid}-goto-config`}
@@ -217,7 +223,7 @@ export function EnvCard({
         )}
         <button
           type="button"
-          aria-label={`刷新 ${title}`}
+          aria-label={t("common.refreshName", { name: title })}
           disabled={refreshing || disabled}
           onClick={refresh}
           className="ml-auto rounded p-1 text-muted-foreground hover:bg-accent disabled:opacity-30"

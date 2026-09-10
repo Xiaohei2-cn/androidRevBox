@@ -56,3 +56,10 @@ if (typeof globalThis.ResizeObserver !== "function") {
 if (typeof Element.prototype.scrollIntoView !== "function") {
   Element.prototype.scrollIntoView = () => {};
 }
+
+// i18n：测试统一固定 zh-CN（jsdom 默认 navigator.language=en-US 会让词典探测漂移，
+// 断言中文文案的用例必须确定性）
+Object.defineProperty(window.navigator, "language", {
+  configurable: true,
+  get: () => "zh-CN",
+});

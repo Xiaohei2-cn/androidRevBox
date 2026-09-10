@@ -1,0 +1,56 @@
+/** 仪表盘：环境/工具卡片、前台应用卡 */
+export default {
+  "dashboard.adb.title": "ADB 环境",
+  "dashboard.adb.connected": "已连接设备 {count}",
+  "dashboard.adb.paused": "设备监听暂停",
+  "dashboard.adb.others": "（另有 {count} 台未授权/离线）",
+  "dashboard.adb.listFailed": "设备列表获取失败",
+
+  "dashboard.python.title": "Python 环境",
+  "dashboard.python.detecting": "检测中…",
+  "dashboard.python.version": "Python {version}",
+  "dashboard.python.notConfiguredHint": "未配置 Python 解释器：请在 设置 → 工具环境 中指定。",
+  "dashboard.python.execFailed": "解释器执行失败: {error}",
+  "dashboard.python.unparsable": "执行 --version 成功但输出无法解析: {output}",
+
+  "dashboard.node.title": "Node 环境",
+  "dashboard.node.version": "Node {version}",
+  "dashboard.node.globalRoot": "全局包",
+  "dashboard.node.nodeLabel": "node",
+  "dashboard.node.missing": "未检测到 node：请安装 Node.js 并加入 PATH，或在 设置 → 工具环境 指定路径。",
+  "dashboard.node.execFailed": "配置的 node 无法执行: {path}",
+  "dashboard.node.unparsable": "node --version 输出无法解析: {output}",
+
+  "dashboard.frida.title": "Frida",
+  "dashboard.frida.waitPython": "待 Python 就绪",
+  "dashboard.frida.hintConfig": "先在 设置 → 工具环境 配置可用的 Python 解释器",
+  "dashboard.frida.notInstalledHint":
+    "该 Python 环境未安装 frida / frida-tools（pip install frida-tools）。",
+
+  "dashboard.ida.title": "IDA MCP",
+  "dashboard.jadx.title": "jadx-gui MCP",
+  "dashboard.mcp.online": "在线 · {port}",
+  "dashboard.mcp.unreachable": "{name} 未检测到（{addr} 连接失败: {error}）。启动工具后点刷新。",
+  "dashboard.mcp.timeout": "{name} 未检测到（{addr} 连接超时）。",
+  "dashboard.mcp.onlineHint": "{name} 服务在线（{addr}）",
+
+  "dashboard.foreground.title": "安卓前台应用",
+  "dashboard.foreground.adbUnavailable": "adb 不可用",
+  "dashboard.foreground.adbHint": "adb 不可用，前台应用检测暂停。",
+  "dashboard.foreground.live": "检测中（实时）",
+  "dashboard.foreground.noDevice": "无在线设备",
+  "dashboard.foreground.noDeviceHint": "无在线设备：连接设备/模拟器后自动开始检测。",
+  "dashboard.foreground.noForeground": "无前台应用",
+  "dashboard.foreground.noForegroundHint":
+    "未解析到前台窗口（可能锁屏、弹窗或系统版本输出差异）。",
+  "dashboard.foreground.paused": "暂停",
+  "dashboard.foreground.package": "包名",
+  "dashboard.foreground.activity": "Activity",
+  "dashboard.foreground.pid": "PID",
+  "dashboard.foreground.nativeLib": "native lib",
+  "dashboard.foreground.procPaths": "/proc 关键路径",
+  "dashboard.foreground.noProc": "进程未运行（pid 不可得）",
+  "dashboard.foreground.unreadable": "不可读（可能需要 root）",
+  "dashboard.foreground.devicesFailed": "adb devices 失败: {error}",
+  "dashboard.foreground.windowFailed": "dumpsys window 失败: {error}",
+} as const;

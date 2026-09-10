@@ -11,6 +11,7 @@ import {
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { configApi } from "@/api/config";
+import { I18nProvider } from "@/i18n";
 
 /** 主题偏好：浅色 / 深色 / 跟随系统 */
 export type ThemePref = "light" | "dark" | "system";
@@ -263,7 +264,9 @@ export function AppProviders({ children }: { children: ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>
       <SettingsProvider>
-        <TooltipProvider delayDuration={200}>{children}</TooltipProvider>
+        <I18nProvider>
+          <TooltipProvider delayDuration={200}>{children}</TooltipProvider>
+        </I18nProvider>
       </SettingsProvider>
     </QueryClientProvider>
   );

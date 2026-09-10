@@ -23,6 +23,15 @@ pub const KEY_NODE_PATH: &str = "app.node.path";
 pub const KEY_IDA_MCP_PORT: &str = "app.tools.ida_mcp_port";
 /// jadx-gui MCP 服务端口（P7）；1–65535
 pub const KEY_JADX_MCP_PORT: &str = "app.tools.jadx_mcp_port";
+/// 界面语言（P8 多语言）；取值见 LOCALES，默认 zh-CN
+pub const KEY_LOCALE: &str = "app.settings.locale";
+
+/// 界面语言白名单（与前端 i18n 词典文件一一对应；新增语种在此登记）
+pub const LOCALES: [&str; 5] = ["zh-CN", "en", "ru", "pt-BR", "ja"];
+
+fn is_valid_locale(v: &str) -> bool {
+    LOCALES.contains(&v)
+}
 
 fn is_valid_theme(v: &str) -> bool {
     matches!(v, "light" | "dark" | "system")
@@ -77,6 +86,7 @@ const ALLOWED_KEYS: &[(&str, ValueValidator)] = &[
     (KEY_NODE_PATH, is_valid_path),
     (KEY_IDA_MCP_PORT, is_valid_port),
     (KEY_JADX_MCP_PORT, is_valid_port),
+    (KEY_LOCALE, is_valid_locale),
 ];
 
 #[derive(Clone)]

@@ -3,6 +3,7 @@ import { Smartphone } from "lucide-react";
 import { deviceApi } from "@/api/device";
 import { envApi, type ForegroundApp } from "@/api/env";
 import { useActiveTab } from "@/app/nav";
+import { useI18n } from "@/i18n";
 import { PathText } from "@/components/ui/PathText";
 import { EnvCard } from "./EnvCards";
 import { cn } from "@/lib/utils";
@@ -18,6 +19,7 @@ const FAST_POLL_MS = 5_000;
 const SLOW_POLL_MS = 30_000;
 
 export function ForegroundCard() {
+  const { t } = useI18n();
   const active = useActiveTab("dashboard");
   const { data: adbEnv } = useQuery({
     queryKey: ["adb", "environment"],
@@ -49,41 +51,47 @@ export function ForegroundCard() {
       <EnvCard
         testid="foreground-card"
         icon={<Smartphone className="h-4 w-4" />}
-        title="安卓前台应用"
+        title={t("dashboard.foreground.title")}
         refresh={() => void refetch()}
         refreshing={isFetching}
         disabled={!adbEnv?.installed}
-        status={statusOf(data, !!adbEnv?.installed)}
+        status={statusOf(data, !!adbEnv?.installed, t)}
       >
-        <ForegroundBody app={data} lastUpdated={dataUpdatedAt} />
+        <ForegroundBody app={data} lastUpdated={dataUpdatedAt} t={t} />
       </EnvCard>
     </div>
   );
 }
 
-function statusOf(app: ForegroundApp | undefined, adbInstalled: boolean) {
-  if (!adbInstalled) return { tone: "muted" as const, label: "adb 不可用" };
-  if (app === undefined) return { tone: "muted" as const, label: "检测中…" };
+function statusOf(
+  app: ForegroundApp | undefined,
+  adbInstalled: boolean,
+  t: (k: string, v?: Record<string, string | number>) => string,
+) {
+  if (!adbInstalled) return { tone: "muted" as const, label: t("dashboard.foreground.adbUnavailable") };
+  if (app === undefined) return { tone: "muted" as const, label: t("common.loading") };
   switch (app.state) {
     case "ready":
-      return { tone: "ok" as const, label: "检测中（实时）" };
+      return { tone: "ok" as const, label: t("dashboard.foreground.live") };
     case "no_device":
-      return { tone: "muted" as const, label: "无在线设备" };
+      return { tone: "muted" as const, label: t("dashboard.foreground.noDevice") };
     case "no_foreground":
-      return { tone: "muted" as const, label: "无前台应用" };
+      return { tone: "muted" as const, label: t("dashboard.foreground.noForeground") };
     case "error":
-      return { tone: "warn" as const, label: "检测失败" };
+      return { tone: "warn" as const, label: t("common.detectFailed") };
     default:
-      return { tone: "muted" as const, label: "暂停" };
+      return { tone: "muted" as const, label: t("dashboard.foreground.paused") };
   }
 }
 
 function ForegroundBody({
   app,
   lastUpdated,
+  t,
 }: {
   app: ForegroundApp | undefined;
   lastUpdated: number;
+  t: (k: string, v?: Record<string, string | number>) => string;
 }) {
   if (!app) return null;
   if (app.state !== "ready") {
@@ -91,15 +99,15 @@ function ForegroundBody({
   }
   return (
     <div className="grid grid-cols-1 gap-x-6 gap-y-1.5 text-xs md:grid-cols-2">
-      <Field label="包名" value={app.package} testid="fg-package" />
-      <Field label="Activity" value={app.activity} testid="fg-activity" />
-      <Field label="PID" value={app.pid} testid="fg-pid" mono />
-      <Field label="native lib" value={app.nativeLibDir} testid="fg-libdir" mono />
+      <Field label={t("dashboard.foreground.package")} value={app.package} testid="fg-package" />
+      <Field label={t("dashboard.foreground.activity")} value={app.activity} testid="fg-activity" />
+      <Field label={t("dashboard.foreground.pid")} value={app.pid} testid="fg-pid" mono />
+      <Field label={t("dashboard.foreground.nativeLib")} value={app.nativeLibDir} testid="fg-libdir" mono />
       <div className="md:col-span-2">
-        <p className="mb-1 text-muted-foreground">/proc 关键路径</p>
+        <p className="mb-1 text-muted-foreground">{t("dashboard.foreground.procPaths")}</p>
         <ul className="space-y-1" data-testid="fg-proc-paths">
           {app.procPaths.length === 0 && (
-            <li className="text-muted-foreground">进程未运行（pid 不可得）</li>
+            <li className="text-muted-foreground">{t("dashboard.foreground.noProc")}</li>
           )}
           {app.procPaths.map((p) => (
             <li key={p.path} className="flex items-baseline gap-2 font-mono">
@@ -111,15 +119,17 @@ function ForegroundBody({
                 )}
                 title={p.summary ?? undefined}
               >
-                {p.readable ? p.summary || "（空）" : "不可读（可能需要 root）"}
+                {p.readable
+                  ? p.summary || t("common.emptyValue")
+                  : t("dashboard.foreground.unreadable")}
               </span>
             </li>
           ))}
         </ul>
       </div>
       <p className="md:col-span-2 text-right text-[10px] text-muted-foreground">
-        设备 <PathText value={app.serial} className="font-mono" /> · 更新于{" "}
-        {new Date(lastUpdated).toLocaleTimeString()}
+        {t("common.device")} <PathText value={app.serial} className="font-mono" /> ·{" "}
+        {t("common.updatedAt")} {new Date(lastUpdated).toLocaleTimeString()}
       </p>
     </div>
   );

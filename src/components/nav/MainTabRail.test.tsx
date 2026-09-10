@@ -3,23 +3,29 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppNavProvider } from "@/app/nav";
+import { DICTIONARIES } from "@/i18n/dictionaries";
+import { I18nProvider } from "@/i18n/I18nProvider";
 import { MAIN_TABS, MainTabRail } from "./MainTabRail";
+
+const ZH_LABELS = DICTIONARIES["zh-CN"];
 
 function renderRail() {
   return render(
     <TooltipProvider>
       <AppNavProvider>
-        <MainTabRail />
+        <I18nProvider>
+          <MainTabRail />
+        </I18nProvider>
       </AppNavProvider>
     </TooltipProvider>,
   );
 }
 
 describe("MainTabRail", () => {
-  it("渲染全部 7 个总 tab", () => {
+  it("渲染全部 7 个总 tab（默认 zh-CN 标签）", () => {
     renderRail();
     for (const tab of MAIN_TABS) {
-      expect(screen.getByRole("button", { name: tab.label })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: ZH_LABELS[tab.labelKey] })).toBeInTheDocument();
     }
     expect(MAIN_TABS).toHaveLength(7);
   });

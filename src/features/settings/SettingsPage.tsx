@@ -14,12 +14,14 @@ import { useAppNav } from "@/app/nav";
 import { deviceApi, type AdbEnvironment } from "@/api/device";
 import { systemApi } from "@/api/system";
 import { configApi } from "@/api/config";
+import { LOCALES, LOCALE_LABELS, useI18n } from "@/i18n";
+import type { Locale } from "@/i18n/dictionaries";
 import { cn } from "@/lib/utils";
 
-const THEME_OPTIONS: { value: ThemePref; label: string }[] = [
-  { value: "light", label: "浅色" },
-  { value: "dark", label: "深色" },
-  { value: "system", label: "跟随系统" },
+const THEME_OPTIONS: { value: ThemePref }[] = [
+  { value: "light" },
+  { value: "dark" },
+  { value: "system" },
 ];
 
 const LOG_LEVEL_OPTIONS: { value: LogLevel; label: string }[] = [
@@ -30,20 +32,21 @@ const LOG_LEVEL_OPTIONS: { value: LogLevel; label: string }[] = [
   { value: "error", label: "error" },
 ];
 
-/** 设置页：外观、ADB、工具环境（P7）、日志级别、关于（P7 自仪表盘迁入） */
+/** 设置页：外观、语言（P8）、ADB、工具环境、日志级别、关于 */
 export function SettingsPage() {
   const { theme, setTheme, opacity, setOpacity, logLevel, setLogLevel, hydrated } =
     useSettings();
+  const { t, locale, setLocale } = useI18n();
   const queryClient = useQueryClient();
 
   return (
     <div className="mx-auto flex h-full max-w-xl flex-col gap-8 overflow-auto pt-4">
       <section className="flex flex-col gap-3">
-        <Label>外观主题</Label>
+        <Label>{t("settings.theme.label")}</Label>
         <div
           className="inline-flex w-fit rounded-lg bg-muted p-1"
           role="radiogroup"
-          aria-label="外观主题"
+          aria-label={t("settings.theme.aria")}
         >
           {THEME_OPTIONS.map((option) => (
             <button
@@ -59,18 +62,16 @@ export function SettingsPage() {
                   : "text-muted-foreground hover:text-foreground",
               )}
             >
-              {option.label}
+              {t(`settings.theme.${option.value}`)}
             </button>
           ))}
         </div>
-        <p className="text-xs text-muted-foreground">
-          「跟随系统」会实时响应系统深浅色切换
-        </p>
+        <p className="text-xs text-muted-foreground">{t("settings.theme.hint")}</p>
       </section>
 
       <section className="flex flex-col gap-3">
         <div className="flex items-center justify-between">
-          <Label htmlFor="opacity-slider">背景不透明度</Label>
+          <Label htmlFor="opacity-slider">{t("settings.opacity.label")}</Label>
           <span className="text-sm tabular-nums text-muted-foreground">
             {opacity}%
           </span>
@@ -83,14 +84,41 @@ export function SettingsPage() {
           value={[opacity]}
           onValueChange={(values) => setOpacity(values[0])}
         />
-        <p className="text-xs text-muted-foreground">
-          调节窗口背景透明度，并叠加毛玻璃效果（macOS Vibrancy / Windows
-          Acrylic；Linux 无合成器时自动降级为纯透明度）。最低 20%，保证内容可读。
-        </p>
+        <p className="text-xs text-muted-foreground">{t("settings.opacity.hint")}</p>
       </section>
 
       <section className="flex flex-col gap-3">
-        <Label>ADB 路径</Label>
+        <Label>{t("settings.language.label")}</Label>
+        <div
+          className="inline-flex w-fit flex-wrap gap-1"
+          role="radiogroup"
+          aria-label={t("settings.language.label")}
+          data-testid="locale-radiogroup"
+        >
+          {LOCALES.map((l) => (
+            <button
+              key={l}
+              type="button"
+              role="radio"
+              aria-checked={locale === l}
+              data-testid={`locale-${l}`}
+              onClick={() => setLocale(l as Locale)}
+              className={cn(
+                "rounded-md border px-3 py-1.5 text-xs transition-colors",
+                locale === l
+                  ? "border-primary bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
+              )}
+            >
+              {LOCALE_LABELS[l]}
+            </button>
+          ))}
+        </div>
+        <p className="text-xs text-muted-foreground">{t("settings.language.hint")}</p>
+      </section>
+
+      <section className="flex flex-col gap-3">
+        <Label>{t("settings.adb.label")}</Label>
         <AdbPathSection onProbed={() => {
           // adb 环境变了：仪表盘/设备页的查询立即失效重取
           void queryClient.invalidateQueries({ queryKey: ["adb"] });
@@ -99,40 +127,38 @@ export function SettingsPage() {
       </section>
 
       <section className="flex flex-col gap-3">
-        <Label>工具环境</Label>
-        <p className="text-xs text-muted-foreground">
-          仪表盘环境卡片使用；改动保存后自动重新探测。
-        </p>
+        <Label>{t("settings.tools.label")}</Label>
+        <p className="text-xs text-muted-foreground">{t("settings.tools.hint")}</p>
         <ConfigInputRow
-          label="Python 解释器路径"
+          label={t("settings.tools.pythonPath")}
           configKey="app.python.path"
-          placeholder="留空 = 未配置（Frida 检测将暂停）；如 /usr/bin/python3"
+          placeholder={t("settings.tools.pythonPath.placeholder")}
           mono
           onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
         />
         <ConfigInputRow
-          label="Node 路径"
+          label={t("settings.tools.nodePath")}
           configKey="app.node.path"
-          placeholder="留空 = 自动探测系统 PATH 上的 node"
+          placeholder={t("settings.tools.nodePath.placeholder")}
           mono
           onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
         />
         <ConfigInputRow
-          label="IDA MCP 端口"
+          label={t("settings.tools.idaPort")}
           configKey="app.tools.ida_mcp_port"
-          placeholder="默认 13337"
+          placeholder={t("settings.tools.idaPort.placeholder")}
           onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
         />
         <ConfigInputRow
-          label="jadx-gui MCP 端口"
+          label={t("settings.tools.jadxPort")}
           configKey="app.tools.jadx_mcp_port"
-          placeholder="默认 8650"
+          placeholder={t("settings.tools.jadxPort.placeholder")}
           onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
         />
       </section>
 
       <section className="flex flex-col gap-3">
-        <Label>日志级别</Label>
+        <Label>{t("settings.log.label")}</Label>
         <div className="inline-flex w-fit gap-1">
           {LOG_LEVEL_OPTIONS.map((option) => (
             <button
@@ -153,8 +179,8 @@ export function SettingsPage() {
           ))}
         </div>
         <p className="text-xs text-muted-foreground">
-          运行时生效并持久化（SQLite app_settings），重启自动恢复。
-          {!hydrated && " 配置同步中…"}
+          {t("settings.log.hint")}
+          {!hydrated && t("settings.log.syncing")}
         </p>
       </section>
 
@@ -185,6 +211,7 @@ function ConfigInputRow({
   const [flash, setFlash] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const { pendingConfigKey, clearPendingConfig } = useAppNav();
+  const { t } = useI18n();
 
   // 初值回显：从 snapshot 里找当前键（缺失 = 用默认）
   const { data: snapshot } = useQuery({
@@ -245,12 +272,12 @@ function ConfigInputRow({
           data-testid={`config-${configKey}`}
         />
         <Button size="sm" variant="outline" disabled={busy} onClick={() => void save()}>
-          应用
+          {t("common.apply")}
         </Button>
       </div>
       {error && <p className="pl-36 text-xs text-destructive">{error}</p>}
       {saved && !error && (
-        <p className="pl-36 text-xs text-emerald-500">已保存，环境卡重新检测中</p>
+        <p className="pl-36 text-xs text-emerald-500">{t("settings.tools.savedReload")}</p>
       )}
     </div>
   );
@@ -258,6 +285,7 @@ function ConfigInputRow({
 
 /** 关于（P7）：应用版本 / Tauri 版本 / 运行平台，自仪表盘系统四卡迁入 */
 function AboutSection() {
+  const { t } = useI18n();
   const { data } = useQuery({
     queryKey: ["system", "ping"],
     queryFn: systemApi.ping,
@@ -266,12 +294,12 @@ function AboutSection() {
 
   return (
     <section className="flex flex-col gap-3">
-      <Label>关于</Label>
+      <Label>{t("settings.about.label")}</Label>
       <dl data-testid="about-section" className="space-y-1.5 text-xs">
-        <AboutRow label="应用版本" value={data?.appVersion} testid="about-app-version" />
-        <AboutRow label="Tauri 版本" value={data?.tauriVersion} testid="about-tauri-version" />
+        <AboutRow label={t("settings.about.appVersion")} value={data?.appVersion} testid="about-app-version" />
+        <AboutRow label={t("settings.about.tauriVersion")} value={data?.tauriVersion} testid="about-tauri-version" />
         <AboutRow
-          label="运行平台"
+          label={t("settings.about.platform")}
           value={data ? `${data.os} · ${data.arch}` : undefined}
           testid="about-platform"
         />
@@ -301,6 +329,7 @@ function AboutRow({
 
 /** ADB 路径设置：空=自动探测（ANDROID_HOME/SDK_ROOT/PATH），手动配置优先 */
 function AdbPathSection({ onProbed }: { onProbed: () => void }) {
+  const { t } = useI18n();
   const [env, setEnv] = useState<AdbEnvironment | null>(null);
   const [path, setPath] = useState("");
   const [busy, setBusy] = useState(false);
@@ -325,15 +354,15 @@ function AdbPathSection({ onProbed }: { onProbed: () => void }) {
       <div className="flex items-center gap-2">
         <Input
           value={path}
-          placeholder="留空自动探测；或填 adb 可执行文件完整路径"
+          placeholder={t("settings.adb.placeholder")}
           onChange={(e) => setPath(e.target.value)}
           className="font-mono"
         />
         <Button size="sm" variant="outline" disabled={busy} onClick={() => void apply(path)}>
-          应用
+          {t("common.apply")}
         </Button>
         <Button size="sm" variant="ghost" disabled={busy} onClick={() => void apply("")}>
-          自动
+          {t("common.auto")}
         </Button>
       </div>
       {error && <p className="text-xs text-destructive">{error}</p>}
