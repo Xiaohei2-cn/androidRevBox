@@ -25,12 +25,14 @@ export function DashboardPage() {
         title="IDA MCP"
         queryFn={envApi.idaMcp}
         configKey="app.tools.ida_mcp_port"
+        brand="ida"
       />
       <McpCard
         testid="env-jadx"
         title="jadx-gui MCP"
         queryFn={envApi.jadxMcp}
         configKey="app.tools.jadx_mcp_port"
+        brand="jadx"
       />
       {/* 唯一整行卡：安卓前台应用，置于最底 */}
       <ForegroundCard />

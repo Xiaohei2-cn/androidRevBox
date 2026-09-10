@@ -48,7 +48,7 @@ export function ForegroundCard() {
     <div className="col-span-2" data-testid="foreground-card-wrapper">
       <EnvCard
         testid="foreground-card"
-        icon={Smartphone}
+        icon={<Smartphone className="h-4 w-4" />}
         title="安卓前台应用"
         refresh={() => void refetch()}
         refreshing={isFetching}

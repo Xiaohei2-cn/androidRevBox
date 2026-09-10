@@ -1,18 +1,8 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  Bug,
-  CheckCircle2,
-  CircleSlash,
-  Hexagon,
-  Plug,
-  RefreshCw,
-  Settings2,
-  TerminalSquare,
-  XCircle,
-  type LucideIcon,
-} from "lucide-react";
+import { CheckCircle2, CircleSlash, RefreshCw, Settings2, XCircle } from "lucide-react";
 import { envApi, type McpEnv } from "@/api/env";
 import { useAppNav } from "@/app/nav";
+import { BrandIcon } from "@/components/ui/BrandIcon";
 import { PathText } from "@/components/ui/PathText";
 import { cn } from "@/lib/utils";
 
@@ -28,7 +18,7 @@ export function PythonCard() {
   return (
     <EnvCard
       testid="env-python"
-      icon={TerminalIcon}
+      icon={<BrandIcon name="python" />}
       title="Python 环境"
       refresh={() => void refetch()}
       refreshing={isFetching}
@@ -59,7 +49,7 @@ export function NodeCard() {
   return (
     <EnvCard
       testid="env-node"
-      icon={HexagonIcon}
+      icon={<BrandIcon name="node" />}
       title="Node 环境"
       refresh={() => void refetch()}
       refreshing={isFetching}
@@ -99,7 +89,7 @@ export function FridaCard({ pythonReady }: { pythonReady: boolean | undefined })
   return (
     <EnvCard
       testid="env-frida"
-      icon={BugIcon}
+      icon={<BrandIcon name="frida" />}
       title="Frida"
       refresh={() => void refetch()}
       refreshing={isFetching}
@@ -137,17 +127,20 @@ export function McpCard({
   title,
   queryFn,
   configKey,
+  brand,
 }: {
   testid: string;
   title: string;
   queryFn: () => Promise<McpEnv>;
   configKey: string;
+  /** 用哪个官方图标标识该工具 */
+  brand: "ida" | "jadx";
 }) {
   const { data, isFetching, refetch } = useEnvQuery(["env", testid], queryFn);
   return (
     <EnvCard
       testid={testid}
-      icon={PlugIcon}
+      icon={<BrandIcon name={brand} />}
       title={title}
       refresh={() => void refetch()}
       refreshing={isFetching}
@@ -181,7 +174,7 @@ export type StatusTone = "ok" | "warn" | "muted";
 
 export function EnvCard({
   testid,
-  icon: Icon,
+  icon,
   title,
   status,
   refresh,
@@ -191,7 +184,8 @@ export function EnvCard({
   children,
 }: {
   testid: string;
-  icon: LucideIcon;
+  /** 卡片图标：品牌图片（BrandIcon）或 lucide 组件，统一渲染为 16×16 */
+  icon: React.ReactNode;
   title: string;
   status: { tone: StatusTone; label: string };
   refresh: () => void;
@@ -205,7 +199,9 @@ export function EnvCard({
   return (
     <div data-testid={testid} className="rounded-xl border bg-card p-4" aria-disabled={disabled}>
       <div className="flex items-center gap-2">
-        <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
+        <span className="flex h-4 w-4 shrink-0 items-center justify-center text-muted-foreground">
+          {icon}
+        </span>
         <span className="truncate text-sm font-semibold">{title}</span>
         {configKey && (
           <button
@@ -279,12 +275,6 @@ function useEnvQuery<T>(
     retry: false,
   });
 }
-
-// 轻量图标别名（卡片标题用，避免与业务命名冲突）
-const TerminalIcon = TerminalSquare;
-const HexagonIcon = Hexagon;
-const BugIcon = Bug;
-const PlugIcon = Plug;
 
 /** 供设置页改动后整体失效环境查询 */
 export function useInvalidateEnvQueries() {
