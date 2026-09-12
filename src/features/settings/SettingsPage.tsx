@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { FolderOpen } from "lucide-react";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
@@ -14,6 +15,7 @@ import { useAppNav } from "@/app/nav";
 import { deviceApi, type AdbEnvironment } from "@/api/device";
 import { systemApi } from "@/api/system";
 import { configApi } from "@/api/config";
+import { pickDirectory, pickFile } from "@/api/dialog";
 import { LOCALES, LOCALE_LABELS, useI18n } from "@/i18n";
 import type { Locale } from "@/i18n/dictionaries";
 import { cn } from "@/lib/utils";
@@ -134,6 +136,7 @@ export function SettingsPage() {
           configKey="app.python.path"
           placeholder={t("settings.tools.pythonPath.placeholder")}
           mono
+          kind="file"
           onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
         />
         <ConfigInputRow
@@ -141,6 +144,7 @@ export function SettingsPage() {
           configKey="app.node.path"
           placeholder={t("settings.tools.nodePath.placeholder")}
           mono
+          kind="file"
           onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
         />
         <ConfigInputRow
@@ -196,12 +200,15 @@ function ConfigInputRow({
   configKey,
   placeholder,
   mono,
+  kind,
   onSaved,
 }: {
   label: string;
   configKey: string;
   placeholder?: string;
   mono?: boolean;
+  /** 路径类输入显示「打开文件夹选择器」按钮：directory=选目录，file=选文件 */
+  kind?: "directory" | "file";
   onSaved: () => void;
 }) {
   const [value, setValue] = useState("");
@@ -212,6 +219,23 @@ function ConfigInputRow({
   const inputRef = useRef<HTMLInputElement>(null);
   const { pendingConfigKey, clearPendingConfig } = useAppNav();
   const { t } = useI18n();
+  const [picking, setPicking] = useState(false);
+
+  // 原生选择器（浏览器 dev 降级为 no-op 返回 null，保持手填可用）
+  const browse = async () => {
+    setPicking(true);
+    try {
+      const picked =
+        kind === "file"
+          ? await pickFile({ title: label })
+          : await pickDirectory(label);
+      if (picked) setValue(picked);
+    } catch {
+      // 选择器异常不阻塞手填
+    } finally {
+      setPicking(false);
+    }
+  };
 
   // 初值回显：从 snapshot 里找当前键（缺失 = 用默认）
   const { data: snapshot } = useQuery({
@@ -271,6 +295,20 @@ function ConfigInputRow({
           )}
           data-testid={`config-${configKey}`}
         />
+        {kind && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-8 w-8 p-0"
+            disabled={picking}
+            aria-label={t("settings.tools.browse")}
+            title={t("settings.tools.browse")}
+            data-testid={`browse-${configKey}`}
+            onClick={() => void browse()}
+          >
+            <FolderOpen className="h-3.5 w-3.5" />
+          </Button>
+        )}
         <Button size="sm" variant="outline" disabled={busy} onClick={() => void save()}>
           {t("common.apply")}
         </Button>
@@ -334,6 +372,22 @@ function AdbPathSection({ onProbed }: { onProbed: () => void }) {
   const [path, setPath] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [picking, setPicking] = useState(false);
+
+  const browse = async () => {
+    setPicking(true);
+    try {
+      const picked = await pickFile({
+        title: t("settings.adb.label"),
+        filters: [{ name: "adb", extensions: process.platform === "win32" ? ["exe"] : ["*"] }],
+      });
+      if (picked) setPath(picked);
+    } catch {
+      // 选择器异常不阻塞手填
+    } finally {
+      setPicking(false);
+    }
+  };
 
   const apply = async (value: string) => {
     setBusy(true);
@@ -358,6 +412,18 @@ function AdbPathSection({ onProbed }: { onProbed: () => void }) {
           onChange={(e) => setPath(e.target.value)}
           className="font-mono"
         />
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-8 w-8 shrink-0 p-0"
+          disabled={picking}
+          aria-label={t("settings.tools.browse")}
+          title={t("settings.tools.browse")}
+          data-testid="browse-app.adb.path"
+          onClick={() => void browse()}
+        >
+          <FolderOpen className="h-3.5 w-3.5" />
+        </Button>
         <Button size="sm" variant="outline" disabled={busy} onClick={() => void apply(path)}>
           {t("common.apply")}
         </Button>

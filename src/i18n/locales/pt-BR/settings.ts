@@ -19,6 +19,7 @@ export default {
   "settings.adb.label": "Caminho do ADB",
   "settings.adb.placeholder": "Vazio = detecção automática; ou caminho completo do adb",
 
+  "settings.tools.browse": "Abrir seletor de arquivos",
   "settings.tools.label": "Ferramentas",
   "settings.tools.hint": "Usado pelos cartões do painel; a verificação é refeita após salvar.",
   "settings.tools.pythonPath": "Interpretador Python",

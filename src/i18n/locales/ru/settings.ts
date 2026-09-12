@@ -19,6 +19,7 @@ export default {
   "settings.adb.label": "Путь к ADB",
   "settings.adb.placeholder": "Пусто = автоопределение; или полный путь к adb",
 
+  "settings.tools.browse": "Открыть выбор файла",
   "settings.tools.label": "Инструменты",
   "settings.tools.hint": "Используется карточками панели; после сохранения проверка повторится.",
   "settings.tools.pythonPath": "Интерпретатор Python",

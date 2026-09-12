@@ -19,6 +19,7 @@ export default {
   "settings.adb.label": "ADB path",
   "settings.adb.placeholder": "Empty = auto-detect; or full path to the adb executable",
 
+  "settings.tools.browse": "Open file picker",
   "settings.tools.label": "Toolchain",
   "settings.tools.hint": "Used by the dashboard cards; cards re-check after saving.",
   "settings.tools.pythonPath": "Python interpreter",

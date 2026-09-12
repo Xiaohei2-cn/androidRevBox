@@ -18,6 +18,7 @@ export default {
   "settings.adb.label": "ADB 路径",
   "settings.adb.placeholder": "留空自动探测；或填 adb 可执行文件完整路径",
 
+  "settings.tools.browse": "打开文件选择器",
   "settings.tools.label": "工具环境",
   "settings.tools.hint": "仪表盘环境卡片使用；改动保存后自动重新探测。",
   "settings.tools.pythonPath": "Python 解释器路径",

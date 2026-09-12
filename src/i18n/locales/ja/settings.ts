@@ -19,6 +19,7 @@ export default {
   "settings.adb.label": "ADB のパス",
   "settings.adb.placeholder": "空欄＝自動検出、または adb 実行ファイルのフルパス",
 
+  "settings.tools.browse": "ファイル選択を開く",
   "settings.tools.label": "ツール環境",
   "settings.tools.hint": "ダッシュボードの環境カードが使用します。保存後に再検出します。",
   "settings.tools.pythonPath": "Python インタプリタ",

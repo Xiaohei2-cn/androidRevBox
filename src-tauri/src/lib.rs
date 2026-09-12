@@ -40,6 +40,7 @@ pub struct AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // 1) 数据库：打开 app data 目录下的 SQLite 并执行增量 migration
             let data_dir = app.path().app_data_dir()?;
