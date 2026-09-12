@@ -610,10 +610,6 @@ impl EnvService {
         self.foreground_auto().await
     }
 
-    async fn foreground(&self) -> ForegroundApp {
-        self.foreground_auto().await
-    }
-
     async fn foreground_auto(&self) -> ForegroundApp {
         let env = self.adb.environment().await;
         if !env.installed {
@@ -1290,7 +1286,7 @@ mod tests {
         mock.expect("status", FIXTURE_STATUS);
         let svc = svc_with(mock.clone());
 
-        let fg = svc.foreground().await;
+        let fg = svc.foreground_auto().await;
         assert_eq!(fg.state, "ready", "{fg:?}");
         assert_eq!(fg.serial.as_deref(), Some("ABC123"));
         assert_eq!(fg.package.as_deref(), Some("com.target.app"));
@@ -1317,7 +1313,7 @@ mod tests {
         // §10 回测核心：adb 不存在 → 前台探测 0 次 shell 调用
         let mock = Arc::new(ScriptedAdb::new(false));
         let svc = svc_with(mock.clone());
-        let fg = svc.foreground().await;
+        let fg = svc.foreground_auto().await;
         assert_eq!(fg.state, "adb_unavailable");
         assert_eq!(mock.call_count(), 0, "剪枝后不应有任何 adb 调用");
         assert!(fg.package.is_none());
@@ -1328,7 +1324,7 @@ mod tests {
         let mock = Arc::new(ScriptedAdb::new(true));
         mock.expect("devices", "\n"); // 空列表
         let svc = svc_with(mock.clone());
-        let fg = svc.foreground().await;
+        let fg = svc.foreground_auto().await;
         assert_eq!(fg.state, "no_device");
         assert_eq!(mock.call_count(), 1, "无设备时只调了 devices，不再继续");
     }
@@ -1339,7 +1335,7 @@ mod tests {
         mock.expect("devices", "ABC123\tdevice\n");
         mock.expect("dumpsys window", "  mCurrentFocus: null\n");
         let svc = svc_with(mock);
-        let fg = svc.foreground().await;
+        let fg = svc.foreground_auto().await;
         assert_eq!(fg.state, "no_foreground");
         assert!(fg.hint.is_some());
         assert!(fg.error.is_none(), "空态不是错误");
