@@ -6,6 +6,10 @@ import { TitleBar } from "@/components/window/TitleBar";
 import { DashboardPage } from "@/features/dashboard/DashboardPage";
 import { DevicesPage } from "@/features/devices/DevicesPage";
 import { AdbPage } from "@/features/adb/AdbPage";
+import { HookPage } from "@/features/hook/HookPage";
+import { BinaryPage } from "@/features/binary/BinaryPage";
+import { UnpackPage } from "@/features/unpack/UnpackPage";
+import { KernelPage } from "@/features/kernel/KernelPage";
 import { CryptoPage } from "@/features/crypto/CryptoPage";
 import { PluginsPage } from "@/features/plugins/PluginsPage";
 import { TasksPage } from "@/features/tasks/TasksPage";
@@ -67,6 +71,18 @@ function ShellBody() {
           </PageHost>
           <PageHost active={tab === "terminal"}>
             <AdbPage />
+          </PageHost>
+          <PageHost active={tab === "hook"}>
+            <HookPage />
+          </PageHost>
+          <PageHost active={tab === "binary"}>
+            <BinaryPage />
+          </PageHost>
+          <PageHost active={tab === "unpack"}>
+            <UnpackPage />
+          </PageHost>
+          <PageHost active={tab === "kernel"}>
+            <KernelPage />
           </PageHost>
           <PageHost active={tab === "crypto"}>
             <CryptoPage />

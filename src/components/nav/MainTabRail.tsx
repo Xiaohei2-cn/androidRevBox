@@ -1,11 +1,15 @@
 import {
   Binary,
+  Bug,
+  FileArchive,
   LayoutDashboard,
   ListTodo,
+  Package,
   Puzzle,
   Settings,
   Smartphone,
   Usb,
+  Waypoints,
   type LucideIcon,
 } from "lucide-react";
 import { useAppNav } from "@/app/nav";
@@ -16,6 +20,10 @@ export type TabId =
   | "dashboard"
   | "devices"
   | "terminal"
+  | "hook"
+  | "binary"
+  | "unpack"
+  | "kernel"
   | "crypto"
   | "plugins"
   | "tasks"
@@ -33,7 +41,11 @@ export const MAIN_TABS: readonly TabDef[] = [
   { id: "dashboard", labelKey: "nav.dashboard", icon: LayoutDashboard },
   { id: "devices", labelKey: "nav.devices", icon: Smartphone },
   { id: "terminal", labelKey: "nav.terminal", icon: Usb },
-  { id: "crypto", labelKey: "nav.crypto", icon: Binary },
+  { id: "hook", labelKey: "nav.hook", icon: Bug },
+  { id: "binary", labelKey: "nav.binary", icon: Binary },
+  { id: "unpack", labelKey: "nav.unpack", icon: Package },
+  { id: "kernel", labelKey: "nav.kernel", icon: FileArchive },
+  { id: "crypto", labelKey: "nav.crypto", icon: Waypoints },
   { id: "plugins", labelKey: "nav.plugins", icon: Puzzle },
   { id: "tasks", labelKey: "nav.tasks", icon: ListTodo },
   { id: "settings", labelKey: "nav.settings", icon: Settings },

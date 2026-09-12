@@ -1,5 +1,6 @@
 /** Настройки: оформление, ADB, инструменты, журнал, о программе */
 export default {
+  "settings.tab.market": "Маркет инструментов",
   "settings.tab.display": "Оформление",
   "settings.tab.language": "Язык",
   "settings.tab.environment": "Окружение",
