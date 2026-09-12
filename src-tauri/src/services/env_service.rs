@@ -447,17 +447,20 @@ impl EnvService {
         // ③ venv 识别（必须先于 symlink 展开）：venv/bin/python 是指向 base 解释器的
         //    symlink，canonicalize 会把 venv 路径「吃掉」变成 pyenv 真身——这正是
         //    用户反馈「选了项目 venv 却显示 pyenv 路径」的根因。
-        //    判据：同目录存在 pyvenv.cfg（virtualenv/venv 的标志文件）。
-        //    venv 本身就是可直接执行的解释器，保持原样返回。
-        if let Some(bin_dir) = std::path::Path::new(&resolved).parent() {
-            if bin_dir.join("pyvenv.cfg").is_file() {
-                return ResolvedInterpreter {
-                    picked_path: picked.to_string(),
-                    version: Self::probe_version(&resolved).await,
-                    resolved_path: resolved,
-                    how: "venv".into(),
-                };
-            }
+        //    判据：pyvenv.cfg 位于【venv 根目录】= bin 的上一级（virtualenv/venv 规范：
+        //    <venv>/pyvenv.cfg + <venv>/bin/python），不是 bin 的同目录！
+        //    venv 的 bin/python 本身就是可直接执行的解释器（含 site-packages 隔离），
+        //    原样返回。
+        if let Some(bin_dir) = std::path::Path::new(&resolved).parent()
+            && let Some(venv_root) = bin_dir.parent()
+            && venv_root.join("pyvenv.cfg").is_file()
+        {
+            return ResolvedInterpreter {
+                picked_path: picked.to_string(),
+                version: Self::probe_version(&resolved).await,
+                resolved_path: resolved,
+                how: "venv".into(),
+            };
         }
 
         // ④ symlink 真身（/usr/bin/python3 → Xcode 的等；venv 已在上面拦下）
@@ -1245,6 +1248,27 @@ mod tests {
         assert!(!frida.python_ready);
         assert!(!frida.installed);
         assert!(frida.hint.unwrap().contains("未配置"));
+    }
+
+    #[tokio::test]
+    async fn venv_python_is_returned_as_is() {
+        // 回归（§10.5.1）：pyvenv.cfg 在 venv 根目录（bin 的上一级），不在 bin 同目录。
+        // 选 venv/bin/python 必须原样返回，不得 canonicalize 成 pyenv 真身。
+        let venv_bin = "/Users/citec/PycharmProjects/android_reverse_study/.venv/bin";
+        if !std::path::Path::new(&format!("{venv_bin}/python")).exists() {
+            eprintln!("skip: 本机无该 venv");
+            return;
+        }
+        let db = Arc::new(crate::db::Db::in_memory().unwrap());
+        let config = Arc::new(ConfigService::new(db));
+        let svc = EnvService::new(config, Arc::new(ScriptedAdb::new(false)));
+        for name in ["python", "python3"] {
+            let picked = format!("{venv_bin}/{name}");
+            let r = svc.resolve_interpreter(&picked).await;
+            assert_eq!(r.resolved_path, picked, "{name}: venv 路径必须原样返回");
+            assert_eq!(r.how, "venv");
+            assert!(r.version.is_some(), "{name}: 应探得版本");
+        }
     }
 
     #[test]
