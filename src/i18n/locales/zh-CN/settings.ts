@@ -26,8 +26,7 @@ export default {
   "settings.tools.label": "工具环境",
   "settings.tools.hint": "仪表盘环境卡片使用；改动保存后自动重新探测。",
   "settings.tools.pythonPath": "Python 解释器路径",
-  "settings.tools.pythonPath.placeholder":
-    "留空 = 未配置（Frida 检测将暂停）；如 /usr/bin/python3",
+  "settings.tools.pythonPath.placeholder": "可选 venv/pyenv 解释器；文件选择器会跟随符号链接（选 venv 时自动反查）",
   "settings.tools.nodePath": "Node 路径",
   "settings.tools.nodePath.placeholder": "留空 = 自动探测系统 PATH 上的 node",
   "settings.tools.idaPort": "IDA MCP 端口",

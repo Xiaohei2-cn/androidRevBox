@@ -27,8 +27,7 @@ export default {
   "settings.tools.label": "ツール環境",
   "settings.tools.hint": "ダッシュボードの環境カードが使用します。保存後に再検出します。",
   "settings.tools.pythonPath": "Python インタプリタ",
-  "settings.tools.pythonPath.placeholder":
-    "空欄＝未設定（Frida 検出は停止）。例: /usr/bin/python3",
+  "settings.tools.pythonPath.placeholder": "venv／pyenv のインタプリタを選択。ファイル選択はシンボリックリンクを追います（venv は自動判別）",
   "settings.tools.nodePath": "Node のパス",
   "settings.tools.nodePath.placeholder": "空欄＝PATH 上の node を自動検出",
   "settings.tools.idaPort": "IDA MCP ポート",

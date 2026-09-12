@@ -27,8 +27,7 @@ export default {
   "settings.tools.label": "Ferramentas",
   "settings.tools.hint": "Usado pelos cartões do painel; a verificação é refeita após salvar.",
   "settings.tools.pythonPath": "Interpretador Python",
-  "settings.tools.pythonPath.placeholder":
-    "Vazio = não configurado (verificação do Frida pausada); ex.: /usr/bin/python3",
+  "settings.tools.pythonPath.placeholder": "Escolha um interpretador venv/pyenv; o seletor segue symlinks (venv é detectado automaticamente)",
   "settings.tools.nodePath": "Caminho do Node",
   "settings.tools.nodePath.placeholder": "Vazio = detectar node no PATH",
   "settings.tools.idaPort": "Porta do IDA MCP",

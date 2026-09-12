@@ -27,8 +27,7 @@ export default {
   "settings.tools.label": "Toolchain",
   "settings.tools.hint": "Used by the dashboard cards; cards re-check after saving.",
   "settings.tools.pythonPath": "Python interpreter",
-  "settings.tools.pythonPath.placeholder":
-    "Empty = not configured (Frida checks pause); e.g. /usr/bin/python3",
+  "settings.tools.pythonPath.placeholder": "Pick a venv/pyenv interpreter; the file picker follows symlinks (venv is auto-detected)",
   "settings.tools.nodePath": "Node path",
   "settings.tools.nodePath.placeholder": "Empty = auto-detect node on PATH",
   "settings.tools.idaPort": "IDA MCP port",

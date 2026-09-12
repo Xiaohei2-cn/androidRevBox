@@ -27,8 +27,7 @@ export default {
   "settings.tools.label": "Инструменты",
   "settings.tools.hint": "Используется карточками панели; после сохранения проверка повторится.",
   "settings.tools.pythonPath": "Интерпретатор Python",
-  "settings.tools.pythonPath.placeholder":
-    "Пусто = не настроено (проверка Frida приостановлена); например /usr/bin/python3",
+  "settings.tools.pythonPath.placeholder": "Выберите интерпретатор venv/pyenv; выбор файла следует по симлинкам (venv определяется автоматически)",
   "settings.tools.nodePath": "Путь к Node",
   "settings.tools.nodePath.placeholder": "Пусто = поиск node в PATH",
   "settings.tools.idaPort": "Порт IDA MCP",
