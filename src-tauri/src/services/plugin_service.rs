@@ -327,11 +327,15 @@ impl PluginService {
             Some(LoadedKind::InProcess(p)) => match p.call_checked(input, &limits) {
                 Ok(pair) => Ok(pair),
                 Err(CallError::Timeout(t)) => {
-                    // 故障处理：句柄进 quarantine（禁卸载）、自动禁用、记录错误
+                    // 故障处理：句柄进 quarantine（禁卸载）、自动禁用、记录错误。
+                    // ⚠️ 锁序纪律：全仓其他路径都是 loaded → call_lock，此处若嵌套
+                    // 持有两锁即成 AB-BA 死锁（commands async 化后真实可达）。
+                    // quarantine 已持有同一 Arc，map 侧引用移除不会触发
+                    // shutdown/dlclose（强计数 2→1），无需调用锁；卡死 worker
+                    // 此刻仍持调用锁，这里任何 lock 等待都会把 IPC 线程挂死。
+                    // 真正的句柄释放在进程退出时随 quarantine 整体回收。
                     self.quarantined.lock().expect("quarantine").push(p);
-                    loader::with_call_lock(|| {
-                        self.loaded.lock().expect("plugin map lock").remove(id);
-                    });
+                    drop(self.loaded.lock().expect("plugin map lock").remove(id));
                     let _ = plugin_repo::set_enabled(&self.db, id, false);
                     self.set_last_error(
                         id,
@@ -563,10 +567,16 @@ impl PluginService {
     /// 卸载全部插件（shutdown）；进程退出前用。
     pub fn unload_all(&self) {
         let mut guard = self.loaded.lock().expect("plugin map lock");
-        loader::with_call_lock(|| {
+        // try_lock：有 worker 仍在插件代码内执行时拿不到调用锁——此时放弃
+        // 显式 shutdown，动态库随进程整体回收（比挂住退出流程安全且友好）。
+        if loader::try_with_call_lock(|| {
             // quarantine 里的句柄绝不 drop（可能仍在执行中）；仅清空活跃句柄
             guard.clear();
-        });
+        })
+        .is_none()
+        {
+            tracing::warn!("插件调用锁被占用，跳过退出时 shutdown（插件库随进程回收）");
+        }
     }
 }
 

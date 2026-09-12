@@ -86,6 +86,13 @@ pub fn with_call_lock<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// 非阻塞版本：锁空闲则执行 f 并返回 Some，被占用返回 None 且不执行 f。
+/// 仅供进程退出路径（PluginService::unload_all）使用：有插件正在执行时
+/// 放弃显式 shutdown——动态库随进程整体回收是安全的，好过挂住退出流程。
+pub fn try_with_call_lock<R>(f: impl FnOnce() -> R) -> Option<R> {
+    LOADED_CALL_LOCK.try_lock().ok().map(|_g| f())
+}
+
 /// 候选插件目录清单：(目录名, canonical 路径) 与预检错误（目录名, 错误）
 pub type CandidateDirs = (Vec<(String, PathBuf)>, Vec<(String, LoadError)>);
 
