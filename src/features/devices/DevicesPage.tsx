@@ -579,9 +579,9 @@ function AppsView({ serial }: { serial: string | null }) {
   return (
     <div className="flex h-full min-h-0 gap-4">
       <div className="min-h-0 w-64 shrink-0 overflow-auto rounded-lg border">
-        {data!.length === 0 && <Empty text="无第三方应用" />}
+        {(data ?? []).length === 0 && <Empty text="无第三方应用" />}
         <ul className="text-xs">
-          {data!.map((pkg) => (
+          {(data ?? []).map((pkg) => (
             <li key={pkg}>
               <button
                 type="button"
