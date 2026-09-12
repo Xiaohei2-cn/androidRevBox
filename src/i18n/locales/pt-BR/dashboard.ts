@@ -36,6 +36,7 @@ export default {
   "dashboard.mcp.unreachable":
     "{name} não detectado (falha ao conectar em {addr}: {error}). Inicie a ferramenta e atualize.",
   "dashboard.mcp.timeout": "{name} não detectado (tempo esgotado ao conectar em {addr}).",
+  "dashboard.mcp.appMissing": "{name} não instalado (MCP não afetado; a porta reaparece quando a ferramenta rodar)",
   "dashboard.mcp.onlineHint": "Serviço {name} online ({addr})",
 
   "dashboard.foreground.title": "App em primeiro plano (Android)",

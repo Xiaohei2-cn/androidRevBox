@@ -36,6 +36,7 @@ export default {
   "dashboard.mcp.unreachable":
     "{name} not detected (connect to {addr} failed: {error}). Start the tool, then refresh.",
   "dashboard.mcp.timeout": "{name} not detected (connect to {addr} timed out).",
+  "dashboard.mcp.appMissing": "{name} not installed (MCP unaffected; port probe recovers once the tool runs)",
   "dashboard.mcp.onlineHint": "{name} service is online ({addr})",
 
   "dashboard.foreground.title": "Android foreground app",

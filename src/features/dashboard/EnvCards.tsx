@@ -158,16 +158,28 @@ export function McpCard({
             : { tone: "warn", label: t("common.notDetected") }
       }
     >
-      {data === undefined ? null : data.reachable ? (
-        <PathLine>
-          <PathText
-            value={`127.0.0.1:${data.port}`}
-            testid={`${testid}-addr`}
-            className="font-mono"
-          />
-        </PathLine>
-      ) : (
-        <PathLine>{data.hint}</PathLine>
+      {data === undefined ? null : (
+        <>
+          <PathLine>
+            <PathText
+              value={`127.0.0.1:${data.port}`}
+              testid={`${testid}-addr`}
+              className="font-mono"
+            />
+          </PathLine>
+          {data.appInstalled !== null && data.appInstalled !== undefined && (
+            <PathLine>
+              {data.appInstalled ? (
+                <span className="text-emerald-500">✓ {data.appPath ?? brand}</span>
+              ) : (
+                <span className="text-amber-500">
+                  {t("dashboard.mcp.appMissing", { name: brand })}
+                </span>
+              )}
+            </PathLine>
+          )}
+          {!data.reachable && <PathLine>{data.hint}</PathLine>}
+        </>
       )}
     </EnvCard>
   );

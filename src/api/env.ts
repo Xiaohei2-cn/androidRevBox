@@ -30,6 +30,10 @@ export interface McpEnv {
   reachable: boolean;
   port: number;
   hint?: string | null;
+  /** 宿主应用是否存在（mac 检测；其他平台暂为 null） */
+  appInstalled?: boolean | null;
+  /** 检测到的应用路径（mac） */
+  appPath?: string | null;
 }
 
 export interface ProcPath {

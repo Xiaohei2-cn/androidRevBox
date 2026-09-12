@@ -221,16 +221,36 @@ impl EnvService {
         }
     }
 
-    /// IDA MCP 状态：端口探活
+    /// IDA 状态：宿主应用存在性（mac）+ MCP 端口探活
     pub async fn ida_mcp(&self) -> McpEnv {
         let port = self.u16_config(KEY_IDA_MCP_PORT, DEFAULT_IDA_MCP_PORT);
-        probe_mcp("IDA MCP", port).await
+        let (app, mut env) = tokio::join!(detect_ida_app(), probe_mcp("IDA MCP", port));
+        env.app_installed = app.as_ref().map(|_| true);
+        env.app_path = app;
+        if let Some(p) = &env.app_path {
+            env.hint = Some(env.hint.take().unwrap_or_default() + &format!("（应用: {p}）"));
+        }
+        env
     }
 
-    /// jadx-gui MCP 状态：端口探活
+    /// jadx-gui 状态：CLI 存在性（`jadx-gui --version`）+ MCP 端口探活
     pub async fn jadx_mcp(&self) -> McpEnv {
         let port = self.u16_config(KEY_JADX_MCP_PORT, DEFAULT_JADX_MCP_PORT);
-        probe_mcp("jadx MCP", port).await
+        let (ver, mut env) = tokio::join!(detect_jadx_cli(), probe_mcp("jadx MCP", port));
+        match ver {
+            Some(v) => {
+                env.app_installed = Some(true);
+                env.app_path = None;
+                env.hint = Some(env.hint.take().unwrap_or_default() + &format!("（jadx-gui {v}）"));
+            }
+            None => {
+                env.app_installed = Some(false);
+                env.hint = Some(
+                    env.hint.take().unwrap_or_default() + &format!("（{}）", "jadx-gui 不在 PATH"),
+                );
+            }
+        }
+        env
     }
 
     /// 安卓前台应用（§10 探测链）。剪枝：adb 不可用 → 0 次 shell 调用；
@@ -429,6 +449,47 @@ async fn run_probe(program: &str, args: &[&str]) -> Result<ProbeOutput, String> 
     })
 }
 
+/// mac：在 /Applications 找 IDA（用户指定的 find 命令语义，浅层 3 级足够）。
+/// 非 mac 返回 None（暂留空，其他平台探测后续补）。
+pub async fn detect_ida_app() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    // find /Applications -maxdepth 3 \( -iname "ida.app" -o -iname "ida64" -o -iname "*ida*" \) 2>/dev/null
+    let out = run_probe(
+        "find",
+        &[
+            "/Applications",
+            "-maxdepth",
+            "3",
+            "(",
+            "-iname",
+            "ida.app",
+            "-o",
+            "-iname",
+            "ida64",
+            "-o",
+            "-iname",
+            "*ida*",
+            ")",
+        ],
+    )
+    .await
+    .ok()?;
+    let v = first_line(&out.stdout);
+    if v.is_empty() { None } else { Some(v) }
+}
+
+/// `jadx-gui --version`：在 PATH 即视为安装，输出版本号
+pub async fn detect_jadx_cli() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = run_probe("jadx-gui", &["--version"]).await.ok()?;
+    let v = first_line(&out.stdout);
+    if v.is_empty() { None } else { Some(v) }
+}
+
 /// MCP 端口探活：TCP 可连 = 服务在跑；连不上是常态（未启动），不算错误。
 async fn probe_mcp(name: &str, port: u16) -> McpEnv {
     use tokio::net::TcpStream;
@@ -438,6 +499,8 @@ async fn probe_mcp(name: &str, port: u16) -> McpEnv {
             reachable: true,
             port,
             hint: Some(format!("{name} 服务在线（{addr}）")),
+            app_installed: None,
+            app_path: None,
         },
         Ok(Err(e)) => McpEnv {
             reachable: false,
@@ -445,11 +508,15 @@ async fn probe_mcp(name: &str, port: u16) -> McpEnv {
             hint: Some(format!(
                 "{name} 未检测到（{addr} 连接失败: {e}）。启动工具后点刷新。"
             )),
+            app_installed: None,
+            app_path: None,
         },
         Err(_) => McpEnv {
             reachable: false,
             port,
             hint: Some(format!("{name} 未检测到（{addr} 连接超时）。")),
+            app_installed: None,
+            app_path: None,
         },
     }
 }
@@ -607,6 +674,10 @@ pub struct McpEnv {
     pub reachable: bool,
     pub port: u16,
     pub hint: Option<String>,
+    /// 宿主应用是否存在（P8 追加：mac 检测 /Applications；其他平台暂留 None）
+    pub app_installed: Option<bool>,
+    /// 检测到的应用可执行文件路径（mac）
+    pub app_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -916,6 +987,20 @@ mod tests {
         assert!(!frida.python_ready);
         assert!(!frida.installed);
         assert!(frida.hint.unwrap().contains("未配置"));
+    }
+
+    #[tokio::test]
+    async fn ida_jadx_app_detection_platform_gate() {
+        // 非 mac 恒 None（其他平台暂留空，仅设计预留 §1.5）
+        if !cfg!(target_os = "macos") {
+            assert!(detect_ida_app().await.is_none());
+            assert!(detect_jadx_cli().await.is_none());
+            return;
+        }
+        // mac：真实探测。本机装没装都可——只断言不 panic 且类型正确。
+        // IDA：find /Applications 命中与否取决于机器，不强制断言结果。
+        let _ = detect_ida_app().await;
+        let _ = detect_jadx_cli().await;
     }
 
     #[tokio::test]
