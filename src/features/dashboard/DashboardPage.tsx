@@ -2,7 +2,6 @@ import { useQuery } from "@tanstack/react-query";
 import { envApi } from "@/api/env";
 import { AdbCard } from "./AdbCard";
 import { FridaCard, McpCard, NodeCard, PythonCard } from "./EnvCards";
-import { ForegroundCard } from "./ForegroundCard";
 
 /**
  * 仪表盘（P7）：环境/工具探测中心。
@@ -36,8 +35,6 @@ export function DashboardPage() {
         brand="jadx"
         appLabel="jadx-gui"
       />
-      {/* 唯一整行卡：安卓前台应用，置于最底 */}
-      <ForegroundCard />
     </div>
   );
 }

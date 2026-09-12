@@ -602,7 +602,19 @@ impl EnvService {
 
     /// 安卓前台应用（§10 探测链）。剪枝：adb 不可用 → 0 次 shell 调用；
     /// 无在线设备 → 只调 devices；解析不出前台窗口 → 空态提示。
-    pub async fn foreground(&self) -> ForegroundApp {
+    /// 指定设备的前台应用（P8：设备页按设备查询）；serial=None 自动选首台在线设备
+    pub async fn foreground_on(&self, serial: Option<String>) -> ForegroundApp {
+        if let Some(ref target) = serial {
+            return self.foreground_inner(target.clone()).await;
+        }
+        self.foreground_auto().await
+    }
+
+    async fn foreground(&self) -> ForegroundApp {
+        self.foreground_auto().await
+    }
+
+    async fn foreground_auto(&self) -> ForegroundApp {
         let env = self.adb.environment().await;
         if !env.installed {
             return ForegroundApp {
@@ -612,7 +624,7 @@ impl EnvService {
             };
         }
         let adb_path = env.path.clone().unwrap_or_default();
-        // 1) 设备在线检查（唯一无条件的 shell 级调用）
+        // 自动选第一台在线设备
         let devices_args = adb_adapter::build_args(None, &adb_adapter::cmd_devices());
         let devices_out = match self
             .adb
@@ -628,19 +640,33 @@ impl EnvService {
                 };
             }
         };
-        let serial = adb_adapter::parse_devices(&devices_out.stdout)
+        let Some(serial) = adb_adapter::parse_devices(&devices_out.stdout)
             .into_iter()
             .find(|d| d.is_ready())
-            .map(|d| d.serial);
-        let Some(serial) = serial else {
+            .map(|d| d.serial)
+        else {
             return ForegroundApp {
                 state: FgState::NoDevice.as_str().into(),
                 hint: Some("无在线设备：连接设备/模拟器后自动开始检测。".into()),
                 ..ForegroundApp::default()
             };
         };
+        self.foreground_inner(serial).await
+    }
 
-        // 2) 前台窗口
+    /// 对指定 serial 的完整探测链（窗口 → pid/lib → /proc）
+    async fn foreground_inner(&self, serial: String) -> ForegroundApp {
+        let env = self.adb.environment().await;
+        if !env.installed {
+            return ForegroundApp {
+                state: FgState::AdbUnavailable.as_str().into(),
+                hint: Some("adb 不可用，前台应用检测暂停。".into()),
+                ..ForegroundApp::default()
+            };
+        }
+        let adb_path = env.path.clone().unwrap_or_default();
+
+        // 前台窗口
         let win_out = match self.shell(&adb_path, &serial, "dumpsys window").await {
             Ok(o) => o,
             Err(e) => {

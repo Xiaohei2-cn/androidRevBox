@@ -33,10 +33,20 @@ pub async fn env_jadx_mcp(state: tauri::State<'_, AppState>) -> CoreResult<McpEn
     Ok(state.env.jadx_mcp().await)
 }
 
-/// 安卓前台应用（可传 serial；缺省自动选第一台在线设备）
+/// 安卓前台应用：按设备查询（P8 设备页）；serial 缺省自动选第一台在线设备
 #[tauri::command]
-pub async fn env_foreground(state: tauri::State<'_, AppState>) -> CoreResult<ForegroundApp> {
-    Ok(state.env.foreground().await)
+pub async fn env_foreground(
+    state: tauri::State<'_, AppState>,
+    args: Option<ForegroundArgs>,
+) -> CoreResult<ForegroundApp> {
+    let serial = args.and_then(|a| a.serial).filter(|s| !s.is_empty());
+    Ok(state.env.foreground_on(serial).await)
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForegroundArgs {
+    pub serial: Option<String>,
 }
 
 /// 仪表盘聚合：一次拿全部环境卡（前端各卡仍可独立刷新）

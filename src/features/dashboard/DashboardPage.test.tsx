@@ -121,22 +121,13 @@ describe("DashboardPage（P7 布局契约）", () => {
     vi.restoreAllMocks();
   });
 
-  it("网格为两列布局，前台应用卡整行(col-span-2)且排最底", async () => {
+  it("网格为两列布局，前台应用卡已迁至设备页（无整行卡）", async () => {
     renderDashboard();
     const grid = screen.getByTestId("dashboard-grid");
     expect(grid.className).toContain("grid-cols-2");
-
-    await waitFor(() =>
-      expect(screen.getByTestId("fg-package")).toHaveTextContent("com.target.app"),
-    );
-
-    const wrapper = screen.getByTestId("foreground-card-wrapper");
-    expect(wrapper.className).toContain("col-span-2");
-    // 最底 = 是网格的最后一个元素子节点
-    const elementChildren = Array.from(grid.children).filter(
-      (c) => c.tagName === "DIV",
-    );
-    expect(elementChildren[elementChildren.length - 1]).toBe(wrapper);
+    // 前台应用信息迁至设备页「设备信息」tab 的设备卡（P8）
+    expect(screen.queryByTestId("foreground-card-wrapper")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fg-package")).not.toBeInTheDocument();
   });
 
   it("卡片顺序：先系统(ADB)→环境(Python/Node)→工具(Frida/IDA/jadx)→前台应用最后", async () => {
@@ -154,14 +145,12 @@ describe("DashboardPage（P7 布局契约）", () => {
     const frida = indexOf("Frida");
     const ida = indexOf("IDA");
     const jadx = indexOf("jadx-gui");
-    const fg = texts.findIndex((t) => t.includes("安卓前台应用"));
     expect(adb).toBeLessThan(python);
     expect(python).toBeLessThan(node);
     expect(node).toBeLessThan(frida);
     expect(frida).toBeLessThan(ida);
     expect(ida).toBeLessThan(jadx);
-    expect(jadx).toBeLessThan(fg);
-    expect(fg).toBe(texts.length - 1);
+    expect(jadx).toBe(texts.length - 1);
   });
 
   it("剪枝：Python 未就绪时 Frida 卡显示待命且不发起 env_frida 查询", async () => {
@@ -197,15 +186,8 @@ describe("DashboardPage（P7 布局契约）", () => {
     expect(screen.getByTestId("env-ida-status")).toHaveTextContent("在线 · 13337");
   });
 
-  it("前台应用卡展示包名/Activity/PID/lib 目录", async () => {
+  it("前台应用信息已迁至设备页（仪表盘不再渲染）", () => {
     renderDashboard();
-    await waitFor(() =>
-      expect(screen.getByTestId("fg-package")).toHaveTextContent("com.target.app"),
-    );
-    expect(screen.getByTestId("fg-activity")).toHaveTextContent(
-      "com.target.app.MainActivity",
-    );
-    expect(screen.getByTestId("fg-pid")).toHaveTextContent("4321");
-    expect(screen.getByTestId("fg-libdir")).toHaveTextContent("/data/app/~~x/lib/arm64");
+    expect(screen.queryByTestId("fg-package")).not.toBeInTheDocument();
   });
 });

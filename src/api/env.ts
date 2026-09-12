@@ -90,9 +90,11 @@ export const envApi = {
   jadxMcp(): Promise<McpEnv> {
     return invokeCommand<McpEnv>("env_jadx_mcp");
   },
-  /** 安卓前台应用；后端 adb 不可用时返回 adb_unavailable（0 次 shell 调用） */
-  foreground(): Promise<ForegroundApp> {
-    return invokeCommand<ForegroundApp>("env_foreground");
+  /** 安卓前台应用；serial 缺省自动选第一台在线设备；adb 不可用返回 adb_unavailable */
+  foreground(serial?: string): Promise<ForegroundApp> {
+    return invokeCommand<ForegroundApp>("env_foreground", {
+      args: { serial: serial ?? null },
+    });
   },
   overview(): Promise<EnvOverview> {
     return invokeCommand<EnvOverview>("env_overview");

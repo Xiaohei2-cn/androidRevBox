@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { CheckCircle2, XCircle, Usb } from "lucide-react";
+import { CheckCircle2, ChevronRight, XCircle, Usb } from "lucide-react";
 import {
   deviceApi,
   type AdbEnvironment,
   type DeviceEntry,
 } from "@/api/device";
-import { useActiveTab } from "@/app/nav";
+import { useActiveTab, useAppNav } from "@/app/nav";
 import { useI18n } from "@/i18n";
 import { BrandIcon } from "@/components/ui/BrandIcon";
 import { PathText } from "@/components/ui/PathText";
@@ -21,6 +21,7 @@ export function AdbCard() {
   const [events, setEvents] = useState(0);
   const active = useActiveTab("dashboard");
   const { t } = useI18n();
+  const { gotoDeviceList } = useAppNav();
 
   const { data: env } = useQuery<AdbEnvironment>({
     queryKey: ["adb", "environment", events],
@@ -126,10 +127,22 @@ export function AdbCard() {
               <li key={d.serial} className="flex items-center gap-2 text-xs">
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
                 <span className="font-mono">{d.model || d.serial}</span>
-                <span className="text-muted-foreground">{d.serial}</span>
-                <span className="ml-auto rounded bg-muted px-1 text-xs text-muted-foreground">
+                <span className="text-muted-foreground">
+                  <PathText value={d.serial} />
+                </span>
+                <span className="rounded bg-muted px-1 text-xs text-muted-foreground">
                   {d.transport}
                 </span>
+                <button
+                  type="button"
+                  aria-label={t("devices.gotoList")}
+                  title={t("devices.gotoList")}
+                  data-testid={`goto-devices-${d.serial}`}
+                  onClick={() => gotoDeviceList()}
+                  className="ml-auto flex items-center rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+                >
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </button>
               </li>
             ))}
           </ul>

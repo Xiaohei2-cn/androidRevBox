@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -6,6 +6,11 @@ import { SubTabs } from "@/components/nav/SubTabs";
 import { TaskLaunchPanel } from "@/components/task/TaskLaunchPanel";
 import { TaskSessionView } from "@/components/task/TaskSessionView";
 import { deviceApi, type DeviceEntry } from "@/api/device";
+import { envApi } from "@/api/env";
+import { useAppNav } from "@/app/nav";
+import { useI18n } from "@/i18n";
+import { PathText } from "@/components/ui/PathText";
+import { BrandIcon } from "@/components/ui/BrandIcon";
 import { cn } from "@/lib/utils";
 
 /**
@@ -16,6 +21,12 @@ import { cn } from "@/lib/utils";
 export function DevicesPage() {
   const [selected, setSelected] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
+  const { pendingDevicesTab } = useAppNav();
+  // 子 tab 受控：导航信号到达时切到对应 tab（list/info）
+  const [subTab, setSubTab] = useState("list");
+  useEffect(() => {
+    if (pendingDevicesTab) setSubTab(pendingDevicesTab);
+  }, [pendingDevicesTab]);
 
   const { data: env } = useQuery({
     queryKey: ["adb", "environment"],
@@ -76,6 +87,8 @@ export function DevicesPage() {
 
   return (
     <SubTabs
+      value={subTab}
+      onValueChange={setSubTab}
       tabs={[
         {
           id: "list",
@@ -92,7 +105,7 @@ export function DevicesPage() {
         {
           id: "info",
           label: "设备信息",
-          content: <DeviceInfoView serial={activeSerial} />,
+          content: <DeviceCardsView devices={devices} activeSerial={activeSerial} />,
         },
         {
           id: "shell",
@@ -150,6 +163,8 @@ function DeviceListView({
   onSelect: (s: string) => void;
   isError: boolean;
 }) {
+  const { t } = useI18n();
+  const { gotoDeviceInfo } = useAppNav();
   if (isError) {
     return <p className="text-xs text-destructive">adb devices 调用失败，检查设备授权或 adb 环境。</p>;
   }
@@ -198,6 +213,21 @@ function DeviceListView({
             >
               {STATE_LABEL[d.state] ?? d.state}
             </span>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 shrink-0 px-2"
+              disabled={d.state !== "device"}
+              title={t("devices.gotoInfo")}
+              data-testid={`goto-info-${d.serial}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelect(d.serial);
+                gotoDeviceInfo(d.serial);
+              }}
+            >
+              {t("devices.gotoInfo")}
+            </Button>
           </button>
         </li>
       ))}
@@ -211,34 +241,200 @@ const STATE_LABEL: Record<string, string> = {
   offline: "离线",
 };
 
-function DeviceInfoView({ serial }: { serial: string | null }) {
+/**
+ * 设备信息 tab（P8 重构）：每台在线设备一张横向拉满的卡。
+ * 上半：设备属性（getprop）；分割线；下半：该设备的前台应用（原仪表盘信息）。
+ * 「去设备信息」导航到达时自动滚动定位到对应卡。
+ */
+function DeviceCardsView({
+  devices,
+  activeSerial,
+}: {
+  devices: DeviceEntry[];
+  activeSerial: string | null;
+}) {
+  const { pendingDeviceSerial, clearPendingDevice } = useAppNav();
+  const online = devices.filter((d) => d.state === "device");
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // 导航定位：pending serial 的卡滚动到可视区 + 高亮闪烁
+  useEffect(() => {
+    if (!pendingDeviceSerial) return;
+    const el = containerRef.current?.querySelector(
+      `[data-device-card="${pendingDeviceSerial}"]`,
+    );
+    el?.scrollIntoView({ behavior: "smooth", block: "start" });
+    el?.classList.add("config-flash");
+    const timer = window.setTimeout(() => {
+      el?.classList.remove("config-flash");
+      clearPendingDevice();
+    }, 1300);
+    return () => window.clearTimeout(timer);
+  }, [pendingDeviceSerial, clearPendingDevice, online.length]);
+
+  if (online.length === 0) {
+    return <Empty text="无在线设备：连接设备后此页显示设备卡片。" />;
+  }
+  return (
+    <div ref={containerRef} className="flex h-full flex-col gap-4 overflow-auto pb-2">
+      {online.map((d) => (
+        <DeviceFullCard key={d.serial} serial={d.serial} transport={d.transport} />
+      ))}
+      {activeSerial === null && null}
+    </div>
+  );
+}
+
+/** 单设备整卡：上=设备属性，分割线，下=前台应用 */
+function DeviceFullCard({ serial, transport }: { serial: string; transport: string }) {
+  const { t } = useI18n();
   const { data, isLoading, error } = useQuery({
     queryKey: ["device", "info", serial],
-    queryFn: () => deviceApi.info(serial!),
+    queryFn: () => deviceApi.info(serial),
     enabled: !!serial,
+    staleTime: 60_000,
   });
-  if (!serial) return <Empty text="未选择设备" />;
-  if (isLoading) return <Empty text="读取属性中…" />;
-  if (error)
-    return <Empty text={`读取失败：${String((error as Error)?.message ?? error)}`} />;
-  const rows: [string, string][] = [
-    ["型号", data!.model],
-    ["厂商", data!.manufacturer],
-    ["Android 版本", data!.androidVersion],
-    ["SDK", data!.sdkInt],
-    ["序列号", data!.serial],
+
+  const rows: [string, string | undefined][] = [
+    [t("devices.info.model"), data?.model],
+    [t("devices.info.manufacturer"), data?.manufacturer],
+    [t("devices.info.androidVersion"), data?.androidVersion],
+    [t("devices.info.sdk"), data?.sdkInt],
+    [t("devices.info.serial"), serial],
+    [t("devices.info.transport"), transport],
   ];
+
   return (
-    <div className="max-w-md rounded-lg border bg-card p-4">
-      <dl className="grid grid-cols-[110px_1fr] gap-y-2 text-xs">
+    <div
+      data-device-card={serial}
+      className="w-full rounded-xl border bg-card p-4"
+    >
+      {/* 上：设备信息 */}
+      <div className="flex items-center gap-2">
+        <BrandIcon name="android" />
+        <span className="text-sm font-semibold">{data?.model || serial}</span>
+        <span
+          className={cn(
+            "ml-auto rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground",
+          )}
+        >
+          {transport}
+        </span>
+      </div>
+      <dl className="mt-3 grid grid-cols-[110px_1fr] gap-y-2 text-xs sm:grid-cols-[110px_1fr_110px_1fr]">
         {rows.map(([k, v]) => (
           <div key={k} className="contents">
             <dt className="text-muted-foreground">{k}</dt>
-            <dd className="break-all font-mono">{v || "—"}</dd>
+            <dd className="min-w-0 break-all font-mono">
+              <PathText value={v || undefined} />
+            </dd>
           </div>
         ))}
       </dl>
+      {isLoading && <p className="mt-2 text-xs text-muted-foreground">读取属性中…</p>}
+      {error && (
+        <p className="mt-2 text-xs text-destructive">
+          {t("devices.info.loadFailed", { error: String((error as Error)?.message ?? error) })}
+        </p>
+      )}
+
+      {/* 分割线 */}
+      <hr className="my-4 border-border" />
+
+      {/* 下：前台应用（原仪表盘信息，按设备查询） */}
+      <ForegroundAppSection serial={serial} />
     </div>
+  );
+}
+
+/** 设备卡下半部：该设备当前前台应用 + /proc 关键路径（复用仪表盘数据链） */
+function ForegroundAppSection({ serial }: { serial: string }) {
+  const { t } = useI18n();
+  const { data, isFetching, refetch } = useQuery({
+    queryKey: ["env", "foreground", serial],
+    queryFn: () => envApi.foreground(serial),
+    staleTime: 4_000,
+    refetchInterval: 5_000,
+    retry: false,
+  });
+
+  const app = data;
+
+  return (
+    <div>
+      <div className="flex items-center gap-2">
+        <Smartphone className="h-3.5 w-3.5 text-muted-foreground" />
+        <span className="text-xs font-semibold">{t("devices.foreground.title")}</span>
+        <button
+          type="button"
+          aria-label={t("common.refresh")}
+          disabled={isFetching}
+          onClick={() => void refetch()}
+          className="ml-auto rounded p-1 text-muted-foreground hover:bg-accent disabled:opacity-30"
+        >
+          <RefreshCw className={cn("h-3 w-3", isFetching && "animate-spin")} />
+        </button>
+      </div>
+      {app === undefined ? (
+        <p className="mt-1.5 text-xs text-muted-foreground">{t("common.loading")}</p>
+      ) : app.state !== "ready" ? (
+        <p className="mt-1.5 text-xs text-muted-foreground">
+          {app.error ?? app.hint ?? t("dashboard.foreground.noForeground")}
+        </p>
+      ) : (
+        <div className="mt-1.5 grid grid-cols-1 gap-x-6 gap-y-1.5 text-xs md:grid-cols-2">
+          <Field label={t("dashboard.foreground.package")} value={app.package} testid={`fg-package-${serial}`} />
+          <Field label={t("dashboard.foreground.activity")} value={app.activity} testid={`fg-activity-${serial}`} />
+          <Field label={t("dashboard.foreground.pid")} value={app.pid} testid={`fg-pid-${serial}`} mono />
+          <Field label={t("dashboard.foreground.nativeLib")} value={app.nativeLibDir} testid={`fg-libdir-${serial}`} mono />
+          <div className="md:col-span-2">
+            <p className="mb-1 text-muted-foreground">{t("dashboard.foreground.procPaths")}</p>
+            <ul className="space-y-1" data-testid={`fg-proc-paths-${serial}`}>
+              {app.procPaths.length === 0 && (
+                <li className="text-muted-foreground">{t("dashboard.foreground.noProc")}</li>
+              )}
+              {app.procPaths.map((p) => (
+                <li key={p.path} className="flex items-baseline gap-2 font-mono">
+                  <PathText value={p.path} className="shrink-0 text-foreground" />
+                  <span
+                    className={cn(
+                      "min-w-0 flex-1 truncate",
+                      p.readable ? "text-muted-foreground" : "text-amber-500",
+                    )}
+                    title={p.summary ?? undefined}
+                  >
+                    {p.readable ? p.summary || t("common.emptyValue") : t("dashboard.foreground.unreadable")}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Field({
+  label,
+  value,
+  mono,
+  testid,
+}: {
+  label: string;
+  value?: string | null;
+  mono?: boolean;
+  testid: string;
+}) {
+  return (
+    <p className="flex min-w-0 items-baseline gap-2">
+      <span className="shrink-0 text-muted-foreground">{label}</span>
+      <PathText
+        value={value}
+        testid={testid}
+        className={cn("min-w-0 flex-1", mono ? "font-mono" : "font-medium")}
+      />
+    </p>
   );
 }
 
