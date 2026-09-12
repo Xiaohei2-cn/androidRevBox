@@ -58,7 +58,7 @@ export function MainTabRail() {
   const { tab, setTab } = useAppNav();
   const { t } = useI18n();
   return (
-    <nav aria-label={t("nav.aria")} className="flex w-20 shrink-0 flex-col items-end gap-1 overflow-y-auto pt-14">
+    <nav aria-label={t("nav.aria")} className="flex w-24 shrink-0 flex-col items-end gap-1 overflow-y-auto pt-14">
       {MAIN_TABS.map((item) => (
         <MainTabButton
           key={item.id}
@@ -102,12 +102,12 @@ function MainTabButton({
       className={cn(
         "app-surface group relative flex h-10 shrink-0 items-center justify-center rounded-l-xl border border-r-0 border-border/60",
         active
-          ? "w-20 bg-primary px-2 text-primary-foreground shadow-sm"
+          ? "max-w-24 bg-primary px-2.5 text-primary-foreground shadow-sm"
           : "w-7 text-muted-foreground hover:w-8 hover:text-foreground",
       )}
     >
       {active ? (
-        <span className="whitespace-nowrap text-sm font-medium leading-none">
+        <span className="max-w-full truncate text-[11px] font-medium leading-none">
           {label}
         </span>
       ) : (
