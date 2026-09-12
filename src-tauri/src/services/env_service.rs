@@ -352,6 +352,128 @@ impl EnvService {
         env
     }
 
+    /// 文件选择器解析（P8）：把用户可能选中的「错误入口」解析成真解释器。
+    /// 处理：pyenv shim（读脚本 exec 行）→ .app bundle 入口 → framework 顶层 →
+    /// symlink 真身。返回 (原始选择, 解析结果, 版本)；解析失败 resolvedPath = 原值。
+    pub async fn resolve_interpreter(&self, picked: &str) -> ResolvedInterpreter {
+        let mut resolved = picked.to_string();
+        let mut how = "as-is".to_string();
+
+        // ① pyenv shim：shim 脚本的 exec 行指向 pyenv 二进制而非解释器，
+        //    必须用 `pyenv which <name>` 语义查真身（PYENV_ROOT 继承自 shim 同目录约定）
+        let p = std::path::Path::new(picked);
+        if picked.contains(".pyenv/shims/") {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("python3")
+                .to_string();
+            // PYENV_ROOT 从 shim 路径反推：~/.pyenv/shims/x → ~/.pyenv
+            let pyenv_root = std::path::Path::new(picked)
+                .parent()
+                .and_then(|shims| shims.parent())
+                .map(|root| root.to_path_buf());
+            if let Some(root) = pyenv_root {
+                // `pyenv which` 依赖当前全局/本地版本设置；直接问 pyenv 二进制
+                let pyenv_bin = root.join("bin").join("pyenv");
+                let pyenv_bin = if pyenv_bin.is_file() {
+                    pyenv_bin
+                } else {
+                    // homebrew 安装：/opt/homebrew/opt/pyenv/bin/pyenv
+                    std::path::PathBuf::from("/opt/homebrew/opt/pyenv/bin/pyenv")
+                };
+                if pyenv_bin.is_file() {
+                    if let Ok(out) =
+                        run_probe(pyenv_bin.to_string_lossy().as_ref(), &["which", &name]).await
+                    {
+                        let bin = out.stdout.trim().to_string();
+                        if !bin.is_empty() && std::path::Path::new(&bin).is_file() {
+                            resolved = bin;
+                            how = "pyenv-shim".into();
+                        }
+                    }
+                }
+            }
+        }
+
+        // ② .app bundle 入口 → 同 bundle 所在 framework 的 bin/python3*
+        if resolved.contains(".app/Contents/MacOS/") {
+            if let Some(idx) = resolved.find(".app/Contents") {
+                let bundle = &resolved[..idx + 4]; // xxx.app
+                if let Some(fw_dir) = std::path::Path::new(bundle).parent() {
+                    // framework 布局：<fw>/Python.framework/Resources/Python.app/Contents/MacOS/Python
+                    // 真解释器在 <fw>/Python.framework/Versions/X.Y/bin/python3*
+                    let fw_root = fw_dir; // .../Python.framework 的宿主目录
+                    let mut found = false;
+                    if let Ok(versions) = std::fs::read_dir(fw_root) {
+                        let mut cands: Vec<_> = versions
+                            .flatten()
+                            .filter(|e| e.path().is_dir())
+                            .flat_map(|e| {
+                                let bin = e.path().join("bin");
+                                std::fs::read_dir(bin)
+                                    .map(|rd| rd.flatten().map(|x| x.path()).collect::<Vec<_>>())
+                                    .unwrap_or_default()
+                            })
+                            .filter(|c| {
+                                c.file_name()
+                                    .and_then(|n| n.to_str())
+                                    .map(|n| n.starts_with("python3"))
+                                    .unwrap_or(false)
+                            })
+                            .collect();
+                        cands.sort();
+                        if let Some(best) = cands.pop() {
+                            resolved = best.to_string_lossy().into_owned();
+                            how = "app-bundle".into();
+                            found = true;
+                        }
+                    }
+                    let _ = found;
+                }
+            }
+        }
+
+        // ③ symlink 真身（/usr/bin/python3 → Xcode 的等）
+        if let Ok(canon) = std::path::Path::new(&resolved).canonicalize() {
+            if canon != std::path::Path::new(&resolved) {
+                resolved = canon.to_string_lossy().into_owned();
+                if how == "as-is" {
+                    how = "symlink".into();
+                }
+            }
+        }
+
+        // 校验可用性并取版本
+        let version = match run_probe(&resolved, &["--version"]).await {
+            Ok(out) => {
+                parse_python_version(&out.stdout).or_else(|| parse_python_version(&out.stderr))
+            }
+            Err(_) => None,
+        };
+        tracing::info!(picked = %picked, resolved = %resolved, how = %how, version = ?version, "解释器路径解析");
+        ResolvedInterpreter {
+            picked_path: picked.to_string(),
+            resolved_path: resolved,
+            version,
+            how,
+        }
+    }
+
+    /// 文件选择器起始目录建议（python）：pyenv versions 目录 > ~/.pyenv > /usr/bin
+    pub async fn python_start_dir(&self) -> String {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let pyenv_versions = format!("{home}/.pyenv/versions");
+        if std::path::Path::new(&pyenv_versions).is_dir() {
+            return pyenv_versions;
+        }
+        let pyenv = format!("{home}/.pyenv");
+        if std::path::Path::new(&pyenv).is_dir() {
+            return pyenv;
+        }
+        "/usr/bin".to_string()
+    }
+
     /// 安卓前台应用（§10 探测链）。剪枝：adb 不可用 → 0 次 shell 调用；
     /// 无在线设备 → 只调 devices；解析不出前台窗口 → 空态提示。
     pub async fn foreground(&self) -> ForegroundApp {
@@ -765,6 +887,17 @@ pub struct FridaEnv {
     pub frida_version: Option<String>,
     pub frida_tools_version: Option<String>,
     pub hint: Option<String>,
+}
+
+/// resolve_interpreter 的返回（serde camelCase 对齐 TS）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedInterpreter {
+    pub picked_path: String,
+    pub resolved_path: String,
+    pub version: Option<String>,
+    /// as-is | pyenv-shim | app-bundle | symlink
+    pub how: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -44,3 +44,18 @@ pub async fn env_foreground(state: tauri::State<'_, AppState>) -> CoreResult<For
 pub async fn env_overview(state: tauri::State<'_, AppState>) -> CoreResult<EnvOverview> {
     Ok(state.env.overview().await)
 }
+
+/// 文件选择器解析：把选中的「错误入口」（pyenv shim / .app / symlink）解析成真解释器
+#[tauri::command]
+pub async fn env_resolve_interpreter(
+    state: tauri::State<'_, AppState>,
+    picked: String,
+) -> CoreResult<crate::services::env_service::ResolvedInterpreter> {
+    Ok(state.env.resolve_interpreter(&picked).await)
+}
+
+/// python 选择器建议起始目录（pyenv versions 优先）
+#[tauri::command]
+pub async fn env_python_start_dir(state: tauri::State<'_, AppState>) -> CoreResult<String> {
+    Ok(state.env.python_start_dir().await)
+}

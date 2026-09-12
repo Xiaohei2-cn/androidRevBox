@@ -141,6 +141,8 @@ pub fn run() {
             commands::env::env_jadx_mcp,
             commands::env::env_foreground,
             commands::env::env_overview,
+            commands::env::env_resolve_interpreter,
+            commands::env::env_python_start_dir,
             commands::plugins::plugins_list,
             commands::plugins::plugins_scan,
             commands::plugins::plugins_call,

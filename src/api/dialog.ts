@@ -10,7 +10,12 @@ function hasTauri(): boolean {
 
 /** 选择单个文件；取消返回 null */
 export async function pickFile(
-  opts: { title?: string; filters?: { name: string; extensions: string[] }[] } = {},
+  opts: {
+    title?: string;
+    /** 选择器初始目录 */
+    defaultPath?: string;
+    filters?: { name: string; extensions: string[] }[];
+  } = {},
 ): Promise<string | null> {
   if (!hasTauri()) return null;
   const picked = await open({ multiple: false, directory: false, ...opts });

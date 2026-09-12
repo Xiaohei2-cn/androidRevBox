@@ -56,6 +56,15 @@ export interface ForegroundApp {
   error?: string | null;
 }
 
+/** env_resolve_interpreter 返回：picked→resolved 解析结果 */
+export interface ResolvedInterpreter {
+  pickedPath: string;
+  resolvedPath: string;
+  version?: string | null;
+  /** as-is | pyenv-shim | app-bundle | symlink */
+  how: string;
+}
+
 export interface EnvOverview {
   python: PythonEnv;
   node: NodeEnv;
@@ -87,5 +96,13 @@ export const envApi = {
   },
   overview(): Promise<EnvOverview> {
     return invokeCommand<EnvOverview>("env_overview");
+  },
+  /** 文件选择器选中项 → 真解释器路径（pyenv shim/.app/symlink 解析） */
+  resolveInterpreter(picked: string): Promise<ResolvedInterpreter> {
+    return invokeCommand<ResolvedInterpreter>("env_resolve_interpreter", { picked });
+  },
+  /** python 选择器建议起始目录 */
+  pythonStartDir(): Promise<string> {
+    return invokeCommand<string>("env_python_start_dir");
   },
 };

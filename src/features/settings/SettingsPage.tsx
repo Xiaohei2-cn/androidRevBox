@@ -16,7 +16,7 @@ import { useAppNav } from "@/app/nav";
 import { deviceApi, type AdbEnvironment } from "@/api/device";
 import { systemApi } from "@/api/system";
 import { configApi } from "@/api/config";
-import { pickDirectory, pickFile } from "@/api/dialog";
+import { pickFile } from "@/api/dialog";
 import { LOCALES, LOCALE_LABELS, useI18n } from "@/i18n";
 import type { Locale } from "@/i18n/dictionaries";
 import { cn } from "@/lib/utils";
@@ -299,11 +299,26 @@ function ConfigInputRow({
   const browse = async () => {
     setPicking(true);
     try {
-      const picked =
+      const isPython = configKey === "app.python.path";
+      const defaultPath = isPython ? await guessPythonStartDir() : undefined;
+      const picked = await pickFile(
         kind === "file"
-          ? await pickFile({ title: label })
-          : await pickDirectory(label);
-      if (picked) setValue(picked);
+          ? { title: label, defaultPath }
+          : { title: label, defaultPath },
+      );
+      if (picked && isPython) {
+        // pyenv shim / .app 包入口 → 后端解析成真解释器路径并回填输入框
+        try {
+          const { envApi } = await import("@/api/env");
+          const resolved = await envApi.resolveInterpreter(picked);
+          if (resolved?.resolvedPath) setValue(resolved.resolvedPath);
+          else setValue(picked);
+        } catch {
+          setValue(picked);
+        }
+      } else if (picked) {
+        setValue(picked);
+      }
     } catch {
       // 选择器异常不阻塞手填
     } finally {
@@ -516,3 +531,16 @@ function AdbPathSection({ onProbed }: { onProbed: () => void }) {
     </div>
   );
 }
+
+
+/** python 选择器起始目录：优先探测 pyenv/conda/framework 的 bin，依次回退到 /usr/bin */
+async function guessPythonStartDir(): Promise<string | undefined> {
+  if (!("__TAURI_INTERNALS__" in window)) return undefined;
+  try {
+    const { invokeCommand } = await import("@/api/client");
+    return await invokeCommand<string>("env_python_start_dir");
+  } catch {
+    return undefined;
+  }
+}
+
