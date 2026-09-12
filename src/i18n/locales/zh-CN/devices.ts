@@ -10,4 +10,7 @@ export default {
   "devices.info.transport": "连接方式",
   "devices.info.loadFailed": "读取失败：{error}",
   "devices.foreground.title": "前台应用",
+  "devices.kind.thirdParty": "三方应用",
+  "devices.kind.system": "系统应用",
+  "devices.kind.unknown": "未知",
 } as const;

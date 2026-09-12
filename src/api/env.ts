@@ -48,6 +48,8 @@ export interface ForegroundApp {
   state: string;
   serial?: string | null;
   package?: string | null;
+  /** third_party 三方 | system 系统 | unknown 未知；空串=未探测 */
+  packageKind?: string;
   activity?: string | null;
   pid?: string | null;
   nativeLibDir?: string | null;

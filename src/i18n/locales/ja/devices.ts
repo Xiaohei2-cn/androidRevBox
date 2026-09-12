@@ -10,4 +10,7 @@ export default {
   "devices.info.transport": "接続方式",
   "devices.info.loadFailed": "読み込み失敗: {error}",
   "devices.foreground.title": "フォアグラウンドアプリ",
+  "devices.kind.thirdParty": "サードパーティ",
+  "devices.kind.system": "システムアプリ",
+  "devices.kind.unknown": "不明",
 } as const;

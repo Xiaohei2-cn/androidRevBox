@@ -10,4 +10,7 @@ export default {
   "devices.info.transport": "Transport",
   "devices.info.loadFailed": "Load failed: {error}",
   "devices.foreground.title": "Foreground app",
+  "devices.kind.thirdParty": "3rd-party",
+  "devices.kind.system": "System app",
+  "devices.kind.unknown": "Unknown",
 } as const;

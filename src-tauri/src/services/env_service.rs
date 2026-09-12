@@ -683,13 +683,22 @@ impl EnvService {
             };
         };
 
-        // 3) 包详情（pidof + legacyNativeLibraryDir）与 4) /proc 探测并发
+        // 3) 包详情（pidof + legacyNativeLibraryDir + 三方判定）并发。
+        //    三方判定（用户指定命令）：`pm list packages -3` 含该包 = 第三方应用。
         let pid_cmd = format!("pidof {package}");
         let lib_cmd = format!("dumpsys package {package} | grep legacyNativeLibraryDir");
-        let (pid_res, lib_res) = tokio::join!(
+        let pkg3_cmd = format!(
+            "pm list packages -3 | grep -q package:{package} && echo third_party || echo not_third_party"
+        );
+        let (pid_res, lib_res, pkg3_res) = tokio::join!(
             self.shell(&adb_path, &serial, &pid_cmd),
             self.shell(&adb_path, &serial, &lib_cmd),
+            self.shell(&adb_path, &serial, &pkg3_cmd),
         );
+        let package_kind = pkg3_res
+            .ok()
+            .map(|o| classify_package_kind(&o.stdout))
+            .unwrap_or_else(|| "unknown".to_string());
         let pid = pid_res
             .ok()
             .and_then(|o| parse_pidof(&o.stdout))
@@ -708,6 +717,7 @@ impl EnvService {
             state: FgState::Ready.as_str().into(),
             serial: Some(serial),
             package: Some(package),
+            package_kind,
             activity: Some(activity),
             pid: non_empty(pid),
             native_lib_dir,
@@ -953,6 +963,19 @@ pub fn parse_foreground_window(stdout: &str) -> Option<(String, String)> {
     None
 }
 
+/// 三方判定解析：`pm list packages -3 | grep -q ... && echo third_party || echo not_third_party`
+/// 输出 third_party = 三方；not_third_party = 系统/平台签名；其他 = unknown。
+pub fn classify_package_kind(stdout: &str) -> String {
+    let t = stdout.trim();
+    if t.contains("third_party") && !t.contains("not_third_party") {
+        "third_party".to_string()
+    } else if t.contains("not_third_party") {
+        "system".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
 /// `dumpsys package <pkg> | grep legacyNativeLibraryDir` → 目录路径
 pub fn parse_legacy_native_lib(stdout: &str) -> Option<String> {
     for line in stdout.lines() {
@@ -1105,6 +1128,9 @@ pub struct ForegroundApp {
     pub state: String,
     pub serial: Option<String>,
     pub package: Option<String>,
+    /// 应用类别（P8）：third_party 三方 | system 系统 | unknown 未知；空串=未探测
+    #[serde(default)]
+    pub package_kind: String,
     pub activity: Option<String>,
     pub pid: Option<String>,
     /// legacyNativeLibraryDir
@@ -1171,6 +1197,16 @@ mod tests {
         );
         assert!(parse_legacy_native_lib("no match").is_none());
         assert!(parse_legacy_native_lib("legacyNativeLibraryDir=\n").is_none());
+    }
+
+    #[test]
+    fn classify_package_kind_matches_user_command_shapes() {
+        assert_eq!(classify_package_kind("third_party"), "third_party");
+        assert_eq!(classify_package_kind("not_third_party"), "system");
+        // grep -q 失败时 shell 可能什么都不输出（|| 分支才是 not_third_party；
+        // 这里覆盖两种失败形态）
+        assert_eq!(classify_package_kind(""), "unknown");
+        assert_eq!(classify_package_kind("grep: no match"), "unknown");
     }
 
     #[test]

@@ -10,4 +10,7 @@ export default {
   "devices.info.transport": "Transporte",
   "devices.info.loadFailed": "Falha ao carregar: {error}",
   "devices.foreground.title": "App em primeiro plano",
+  "devices.kind.thirdParty": "De terceiros",
+  "devices.kind.system": "App do sistema",
+  "devices.kind.unknown": "Desconhecido",
 } as const;

@@ -10,4 +10,7 @@ export default {
   "devices.info.transport": "Транспорт",
   "devices.info.loadFailed": "Ошибка загрузки: {error}",
   "devices.foreground.title": "Активное приложение",
+  "devices.kind.thirdParty": "Стороннее",
+  "devices.kind.system": "Системное",
+  "devices.kind.unknown": "Неизвестно",
 } as const;

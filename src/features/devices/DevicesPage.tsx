@@ -383,7 +383,17 @@ function ForegroundAppSection({ serial }: { serial: string }) {
         </p>
       ) : (
         <div className="mt-1.5 grid grid-cols-1 gap-x-6 gap-y-1.5 text-xs md:grid-cols-2">
-          <Field label={t("dashboard.foreground.package")} value={app.package} testid={`fg-package-${serial}`} />
+          <p className="flex min-w-0 items-baseline gap-2">
+            <span className="shrink-0 text-muted-foreground">
+              {t("dashboard.foreground.package")}
+            </span>
+            <KindDot kind={app.packageKind} />
+            <PathText
+              value={app.package}
+              testid={`fg-package-${serial}`}
+              className="min-w-0 flex-1 font-medium"
+            />
+          </p>
           <Field label={t("dashboard.foreground.activity")} value={app.activity} testid={`fg-activity-${serial}`} />
           <Field label={t("dashboard.foreground.pid")} value={app.pid} testid={`fg-pid-${serial}`} mono />
           <Field label={t("dashboard.foreground.nativeLib")} value={app.nativeLibDir} testid={`fg-libdir-${serial}`} mono />
@@ -412,6 +422,29 @@ function ForegroundAppSection({ serial }: { serial: string }) {
         </div>
       )}
     </div>
+  );
+}
+
+/** 包类别指示灯：绿=三方应用、黄=系统应用、红=未知（探测失败） */
+function KindDot({ kind }: { kind?: string }) {
+  const { t } = useI18n();
+  const tone =
+    kind === "third_party"
+      ? "bg-emerald-500"
+      : kind === "system"
+        ? "bg-amber-500"
+        : "bg-red-500";
+  const label =
+    kind === "third_party"
+      ? t("devices.kind.thirdParty")
+      : kind === "system"
+        ? t("devices.kind.system")
+        : t("devices.kind.unknown");
+  return (
+    <span className="flex shrink-0 items-center gap-1" title={label}>
+      <span className={cn("h-1.5 w-1.5 rounded-full", tone)} />
+      <span className="text-[10px] text-muted-foreground">{label}</span>
+    </span>
   );
 }
 
