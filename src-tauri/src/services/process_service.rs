@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 
 use crate::core::error::{CoreError, CoreResult};
 
@@ -123,20 +123,6 @@ pub async fn execute(
     spawn_pump(BufReader::new(stdout), StreamKind::Stdout, tx.clone());
     spawn_pump(BufReader::new(stderr), StreamKind::Stderr, tx);
 
-    // 退出码等待器
-    let (exit_tx, exit_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        match child.wait().await {
-            Ok(status) => {
-                let _ = exit_tx.send(status.code());
-            }
-            Err(_) => {
-                let _ = exit_tx.send(None);
-            }
-        }
-    });
-    let mut exit_rx = exit_rx;
-
     let mut exit_code: Option<Option<i32>> = None; // 外层 None=未退出，内层 None=无码
     let mut rx_open = true;
     let mut terminate_sent_at: Option<tokio::time::Instant> = None;
@@ -163,31 +149,41 @@ pub async fn execute(
                     None => rx_open = false,
                 }
             }
-            // 进程退出
-            code = &mut exit_rx, if exit_code.is_none() => {
-                exit_code = Some(code.unwrap_or(None));
+            // 进程退出（wait 可取消安全：select 其他分支先完成不丢退出事件）
+            code = child.wait(), if exit_code.is_none() => {
+                exit_code = Some(code.ok().and_then(|s| s.code()));
             }
             // 取消
             _ = cancel.cancelled(), if reason.is_none() => {
-                terminate_tree(pid);
-                terminate_sent_at = Some(tokio::time::Instant::now());
+                // 已退出（wait 完成即 reap）就不再向该 pid 发信号，防 pid 复用误杀；
+                // 未 reap 的僵尸收 SIGTERM 无害
+                if exit_code.is_none() {
+                    terminate_tree(pid);
+                    terminate_sent_at = Some(tokio::time::Instant::now());
+                }
                 reason = Some(Outcome::Cancelled);
                 sink(StreamKind::System, "任务被取消，正在终止进程…");
             }
             // 超时
             _ = timeout_fut, if reason.is_none() && spec.timeout.is_some() => {
-                terminate_tree(pid);
-                terminate_sent_at = Some(tokio::time::Instant::now());
+                if exit_code.is_none() {
+                    terminate_tree(pid);
+                    terminate_sent_at = Some(tokio::time::Instant::now());
+                }
                 reason = Some(Outcome::TimedOut);
                 sink(StreamKind::System, "任务超时，正在终止进程…");
             }
         }
 
-        // 取消/超时后升级：宽限期到后强杀一次（幂等标志防重复）
+        // 取消/超时后升级：宽限期到后强杀一次（幂等标志防重复）。
+        // 强杀走 Child 句柄（unix start_kill = 句柄级 SIGKILL），pid 复用不误杀；
+        // exit_code 已知说明进程已退出被 reap，跳过信号。
         if !force_sent {
             if let Some(at) = terminate_sent_at {
-                if tokio::time::Instant::now() - at >= GRACE_AFTER_TERM {
-                    force_kill(pid);
+                if exit_code.is_none()
+                    && tokio::time::Instant::now() - at >= GRACE_AFTER_TERM
+                {
+                    force_kill_handle(&mut child, pid);
                     force_sent = true;
                 }
             }
@@ -211,6 +207,20 @@ pub async fn execute(
     }
 }
 
+/// 强杀兜底：unix 走 Child 句柄级 SIGKILL（tokio start_kill，已 wait 的句柄
+/// no-op，pid 复用不误杀）；Windows 回退 taskkill /T /F（按 spawn 时的 pid）。
+fn force_kill_handle(child: &mut tokio::process::Child, pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = pid; // 句柄级信号不需要 pid
+        let _ = child.start_kill();
+    }
+    #[cfg(windows)]
+    {
+        force_kill(pid);
+        let _ = child;
+    }
+}
 /// 逐行泵送 reader 输出到通道；EOF/sender 断开即结束并释放 sender。
 fn spawn_pump<R>(
     reader: BufReader<R>,
@@ -248,15 +258,6 @@ fn terminate_tree(pid: u32) {
     if pid != 0 {
         unsafe {
             libc::kill(pid as i32, libc::SIGTERM);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn force_kill(pid: u32) {
-    if pid != 0 {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
         }
     }
 }
