@@ -31,6 +31,15 @@ pub struct AdbRunOutput {
     pub exit_code: Option<i32>,
 }
 
+/// 一条端口转发规则（forward --list 行）
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForwardRule {
+    pub serial: String,
+    pub local: String,
+    pub remote: String,
+}
+
 /// AdbRunner：全部 adb 基础指令的统一 Rust 接口（三端一致，差异只进实现）。
 #[async_trait]
 pub trait AdbRunner: Send + Sync {
@@ -439,7 +448,7 @@ impl DeviceService {
         Ok(adb::parse_devices(&out.stdout))
     }
 
-    /// 设备信息（getprop 抽取常用字段）
+    /// 设备信息（getprop 常用字段 + wlan0 IP）
     pub async fn device_info(&self, serial: &str) -> CoreResult<DeviceInfo> {
         let args = adb::build_args(Some(serial), &adb::cmd_getprop());
         let out = self.run_adb(&args).await?;
@@ -449,10 +458,10 @@ impl DeviceService {
                 out.stderr.trim()
             )));
         }
-        Ok(adb::device_info_from_props(
-            serial,
-            &adb::parse_getprop(&out.stdout),
-        ))
+        let mut info = adb::device_info_from_props(serial, &adb::parse_getprop(&out.stdout));
+        // IP 读取尽力而为：失败（未连 Wi-Fi/旧 ROM）不影响 info 其他字段
+        info.ip = self.device_ip(serial).await.ok().flatten();
+        Ok(info)
     }
 
     /// 设备侧目录列表（短命令 ls -lA）
@@ -479,6 +488,79 @@ impl DeviceService {
             )));
         }
         Ok(adb::parse_packages(&out.stdout))
+    }
+
+    /// 设备 wlan0 IPv4：`adb -s <serial> shell ip addr show wlan0`
+    /// （用户指定命令；解析不到返回 None——未连 Wi-Fi / 双卡数据流量）
+    pub async fn device_ip(&self, serial: &str) -> CoreResult<Option<String>> {
+        let args = adb::build_args(Some(serial), &adb::cmd_ip_addr());
+        let out = self.run_adb(&args).await?;
+        if out.exit_code != Some(0) {
+            return Err(CoreError::Internal(format!(
+                "ip addr 失败: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok(adb::parse_wlan0_ip(&out.stdout))
+    }
+
+    // ===== 端口转发管理（P9：ADB 页端口转发 tab；全部调用 -s 绑定设备）=====
+
+    /// 建立转发规则。返回后端实际规则行（serial, local, remote）。
+    pub async fn forward_setup(
+        &self,
+        serial: &str,
+        local: &str,
+        remote: &str,
+    ) -> CoreResult<(String, String, String)> {
+        if !adb::is_valid_forward_spec(local) || !adb::is_valid_forward_spec(remote) {
+            return Err(CoreError::Internal(format!(
+                "转发规格非法（允许 tcp:1-65535 / localabstract:name / localreserved:name）: {local} → {remote}"
+            )));
+        }
+        let args = adb::build_args(Some(serial), &adb::cmd_forward(local, remote));
+        let out = self.run_adb(&args).await?;
+        if out.exit_code != Some(0) {
+            return Err(CoreError::Internal(format!(
+                "adb forward 失败: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok((serial.to_string(), local.to_string(), remote.to_string()))
+    }
+
+    /// 列出该设备当前全部转发规则。
+    pub async fn forward_list(&self, serial: &str) -> CoreResult<Vec<ForwardRule>> {
+        let args = adb::build_args(Some(serial), &adb::cmd_forward_list());
+        let out = self.run_adb(&args).await?;
+        if out.exit_code != Some(0) {
+            return Err(CoreError::Internal(format!(
+                "adb forward --list 失败: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok(adb::parse_forward_list(&out.stdout)
+            .into_iter()
+            .map(|(s, l, r)| ForwardRule { serial: s, local: l, remote: r })
+            .collect())
+    }
+
+    /// 删除一条转发（local=None 删全部）。
+    pub async fn forward_remove(&self, serial: &str, local: Option<&str>) -> CoreResult<()> {
+        if let Some(l) = local {
+            if !adb::is_valid_forward_spec(l) {
+                return Err(CoreError::Internal(format!("转发规格非法: {l}")));
+            }
+        }
+        let args = adb::build_args(Some(serial), &adb::cmd_forward_remove(local));
+        let out = self.run_adb(&args).await?;
+        if out.exit_code != Some(0) {
+            return Err(CoreError::Internal(format!(
+                "adb forward --remove 失败: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok(())
     }
 
     // ===== 长操作：全部生成 TaskService 任务（事件流 + 历史）=====

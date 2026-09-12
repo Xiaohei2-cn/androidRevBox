@@ -5,7 +5,7 @@ import {
   Puzzle,
   Settings,
   Smartphone,
-  SquareTerminal,
+  Usb,
   type LucideIcon,
 } from "lucide-react";
 import { useAppNav } from "@/app/nav";
@@ -32,7 +32,7 @@ interface TabDef {
 export const MAIN_TABS: readonly TabDef[] = [
   { id: "dashboard", labelKey: "nav.dashboard", icon: LayoutDashboard },
   { id: "devices", labelKey: "nav.devices", icon: Smartphone },
-  { id: "terminal", labelKey: "nav.terminal", icon: SquareTerminal },
+  { id: "terminal", labelKey: "nav.terminal", icon: Usb },
   { id: "crypto", labelKey: "nav.crypto", icon: Binary },
   { id: "plugins", labelKey: "nav.plugins", icon: Puzzle },
   { id: "tasks", labelKey: "nav.tasks", icon: ListTodo },

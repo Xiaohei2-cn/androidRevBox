@@ -6,7 +6,7 @@ export default {
   "nav.aria": "Main navigation",
   "nav.dashboard": "Dashboard",
   "nav.devices": "Devices",
-  "nav.terminal": "Terminal",
+  "nav.terminal": "ADB",
   "nav.crypto": "Algorithms",
   "nav.plugins": "Plugins",
   "nav.tasks": "Tasks",

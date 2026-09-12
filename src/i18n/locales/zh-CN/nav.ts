@@ -6,7 +6,7 @@ export default {
   "nav.aria": "主导航",
   "nav.dashboard": "仪表盘",
   "nav.devices": "设备",
-  "nav.terminal": "终端",
+  "nav.terminal": "ADB",
   "nav.crypto": "算法工具",
   "nav.plugins": "插件中心",
   "nav.tasks": "任务中心",

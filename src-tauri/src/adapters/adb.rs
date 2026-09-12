@@ -145,6 +145,8 @@ pub struct DeviceInfo {
     pub android_version: String,
     pub sdk_int: String,
     pub serial: String,
+    /// wlan0 IPv4（读取失败为 None，如未连 Wi-Fi / 纯 USB 无网）
+    pub ip: Option<String>,
 }
 
 /// 从已解析的 getprop map 组装设备信息。
@@ -159,6 +161,7 @@ pub fn device_info_from_props(
         android_version: g("ro.build.version.release"),
         sdk_int: g("ro.build.version.sdk"),
         serial: serial.to_string(),
+        ip: None,
     }
 }
 
@@ -377,17 +380,30 @@ pub fn cmd_ls(path: &str) -> Vec<String> {
 pub fn cmd_cat_preview(path: &str, max_bytes: u64) -> Vec<String> {
     vec!["shell".into(), format!("head -c {max_bytes} {path}")]
 }
-/// 端口转发/重启类构造器：P3 设备页 UI 暂不接入（§6.2 的端口/系统能力归 P7
-/// 系统面板），协议先行冻结。
+/// 读取 wlan0 的 IP（用户指定命令）：`adb -s <serial> shell ip addr show wlan0`
+pub fn cmd_ip_addr() -> Vec<String> {
+    vec!["shell".into(), "ip addr show wlan0".into()]
+}
+/// 端口转发：`adb -s <serial> forward <local> <remote>`（local/remote 形如 tcp:8080）
 #[allow(dead_code)]
 pub fn cmd_forward(local: &str, remote: &str) -> Vec<String> {
     vec!["forward".into(), local.into(), remote.into()]
 }
-#[allow(dead_code)]
+/// 列出该设备的全部转发规则：`adb -s <serial> forward --list`
+pub fn cmd_forward_list() -> Vec<String> {
+    vec!["forward".into(), "--list".into()]
+}
+/// 删除一条转发：`adb -s <serial> forward --remove <local>`；local 为 None 时 --remove-all
+pub fn cmd_forward_remove(local: Option<&str>) -> Vec<String> {
+    match local {
+        Some(l) => vec!["forward".into(), "--remove".into(), l.into()],
+        None => vec!["forward".into(), "--remove-all".into()],
+    }
+}
+/// 端口反向转发（设备侧服务暴露给宿主）：`adb -s <serial> reverse <remote> <local>`
 pub fn cmd_reverse(remote: &str, local: &str) -> Vec<String> {
     vec!["reverse".into(), remote.into(), local.into()]
 }
-#[allow(dead_code)]
 pub fn cmd_reboot() -> Vec<String> {
     vec!["reboot".into()]
 }
@@ -398,6 +414,61 @@ pub fn parse_packages(stdout: &str) -> Vec<String> {
         .lines()
         .map(|l| l.trim_end_matches('\r').trim())
         .filter_map(|l| l.strip_prefix("package:").map(String::from))
+        .collect()
+}
+
+/// 解析 `ip addr show wlan0` 输出中的 wlan0 IPv4 地址（inet 192.168.1.5/24）。
+/// 多块网卡/多地址时取第一个；解析不到返回 None（如设备用 eth0 或未连 Wi-Fi）。
+pub fn parse_wlan0_ip(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let t = line.trim_end_matches('\r').trim();
+        // 形如 "inet 192.168.1.5/24 brd 192.168.1.255 scope global wlan0"
+        if let Some(rest) = t.strip_prefix("inet ") {
+            let token = rest.split_whitespace().next().unwrap_or("");
+            if let Some(ip) = token.split('/').next() {
+                if ip.split('.').count() == 4 && ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 校验 forward 规格字符串：仅允许 `tcp:<1-65535>` 与 `localabstract:<name>`、
+/// `localreserved:<name>`（host 侧只接受这三种常用形态；防参数注入额外 adb 参数）。
+pub fn is_valid_forward_spec(spec: &str) -> bool {
+    let Some((scheme, value)) = spec.split_once(':') else {
+        return false;
+    };
+    match scheme {
+        "tcp" => value
+            .parse::<u16>()
+            .map(|p| p > 0)
+            .unwrap_or(false)
+            .then_some(())
+            .is_some(),
+        "localabstract" | "localreserved" => {
+            !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+        }
+        _ => false,
+    }
+}
+
+/// 解析 `forward --list` 输出行：`<serial> <local> <remote>`（空格分隔）。
+pub fn parse_forward_list(stdout: &str) -> Vec<(String, String, String)> {
+    stdout
+        .lines()
+        .map(|l| l.trim_end_matches('\r').trim())
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            Some((
+                it.next()?.to_string(),
+                it.next()?.to_string(),
+                it.next()?.to_string(),
+            ))
+        })
         .collect()
 }
 
@@ -613,6 +684,57 @@ mod tests {
         assert_eq!(
             parse_packages(out),
             vec!["com.android.settings", "com.demo"]
+        );
+    }
+
+    #[test]
+    fn parse_wlan0_ip_extracts_inet() {
+        let out = "24: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\r\n\
+                   inet 192.168.1.5/24 brd 192.168.1.255 scope global wlan0\r\n\
+                   valid_lft forever preferred_lft forever\r\n";
+        assert_eq!(parse_wlan0_ip(out).as_deref(), Some("192.168.1.5"));
+        assert!(parse_wlan0_ip("no match").is_none());
+        // IPv6 inet 行不误报
+        let v6 = "inet6 fe80::1/64 scope link\n";
+        assert_eq!(parse_wlan0_ip(v6), None);
+    }
+
+    #[test]
+    fn forward_spec_validation() {
+        assert!(is_valid_forward_spec("tcp:8080"));
+        assert!(is_valid_forward_spec("tcp:1"));
+        assert!(is_valid_forward_spec("localabstract:foo.bar_baz-x"));
+        assert!(!is_valid_forward_spec("tcp:0"));
+        assert!(!is_valid_forward_spec("tcp:99999"));
+        assert!(!is_valid_forward_spec("tcp:8080 extra"));
+        assert!(!is_valid_forward_spec("shell:rm"));
+        assert!(!is_valid_forward_spec("8080"));
+    }
+
+    #[test]
+    fn parse_forward_list_rows() {
+        let out = "ABC123 tcp:8080 tcp:9000\r\nABC123 tcp:5555 localabstract:foo\r\n";
+        let rows = parse_forward_list(out);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("ABC123".into(), "tcp:8080".into(), "tcp:9000".into()));
+        assert_eq!(rows[1].2, "localabstract:foo");
+        assert!(parse_forward_list("").is_empty());
+    }
+
+    #[test]
+    fn forward_command_builders() {
+        assert_eq!(cmd_ip_addr(), ["shell", "ip addr show wlan0"]);
+        assert_eq!(
+            cmd_forward("tcp:8080", "tcp:9000"),
+            ["forward", "tcp:8080", "tcp:9000"]
+        );
+        assert_eq!(cmd_forward_list(), ["forward", "--list"]);
+        assert_eq!(cmd_forward_remove(Some("tcp:1")), ["forward", "--remove", "tcp:1"]);
+        assert_eq!(cmd_forward_remove(None), ["forward", "--remove-all"]);
+        // -s 绑定组合（多设备隔离的关键）
+        assert_eq!(
+            build_args(Some("s1"), &cmd_forward_list()),
+            ["-s", "s1", "forward", "--list"]
         );
     }
 }

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::AppState;
 use crate::adapters::adb::{DeviceEntry, DeviceInfo, FileEntry};
 use crate::core::error::{CoreError, CoreResult};
-use crate::services::device_service::{AdbEnvironment, DeviceChangedPayload};
+use crate::services::device_service::{AdbEnvironment, DeviceChangedPayload, ForwardRule};
 
 // ===== 环境 / 列表 =====
 
@@ -88,6 +88,58 @@ pub async fn device_packages(
     serial: String,
 ) -> CoreResult<Vec<String>> {
     state.device.list_packages(&serial).await
+}
+
+/// 设备 wlan0 IP（adb -s <serial> shell ip addr show wlan0；用户指定命令）
+#[tauri::command]
+pub async fn device_ip(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+) -> CoreResult<Option<String>> {
+    state.device.device_ip(&serial).await
+}
+
+// ===== 端口转发（P9 ADB 页；全部 -s 绑定设备，多设备互不串扰）=====
+
+/// 建立转发：adb -s <serial> forward <local> <remote>
+#[tauri::command]
+pub async fn adb_forward_setup(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    local: String,
+    remote: String,
+) -> CoreResult<ForwardRule> {
+    let (s, l, r) = state
+        .device
+        .forward_setup(&serial, &local, &remote)
+        .await?;
+    Ok(ForwardRule {
+        serial: s,
+        local: l,
+        remote: r,
+    })
+}
+
+/// 列出该设备当前全部转发规则（验证「是否生效」的数据源）
+#[tauri::command]
+pub async fn adb_forward_list(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+) -> CoreResult<Vec<ForwardRule>> {
+    state.device.forward_list(&serial).await
+}
+
+/// 删除转发（local 缺省 = 删该设备全部规则）
+#[tauri::command]
+pub async fn adb_forward_remove(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    local: Option<String>,
+) -> CoreResult<()> {
+    state
+        .device
+        .forward_remove(&serial, local.as_deref())
+        .await
 }
 
 // ===== 长操作：返回 task_id =====

@@ -26,6 +26,8 @@ export interface DeviceInfo {
   androidVersion: string;
   sdkInt: string;
   serial: string;
+  /** wlan0 IPv4（未连 Wi-Fi / 读取失败为 null） */
+  ip?: string | null;
 }
 
 export interface FileEntry {
@@ -33,6 +35,13 @@ export interface FileEntry {
   isDir: boolean;
   size: number;
   symlink?: string | null;
+}
+
+/** 一条端口转发规则（adb forward --list 行） */
+export interface ForwardRule {
+  serial: string;
+  local: string;
+  remote: string;
 }
 
 export interface DeviceChangedPayload {
@@ -62,6 +71,22 @@ export const deviceApi = {
   },
   packages(serial: string): Promise<string[]> {
     return invokeCommand<string[]>("device_packages", { serial });
+  },
+  /** 设备 wlan0 IPv4（adb -s <serial> shell ip addr show wlan0） */
+  ip(serial: string): Promise<string | null> {
+    return invokeCommand<string | null>("device_ip", { serial });
+  },
+  /** 建立端口转发（adb -s <serial> forward <local> <remote>） */
+  forwardSetup(serial: string, local: string, remote: string): Promise<ForwardRule> {
+    return invokeCommand<ForwardRule>("adb_forward_setup", { serial, local, remote });
+  },
+  /** 列出该设备当前全部转发规则 */
+  forwardList(serial: string): Promise<ForwardRule[]> {
+    return invokeCommand<ForwardRule[]>("adb_forward_list", { serial });
+  },
+  /** 删除转发规则（local 缺省 = 删全部） */
+  forwardRemove(serial: string, local?: string): Promise<void> {
+    return invokeCommand<void>("adb_forward_remove", { serial, local: local ?? null });
   },
   /** 以下长操作返回 task_id，输出走 task:// 事件流 */
   shell(serial: string, command: string): Promise<string> {

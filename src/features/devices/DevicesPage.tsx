@@ -302,6 +302,10 @@ function DeviceFullCard({ serial, transport }: { serial: string; transport: stri
     [t("devices.info.sdk"), data?.sdkInt],
     [t("devices.info.serial"), serial],
     [t("devices.info.transport"), transport],
+    [
+      t("devices.info.ip"),
+      data?.ip ?? (data === undefined ? undefined : t("devices.info.ipUnavailable")),
+    ],
   ];
 
   return (

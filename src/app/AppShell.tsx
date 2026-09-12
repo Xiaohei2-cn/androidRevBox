@@ -5,7 +5,7 @@ import { MainTabRail } from "@/components/nav/MainTabRail";
 import { TitleBar } from "@/components/window/TitleBar";
 import { DashboardPage } from "@/features/dashboard/DashboardPage";
 import { DevicesPage } from "@/features/devices/DevicesPage";
-import { TerminalPage } from "@/features/terminal/TerminalPage";
+import { AdbPage } from "@/features/adb/AdbPage";
 import { CryptoPage } from "@/features/crypto/CryptoPage";
 import { PluginsPage } from "@/features/plugins/PluginsPage";
 import { TasksPage } from "@/features/tasks/TasksPage";
@@ -66,7 +66,7 @@ function ShellBody() {
             <DevicesPage />
           </PageHost>
           <PageHost active={tab === "terminal"}>
-            <TerminalPage />
+            <AdbPage />
           </PageHost>
           <PageHost active={tab === "crypto"}>
             <CryptoPage />
