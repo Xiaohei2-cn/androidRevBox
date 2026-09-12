@@ -352,6 +352,16 @@ impl EnvService {
         env
     }
 
+    /// 探测给定解释器路径的版本（stdout+stderr 合并解析）
+    async fn probe_version(path: &str) -> Option<String> {
+        match run_probe(path, &["--version"]).await {
+            Ok(out) => {
+                parse_python_version(&out.stdout).or_else(|| parse_python_version(&out.stderr))
+            }
+            Err(_) => None,
+        }
+    }
+
     /// 文件选择器解析（P8）：把用户可能选中的「错误入口」解析成真解释器。
     /// 处理：pyenv shim（读脚本 exec 行）→ .app bundle 入口 → framework 顶层 →
     /// symlink 真身。返回 (原始选择, 解析结果, 版本)；解析失败 resolvedPath = 原值。
@@ -434,7 +444,23 @@ impl EnvService {
             }
         }
 
-        // ③ symlink 真身（/usr/bin/python3 → Xcode 的等）
+        // ③ venv 识别（必须先于 symlink 展开）：venv/bin/python 是指向 base 解释器的
+        //    symlink，canonicalize 会把 venv 路径「吃掉」变成 pyenv 真身——这正是
+        //    用户反馈「选了项目 venv 却显示 pyenv 路径」的根因。
+        //    判据：同目录存在 pyvenv.cfg（virtualenv/venv 的标志文件）。
+        //    venv 本身就是可直接执行的解释器，保持原样返回。
+        if let Some(bin_dir) = std::path::Path::new(&resolved).parent() {
+            if bin_dir.join("pyvenv.cfg").is_file() {
+                return ResolvedInterpreter {
+                    picked_path: picked.to_string(),
+                    version: Self::probe_version(&resolved).await,
+                    resolved_path: resolved,
+                    how: "venv".into(),
+                };
+            }
+        }
+
+        // ④ symlink 真身（/usr/bin/python3 → Xcode 的等；venv 已在上面拦下）
         if let Ok(canon) = std::path::Path::new(&resolved).canonicalize() {
             if canon != std::path::Path::new(&resolved) {
                 resolved = canon.to_string_lossy().into_owned();
