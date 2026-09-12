@@ -22,17 +22,19 @@ export function DashboardPage() {
       <FridaCardWrapper />
       <McpCard
         testid="env-ida"
-        title="IDA MCP"
+        title="IDA"
         queryFn={envApi.idaMcp}
         configKey="app.tools.ida_mcp_port"
         brand="ida"
+        appLabel="IDA"
       />
       <McpCard
         testid="env-jadx"
-        title="jadx-gui MCP"
+        title="jadx-gui"
         queryFn={envApi.jadxMcp}
         configKey="app.tools.jadx_mcp_port"
         brand="jadx"
+        appLabel="jadx-gui"
       />
       {/* 唯一整行卡：安卓前台应用，置于最底 */}
       <ForegroundCard />

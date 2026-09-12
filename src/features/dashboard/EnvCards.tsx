@@ -125,13 +125,18 @@ export function FridaCard({ pythonReady }: { pythonReady: boolean | undefined })
   );
 }
 
-/** IDA / jadx MCP 状态卡（同形组件，端口可配置；连不上是常态不打红） */
+/**
+ * IDA / jadx-gui 工具卡（主状态 = 工具环境本身；MCP 端口只是附带展示）。
+ * 主状态：mac 下应用已检测（✓ 路径/版本）→ ok；未检测到应用 → warn；
+ * 平台未实现（null）→ 退回 MCP 在线与否作为状态。
+ */
 export function McpCard({
   testid,
   title,
   queryFn,
   configKey,
   brand,
+  appLabel,
 }: {
   testid: string;
   title: string;
@@ -139,9 +144,31 @@ export function McpCard({
   configKey: string;
   /** 用哪个官方图标标识该工具 */
   brand: "ida" | "jadx";
+  /** 宿主应用的展示名（ida → IDA，jadx → jadx-gui） */
+  appLabel: string;
 }) {
   const { t } = useI18n();
   const { data, isFetching, refetch } = useEnvQuery(["env", testid], queryFn);
+
+  const appState = (() => {
+    if (data === undefined) return undefined;
+    if (data.appInstalled === true) return { ok: true, text: data.appPath ?? appLabel };
+    if (data.appInstalled === false) return { ok: false, text: t("dashboard.tool.appMissing", { name: appLabel }) };
+    return null; // 平台未实现：退回 MCP 状态
+  })();
+
+  const status = (() => {
+    if (data === undefined) return { tone: "muted" as const, label: t("common.loading") };
+    if (appState) {
+      return appState.ok
+        ? { tone: "ok" as const, label: appState.text }
+        : { tone: "warn" as const, label: appState.text };
+    }
+    return data.reachable
+      ? { tone: "ok" as const, label: t("dashboard.mcp.online", { port: data.port }) }
+      : { tone: "warn" as const, label: t("common.notDetected") };
+  })();
+
   return (
     <EnvCard
       testid={testid}
@@ -150,35 +177,37 @@ export function McpCard({
       refresh={() => void refetch()}
       refreshing={isFetching}
       configKey={configKey}
-      status={
-        data === undefined
-          ? { tone: "muted", label: t("common.loading") }
-          : data.reachable
-            ? { tone: "ok", label: t("dashboard.mcp.online", { port: data.port }) }
-            : { tone: "warn", label: t("common.notDetected") }
-      }
+      status={status}
     >
       {data === undefined ? null : (
         <>
-          <PathLine>
-            <PathText
-              value={`127.0.0.1:${data.port}`}
-              testid={`${testid}-addr`}
-              className="font-mono"
-            />
-          </PathLine>
-          {data.appInstalled !== null && data.appInstalled !== undefined && (
+          {/* 主信息：应用环境 */}
+          {appState && (
             <PathLine>
-              {data.appInstalled ? (
-                <span className="text-emerald-500">✓ {data.appPath ?? brand}</span>
+              {appState.ok ? (
+                <PathText value={appState.text} testid={`${testid}-app`} className="font-mono" />
               ) : (
-                <span className="text-amber-500">
-                  {t("dashboard.mcp.appMissing", { name: brand })}
-                </span>
+                <span>{appState.text}</span>
               )}
             </PathLine>
           )}
-          {!data.reachable && <PathLine>{data.hint}</PathLine>}
+          {/* 辅信息：MCP 端口（附带展示，不占主状态） */}
+          <PathLine label={t("dashboard.tool.mcpLabel")}>
+            <PathText
+              value={`127.0.0.1:${data.port}`}
+              testid={`${testid}-addr`}
+              className={cn("font-mono", !data.reachable && "text-muted-foreground/70")}
+            />
+            <span
+              className={cn(
+                "ml-1 shrink-0",
+                data.reachable ? "text-emerald-500" : "text-muted-foreground",
+              )}
+            >
+              {data.reachable ? t("dashboard.tool.mcpOnline") : t("dashboard.tool.mcpOffline")}
+            </span>
+          </PathLine>
+          {!data.reachable && !appState && <PathLine>{data.hint}</PathLine>}
         </>
       )}
     </EnvCard>

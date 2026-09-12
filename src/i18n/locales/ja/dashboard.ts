@@ -36,7 +36,10 @@ export default {
   "dashboard.mcp.unreachable":
     "{name} を検出できません（{addr} への接続に失敗: {error}）。ツールを起動して更新してください。",
   "dashboard.mcp.timeout": "{name} を検出できません（{addr} への接続がタイムアウト）。",
-  "dashboard.mcp.appMissing": "{name} が未インストールです（MCP には影響なし、ツール起動後にポート検出が復帰）",
+  "dashboard.tool.appMissing": "{name} が未インストール",
+  "dashboard.tool.mcpLabel": "MCP",
+  "dashboard.tool.mcpOnline": "MCP オンライン",
+  "dashboard.tool.mcpOffline": "MCP 未起動",
   "dashboard.mcp.onlineHint": "{name} サービスはオンラインです（{addr}）",
 
   "dashboard.foreground.title": "Android フォアグラウンドアプリ",

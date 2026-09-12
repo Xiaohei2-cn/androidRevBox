@@ -32,7 +32,10 @@ export default {
   "dashboard.mcp.online": "在线 · {port}",
   "dashboard.mcp.unreachable": "{name} 未检测到（{addr} 连接失败: {error}）。启动工具后点刷新。",
   "dashboard.mcp.timeout": "{name} 未检测到（{addr} 连接超时）。",
-  "dashboard.mcp.appMissing": "{name} 未安装（不影响 MCP，工具启动后端口探活自动恢复）",
+  "dashboard.tool.appMissing": "{name} 未安装",
+  "dashboard.tool.mcpLabel": "MCP",
+  "dashboard.tool.mcpOnline": "MCP 在线",
+  "dashboard.tool.mcpOffline": "MCP 未启动",
   "dashboard.mcp.onlineHint": "{name} 服务在线（{addr}）",
 
   "dashboard.foreground.title": "安卓前台应用",

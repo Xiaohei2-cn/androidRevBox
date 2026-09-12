@@ -36,7 +36,10 @@ export default {
   "dashboard.mcp.unreachable":
     "{name} не обнаружен (подключение к {addr} не удалось: {error}). Запустите инструмент и обновите.",
   "dashboard.mcp.timeout": "{name} не обнаружен (тайм-аут подключения к {addr}).",
-  "dashboard.mcp.appMissing": "{name} не установлен (MCP не затронут; порт появится после запуска инструмента)",
+  "dashboard.tool.appMissing": "{name} не установлен",
+  "dashboard.tool.mcpLabel": "MCP",
+  "dashboard.tool.mcpOnline": "MCP в сети",
+  "dashboard.tool.mcpOffline": "MCP не запущен",
   "dashboard.mcp.onlineHint": "Служба {name} доступна ({addr})",
 
   "dashboard.foreground.title": "Активное приложение Android",

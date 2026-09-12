@@ -152,8 +152,8 @@ describe("DashboardPage（P7 布局契约）", () => {
     const python = indexOf("Python 环境");
     const node = indexOf("Node 环境");
     const frida = indexOf("Frida");
-    const ida = indexOf("IDA MCP");
-    const jadx = indexOf("jadx-gui MCP");
+    const ida = indexOf("IDA");
+    const jadx = indexOf("jadx-gui");
     const fg = texts.findIndex((t) => t.includes("安卓前台应用"));
     expect(adb).toBeLessThan(python);
     expect(python).toBeLessThan(node);
