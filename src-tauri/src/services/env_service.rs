@@ -923,27 +923,33 @@ fn non_empty(s: String) -> Option<String> {
 /// dumpsys window → (包名, Activity)。
 /// 兼容 mCurrentFocus / mFocusedWindow；null → None。
 pub fn parse_foreground_window(stdout: &str) -> Option<(String, String)> {
+    // ⚠️ 某些 ROM 的 dumpsys window 会输出【多行】mCurrentFocus（如先 null 后真实窗口，
+    //    或桌面/弹窗交替）。见到 null 必须跳过该行继续找，不能提前返回 None——
+    //    用户真机上 "mCurrentFocus=null\nmCurrentFocus=Window{...}" 会误报无前台（P8 反馈）。
+    let mut saw_focus_line = false;
     for line in stdout.lines() {
         let t = line.trim();
         if !(t.starts_with("mCurrentFocus") || t.starts_with("mFocusedWindow")) {
             continue;
         }
+        saw_focus_line = true;
         if t.contains("null") {
-            return None;
+            continue;
         }
-        // Window{7a4c1de u0 com.pkg/com.pkg.Activity}
+        // Window{7a4c1de u0 com.pkg/com.pkg.Activity ... type=1}
         if let Some(brace) = t.find('{') {
-            let inner = &t[brace + 1..].trim_end_matches('}');
+            let inner = t[brace + 1..].trim_end_matches('}');
             if let Some(activity_part) = inner.split_whitespace().find(|s| s.contains('/')) {
                 let mut it = activity_part.splitn(2, '/');
-                let package = it.next()?.to_string();
-                let activity = it.next()?.to_string();
-                if !package.is_empty() && !activity.is_empty() {
-                    return Some((package, activity));
+                if let (Some(package), Some(activity)) = (it.next(), it.next()) {
+                    if !package.is_empty() && !activity.is_empty() {
+                        return Some((package.to_string(), activity.to_string()));
+                    }
                 }
             }
         }
     }
+    let _ = saw_focus_line;
     None
 }
 
@@ -1138,6 +1144,15 @@ mod tests {
         let (pkg, act) = parse_foreground_window(out).unwrap();
         assert_eq!(pkg, "com.android.launcher3");
         assert!(act.contains("Launcher"));
+    }
+
+    #[test]
+    fn parse_foreground_window_skips_null_then_finds_window() {
+        // P8 用户真机实况：多行 mCurrentFocus，第一行 null 第二行有效
+        let out = "  mCurrentFocus=null\n  mCurrentFocus=Window{d431874 u0 com.ss.android.yumme.video/com.ss.android.ugc.aweme.splash.SplashActivity type=1 }\n";
+        let (pkg, act) = parse_foreground_window(out).expect("应解析出前台窗口");
+        assert_eq!(pkg, "com.ss.android.yumme.video");
+        assert_eq!(act, "com.ss.android.ugc.aweme.splash.SplashActivity");
     }
 
     #[test]
