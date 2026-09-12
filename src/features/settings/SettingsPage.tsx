@@ -5,6 +5,7 @@ import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { SubTabs } from "@/components/nav/SubTabs";
 import {
   MIN_OPACITY,
   useSettings,
@@ -34,15 +35,61 @@ const LOG_LEVEL_OPTIONS: { value: LogLevel; label: string }[] = [
   { value: "error", label: "error" },
 ];
 
-/** 设置页：外观、语言（P8）、ADB、工具环境、日志级别、关于 */
+/**
+ * 设置页（P8 改版）：按职能分 tab——显示 / 语言 / 环境 / 系统。
+ * 分 tab 复用通用 SubTabs 机制；「去配置」跳转的目标键所在 tab 由 ConfigInputRow
+ * 自身渲染（各 tab 都挂载，Radix Tabs 未激活内容仍在 DOM，聚焦定位天然可用）。
+ */
 export function SettingsPage() {
-  const { theme, setTheme, opacity, setOpacity, logLevel, setLogLevel, hydrated } =
-    useSettings();
-  const { t, locale, setLocale } = useI18n();
-  const queryClient = useQueryClient();
+  const { t } = useI18n();
+  const { pendingConfigKey } = useAppNav();
+
+  // 「去配置」跨 tab 定位：目标键落在环境 tab（未来新键按前缀归 tab）
+  const targetTab = pendingConfigKey?.startsWith("app.tools.") ||
+      pendingConfigKey === "app.python.path" ||
+      pendingConfigKey === "app.node.path" ||
+      pendingConfigKey === "app.adb.path"
+    ? "environment"
+    : null;
 
   return (
-    <div className="mx-auto flex h-full max-w-xl flex-col gap-8 overflow-auto pt-4">
+    <div className="h-full pt-1">
+      <SubTabs
+        activateSignal={targetTab}
+        tabs={[
+          {
+            id: "display",
+            label: t("settings.tab.display"),
+            content: <DisplayTab />,
+          },
+          {
+            id: "language",
+            label: t("settings.tab.language"),
+            content: <LanguageTab />,
+          },
+          {
+            id: "environment",
+            label: t("settings.tab.environment"),
+            content: <EnvironmentTab />,
+          },
+          {
+            id: "system",
+            label: t("settings.tab.system"),
+            content: <SystemTab />,
+          },
+        ]}
+      />
+    </div>
+  );
+}
+
+/** 显示：主题 + 背景不透明度 */
+function DisplayTab() {
+  const { theme, setTheme, opacity, setOpacity } = useSettings();
+  const { t } = useI18n();
+
+  return (
+    <div className="mx-auto flex max-w-xl flex-col gap-8 pt-2">
       <section className="flex flex-col gap-3">
         <Label>{t("settings.theme.label")}</Label>
         <div
@@ -88,37 +135,54 @@ export function SettingsPage() {
         />
         <p className="text-xs text-muted-foreground">{t("settings.opacity.hint")}</p>
       </section>
+    </div>
+  );
+}
 
-      <section className="flex flex-col gap-3">
-        <Label>{t("settings.language.label")}</Label>
-        <div
-          className="inline-flex w-fit flex-wrap gap-1"
-          role="radiogroup"
-          aria-label={t("settings.language.label")}
-          data-testid="locale-radiogroup"
-        >
-          {LOCALES.map((l) => (
-            <button
-              key={l}
-              type="button"
-              role="radio"
-              aria-checked={locale === l}
-              data-testid={`locale-${l}`}
-              onClick={() => setLocale(l as Locale)}
-              className={cn(
-                "rounded-md border px-3 py-1.5 text-xs transition-colors",
-                locale === l
-                  ? "border-primary bg-primary text-primary-foreground"
-                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
-              )}
-            >
-              {LOCALE_LABELS[l]}
-            </button>
-          ))}
-        </div>
-        <p className="text-xs text-muted-foreground">{t("settings.language.hint")}</p>
-      </section>
+/** 语言：界面语种切换 */
+function LanguageTab() {
+  const { t, locale, setLocale } = useI18n();
 
+  return (
+    <div className="mx-auto flex max-w-xl flex-col gap-3 pt-2">
+      <Label>{t("settings.language.label")}</Label>
+      <div
+        className="inline-flex w-fit flex-wrap gap-1"
+        role="radiogroup"
+        aria-label={t("settings.language.label")}
+        data-testid="locale-radiogroup"
+      >
+        {LOCALES.map((l) => (
+          <button
+            key={l}
+            type="button"
+            role="radio"
+            aria-checked={locale === l}
+            data-testid={`locale-${l}`}
+            onClick={() => setLocale(l as Locale)}
+            className={cn(
+              "rounded-md border px-3 py-1.5 text-xs transition-colors",
+              locale === l
+                ? "border-primary bg-primary text-primary-foreground"
+                : "text-muted-foreground hover:bg-accent hover:text-foreground",
+            )}
+          >
+            {LOCALE_LABELS[l]}
+          </button>
+        ))}
+      </div>
+      <p className="text-xs text-muted-foreground">{t("settings.language.hint")}</p>
+    </div>
+  );
+}
+
+/** 环境：ADB 路径 + 工具链（Python/Node/MCP 端口） */
+function EnvironmentTab() {
+  const { t } = useI18n();
+  const queryClient = useQueryClient();
+
+  return (
+    <div className="mx-auto flex max-w-xl flex-col gap-8 pt-2">
       <section className="flex flex-col gap-3">
         <Label>{t("settings.adb.label")}</Label>
         <AdbPathSection onProbed={() => {
@@ -160,7 +224,17 @@ export function SettingsPage() {
           onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
         />
       </section>
+    </div>
+  );
+}
 
+/** 系统：日志级别 + 关于 */
+function SystemTab() {
+  const { logLevel, setLogLevel, hydrated } = useSettings();
+  const { t } = useI18n();
+
+  return (
+    <div className="mx-auto flex max-w-xl flex-col gap-8 pt-2">
       <section className="flex flex-col gap-3">
         <Label>{t("settings.log.label")}</Label>
         <div className="inline-flex w-fit gap-1">

@@ -1,5 +1,9 @@
 /** Настройки: оформление, ADB, инструменты, журнал, о программе */
 export default {
+  "settings.tab.display": "Оформление",
+  "settings.tab.language": "Язык",
+  "settings.tab.environment": "Окружение",
+  "settings.tab.system": "Система",
   "settings.theme.label": "Оформление",
   "settings.theme.aria": "Тема оформления",
   "settings.theme.light": "Светлая",

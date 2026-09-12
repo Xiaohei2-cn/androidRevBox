@@ -1,5 +1,9 @@
 /** 設定：外観、ADB、ツール環境、ログ、このアプリについて */
 export default {
+  "settings.tab.display": "表示",
+  "settings.tab.language": "言語",
+  "settings.tab.environment": "環境",
+  "settings.tab.system": "システム",
   "settings.theme.label": "外観テーマ",
   "settings.theme.aria": "外観テーマ",
   "settings.theme.light": "ライト",

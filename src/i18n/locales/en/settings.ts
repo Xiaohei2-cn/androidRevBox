@@ -1,5 +1,9 @@
 /** Settings: appearance, ADB, toolchain, logging, about */
 export default {
+  "settings.tab.display": "Display",
+  "settings.tab.language": "Language",
+  "settings.tab.environment": "Environment",
+  "settings.tab.system": "System",
   "settings.theme.label": "Appearance",
   "settings.theme.aria": "Appearance theme",
   "settings.theme.light": "Light",

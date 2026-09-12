@@ -1,5 +1,9 @@
 /** 设置页：外观、ADB、工具环境、日志、关于 */
 export default {
+  "settings.tab.display": "显示",
+  "settings.tab.language": "语言",
+  "settings.tab.environment": "环境",
+  "settings.tab.system": "系统",
   "settings.theme.label": "外观主题",
   "settings.theme.aria": "外观主题",
   "settings.theme.light": "浅色",

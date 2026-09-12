@@ -1,5 +1,9 @@
 /** Configurações: aparência, ADB, ferramentas, log, sobre */
 export default {
+  "settings.tab.display": "Exibição",
+  "settings.tab.language": "Idioma",
+  "settings.tab.environment": "Ambiente",
+  "settings.tab.system": "Sistema",
   "settings.theme.label": "Aparência",
   "settings.theme.aria": "Tema da aparência",
   "settings.theme.light": "Claro",
