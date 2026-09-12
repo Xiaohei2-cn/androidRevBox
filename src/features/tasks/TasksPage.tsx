@@ -275,7 +275,7 @@ function StatusBadge({ status }: { status: TaskDto["status"] }) {
     cancelled: "已取消",
   };
   return (
-    <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
+    <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
       {map[status]}
     </span>
   );
@@ -346,7 +346,7 @@ function OutputView({
     <div
       ref={boxRef}
       data-testid="task-output"
-      className="h-full overflow-auto rounded-lg border bg-black/80 p-3 font-mono text-[11px] leading-relaxed dark:bg-black/40"
+      className="h-full overflow-auto rounded-lg border bg-black/80 p-3 font-mono text-sm leading-relaxed dark:bg-black/40"
     >
       {lines.length === 0 && (
         <span className="text-muted-foreground">{running ? "等待输出…" : "（无输出）"}</span>

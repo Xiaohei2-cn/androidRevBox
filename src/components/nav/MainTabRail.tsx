@@ -92,7 +92,7 @@ function MainTabButton({
       )}
     >
       {active ? (
-        <span className="whitespace-nowrap text-[11px] font-medium leading-none">
+        <span className="whitespace-nowrap text-sm font-medium leading-none">
           {label}
         </span>
       ) : (

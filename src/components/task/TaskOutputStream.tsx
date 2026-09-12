@@ -49,7 +49,7 @@ export function TaskOutputStream({
     <div
       ref={boxRef}
       data-testid="task-output"
-      className="h-full min-h-[120px] overflow-auto rounded-lg border bg-black/80 p-3 font-mono text-[11px] leading-relaxed dark:bg-black/40"
+      className="h-full min-h-[120px] overflow-auto rounded-lg border bg-black/80 p-3 font-mono text-sm leading-relaxed dark:bg-black/40"
     >
       {lines.length === 0 && (
         <span className="text-muted-foreground">

@@ -89,7 +89,7 @@ export function AdbCard() {
           </p>
           <p className="flex items-center gap-1 font-mono text-xs">
             <PathText value={env.path} className="min-w-0 flex-1" />
-            <span className="shrink-0 rounded bg-muted px-1 py-px text-[10px]">
+            <span className="shrink-0 rounded bg-muted px-1 py-px text-xs">
               {SOURCE_LABEL[env.source ?? "unknown"] ?? env.source}
             </span>
           </p>
@@ -127,7 +127,7 @@ export function AdbCard() {
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
                 <span className="font-mono">{d.model || d.serial}</span>
                 <span className="text-muted-foreground">{d.serial}</span>
-                <span className="ml-auto rounded bg-muted px-1 text-[10px] text-muted-foreground">
+                <span className="ml-auto rounded bg-muted px-1 text-xs text-muted-foreground">
                   {d.transport}
                 </span>
               </li>

@@ -187,12 +187,12 @@ function DeviceListView({
               <p className="truncate font-medium">{d.model || "未知型号"}</p>
               <p className="truncate font-mono text-muted-foreground">{d.serial}</p>
             </div>
-            <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+            <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
               {d.transport}
             </span>
             <span
               className={cn(
-                "w-20 text-right text-[10px]",
+                "w-20 text-right text-xs",
                 d.state === "device" ? "text-emerald-500" : "text-amber-500",
               )}
             >
@@ -316,7 +316,7 @@ function FilesView({ serial }: { serial: string | null }) {
           <Download className="h-3.5 w-3.5" />
           Pull…
         </Button>
-        <p className="self-center text-[10px] text-muted-foreground">
+        <p className="self-center text-xs text-muted-foreground">
           传输任务接口已就绪（device_push/pull），按钮待文件选择器
         </p>
       </div>

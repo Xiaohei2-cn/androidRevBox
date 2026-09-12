@@ -127,7 +127,7 @@ function ForegroundBody({
           ))}
         </ul>
       </div>
-      <p className="md:col-span-2 text-right text-[10px] text-muted-foreground">
+      <p className="md:col-span-2 text-right text-xs text-muted-foreground">
         {t("common.device")} <PathText value={app.serial} className="font-mono" /> ·{" "}
         {t("common.updatedAt")} {new Date(lastUpdated).toLocaleTimeString()}
       </p>
