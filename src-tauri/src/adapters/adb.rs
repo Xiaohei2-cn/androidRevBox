@@ -91,7 +91,8 @@ pub fn parse_devices(stdout: &str) -> Vec<DeviceEntry> {
         for tok in it {
             if let Some(v) = tok.strip_prefix("model:") {
                 model = v.to_string();
-            } else if tok == "usb" {
+            } else if tok == "usb" || tok.starts_with("usb:") {
+                // 新版 adb -l 输出 "usb:1-2"（带端口），旧版是裸 "usb"
                 has_usb = true;
             }
         }
@@ -542,6 +543,15 @@ mod tests {
         assert_eq!(v.version, "1.0.41");
         assert_eq!(v.build, "37.0.0-14910828");
         assert!(parse_version("garbage").is_none());
+    }
+
+    #[test]
+    fn parse_devices_new_format_usb_marker() {
+        // 新版 adb devices -l：USB 标记是 "usb:1-2"（带冒号），非裸 "usb"
+        let out = "List of devices attached\nABC123       device usb:1-2 product:foo model:Pixel transport_id:1\n";
+        let devs = parse_devices(out);
+        assert_eq!(devs.len(), 1);
+        assert_eq!(devs[0].transport, "usb", "usb:1-2 应识别为 USB 设备");
     }
 
     #[test]
