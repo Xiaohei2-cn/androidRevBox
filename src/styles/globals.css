@@ -3,25 +3,25 @@
 @tailwind utilities;
 
 @layer base {
-  /* 文本加深（P7 用户反馈：所有字体加深一些）。
-     策略：主文本压到近黑/近白，次级文本（muted-foreground 全局承担）显著加深一档——
-     亮色 46.1%→30%、暗色 64.9%→78%，对比度整体提升但仍保留「次级」层级感。
-     次级色是仪表盘/设置页大量说明文字与数值的唯一来源，改这一处即全局生效。 */
+  /* 文本加深（P7 用户反馈，第二轮：在首轮基础上再压一档）。
+     亮色：主文本纯黑；次级 muted-foreground 46%→30%→24%（对比度 ≈12.6:1）。
+     暗色：主文本纯白；次级 65%→78%→84%（对比度 ≈9.9:1）。
+     层级感靠字号/字重区分，不再靠灰度——次级文本只保留「略淡」的弱层级。 */
   :root {
     --background: 0 0% 100%;
-    --foreground: 240 10% 2%;
+    --foreground: 0 0% 0%;
     --card: 0 0% 100%;
-    --card-foreground: 240 10% 2%;
+    --card-foreground: 0 0% 0%;
     --popover: 0 0% 100%;
-    --popover-foreground: 240 10% 2%;
+    --popover-foreground: 0 0% 0%;
     --primary: 243 75% 59%;
     --primary-foreground: 0 0% 100%;
     --secondary: 240 4.8% 95.9%;
-    --secondary-foreground: 240 5.9% 6%;
+    --secondary-foreground: 240 5.9% 3%;
     --muted: 240 4.8% 95.9%;
-    --muted-foreground: 240 5% 30%;
+    --muted-foreground: 240 6% 24%;
     --accent: 240 4.8% 95.9%;
-    --accent-foreground: 240 5.9% 6%;
+    --accent-foreground: 240 5.9% 3%;
     --destructive: 0 84.2% 52%;
     --destructive-foreground: 0 0% 98%;
     --border: 240 5.9% 88%;
@@ -47,7 +47,7 @@
     --secondary: 240 4% 16%;
     --secondary-foreground: 0 0% 100%;
     --muted: 240 4% 16%;
-    --muted-foreground: 240 5% 78%;
+    --muted-foreground: 240 6% 84%;
     --accent: 240 4% 16%;
     --accent-foreground: 0 0% 100%;
     --destructive: 0 62.8% 58%;
