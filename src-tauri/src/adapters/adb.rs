@@ -455,6 +455,17 @@ pub fn is_valid_forward_spec(spec: &str) -> bool {
     }
 }
 
+/// 规格归一：纯数字（用户习惯只填端口）自动按 `tcp:` 处理，其余原样返回。
+/// 归一后再走 is_valid_forward_spec 校验，两侧输入都更宽容。
+pub fn normalize_forward_spec(spec: &str) -> String {
+    let s = spec.trim();
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+        format!("tcp:{s}")
+    } else {
+        s.to_string()
+    }
+}
+
 /// 解析 `forward --list` 输出行：`<serial> <local> <remote>`（空格分隔）。
 pub fn parse_forward_list(stdout: &str) -> Vec<(String, String, String)> {
     stdout
@@ -709,6 +720,21 @@ mod tests {
         assert!(!is_valid_forward_spec("tcp:8080 extra"));
         assert!(!is_valid_forward_spec("shell:rm"));
         assert!(!is_valid_forward_spec("8080"));
+    }
+
+    #[test]
+    fn forward_spec_normalize_bare_port() {
+        // 用户只填端口 → 自动 tcp:；带前缀 / 非数字原样
+        assert_eq!(normalize_forward_spec("22222"), "tcp:22222");
+        assert_eq!(normalize_forward_spec(" 8080 "), "tcp:8080");
+        assert_eq!(normalize_forward_spec("tcp:8080"), "tcp:8080");
+        assert_eq!(
+            normalize_forward_spec("localabstract:foo"),
+            "localabstract:foo"
+        );
+        // 归一后必须过校验（回归：裸端口曾被拒）
+        assert!(is_valid_forward_spec(&normalize_forward_spec("22222")));
+        assert!(!is_valid_forward_spec(&normalize_forward_spec("99999")));
     }
 
     #[test]

@@ -226,6 +226,10 @@ function ForwardRow({
 
   const effectiveHost = row.host;
   const localSpec = `tcp:${row.localPort.trim()}`;
+  /** 前端归一：设备侧裸数字（用户只填端口）自动按 tcp: 处理，与后端兜底一致 */
+  const remoteSpec = /^\d+$/.test(row.remote.trim())
+    ? `tcp:${row.remote.trim()}`
+    : row.remote.trim();
 
   /** 勾选「用设备 IP」：单设备直接填；多设备弹清单让用户选 */
   const handleUseDeviceIp = async (checked: boolean) => {
@@ -272,7 +276,7 @@ function ForwardRow({
       return;
     }
     try {
-      const rule = await deviceApi.forwardSetup(serial, localSpec, row.remote.trim());
+      const rule = await deviceApi.forwardSetup(serial, localSpec, remoteSpec);
       onNotice(t("adb.forward.applyOk", { local: rule.local, remote: rule.remote }));
       await doVerify();
     } catch (e) {
@@ -290,7 +294,7 @@ function ForwardRow({
     try {
       const rules = await deviceApi.forwardList(serial);
       const hit = rules.find((r: ForwardRule) => r.local === localSpec);
-      if (hit && hit.remote === row.remote.trim()) {
+      if (hit && hit.remote === remoteSpec) {
         onVerifyState({ kind: "active", connected: false });
       } else if (hit) {
         // 本地端口被别的远端占用：视作未按本行配置生效

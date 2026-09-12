@@ -507,18 +507,21 @@ impl DeviceService {
     // ===== 端口转发管理（P9：ADB 页端口转发 tab；全部调用 -s 绑定设备）=====
 
     /// 建立转发规则。返回后端实际规则行（serial, local, remote）。
+    /// 裸数字规格自动按 tcp: 处理（用户只填端口的习惯输入）。
     pub async fn forward_setup(
         &self,
         serial: &str,
         local: &str,
         remote: &str,
     ) -> CoreResult<(String, String, String)> {
-        if !adb::is_valid_forward_spec(local) || !adb::is_valid_forward_spec(remote) {
+        let local = adb::normalize_forward_spec(local);
+        let remote = adb::normalize_forward_spec(remote);
+        if !adb::is_valid_forward_spec(&local) || !adb::is_valid_forward_spec(&remote) {
             return Err(CoreError::Internal(format!(
                 "转发规格非法（允许 tcp:1-65535 / localabstract:name / localreserved:name）: {local} → {remote}"
             )));
         }
-        let args = adb::build_args(Some(serial), &adb::cmd_forward(local, remote));
+        let args = adb::build_args(Some(serial), &adb::cmd_forward(&local, &remote));
         let out = self.run_adb(&args).await?;
         if out.exit_code != Some(0) {
             return Err(CoreError::Internal(format!(
@@ -526,7 +529,7 @@ impl DeviceService {
                 out.stderr.trim()
             )));
         }
-        Ok((serial.to_string(), local.to_string(), remote.to_string()))
+        Ok((serial.to_string(), local, remote))
     }
 
     /// 列出该设备当前全部转发规则。
@@ -545,14 +548,15 @@ impl DeviceService {
             .collect())
     }
 
-    /// 删除一条转发（local=None 删全部）。
+    /// 删除一条转发（local=None 删全部）。裸数字规格自动按 tcp: 处理。
     pub async fn forward_remove(&self, serial: &str, local: Option<&str>) -> CoreResult<()> {
-        if let Some(l) = local {
+        let local = local.map(adb::normalize_forward_spec);
+        if let Some(l) = &local {
             if !adb::is_valid_forward_spec(l) {
                 return Err(CoreError::Internal(format!("转发规格非法: {l}")));
             }
         }
-        let args = adb::build_args(Some(serial), &adb::cmd_forward_remove(local));
+        let args = adb::build_args(Some(serial), &adb::cmd_forward_remove(local.as_deref()));
         let out = self.run_adb(&args).await?;
         if out.exit_code != Some(0) {
             return Err(CoreError::Internal(format!(
