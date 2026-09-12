@@ -473,6 +473,18 @@ impl EnvService {
             }
         }
 
+        // ⑤ 反查 venv（根因三：macOS NSOpenPanel 的 resolvesAliases 默认 true，
+        //    用户在面板里点 venv/bin/python 时【返回值已被解析成 base 真身】，
+        //    rfd/tauri-plugin-dialog 未暴露关闭开关——我们拿到的 picked 就不是 venv）。
+        //    对策：picked 指向 base 解释器时，扫描常见项目位置的 venv，
+        //    用 pyvenv.cfg 的 base-executable/home 反向匹配，命中则改返回 venv 路径。
+        if how != "venv"
+            && let Some(venv) = self.find_venv_referencing(&resolved).await
+        {
+            resolved = venv;
+            how = "venv-reverse".into();
+        }
+
         // 校验可用性并取版本
         let version = match run_probe(&resolved, &["--version"]).await {
             Ok(out) => {
@@ -501,6 +513,91 @@ impl EnvService {
             return pyenv;
         }
         "/usr/bin".to_string()
+    }
+
+    /// 反查 venv：扫描常见项目目录的 `*/.venv/pyvenv.cfg` 与 `*/venv/pyvenv.cfg`，
+    /// pyvenv.cfg 的 base-executable / home 指向 picked（或其所在版本目录）即命中。
+    /// 多个命中取 mtime 最新的（最近在用的项目）。同步 IO 但目录浅、量小。
+    async fn find_venv_referencing(&self, base: &str) -> Option<String> {
+        let home = std::env::var("HOME").ok()?;
+        let base_path = std::path::Path::new(base);
+        let base_canon = base_path.canonicalize().ok();
+
+        let mut project_roots: Vec<std::path::PathBuf> = Vec::new();
+        for root in [
+            "PycharmProjects",
+            "PyCharmMiscProject",
+            "RustroverProjects",
+            "IdeaProjects",
+            "Projects",
+            "code",
+            "dev",
+        ] {
+            let dir = std::path::Path::new(&home).join(root);
+            if dir.is_dir() {
+                project_roots.push(dir);
+            }
+        }
+
+        let mut hits: Vec<(std::time::SystemTime, String)> = Vec::new();
+        for root in project_roots {
+            let Ok(projects) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for project in projects.flatten() {
+                for venv_name in [".venv", "venv"] {
+                    let cfg = project.path().join(venv_name).join("pyvenv.cfg");
+                    if !cfg.is_file() {
+                        continue;
+                    }
+                    let Ok(text) = std::fs::read_to_string(&cfg) else {
+                        continue;
+                    };
+                    let mut referenced = false;
+                    for line in text.lines() {
+                        let t = line.trim();
+                        let value = t
+                            .strip_prefix("base-executable = ")
+                            .or_else(|| t.strip_prefix("home = "))
+                            .or_else(|| t.strip_prefix("base-exec-prefix = "));
+                        if let Some(v) = value {
+                            let v = v.trim().trim_matches('"');
+                            let v_path = std::path::Path::new(v);
+                            let v_canon = v_path
+                                .canonicalize()
+                                .unwrap_or_else(|_| v_path.to_path_buf());
+                            if let Some(bp) = base_canon.as_deref() {
+                                if v_canon == bp
+                                    || bp.starts_with(&v_canon)
+                                    || v_canon.starts_with(base_path)
+                                {
+                                    referenced = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if referenced {
+                        let Some(venv_dir) = cfg.parent() else {
+                            continue;
+                        };
+                        let python = ["python3", "python"]
+                            .iter()
+                            .map(|n| venv_dir.join("bin").join(n))
+                            .find(|p| p.exists());
+                        if let Some(py) = python {
+                            let mtime = std::fs::metadata(venv_dir)
+                                .and_then(|m| m.modified())
+                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                            hits.push((mtime, py.to_string_lossy().into_owned()));
+                        }
+                    }
+                }
+            }
+        }
+        hits.sort_by_key(|h| std::cmp::Reverse(h.0));
+        tracing::info!(base = %base, found = ?hits.first(), "反查 venv");
+        hits.into_iter().next().map(|(_, p)| p)
     }
 
     /// 安卓前台应用（§10 探测链）。剪枝：adb 不可用 → 0 次 shell 调用；
@@ -1248,6 +1345,33 @@ mod tests {
         assert!(!frida.python_ready);
         assert!(!frida.installed);
         assert!(frida.hint.unwrap().contains("未配置"));
+    }
+
+    #[tokio::test]
+    async fn resolve_base_interpreter_reverse_finds_venv() {
+        // 根因三回归：macOS 文件选择器 resolvesAliases 把 venv/bin/python 解析成
+        // base 真身返回——host 拿到的 picked 已是 ~/.pyenv/...；反查 venv 应回到 venv。
+        let venv_python = "/Users/citec/PycharmProjects/android_reverse_study/.venv/bin/python";
+        let base = "/Users/citec/.pyenv/versions/3.13.5/bin/python3.13";
+        if !std::path::Path::new(venv_python).exists() || !std::path::Path::new(base).exists() {
+            eprintln!("skip: 本机缺该 venv/base");
+            return;
+        }
+        let db = Arc::new(crate::db::Db::in_memory().unwrap());
+        let config = Arc::new(ConfigService::new(db));
+        let svc = EnvService::new(config, Arc::new(ScriptedAdb::new(false)));
+        let r = svc.resolve_interpreter(base).await;
+        eprintln!(
+            "picked={} resolved={} how={}",
+            r.picked_path, r.resolved_path, r.how
+        );
+        let venv_bin = std::path::Path::new(venv_python).parent().unwrap();
+        assert_eq!(
+            std::path::Path::new(&r.resolved_path).parent(),
+            Some(venv_bin),
+            "应反查回该 venv 的 bin（python3/python 任一变体）"
+        );
+        assert_eq!(r.how, "venv-reverse");
     }
 
     #[tokio::test]
