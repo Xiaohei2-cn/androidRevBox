@@ -8,6 +8,7 @@ import {
   Puzzle,
   Settings,
   Smartphone,
+  Store,
   Usb,
   Waypoints,
   type LucideIcon,
@@ -27,6 +28,7 @@ export type TabId =
   | "crypto"
   | "plugins"
   | "tasks"
+  | "market"
   | "settings";
 
 interface TabDef {
@@ -48,6 +50,7 @@ export const MAIN_TABS: readonly TabDef[] = [
   { id: "crypto", labelKey: "nav.crypto", icon: Waypoints },
   { id: "plugins", labelKey: "nav.plugins", icon: Puzzle },
   { id: "tasks", labelKey: "nav.tasks", icon: ListTodo },
+  { id: "market", labelKey: "nav.market", icon: Store },
   { id: "settings", labelKey: "nav.settings", icon: Settings },
 ] as const;
 

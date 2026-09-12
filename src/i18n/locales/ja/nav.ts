@@ -14,5 +14,6 @@ export default {
   "nav.crypto": "アルゴリズム",
   "nav.plugins": "プラグイン",
   "nav.tasks": "タスク",
+  "nav.market": "ツールマーケット",
   "nav.settings": "設定",
 } as const;

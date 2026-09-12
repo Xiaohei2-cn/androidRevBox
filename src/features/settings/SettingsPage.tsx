@@ -6,7 +6,6 @@ import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SubTabs } from "@/components/nav/SubTabs";
-import { Placeholder } from "@/components/nav/Placeholder";
 import {
   MIN_OPACITY,
   useSettings,
@@ -58,17 +57,6 @@ export function SettingsPage() {
       <SubTabs
         activateSignal={targetTab}
         tabs={[
-          {
-            id: "market",
-            label: t("settings.tab.market"),
-            content: (
-              <Placeholder
-                title="工具市场"
-                description=" Frida / objection / jeb / radare2 等工具的一键安装与版本管理将在此实现"
-                phase="占位 · 规划中"
-              />
-            ),
-          },
           {
             id: "display",
             label: t("settings.tab.display"),

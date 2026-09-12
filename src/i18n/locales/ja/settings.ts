@@ -1,6 +1,5 @@
 /** 設定：外観、ADB、ツール環境、ログ、このアプリについて */
 export default {
-  "settings.tab.market": "ツールマーケット",
   "settings.tab.display": "表示",
   "settings.tab.language": "言語",
   "settings.tab.environment": "環境",

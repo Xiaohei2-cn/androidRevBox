@@ -14,5 +14,6 @@ export default {
   "nav.crypto": "Algorithms",
   "nav.plugins": "Plugins",
   "nav.tasks": "Tasks",
+  "nav.market": "Tool market",
   "nav.settings": "Settings",
 } as const;

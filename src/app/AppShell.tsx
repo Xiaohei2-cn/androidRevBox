@@ -10,6 +10,7 @@ import { HookPage } from "@/features/hook/HookPage";
 import { BinaryPage } from "@/features/binary/BinaryPage";
 import { UnpackPage } from "@/features/unpack/UnpackPage";
 import { KernelPage } from "@/features/kernel/KernelPage";
+import { MarketPage } from "@/features/market/MarketPage";
 import { CryptoPage } from "@/features/crypto/CryptoPage";
 import { PluginsPage } from "@/features/plugins/PluginsPage";
 import { TasksPage } from "@/features/tasks/TasksPage";
@@ -92,6 +93,9 @@ function ShellBody() {
           </PageHost>
           <PageHost active={tab === "tasks"}>
             <TasksPage />
+          </PageHost>
+          <PageHost active={tab === "market"}>
+            <MarketPage />
           </PageHost>
           <PageHost active={tab === "settings"}>
             <SettingsPage />

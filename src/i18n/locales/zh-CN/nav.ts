@@ -14,5 +14,6 @@ export default {
   "nav.crypto": "算法工具",
   "nav.plugins": "插件中心",
   "nav.tasks": "任务中心",
+  "nav.market": "工具市场",
   "nav.settings": "设置",
 } as const;

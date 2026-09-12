@@ -1,6 +1,5 @@
 /** Settings: appearance, ADB, toolchain, logging, about */
 export default {
-  "settings.tab.market": "Tool market",
   "settings.tab.display": "Display",
   "settings.tab.language": "Language",
   "settings.tab.environment": "Environment",

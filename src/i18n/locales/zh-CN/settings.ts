@@ -1,6 +1,5 @@
 /** 设置页：外观、ADB、工具环境、日志、关于 */
 export default {
-  "settings.tab.market": "工具市场",
   "settings.tab.display": "显示",
   "settings.tab.language": "语言",
   "settings.tab.environment": "环境",

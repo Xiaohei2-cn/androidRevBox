@@ -1,6 +1,5 @@
 /** Configurações: aparência, ADB, ferramentas, log, sobre */
 export default {
-  "settings.tab.market": "Central de ferramentas",
   "settings.tab.display": "Exibição",
   "settings.tab.language": "Idioma",
   "settings.tab.environment": "Ambiente",
