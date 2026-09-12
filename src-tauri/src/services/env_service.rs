@@ -406,40 +406,61 @@ impl EnvService {
             }
         }
 
-        // ② .app bundle 入口 → 同 bundle 所在 framework 的 bin/python3*
+        // ② .app bundle 入口 → 同 framework 的 Versions/X.Y/bin/python3*
         if resolved.contains(".app/Contents/MacOS/") {
             if let Some(idx) = resolved.find(".app/Contents") {
                 let bundle = &resolved[..idx + 4]; // xxx.app
-                if let Some(fw_dir) = std::path::Path::new(bundle).parent() {
+                if let Some(resources) = std::path::Path::new(bundle).parent() {
                     // framework 布局：<fw>/Python.framework/Resources/Python.app/Contents/MacOS/Python
                     // 真解释器在 <fw>/Python.framework/Versions/X.Y/bin/python3*
-                    let fw_root = fw_dir; // .../Python.framework 的宿主目录
-                    let mut found = false;
-                    if let Ok(versions) = std::fs::read_dir(fw_root) {
-                        let mut cands: Vec<_> = versions
-                            .flatten()
-                            .filter(|e| e.path().is_dir())
-                            .flat_map(|e| {
-                                let bin = e.path().join("bin");
-                                std::fs::read_dir(bin)
-                                    .map(|rd| rd.flatten().map(|x| x.path()).collect::<Vec<_>>())
-                                    .unwrap_or_default()
+                    // （bundle.parent() = .../Resources，再上一层才是 framework 根）
+                    let fw_root = resources
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .filter(|n| *n == "Resources")
+                        .and_then(|_| resources.parent())
+                        .unwrap_or(resources);
+                    let mut cands: Vec<_> = std::fs::read_dir(fw_root)
+                        .map(|rd| {
+                            rd.flatten()
+                                .map(|e| e.path())
+                                .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some("Versions"))
+                                .flat_map(|versions| {
+                                    std::fs::read_dir(versions)
+                                        .map(|vd| {
+                                            vd.flatten()
+                                                .filter(|e| e.path().is_dir())
+                                                .map(|e| e.path().join("bin"))
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    cands.sort();
+                    let best = cands.into_iter().rev().find_map(|bin| {
+                        // 每个 X.Y/bin 下取最大的 python3*（数字序：3.13 > 3.9 字典序同样成立）
+                        let mut bins: Vec<std::path::PathBuf> = std::fs::read_dir(&bin)
+                            .map(|rd| {
+                                rd.flatten()
+                                    .map(|e| e.path())
+                                    .filter(|c| {
+                                        c.file_name()
+                                            .and_then(|n| n.to_str())
+                                            .map(|n| n.starts_with("python3"))
+                                            .unwrap_or(false)
+                                    })
+                                    .collect()
                             })
-                            .filter(|c| {
-                                c.file_name()
-                                    .and_then(|n| n.to_str())
-                                    .map(|n| n.starts_with("python3"))
-                                    .unwrap_or(false)
-                            })
-                            .collect();
-                        cands.sort();
-                        if let Some(best) = cands.pop() {
-                            resolved = best.to_string_lossy().into_owned();
-                            how = "app-bundle".into();
-                            found = true;
-                        }
+                            .unwrap_or_default();
+                        bins.sort();
+                        bins.pop()
+                    });
+                    if let Some(best) = best {
+                        resolved = best.to_string_lossy().into_owned();
+                        how = "app-bundle".into();
                     }
-                    let _ = found;
                 }
             }
         }
@@ -943,7 +964,9 @@ pub fn parse_foreground_window(stdout: &str) -> Option<(String, String)> {
             continue;
         }
         saw_focus_line = true;
-        if t.contains("null") {
+        // null 判空只看「= 后无 Window{」：不能对整行 contains("null")，
+        // 包名含 "null"（如 com.nullpoint.app）的真实窗口会被误跳过（P8 反馈）
+        if !t.contains('{') {
             continue;
         }
         // Window{7a4c1de u0 com.pkg/com.pkg.Activity ... type=1}
@@ -1186,6 +1209,15 @@ mod tests {
         assert!(parse_foreground_window("  mCurrentFocus: null\n").is_none());
         assert!(parse_foreground_window("nothing useful here").is_none());
         assert!(parse_foreground_window("").is_none());
+    }
+
+    #[test]
+    fn parse_foreground_window_pkg_containing_null_literal() {
+        // 回归：整行 contains("null") 的旧判法会把包名含 null 的窗口误当空行跳过
+        let out = "  mCurrentFocus: Window{abc u0 com.nullpoint.app/com.nullpoint.app.MainActivity}\n";
+        let (pkg, act) = parse_foreground_window(out).expect("包名含 null 的窗口应正常解析");
+        assert_eq!(pkg, "com.nullpoint.app");
+        assert_eq!(act, "com.nullpoint.app.MainActivity");
     }
 
     #[test]
