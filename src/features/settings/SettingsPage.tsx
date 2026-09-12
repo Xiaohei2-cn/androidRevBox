@@ -326,15 +326,21 @@ function ConfigInputRow({
     }
   };
 
-  // 初值回显：从 snapshot 里找当前键（缺失 = 用默认）
+  // 初值回显：只做一次（组件挂载后第一批数据到达时）。
+  // ⚠️ 不能挂在 [snapshot, configKey] 上反复覆盖——否则用户刚用文件选择器
+  // 选好的路径会被 60s 后的 snapshot refetch 用 DB 旧值刷掉（用户反馈的
+  // 「选了 venv 却还是 pyenv 路径」的另一半根因：选择值被回显覆盖后又点应用）。
   const { data: snapshot } = useQuery({
     queryKey: ["config", "snapshot"],
     queryFn: configApi.snapshot,
     staleTime: 60_000,
   });
+  const hydratedRef = useRef(false);
   useEffect(() => {
-    const row = snapshot?.find((s) => s.key === configKey);
+    if (hydratedRef.current || snapshot === undefined) return;
+    const row = snapshot.find((s) => s.key === configKey);
     if (row !== undefined) setValue(row.value);
+    hydratedRef.current = true;
   }, [snapshot, configKey]);
 
   useEffect(() => {
