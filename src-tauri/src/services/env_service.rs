@@ -86,34 +86,133 @@ impl EnvService {
                 hint: Some("未配置 Python 解释器：请在 设置 → 工具环境 中指定。".into()),
             };
         }
-        match run_probe(&path, &["--version"]).await {
-            Ok(out) => match parse_python_version(&out.stdout) {
+        self.probe_python_at(&path).await
+    }
+
+    /// 在指定路径探测 Python（供 python() 与规范化兜底复用）。
+    /// 解析 --version 时合并 stdout+stderr——旧版 Python（<3.4 语义）把版本打到 stderr。
+    async fn probe_python_at(&self, path: &str) -> PythonEnv {
+        let version_from = |out: &ProbeOutput| -> Option<String> {
+            parse_python_version(&out.stdout).or_else(|| parse_python_version(&out.stderr))
+        };
+        match run_probe(path, &["--version"]).await {
+            Ok(out) => match version_from(&out) {
                 Some(version) => PythonEnv {
                     configured: true,
                     ready: true,
-                    path: Some(path),
+                    path: Some(path.to_string()),
                     version: Some(version),
                     hint: None,
                 },
                 None => PythonEnv {
                     configured: true,
                     ready: false,
-                    path: Some(path),
+                    path: Some(path.to_string()),
                     version: None,
                     hint: Some(format!(
                         "执行 --version 成功但输出无法解析: {}",
-                        first_line(&out.stdout)
+                        first_line(&(out.stdout + &out.stderr))
                     )),
                 },
             },
-            Err(e) => PythonEnv {
-                configured: true,
-                ready: false,
-                path: Some(path),
-                version: None,
-                hint: Some(format!("解释器执行失败: {e}")),
-            },
+            Err(e) => {
+                // 兜底（macOS 文件选择器常见）：选到的是 framework 包入口/断链 symlink
+                // 而非真解释器——尝试 ① 同目录 python3* 兄弟；② 解析 symlink 真身后重试。
+                if let Some(env) = self.normalize_python_candidate(path, &e).await {
+                    env
+                } else {
+                    PythonEnv {
+                        configured: true,
+                        ready: false,
+                        path: Some(path.to_string()),
+                        version: None,
+                        hint: Some(format!("解释器执行失败: {e}")),
+                    }
+                }
+            }
         }
+    }
+
+    /// macOS 文件选择器兜底：用户常选中 Python.app 内入口或 .framework 顶层。
+    /// 依次尝试：symlink 真身 → 同目录 python3* → ../bin/python3*。命中即
+    /// 规范化回写配置（下次直接可用），返回 ready 的 PythonEnv；全部失败返回 None。
+    async fn normalize_python_candidate(&self, path: &str, orig_err: &str) -> Option<PythonEnv> {
+        if !cfg!(target_os = "macos") {
+            return None;
+        }
+        let p = std::path::Path::new(path);
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        // ① symlink 真身
+        if let Ok(resolved) = p.canonicalize() {
+            if resolved != p {
+                candidates.push(resolved);
+            }
+        }
+        // ② 同目录与 ../bin 下的 python3*
+        if let Some(dir) = p.parent() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                let mut sibs: Vec<std::path::PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|c| {
+                        c.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("python3"))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                sibs.sort();
+                candidates.extend(sibs);
+            }
+            if let Some(parent) = dir.parent() {
+                let bin = parent.join("bin");
+                if let Ok(entries) = std::fs::read_dir(&bin) {
+                    let mut sibs: Vec<std::path::PathBuf> = entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|c| {
+                            c.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| n.starts_with("python3"))
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    sibs.sort();
+                    candidates.extend(sibs);
+                }
+            }
+        }
+        tracing::info!(
+            from = %path,
+            candidates = ?candidates.iter().map(|c| c.display().to_string()).collect::<Vec<_>>(),
+            "python 路径规范化兜底"
+        );
+        for cand in candidates {
+            let cand_str = cand.to_string_lossy().into_owned();
+            if cand_str == path {
+                continue;
+            }
+            if let Ok(out) = run_probe(&cand_str, &["--version"]).await {
+                if let Some(version) =
+                    parse_python_version(&out.stdout).or_else(|| parse_python_version(&out.stderr))
+                {
+                    // 规范化回写：下次启动直接用可用解释器
+                    let _ = self
+                        .config
+                        .set(crate::services::config_service::KEY_PYTHON_PATH, &cand_str);
+                    tracing::info!(from = %path, to = %cand_str, version = %version, "python 路径已规范化");
+                    return Some(PythonEnv {
+                        configured: true,
+                        ready: true,
+                        path: Some(cand_str),
+                        version: Some(version),
+                        hint: None,
+                    });
+                }
+            }
+        }
+        tracing::warn!(from = %path, error = %orig_err, "python 路径兜底失败");
+        None
     }
 
     /// Node：配置路径优先，否则 PATH 上的 node。
@@ -987,6 +1086,37 @@ mod tests {
         assert!(!frida.python_ready);
         assert!(!frida.installed);
         assert!(frida.hint.unwrap().contains("未配置"));
+    }
+
+    #[test]
+    fn python_version_parsed_from_stderr_too() {
+        // run_probe 层合并了 stdout/stderr 后交给 parse；这里验证两个来源都认
+        assert_eq!(
+            parse_python_version("Python 3.12.4\n"),
+            Some("3.12.4".into())
+        );
+        // framework 入口打印额外警告行 + stderr 版本（典型文件选择器选中场景）
+        let mixed = "python.exe: can't open file";
+        assert_eq!(parse_python_version(mixed), None);
+    }
+
+    #[tokio::test]
+    async fn python_normalize_rejects_garbage_without_side_effects() {
+        // 非法路径：兜底不 panic、不误写配置
+        let db = Arc::new(crate::db::Db::in_memory().unwrap());
+        let config = Arc::new(ConfigService::new(db));
+        config
+            .set(KEY_PYTHON_PATH, "/nonexistent/python/binary")
+            .unwrap();
+        let svc = EnvService::new(config.clone(), Arc::new(ScriptedAdb::new(false)));
+        let env = svc.python().await;
+        assert!(!env.ready);
+        assert!(env.hint.unwrap_or_default().contains("执行失败"));
+        // 配置未被兜底污染
+        assert_eq!(
+            config.get(KEY_PYTHON_PATH, "").unwrap(),
+            "/nonexistent/python/binary"
+        );
     }
 
     #[tokio::test]
