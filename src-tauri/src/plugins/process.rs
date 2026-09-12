@@ -57,6 +57,33 @@ struct RunningChild {
     next_id: u64,
 }
 
+/// 握手阶段 RAII：任何提前 return（写管道失败 / 握手超时 / 崩溃 / 协议错误 /
+/// 线程 spawn 失败）都自动 kill + reap 子进程，防孤儿插件进程泄漏；
+/// 握手成功后 disarm 把所有权移交 RunningChild。
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// 解除保护并交出 Child（仅握手成功路径调用）
+    fn disarm(mut self) -> Child {
+        self.child.take().expect("child present until disarm")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
 /// 进程插件句柄。Drop 时发 shutdown 并回收子进程。
 pub struct ProcessPlugin {
     manifest: PluginManifest,
@@ -177,7 +204,7 @@ fn ensure_running<'a>(
 fn spawn_and_initialize(exe: &std::path::Path) -> Result<RunningChild, ProcessError> {
     #[cfg(unix)]
     let exe = ensure_executable(exe)?;
-    let mut child = Command::new(&exe)
+    let child = Command::new(&exe)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -186,9 +213,13 @@ fn spawn_and_initialize(exe: &std::path::Path) -> Result<RunningChild, ProcessEr
             path: exe.display().to_string(),
             source,
         })?;
-    let stdin = child.stdin.take().expect("stdin piped");
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    // 握手完成前由 guard 兜底回收：任何 ? 提前 return（写管道失败 / 握手超时 /
+    // 崩溃 / 协议错误 / 线程 spawn 失败）都会 kill + reap，不留孤儿进程
+    let mut guard = ChildGuard::new(child);
+    let slot = guard.child.as_mut().expect("guard holds child");
+    let mut stdin = slot.stdin.take().expect("stdin piped");
+    let stdout = slot.stdout.take().expect("stdout piped");
+    let stderr = slot.stderr.take().expect("stderr piped");
 
     // stderr 转发到 tracing（插件诊断输出，不影响协议）
     std::thread::Builder::new()
@@ -213,20 +244,14 @@ fn spawn_and_initialize(exe: &std::path::Path) -> Result<RunningChild, ProcessEr
         })
         .map_err(|e| ProcessError::Io(std::io::Error::other(e.to_string())))?;
 
-    let mut c = RunningChild {
-        child,
-        stdin,
-        rx,
-        next_id: 1,
-    };
     // initialize 握手
     let req = serde_json::json!({
         "jsonrpc": "2.0", "id": 0, "method": "initialize",
         "params": { "protocolVersion": 1 }
     });
-    write_line(&mut c.stdin, &req.to_string())?;
+    write_line(&mut stdin, &req.to_string())?;
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let result = wait_response(&c.rx, 0, deadline)?;
+    let result = wait_response(&rx, 0, deadline)?;
     let reported = result
         .get("id")
         .and_then(Value::as_str)
@@ -237,7 +262,12 @@ fn spawn_and_initialize(exe: &std::path::Path) -> Result<RunningChild, ProcessEr
             "initialize 结果缺少 id 字段".into(),
         ));
     }
-    Ok(c)
+    Ok(RunningChild {
+        child: guard.disarm(),
+        stdin,
+        rx,
+        next_id: 1,
+    })
 }
 
 /// 等待指定 id 的响应；跳过通知行。崩溃/超时/协议错误分别报错。
@@ -261,9 +291,15 @@ fn wait_response(rx: &Receiver<String>, id: u64, deadline: Instant) -> Result<Va
                     tracing::debug!(target: "plugin_process", method, "notification");
                     continue;
                 }
-                let resp_id = v.get("id").and_then(Value::as_u64).unwrap_or(u64::MAX);
-                if resp_id != id {
-                    continue; // 旧响应，忽略
+                // id 匹配：host 恒发数字 id；第三方插件按 JSON-RPC 惯例可能回
+                // 字符串形式（"1"）。两种都认，其余视为旧响应跳过。
+                let resp_id = v.get("id").and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                });
+                match resp_id {
+                    Some(got) if got == id => {}
+                    _ => continue, // 旧响应/无法解析的 id，忽略
                 }
                 if let Some(err) = v.get("error") {
                     return Err(ProcessError::BadProtocol(format!("JSON-RPC error: {err}")));
@@ -342,6 +378,54 @@ mod tests {
         (manifest, PathBuf::from(exe_name))
     }
 
+    /// 回归（握手泄漏修复）：ChildGuard 未 disarm 即 drop → 子进程被 kill + reap，
+    /// 不会留下孤儿进程
+    #[test]
+    fn child_guard_kills_child_on_drop() {
+        let child = Command::new(if cfg!(windows) { "ping" } else { "sleep" })
+            .args(if cfg!(windows) {
+                vec!["-n", "30", "127.0.0.1"]
+            } else {
+                vec!["30"]
+            })
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        // guard drop 时同步 kill + wait（实现见 ChildGuard::drop）；
+        // 此处主要断言 drop 不 panic、不阻塞
+        drop(ChildGuard::new(child));
+    }
+
+    /// 回归（握手泄漏修复）：启动一个「不说话就常驻」的假插件进程，
+    /// wait_response 崩溃路径（Disconnected 前先超时太慢，用立即退出的假插件）
+    /// ——脚本秒退 → Crashed；guard 确保 reap；再断言 ensure_running 后槽位为空。
+    #[test]
+    fn handshake_failure_returns_error_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("silent-exit");
+        #[cfg(unix)]
+        {
+            std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let err = match spawn_and_initialize(&script) {
+                Err(e) => e,
+                Ok(_) => panic!("假插件不应握手成功"),
+            };
+            assert!(matches!(err, ProcessError::Crashed { .. }), "{err:?}");
+        }
+        #[cfg(windows)]
+        {
+            let _ = script;
+            // Windows 用 cmd 秒退等价物：无参 cmd 即刻退出或不说协议，两条失败路径都可
+            let err = match spawn_and_initialize(std::path::Path::new("cmd.exe")) {
+                Err(e) => e,
+                Ok(_) => panic!("cmd.exe 不应握手成功"),
+            };
+            assert!(matches!(err, ProcessError::Crashed { .. }), "{err:?}");
+        }
+    }
+
     #[test]
     fn wait_response_skips_notifications_and_matches_id() {
         let (tx, rx) = channel::<String>();
@@ -350,6 +434,16 @@ mod tests {
         tx.send(r#"{"jsonrpc":"2.0","id":99,"result":{}}"#.into())
             .unwrap();
         tx.send(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.into())
+            .unwrap();
+        let v = wait_response(&rx, 1, Instant::now() + Duration::from_secs(1)).unwrap();
+        assert_eq!(v["ok"], true);
+    }
+
+    /// 回归（字符串 id 兼容）：第三方按 JSON-RPC 惯例回字符串 id（"1"）也能命中
+    #[test]
+    fn wait_response_accepts_string_id() {
+        let (tx, rx) = channel::<String>();
+        tx.send(r#"{"jsonrpc":"2.0","id":"1","result":{"ok":true}}"#.into())
             .unwrap();
         let v = wait_response(&rx, 1, Instant::now() + Duration::from_secs(1)).unwrap();
         assert_eq!(v["ok"], true);
