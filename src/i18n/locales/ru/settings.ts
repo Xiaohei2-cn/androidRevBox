@@ -44,4 +44,9 @@ export default {
   "settings.about.appVersion": "Версия приложения",
   "settings.about.tauriVersion": "Версия Tauri",
   "settings.about.platform": "Платформа",
+
+  "settings.tab.donate": "Поддержать",
+  "settings.tab.about": "О программе",
+  "settings.donate.title": "Поддержать разработчика",
+  "settings.donate.description": "Если инструмент вам полезен, поддержите разработчика — каналы донатов (Alipay / WeChat / Boosty и др.) появятся здесь.",
 } as const;

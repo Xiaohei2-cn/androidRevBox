@@ -6,6 +6,7 @@ import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SubTabs } from "@/components/nav/SubTabs";
+import { Placeholder } from "@/components/nav/Placeholder";
 import {
   MIN_OPACITY,
   useSettings,
@@ -76,6 +77,26 @@ export function SettingsPage() {
             id: "system",
             label: t("settings.tab.system"),
             content: <SystemTab />,
+          },
+          {
+            id: "donate",
+            label: t("settings.tab.donate"),
+            content: (
+              <Placeholder
+                title={t("settings.donate.title")}
+                description={t("settings.donate.description")}
+                phase={t("common.phasePlaceholder")}
+              />
+            ),
+          },
+          {
+            id: "about",
+            label: t("settings.tab.about"),
+            content: (
+              <div className="mx-auto flex max-w-xl flex-col gap-8 pt-2">
+                <AboutSection />
+              </div>
+            ),
           },
         ]}
       />
@@ -262,7 +283,6 @@ function SystemTab() {
         </p>
       </section>
 
-      <AboutSection />
     </div>
   );
 }

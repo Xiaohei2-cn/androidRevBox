@@ -25,4 +25,5 @@ export default {
   "common.emptyValue": "（空）",
   "common.device": "设备",
   "common.updatedAt": "更新于",
+  "common.phasePlaceholder": "占位 · 规划中",
 } as const;

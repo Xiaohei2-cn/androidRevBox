@@ -44,4 +44,9 @@ export default {
   "settings.about.appVersion": "App version",
   "settings.about.tauriVersion": "Tauri version",
   "settings.about.platform": "Platform",
+
+  "settings.tab.donate": "Donate",
+  "settings.tab.about": "About",
+  "settings.donate.title": "Donate",
+  "settings.donate.description": "If this tool helps you, consider supporting the developer — donation channels (Alipay / WeChat / Afadian etc.) will be added here.",
 } as const;

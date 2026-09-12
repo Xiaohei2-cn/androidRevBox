@@ -43,4 +43,9 @@ export default {
   "settings.about.appVersion": "应用版本",
   "settings.about.tauriVersion": "Tauri 版本",
   "settings.about.platform": "运行平台",
+
+  "settings.tab.donate": "捐赠",
+  "settings.tab.about": "关于",
+  "settings.donate.title": "捐赠",
+  "settings.donate.description": "如果这个工具对你有帮助，欢迎支持开发者——捐赠渠道（支付宝/微信/爱发电等）将在此接入。",
 } as const;

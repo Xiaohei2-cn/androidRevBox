@@ -25,4 +25,5 @@ export default {
   "common.emptyValue": "(пусто)",
   "common.device": "Устройство",
   "common.updatedAt": "Обновлено",
+  "common.phasePlaceholder": "Заглушка · в планах",
 } as const;

@@ -44,4 +44,9 @@ export default {
   "settings.about.appVersion": "アプリのバージョン",
   "settings.about.tauriVersion": "Tauri のバージョン",
   "settings.about.platform": "実行プラットフォーム",
+
+  "settings.tab.donate": "寄付",
+  "settings.tab.about": "について",
+  "settings.donate.title": "寄付",
+  "settings.donate.description": "このツールが役に立ったら開発者を応援してください — 寄付チャネル（Alipay / WeChat / Afdian など）はここに追加されます。",
 } as const;

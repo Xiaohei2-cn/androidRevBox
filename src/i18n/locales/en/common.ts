@@ -25,4 +25,5 @@ export default {
   "common.emptyValue": "(empty)",
   "common.device": "Device",
   "common.updatedAt": "Updated",
+  "common.phasePlaceholder": "Placeholder · planned",
 } as const;

@@ -25,4 +25,5 @@ export default {
   "common.emptyValue": "（空）",
   "common.device": "デバイス",
   "common.updatedAt": "更新",
+  "common.phasePlaceholder": "プレースホルダー · 予定",
 } as const;

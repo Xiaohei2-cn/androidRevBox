@@ -25,4 +25,5 @@ export default {
   "common.emptyValue": "(vazio)",
   "common.device": "Dispositivo",
   "common.updatedAt": "Atualizado em",
+  "common.phasePlaceholder": "Placeholder · planejado",
 } as const;
