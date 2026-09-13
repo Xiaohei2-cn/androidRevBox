@@ -28,7 +28,21 @@ interface HostedRow {
   ports: ListenPort[];
   /** 端口查询进行中标记 */
   portsLoading: boolean;
+  /** 备注（用途说明），localStorage 持久化 */
+  note: string;
 }
+
+/** 常驻快捷备注选项（值为写入备注的文本本身，跨语言固定） */
+const NOTE_PRESETS = ["frida server", "ida远程调试server", "dumper"] as const;
+
+/** 备注持久化键：设备 serial + 文件名维度，跨重启/重托管保留 */
+const noteKey = (serial: string, name: string) => `adb.binary.note.${serial}.${name}`;
+const loadNote = (serial: string | null, name: string) =>
+  (serial && localStorage.getItem(noteKey(serial, name))) || "";
+const saveNote = (serial: string, name: string, value: string) => {
+  if (value) localStorage.setItem(noteKey(serial, name), value);
+  else localStorage.removeItem(noteKey(serial, name));
+};
 
 export function BinaryHosting() {
   const { t } = useI18n();
@@ -95,6 +109,7 @@ export function BinaryHosting() {
               root: false,
               ports: [],
               portsLoading: false,
+              note: loadNote(deviceSerial, b.name),
             },
           ],
     );
@@ -344,6 +359,39 @@ export function BinaryHosting() {
                       >
                         <Trash2 className="h-3 w-3" />
                       </Button>
+                    </div>
+                    <div className="mt-1.5 flex items-center gap-1.5">
+                      <input
+                        aria-label={t("adb.binary.noteLabel", { name: row.name })}
+                        data-testid={`note-${row.name}`}
+                        className="path-selectable h-6 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-xs"
+                        placeholder={t("adb.binary.notePlaceholder")}
+                        value={row.note}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          patchRow(row.name, { note: v });
+                          if (deviceSerial) saveNote(deviceSerial, row.name, v);
+                        }}
+                      />
+                      <select
+                        aria-label={t("adb.binary.noteQuick")}
+                        data-testid={`note-quick-${row.name}`}
+                        className="h-6 shrink-0 rounded-md border border-input bg-transparent px-1 text-xs text-muted-foreground"
+                        value=""
+                        onChange={(e) => {
+                          if (!e.target.value) return;
+                          patchRow(row.name, { note: e.target.value });
+                          if (deviceSerial) saveNote(deviceSerial, row.name, e.target.value);
+                          e.target.value = "";
+                        }}
+                      >
+                        <option value="">{t("adb.binary.noteQuick")}</option>
+                        {NOTE_PRESETS.map((preset) => (
+                          <option key={preset} value={preset}>
+                            {preset}
+                          </option>
+                        ))}
+                      </select>
                     </div>
                     {row.error && (
                       <p className="mt-1.5 break-all text-[11px] leading-relaxed text-destructive" data-testid={`err-${row.name}`}>
