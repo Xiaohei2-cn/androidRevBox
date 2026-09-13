@@ -397,7 +397,7 @@ export function BinaryHosting() {
 }
 
 /** 可点击复制的 chip（pid / 端口通用）：复制成功后短暂显示对勾 */
-function CopyChip({
+export function CopyChip({
   value,
   label,
   title,
@@ -431,7 +431,7 @@ function CopyChip({
   );
 }
 
-function DeviceBar({
+export function DeviceBar({
   online,
   selected,
   onSelect,

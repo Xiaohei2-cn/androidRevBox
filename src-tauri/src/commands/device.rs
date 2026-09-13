@@ -5,7 +5,9 @@
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::adapters::adb::{DeviceEntry, DeviceInfo, FileEntry, HostedBinary, ListenPort};
+use crate::adapters::adb::{
+    DeviceEntry, DeviceInfo, FileEntry, HostedBinary, ListenPort, PortHolder,
+};
 use crate::core::error::{CoreError, CoreResult};
 use crate::services::device_service::{AdbEnvironment, DeviceChangedPayload, ForwardRule};
 
@@ -225,6 +227,34 @@ pub async fn device_binary_ports(
     state
         .device
         .hosted_ports(&serial, pid, root.unwrap_or(false))
+        .await
+}
+
+/// PID→端口（任意进程）：/proc/<pid>/fd socket inode → /proc/net/tcp(6)
+#[tauri::command]
+pub async fn device_proc_ports(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    pid: u32,
+    root: Option<bool>,
+) -> CoreResult<Vec<ListenPort>> {
+    state
+        .device
+        .process_ports(&serial, pid, root.unwrap_or(false))
+        .await
+}
+
+/// 端口→PID 反查（LISTEN 行 inode → 扫 /proc/[0-9]*/fd 找持有进程）
+#[tauri::command]
+pub async fn device_proc_by_port(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    port: u16,
+    root: Option<bool>,
+) -> CoreResult<Vec<PortHolder>> {
+    state
+        .device
+        .pids_by_port(&serial, port, root.unwrap_or(false))
         .await
 }
 

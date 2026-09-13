@@ -725,6 +725,52 @@ impl DeviceService {
         Ok(adb::parse_listening_ports(&out.stdout))
     }
 
+    /// 查任意进程监听端口（PID→端口方向；pid 不限于托管行，复用同链路）。
+    pub async fn process_ports(
+        &self,
+        serial: &str,
+        pid: u32,
+        root: bool,
+    ) -> CoreResult<Vec<adb::ListenPort>> {
+        self.hosted_ports(serial, pid, root).await
+    }
+
+    /// 端口→PID 反查（两步链，全 -s 绑定）：
+    /// ① grep 端口十六进制 → 解析取 LISTEN 且端口精确匹配的 inode；
+    /// ② inode_owner_cmd 扫 /proc/[0-9]*/fd 找持有者（同行输出 pid+comm）。
+    /// ⚠️ 不开 root 时 shell 用户读不到别人的 /proc/<pid>/fd，
+    /// 只能命中 shell 自属进程——前端默认引导勾选 Root。
+    pub async fn pids_by_port(
+        &self,
+        serial: &str,
+        port: u16,
+        root: bool,
+    ) -> CoreResult<Vec<adb::PortHolder>> {
+        let wrap = |c: String| if root { adb::su_wrap(&c) } else { c };
+
+        let args =
+            adb::build_args(Some(serial), &adb::cmd_shell(&wrap(adb::port_grep_cmd(port))));
+        let out = self.run_adb(&args).await?;
+        let mut inodes: Vec<u64> = adb::parse_proc_net_entries(&out.stdout)
+            .into_iter()
+            .filter(|e| e.listen && e.listen_port.port == port && e.inode != 0)
+            .map(|e| e.inode)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        if inodes.is_empty() {
+            return Ok(Vec::new());
+        }
+        inodes.sort_unstable();
+
+        let args = adb::build_args(
+            Some(serial),
+            &adb::cmd_shell(&wrap(adb::inode_owner_cmd(&inodes))),
+        );
+        let out = self.run_adb(&args).await?;
+        Ok(adb::parse_port_holders(&out.stdout))
+    }
+
     /// 拼 `<verb> <dir>/<name>` 并做名称安全校验（所有托管文件操作共用入口）。
     fn hosted_shell(name: &str, verb: &str) -> CoreResult<String> {
         if !adb::is_safe_hosted_name(name) {

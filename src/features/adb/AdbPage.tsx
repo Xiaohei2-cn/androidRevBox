@@ -1,6 +1,7 @@
 import { SubTabs } from "@/components/nav/SubTabs";
 import { ForwardManager } from "@/features/adb/ForwardManager";
 import { BinaryHosting } from "@/features/adb/BinaryHosting";
+import { ProcPorts } from "@/features/adb/ProcPorts";
 import { Placeholder } from "@/components/nav/Placeholder";
 
 /**
@@ -22,6 +23,11 @@ export function AdbPage() {
           id: "binary-hosting",
           label: "二进制托管",
           content: <BinaryHosting />,
+        },
+        {
+          id: "proc-ports",
+          label: "进程端口",
+          content: <ProcPorts />,
         },
         {
           id: "terminal",

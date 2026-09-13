@@ -135,6 +135,8 @@ pub fn run() {
             commands::device::device_binary_run,
             commands::device::device_binary_kill,
             commands::device::device_binary_ports,
+            commands::device::device_proc_ports,
+            commands::device::device_proc_by_port,
             commands::device::device_ls,
             commands::device::device_packages,
             commands::device::device_shell,

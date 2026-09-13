@@ -53,6 +53,12 @@ export interface HostedBinary {
   hasExec: boolean;
 }
 
+/** 端口→PID 反查的持有进程行 */
+export interface PortHolder {
+  pid: number;
+  name: string;
+}
+
 /** 托管进程的一个 LISTEN 端口（/proc/net/tcp(6) 十六进制已还原） */
 export interface ListenPort {
   address: string;
@@ -132,6 +138,14 @@ export const deviceApi = {
   /** 查托管进程监听端口（/proc/<pid>/fd → /proc/net/tcp(6)） */
   binaryPorts(serial: string, pid: number, root = false): Promise<ListenPort[]> {
     return invokeCommand<ListenPort[]>("device_binary_ports", { serial, pid, root });
+  },
+  /** 进程端口互查：PID→端口（任意进程） */
+  procPorts(serial: string, pid: number, root = false): Promise<ListenPort[]> {
+    return invokeCommand<ListenPort[]>("device_proc_ports", { serial, pid, root });
+  },
+  /** 进程端口互查：端口→PID（LISTEN inode → /proc fd 持有者） */
+  procByPort(serial: string, port: number, root = false): Promise<PortHolder[]> {
+    return invokeCommand<PortHolder[]>("device_proc_by_port", { serial, port, root });
   },
   /** 以下长操作返回 task_id，输出走 task:// 事件流 */
   shell(serial: string, command: string): Promise<string> {

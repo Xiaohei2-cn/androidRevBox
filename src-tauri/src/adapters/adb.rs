@@ -439,16 +439,41 @@ fn hex_ipv6(hex: &str) -> Option<String> {
     Some(addr.to_string())
 }
 
-/// 解析单行 `/proc/net/tcp` 或 `tcp6` 记录（可带 grep 输出的 `tcp:`/`tcp6:`
-/// 行首前缀——先剥前缀再分词，否则行头粘成 `tcp:sl` 无法解析）：
-/// `sl local_address rem_address st ...`。要求字段严格为 8/32 hex + ':' +
-/// 4 hex 形态；遇假 hex（如 IPv6 组里的 "::"）跳过继续扫，不整行放弃。
-fn parse_proc_net_line(line: &str, family: &'static str) -> Option<ListenPort> {
-    let stripped = match family {
-        "tcp6" => line.strip_prefix("tcp6:").or_else(|| line.strip_prefix("tcp:"))?,
-        _ => line.strip_prefix("tcp:")?,
-    };
-    let toks: Vec<&str> = stripped.split_whitespace().collect();
+/// 剥 grep 多文件输出的行首路径前缀（`/proc/net/tcp:`、`/proc/net/tcp6:`、
+/// 兼容裸 `tcp:`/`tcp6:`），返回 (family, 剥离后的行)。
+fn strip_proc_net_prefix(line: &str) -> Option<(&'static str, &str)> {
+    for (prefix, fam) in [
+        ("/proc/net/tcp6:", "tcp6"),
+        ("/proc/net/tcp:", "tcp"),
+        ("tcp6:", "tcp6"),
+        ("tcp:", "tcp"),
+    ] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            return Some((fam, rest));
+        }
+    }
+    None
+}
+
+/// /proc/net/tcp(6) 单行的通用解析结果（含 uid/inode，供端口→PID 反查）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcNetEntry {
+    pub family: &'static str,
+    /// 状态十六进制原文（0A=LISTEN）
+    pub state: String,
+    pub listen: bool,
+    /// 本地地址（还原后 ip + 十进制端口）
+    pub listen_port: ListenPort,
+    pub uid: u32,
+    pub inode: u64,
+}
+
+/// 解析单行 `/proc/net/tcp` 或 `tcp6` 记录（已剥 grep 前缀后的正文）：
+/// `sl local_address rem_address st tx:rx tr:tm retrnsmt uid timeout inode ...`。
+/// 要求字段严格为 8/32 hex + ':' + 4 hex 形态；遇假 hex（如 IPv6 组里的
+/// "::"）跳过继续扫，不整行放弃。
+fn parse_proc_net_body(toks: &[&str], family: &'static str) -> Option<ProcNetEntry> {
     for (idx, tok) in toks.iter().enumerate() {
         let Some((ip_hex, port_hex)) = tok.split_once(':') else {
             continue;
@@ -469,41 +494,73 @@ fn parse_proc_net_line(line: &str, family: &'static str) -> Option<ListenPort> {
             continue;
         };
         let state = toks.get(idx + 2).copied().unwrap_or("");
-        return Some(ListenPort {
-            address,
-            port,
-            listen: state.eq_ignore_ascii_case("0A"),
+        // 字段布局：[idx+3]=tx:rx [idx+4]=tr:tm->when [idx+5]=retrnsmt [idx+6]=uid [idx+7]=timeout [idx+8]=inode
+        let uid = toks
+            .get(idx + 6)
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(u32::MAX);
+        let inode = toks
+            .get(idx + 8)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        return Some(ProcNetEntry {
             family,
+            listen: state.eq_ignore_ascii_case("0A"),
+            state: state.to_string(),
+            listen_port: ListenPort {
+                address,
+                port,
+                listen: state.eq_ignore_ascii_case("0A"),
+                family,
+            },
+            uid,
+            inode,
         });
     }
     None
 }
 
 /// 解析设备端 socket inode 匹配输出（每行形如
-/// `tcp:   0      0 0100007F:1F90 00000000:0000 0A ...` 或 `tcp6: ...`，
-/// 也兼容 grep 直接输出无 sl 前缀变体）。去重 + 只保留 LISTEN，端口升序。
+/// `/proc/net/tcp:   1: 0100007F:1F90 00000000:0000 0A ...` 或 grep 的
+/// `tcp:` 裸前缀变体）。去重 + 只保留 LISTEN，端口升序。
 pub fn parse_listening_ports(stdout: &str) -> Vec<ListenPort> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for line in stdout.lines() {
-        let fam = if line.trim_start().starts_with("tcp6:") {
-            "tcp6"
-        } else if line.trim_start().starts_with("tcp:") {
-            "tcp"
-        } else {
-            continue;
-        };
-        let Some(p) = parse_proc_net_line(line, fam) else {
-            continue;
-        };
-        if !p.listen {
+    for e in parse_proc_net_entries(stdout) {
+        if !e.listen {
             continue;
         }
-        if seen.insert((p.port, p.address.clone(), p.family)) {
-            out.push(p);
+        if seen.insert((e.listen_port.port, e.listen_port.address.clone(), e.family)) {
+            out.push(e.listen_port);
         }
     }
-    out.sort_by(|a, b| a.port.cmp(&b.port).then(a.family.cmp(b.family)).then(a.address.cmp(&b.address)));
+    out.sort_by(|a, b| {
+        a.port
+            .cmp(&b.port)
+            .then(a.family.cmp(b.family))
+            .then(a.address.cmp(&b.address))
+    });
+    out
+}
+
+/// 解析 /proc/net/tcp(6) grep 输出为全量条目（含 uid/inode/状态，不筛 LISTEN），
+/// 供端口→PID 反查。按 (family, local, inode) 去重，保持出现顺序。
+pub fn parse_proc_net_entries(stdout: &str) -> Vec<ProcNetEntry> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some((fam, rest)) = strip_proc_net_prefix(line) else {
+            continue;
+        };
+        let toks: Vec<&str> = rest.split_whitespace().collect();
+        let Some(e) = parse_proc_net_body(&toks, fam) else {
+            continue;
+        };
+        if seen.insert((e.family, e.listen_port.address.clone(), e.listen_port.port, e.inode)) {
+            out.push(e);
+        }
+    }
     out
 }
 
@@ -513,6 +570,63 @@ pub fn hosted_ports_cmd(pid: u32) -> String {
     format!(
         "for i in $(ls -l /proc/{pid}/fd 2>/dev/null | sed -n \"s/.*socket:\\[\\(.*\\)\\].*/\\1/p\"); do grep \"$i\" /proc/net/tcp /proc/net/tcp6; done"
     )
+}
+
+// ===== 进程端口互查（PID ↔ 端口）=====
+
+/// 反查第二步：按端口（大写 hex，含尾随空格防误中）匹配行——
+/// `grep ":1F90 " /proc/net/tcp /proc/net/tcp6 2>/dev/null`。
+/// LISTEN/十进制端口过滤在 host 侧解析后做（parser 已还原端口与状态）。
+pub fn port_grep_cmd(port: u16) -> String {
+    let hex = format!("{port:04X}");
+    format!("grep \":{hex} \" /proc/net/tcp /proc/net/tcp6 2>/dev/null")
+}
+
+/// 反查第三步：给定 inode 列表，扫全设备 fd 找持有者，命中即输出
+/// `<pid> <comm>` 一行（同一循环内读 comm，省一次往返）。
+/// inodes 已由调用方过滤为纯数字。
+pub fn inode_owner_cmd(inodes: &[u64]) -> String {
+    if inodes.is_empty() {
+        return "echo ''".to_string();
+    }
+    let alt = inodes
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "for p in /proc/[0-9]*; do ls -l $p/fd 2>/dev/null | grep -qE \"socket:\\[({alt})\\]\" && echo \"$(basename $p) $(cat $p/comm 2>/dev/null)\"; done"
+    )
+}
+
+/// 持有某端口的进程（反查结果行）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortHolder {
+    pub pid: u32,
+    pub name: String,
+}
+
+/// 解析 inode_owner_cmd 的输出（每行 `<pid> <comm>`）为持有者列表。
+pub fn parse_port_holders(stdout: &str) -> Vec<PortHolder> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let t = line.trim_end_matches('\r').trim();
+        let mut it = t.splitn(2, ' ');
+        let Some(pid) = it.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let name = it.next().unwrap_or("").trim().to_string();
+        if seen.insert(pid) {
+            out.push(PortHolder {
+                pid,
+                name: if name.is_empty() { "?".to_string() } else { name },
+            });
+        }
+    }
+    out.sort_by_key(|h| h.pid);
+    out
 }
 
 /// adb 版本信息（`adb version` 解析结果）
@@ -1075,11 +1189,11 @@ mod tests {
 
     #[test]
     fn listening_ports_parses_v4_v6_and_hex() {
-        // 真机典型形态：grep 多文件带 tcp:/tcp6: 前缀，1F90=8080，27042=0x69A2
+        // 真机典型形态：grep 多文件带 /proc/net/tcp: 前缀，1F90=8080，27042=0x69A2
         let out = "\
-tcp:   1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10093 0 0000000000000000 1 0
-tcp:   2: 00000000:69A2 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10093 0 0000000000000000 1 0
-tcp6:  3: 00000000000000000000000001000000:1F91 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 10093 0 0000000000000000 1 0
+/proc/net/tcp:   1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10093 0 24567 1 0
+/proc/net/tcp:   2: 00000000:69A2 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10093 0 24568 1 0
+/proc/net/tcp6:  3: 00000000000000000000000001000000:1F91 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 10093 0 24569 1 0
 ";
         let ports = parse_listening_ports(out);
         assert_eq!(ports.len(), 3);
@@ -1089,6 +1203,45 @@ tcp6:  3: 00000000000000000000000001000000:1F91 00000000000000000000000000000000
         assert_eq!(ports[1].family, "tcp6");
         assert_eq!((ports[2].port, ports[2].address.as_str()), (27042, "0.0.0.0"));
         assert!(ports.iter().all(|p| p.listen));
+        // 兼容裸 tcp: 前缀（部分 shell 省略路径）
+        let bare = out.replace("/proc/net/", "");
+        assert_eq!(parse_listening_ports(&bare).len(), 3);
+    }
+
+    #[test]
+    fn proc_net_entries_extracts_uid_inode() {
+        let out = "/proc/net/tcp:   1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10093 0 24567 1 0\n\
+                    /proc/net/tcp:   2: 0100007F:0016 0A0A0A0A:C000 01 00000000:00000000 00:00000000 00000000 0 0 24570 2 0\n";
+        let es = parse_proc_net_entries(out);
+        assert_eq!(es.len(), 2);
+        assert!(es[0].listen);
+        assert_eq!(es[0].inode, 24567);
+        assert_eq!(es[0].uid, 10093);
+        assert!(!es[1].listen, "01=ESTABLISHED");
+        // 反查 grep 命令模板：端口大写 hex + 无双引号内单引号（su 包裹安全）
+        let c = port_grep_cmd(8080);
+        assert!(c.contains(":1F90"), "{c}");
+        assert!(!c.contains('\''), "su -c 单引号包裹命令不得内嵌单引号");
+    }
+
+    #[test]
+    fn inode_owner_cmd_shape() {
+        let c = inode_owner_cmd(&[24567, 24568]);
+        assert!(c.contains("socket:\\[(24567|24568)\\]"), "{c}");
+        assert!(c.contains("basename $p"), "{c}");
+        assert!(c.contains("cat $p/comm"), "{c}");
+        assert!(!c.contains('\''), "su 包裹安全");
+        assert_eq!(inode_owner_cmd(&[]), "echo ''");
+    }
+
+    #[test]
+    fn parse_port_holders_rows() {
+        let out = "30743 xhmfd1656-n\n1 frida-server\n30743 xhmfd1656-n\n";
+        let hs = parse_port_holders(out);
+        assert_eq!(hs.len(), 2, "pid 去重");
+        assert_eq!(hs[0].pid, 1);
+        assert_eq!(hs[1].name, "xhmfd1656-n");
+        assert!(parse_port_holders("nope\n").is_empty());
     }
 
     #[test]
@@ -1186,3 +1339,4 @@ tcp: garbage line
         );
     }
 }
+
