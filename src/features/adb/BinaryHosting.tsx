@@ -1,0 +1,316 @@
+import { useEffect, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { Play, RefreshCw, ShieldCheck, Square, Trash2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { deviceApi, type DeviceEntry, type HostedBinary } from "@/api/device";
+import { useI18n } from "@/i18n";
+import { cn } from "@/lib/utils";
+
+/**
+ * 二进制托管（ADB 页子标签）：管理 /data/local/tmp 下的 ELF 文件。
+ * - 上区：file 判 ELF 后列出——绿色 = 有执行权限（双击加入下区托管），
+ *   红色 = 无执行权限（「赋予权限」按钮走 chmod +x）；
+ * - 下区：托管清单——「执行」后台启动（cd 目录 + nohup ./name）并回显 pid，
+ *   有 pid 时「终止」按钮走 kill -9；可移除托管行。
+ * 所有 adb 调用后端 -s 绑定设备。
+ */
+
+interface HostedRow {
+  name: string;
+  pid: number | null;
+  running: boolean;
+  error: string | null;
+}
+
+export function BinaryHosting() {
+  const { t } = useI18n();
+  const [deviceSerial, setDeviceSerial] = useState<string | null>(null);
+  const [hosted, setHosted] = useState<HostedRow[]>([]);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const { data: env } = useQuery({
+    queryKey: ["adb", "environment"],
+    queryFn: deviceApi.environment,
+    staleTime: 10_000,
+  });
+  const adbReady = !!env?.installed;
+
+  const { data: devices = [] } = useQuery({
+    queryKey: ["devices", "binary"],
+    queryFn: () => deviceApi.list(true),
+    enabled: adbReady,
+    refetchInterval: 10_000,
+  });
+  const online = useMemo(() => devices.filter((d) => d.state === "device"), [devices]);
+  useEffect(() => {
+    if (!deviceSerial && online.length > 0) setDeviceSerial(online[0].serial);
+  }, [deviceSerial, online]);
+
+  const {
+    data: binaries = [],
+    isLoading,
+    isError,
+    error: listError,
+    refetch,
+    isFetching,
+  } = useQuery({
+    queryKey: ["device", "binaries", deviceSerial],
+    queryFn: () => deviceApi.binaries(deviceSerial!),
+    enabled: !!deviceSerial,
+    retry: false,
+  });
+
+  // 设备切换：托管区清空（pid 属于旧设备）
+  useEffect(() => {
+    setHosted([]);
+    setNotice(null);
+  }, [deviceSerial]);
+
+  const patchRow = (name: string, p: Partial<HostedRow>) =>
+    setHosted((hs) => hs.map((h) => (h.name === name ? { ...h, ...p } : h)));
+
+  const addHosted = (b: HostedBinary) => {
+    if (!b.hasExec) return; // 红色不可双击托管（先 chmod）
+    setHosted((hs) => (hs.some((h) => h.name === b.name) ? hs : [...hs, { name: b.name, pid: null, running: false, error: null }]));
+  };
+
+  const chmod = async (b: HostedBinary) => {
+    if (!deviceSerial) return;
+    try {
+      await deviceApi.binaryChmod(deviceSerial, b.name);
+      setNotice(t("adb.binary.chmodOk", { name: b.name }));
+      void refetch();
+    } catch (e) {
+      setNotice(String((e as Error)?.message ?? e));
+    }
+  };
+
+  const run = async (row: HostedRow) => {
+    if (!deviceSerial || row.running) return;
+    patchRow(row.name, { running: true, error: null });
+    try {
+      const pid = await deviceApi.binaryRun(deviceSerial, row.name);
+      patchRow(row.name, { pid, running: false });
+    } catch (e) {
+      patchRow(row.name, { running: false, error: String((e as Error)?.message ?? e) });
+    }
+  };
+
+  const kill = async (row: HostedRow) => {
+    if (!deviceSerial || row.pid === null) return;
+    patchRow(row.name, { running: true, error: null });
+    try {
+      await deviceApi.binaryKill(deviceSerial, row.pid);
+      patchRow(row.name, { pid: null, running: false, error: t("adb.binary.killed", { pid: row.pid }) });
+    } catch (e) {
+      patchRow(row.name, { running: false, error: String((e as Error)?.message ?? e) });
+    }
+  };
+
+  if (!adbReady) {
+    return (
+      <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
+        {env?.hint ?? t("common.loading")}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-3">
+      <div className="flex shrink-0 items-center gap-3">
+        <p className="text-xs leading-relaxed text-muted-foreground">{t("adb.binary.description")}</p>
+      </div>
+
+      <DeviceBar
+        online={online}
+        selected={deviceSerial}
+        onSelect={setDeviceSerial}
+        onRefresh={() => void refetch()}
+        refreshing={isFetching}
+      />
+
+      {/* 上区：ELF 文件列表 */}
+      <section className="flex min-h-0 flex-1 flex-col gap-1" aria-label={t("adb.binary.listTitle")}>
+        <div className="flex shrink-0 items-center justify-between">
+          <h3 className="text-xs font-semibold">{t("adb.binary.listTitle")}</h3>
+          <span className="text-[10px] text-muted-foreground">{t("adb.binary.listHint")}</span>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto rounded-lg border bg-card">
+          {isLoading && <p className="p-3 text-xs text-muted-foreground">{t("common.loading")}</p>}
+          {isError && (
+            <p className="p-3 text-xs text-destructive">
+              {String((listError as Error)?.message ?? listError)}
+            </p>
+          )}
+          {!isLoading && !isError && binaries.length === 0 && (
+            <p className="p-3 text-xs text-muted-foreground">{t("adb.binary.empty")}</p>
+          )}
+          <ul className="divide-y text-xs">
+            {binaries.map((b) => (
+              <li key={b.name} data-testid={`bin-${b.name}`}>
+                <button
+                  type="button"
+                  className={cn(
+                    "flex w-full items-center gap-3 px-3 py-2 text-left transition-colors hover:bg-accent",
+                    !b.hasExec && "cursor-default hover:bg-transparent",
+                  )}
+                  onDoubleClick={() => addHosted(b)}
+                  title={b.hasExec ? t("adb.binary.dblClickAdd") : undefined}
+                >
+                  <span
+                    className={cn(
+                      "min-w-0 flex-1 truncate font-mono font-medium",
+                      b.hasExec ? "text-emerald-500" : "text-red-500",
+                    )}
+                  >
+                    {b.name}
+                  </span>
+                  <span className="shrink-0 font-mono text-muted-foreground">{b.perms}</span>
+                  <span className="w-14 shrink-0 text-right tabular-nums text-muted-foreground">
+                    {b.size} B
+                  </span>
+                  {!b.hasExec && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 shrink-0 gap-1 px-2"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void chmod(b);
+                      }}
+                    >
+                      <ShieldCheck className="h-3 w-3" />
+                      {t("adb.binary.chmod")}
+                    </Button>
+                  )}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </section>
+
+      {/* 下区：托管执行 */}
+      <section className="flex shrink-0 max-h-[45%] flex-col gap-1" aria-label={t("adb.binary.hostTitle")}>
+        <div className="flex shrink-0 items-center justify-between">
+          <h3 className="text-xs font-semibold">{t("adb.binary.hostTitle")}</h3>
+          <span className="text-[10px] text-muted-foreground">{t("adb.binary.dblClickAdd")}</span>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto rounded-lg border bg-card">
+          {hosted.length === 0 ? (
+            <p className="p-3 text-xs text-muted-foreground">{t("adb.binary.hostEmpty")}</p>
+          ) : (
+            <ul className="divide-y text-xs">
+              {hosted.map((row) => {
+                const bin = binaries.find((b) => b.name === row.name);
+                return (
+                  <li key={row.name} className="flex items-center gap-3 px-3 py-2" data-testid={`hosted-${row.name}`}>
+                    <span className={cn("min-w-0 flex-1 truncate font-mono font-medium", (bin?.hasExec ?? true) ? "text-emerald-500" : "text-red-500")}>
+                      ./{row.name}
+                    </span>
+                    {row.pid !== null ? (
+                      <span className="shrink-0 rounded bg-emerald-500/10 px-1.5 py-0.5 font-mono text-emerald-500" data-testid={`pid-${row.name}`}>
+                        pid {row.pid}
+                      </span>
+                    ) : (
+                      <span className="shrink-0 text-muted-foreground">{row.error ?? t("adb.binary.idle")}</span>
+                    )}
+                    {row.pid !== null ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-6 shrink-0 gap-1 px-2 text-destructive"
+                        disabled={row.running}
+                        onClick={() => void kill(row)}
+                      >
+                        <Square className="h-3 w-3" />
+                        {t("adb.binary.kill")}
+                      </Button>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-6 shrink-0 gap-1 px-2"
+                        disabled={row.running || bin?.hasExec === false}
+                        onClick={() => void run(row)}
+                      >
+                        {row.running ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />}
+                        {row.running ? t("adb.binary.starting") : t("adb.binary.execute")}
+                      </Button>
+                    )}
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 shrink-0 px-1.5 text-muted-foreground"
+                      disabled={row.pid !== null}
+                      title={t("adb.binary.removeRow")}
+                      onClick={() => setHosted((hs) => hs.filter((h) => h.name !== row.name))}
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </Button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      </section>
+
+      {notice && (
+        <p className="shrink-0 break-all rounded-md border bg-muted/40 px-2 py-1 text-xs text-muted-foreground">
+          {notice}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function DeviceBar({
+  online,
+  selected,
+  onSelect,
+  onRefresh,
+  refreshing,
+}: {
+  online: DeviceEntry[];
+  selected: string | null;
+  onSelect: (s: string) => void;
+  onRefresh: () => void;
+  refreshing: boolean;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="flex shrink-0 items-center gap-2 text-xs">
+      {online.length === 0 && <span className="text-muted-foreground">{t("adb.forward.rowInactive")}</span>}
+      {online.length === 1 && (
+        <span className="font-mono text-muted-foreground">-s {online[0].serial}</span>
+      )}
+      {online.length > 1 && (
+        <label className="flex items-center gap-2">
+          <span className="font-mono text-muted-foreground">-s</span>
+          <select
+            className="h-7 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
+            value={selected ?? ""}
+            onChange={(e) => onSelect(e.target.value)}
+          >
+            {online.map((d) => (
+              <option key={d.serial} value={d.serial}>
+                {d.model || d.serial}（{d.serial}）
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+      <Button
+        size="sm"
+        variant="outline"
+        className="ml-auto h-7 gap-1 px-2"
+        disabled={refreshing || !selected}
+        onClick={onRefresh}
+      >
+        <RefreshCw className={cn("h-3 w-3", refreshing && "animate-spin")} />
+        {t("common.refresh")}
+      </Button>
+    </div>
+  );
+}

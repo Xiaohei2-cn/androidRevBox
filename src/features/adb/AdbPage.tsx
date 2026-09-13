@@ -1,10 +1,12 @@
 import { SubTabs } from "@/components/nav/SubTabs";
 import { ForwardManager } from "@/features/adb/ForwardManager";
+import { BinaryHosting } from "@/features/adb/BinaryHosting";
 import { Placeholder } from "@/components/nav/Placeholder";
 
 /**
  * ADB 页（原「终端」主 tab 改造）：多个子标签。
  * - 端口转发：五行默认行 + 可增行，每行独立建立/删除/验证；
+ * - 二进制托管：/data/local/tmp 下 ELF 的浏览/授权/后台执行/终止；
  * - 终端等后续能力继续追加为子标签。
  */
 export function AdbPage() {
@@ -15,6 +17,11 @@ export function AdbPage() {
           id: "forward",
           label: "端口转发",
           content: <ForwardManager />,
+        },
+        {
+          id: "binary-hosting",
+          label: "二进制托管",
+          content: <BinaryHosting />,
         },
         {
           id: "traffic",

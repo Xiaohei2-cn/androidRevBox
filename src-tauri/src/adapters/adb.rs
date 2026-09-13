@@ -173,6 +173,9 @@ pub struct FileEntry {
     pub is_dir: bool,
     pub size: i64,
     pub symlink: Option<String>,
+    /// 原始权限串（如 "-rwxr-xr-x"）；文件浏览 UI 可忽略
+    #[serde(default)]
+    pub perms: String,
 }
 
 /// 解析 `ls -l` 行。示例：
@@ -232,6 +235,7 @@ pub fn parse_ls_long(line: &str) -> Option<FileEntry> {
         is_dir,
         size,
         symlink,
+        perms: perms.to_string(),
     })
 }
 
@@ -247,6 +251,94 @@ pub fn join_remote_path(dir: &str, name: &str) -> String {
     let mut segs = clean_path_segments(dir);
     segs.extend(clean_path_segments(name));
     format!("/{}", segs.join("/"))
+}
+
+// ===== 二进制托管（/data/local/tmp）=====
+
+/// 托管目录固定路径（用户指定默认）。
+pub const HOSTED_DIR: &str = "/data/local/tmp";
+
+/// 一个被托管的二进制（tmp 目录下的 ELF 文件）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostedBinary {
+    pub name: String,
+    pub path: String,
+    pub size: i64,
+    /// 原始权限串（如 "-rwxr-xr-x"）
+    pub perms: String,
+    /// owner 有执行位 → 绿色；否则红色（可 chmod 赋予）
+    pub has_exec: bool,
+}
+
+/// 校验托管文件名：仅允许安全字符（防 shell 注入 / 路径逃逸）。
+/// 拒绝空、以 . 开头（隐藏文件）、含 `/`、空格或 shell 元字符。
+pub fn is_safe_hosted_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// ls 权限串（如 "-rwxr-xr-x"）是否 owner 可执行（第 4 字符 x/s）。
+pub fn perms_has_exec(perms: &str) -> bool {
+    // -rwxr-xr-x → 索引 3 是 owner 的 execute
+    perms.chars().nth(3).is_some_and(|c| c == 'x' || c == 's')
+}
+
+/// `file /data/local/tmp/x` 输出是否识别为 ELF（"ELF 64-bit ... executable"）。
+pub fn is_elf_file_output(output: &str) -> bool {
+    // 设备端 file 缺失时输出 "file: not found" 等，一律不算 ELF
+    output.contains("ELF")
+}
+
+/// 组合 ls -l 与 file 输出为托管二进制列表：
+/// - `ls_entries`：`ls -l <dir>` 已解析出的普通文件；
+/// - `file_lines`：`file <dir>/*` 的输出行（每行 `<path>: <type>`）。
+///
+/// 只保留被 file 判定为 ELF 的文件。
+pub fn hosted_binaries(
+    ls_stdout: &str,
+    file_stdout: &str,
+) -> Vec<HostedBinary> {
+    // 收集 ELF 命中的绝对路径集合
+    let elf_paths: std::collections::HashSet<String> = file_stdout
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| is_elf_file_output(l))
+        .filter_map(|l| l.split_once(':').map(|(p, _)| p.trim().to_string()))
+        .collect();
+    let mut out: Vec<HostedBinary> = Vec::new();
+    for line in ls_stdout.lines() {
+        let Some(fe) = parse_ls_long(line) else { continue };
+        if fe.is_dir {
+            continue;
+        }
+        let path = format!("{HOSTED_DIR}/{}", fe.name);
+        if !elf_paths.contains(&path) {
+            continue;
+        }
+        out.push(HostedBinary {
+            name: fe.name.clone(),
+            path,
+            size: fe.size,
+            has_exec: perms_has_exec(&fe.perms),
+            perms: fe.perms,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// 解析 `nohup ./x & echo $!` 的输出为首个整数 pid。
+pub fn parse_run_pid(stdout: &str) -> Option<u32> {
+    stdout
+        .trim()
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()))
+        .and_then(|l| l.parse::<u32>().ok())
 }
 
 /// adb 版本信息（`adb version` 解析结果）
@@ -696,6 +788,60 @@ mod tests {
             parse_packages(out),
             vec!["com.android.settings", "com.demo"]
         );
+    }
+
+    #[test]
+    fn hosted_name_safety() {
+        assert!(is_safe_hosted_name("test"));
+        assert!(is_safe_hosted_name("frida-server_16.5.9"));
+        assert!(is_safe_hosted_name("lib-dump.so"));
+        assert!(!is_safe_hosted_name(""));
+        assert!(!is_safe_hosted_name(".hidden"));
+        assert!(!is_safe_hosted_name("a/../b"));
+        assert!(!is_safe_hosted_name("a b"));
+        assert!(!is_safe_hosted_name("x; rm -rf /"));
+        assert!(!is_safe_hosted_name("x`id`"));
+        assert!(!is_safe_hosted_name("$IFS"));
+    }
+
+    #[test]
+    fn perms_exec_detection() {
+        assert!(perms_has_exec("-rwxr-xr-x"));
+        assert!(perms_has_exec("-rwsr--r--"));
+        // 目录位也看 owner x（目录过滤由调用方 is_dir 负责）
+        assert!(perms_has_exec("drwxrwxrwx"));
+        assert!(!perms_has_exec("-rw-r--r--"));
+        assert!(!perms_has_exec("drw-r--r--"));
+        assert!(!perms_has_exec(""));
+    }
+
+    #[test]
+    fn hosted_binaries_filters_elf_only() {
+        let ls = "-rwxr-xr-x 1 shell shell 10240 2026-01-01 08:00 test\r\n\
+                  -rw-r--r-- 1 shell shell 2048 2026-01-01 08:00 noexec\r\n\
+                  -rw-r--r-- 1 shell shell 100 2026-01-01 08:00 readme.txt\r\n\
+                  drwxr-xr-x 2 shell shell 4096 2026-01-01 08:00 subdir\r\n";
+        let file = "/data/local/tmp/test: ELF 64-bit LSB executable, ARM aarch64\r\n\
+                    /data/local/tmp/noexec: ELF 64-bit LSB shared object, ARM aarch64\r\n\
+                    /data/local/tmp/readme.txt: ASCII text\r\n\
+                    /data/local/tmp/subdir: directory\r\n";
+        let bins = hosted_binaries(ls, file);
+        assert_eq!(bins.len(), 2);
+        assert_eq!(bins[0].name, "noexec");
+        assert!(!bins[0].has_exec, "rw-r-- 无执行位");
+        assert_eq!(bins[1].name, "test");
+        assert!(bins[1].has_exec);
+        assert_eq!(bins[1].path, "/data/local/tmp/test");
+        // file 缺失/权限拒绝输出不误报
+        assert!(hosted_binaries(ls, "file: not found").is_empty());
+    }
+
+    #[test]
+    fn parse_run_pid_takes_first_number() {
+        assert_eq!(parse_run_pid("12345\n"), Some(12345));
+        assert_eq!(parse_run_pid("nohup: redirecting stderr\n99\n"), Some(99));
+        assert_eq!(parse_run_pid("not a pid"), None);
+        assert_eq!(parse_run_pid(""), None);
     }
 
     #[test]

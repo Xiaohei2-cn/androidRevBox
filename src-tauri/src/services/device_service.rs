@@ -567,6 +567,107 @@ impl DeviceService {
         Ok(())
     }
 
+    // ===== 二进制托管（P9：/data/local/tmp 下 ELF 的浏览 / chmod / 后台运行 / kill）=====
+
+    /// 列出托管目录下的 ELF 可执行文件：`ls -l` 拿权限 + `file <dir>/*` 判 ELF。
+    /// file 命令本身不可用时报错（不猜测——避免把文本文件当二进制展示）。
+    pub async fn hosted_binaries(&self, serial: &str) -> CoreResult<Vec<adb::HostedBinary>> {
+        let dir = adb::HOSTED_DIR;
+        let ls_args = adb::build_args(Some(serial), &adb::cmd_ls(dir));
+        let ls_out = self.run_adb(&ls_args).await?;
+        if ls_out.exit_code != Some(0) {
+            return Err(CoreError::Internal(format!(
+                "读取 {dir} 失败: {}",
+                ls_out.stderr.trim()
+            )));
+        }
+        let file_cmd = format!("file {dir}/*");
+        let file_args = adb::build_args(Some(serial), &adb::cmd_shell(&file_cmd));
+        let file_out = self.run_adb(&file_args).await?;
+        // file 缺失（exit!=0 且输出含 not found 类）时给可读错误
+        if file_out.exit_code != Some(0) && !file_out.stdout.contains(':') {
+            return Err(CoreError::Internal(format!(
+                "设备不支持 file 命令，无法识别 ELF: {}",
+                file_out.stderr.trim()
+            )));
+        }
+        Ok(adb::hosted_binaries(&ls_out.stdout, &file_out.stdout))
+    }
+
+    /// 赋予执行权限：`chmod +x <dir>/<name>`（name 过安全白名单校验，防注入）。
+    pub async fn hosted_chmod(&self, serial: &str, name: &str) -> CoreResult<()> {
+        let cmd = Self::hosted_shell(name, "chmod +x")?;
+        let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
+        let out = self.run_adb(&args).await?;
+        if out.exit_code != Some(0) {
+            return Err(CoreError::Internal(format!(
+                "chmod 失败: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 后台启动并返回 pid：`cd <dir> && nohup ./<name> >/dev/null 2>&1 & echo $!`。
+    /// 在托管目录内以 ./name 形式执行（依赖相对路径加载库的二进制更稳）。
+    /// 启动后复查存活（短暂 sleep + kill -0）：秒退通常是缺依赖库/权限竞态，
+    /// 复查失败时返回可读错误而非假 pid。
+    pub async fn hosted_run(&self, serial: &str, name: &str) -> CoreResult<u32> {
+        if !adb::is_safe_hosted_name(name) {
+            return Err(CoreError::Internal(format!(
+                "文件名非法（仅允许字母数字与 _.-，且不以 . 开头）: {name}"
+            )));
+        }
+        let run_cmd = format!(
+            "cd {} && nohup ./{name} >/dev/null 2>&1 & echo $!",
+            adb::HOSTED_DIR
+        );
+        let args = adb::build_args(Some(serial), &adb::cmd_shell(&run_cmd));
+        let out = self.run_adb(&args).await?;
+        if out.exit_code != Some(0) {
+            return Err(CoreError::Internal(format!(
+                "启动失败: {}",
+                out.stderr.trim()
+            )));
+        }
+        let pid = adb::parse_run_pid(&out.stdout)
+            .ok_or_else(|| CoreError::Internal(format!("未能解析启动 pid，输出: {}", out.stdout.trim())))?;
+        // 存活复查（nohup 秒退场景）
+        let check_cmd = format!("sleep 0.3; kill -0 {pid} 2>/dev/null && echo alive || echo dead");
+        let check_args = adb::build_args(Some(serial), &adb::cmd_shell(&check_cmd));
+        let check = self.run_adb(&check_args).await?;
+        if check.stdout.trim() != "alive" {
+            return Err(CoreError::Internal(format!(
+                "{name} 启动后立即退出（可能缺少依赖库或权限不足），pid={pid}"
+            )));
+        }
+        Ok(pid)
+    }
+
+    /// 终止托管进程：`kill -9 <pid>`（pid 仅接受纯数字）。
+    pub async fn hosted_kill(&self, serial: &str, pid: u32) -> CoreResult<()> {
+        let cmd = format!("kill -9 {pid}");
+        let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
+        let out = self.run_adb(&args).await?;
+        if out.exit_code != Some(0) {
+            return Err(CoreError::Internal(format!(
+                "kill 失败（进程可能已退出）: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 拼 `<verb> <dir>/<name>` 并做名称安全校验（所有托管文件操作共用入口）。
+    fn hosted_shell(name: &str, verb: &str) -> CoreResult<String> {
+        if !adb::is_safe_hosted_name(name) {
+            return Err(CoreError::Internal(format!(
+                "文件名非法（仅允许字母数字与 _.-，且不以 . 开头）: {name}"
+            )));
+        }
+        Ok(format!("{verb} {}/{}", adb::HOSTED_DIR, name))
+    }
+
     // ===== 长操作：全部生成 TaskService 任务（事件流 + 历史）=====
 
     async fn adb_task(&self, serial: Option<&str>, subcommand: &[String]) -> CoreResult<String> {

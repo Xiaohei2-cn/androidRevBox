@@ -44,6 +44,15 @@ export interface ForwardRule {
   remote: string;
 }
 
+/** /data/local/tmp 下被托管的 ELF 二进制 */
+export interface HostedBinary {
+  name: string;
+  path: string;
+  size: number;
+  perms: string;
+  hasExec: boolean;
+}
+
 export interface DeviceChangedPayload {
   serial: string;
   transport: string;
@@ -87,6 +96,22 @@ export const deviceApi = {
   /** 删除转发规则（local 缺省 = 删全部） */
   forwardRemove(serial: string, local?: string): Promise<void> {
     return invokeCommand<void>("adb_forward_remove", { serial, local: local ?? null });
+  },
+  /** 列出 /data/local/tmp 下的 ELF 二进制（含执行权限） */
+  binaries(serial: string): Promise<HostedBinary[]> {
+    return invokeCommand<HostedBinary[]>("device_binaries", { serial });
+  },
+  /** 赋予执行权限（chmod +x） */
+  binaryChmod(serial: string, name: string): Promise<void> {
+    return invokeCommand<void>("device_binary_chmod", { serial, name });
+  },
+  /** 后台启动二进制，返回 pid */
+  binaryRun(serial: string, name: string): Promise<number> {
+    return invokeCommand<number>("device_binary_run", { serial, name });
+  },
+  /** 终止托管进程（kill -9 pid） */
+  binaryKill(serial: string, pid: number): Promise<void> {
+    return invokeCommand<void>("device_binary_kill", { serial, pid });
   },
   /** 以下长操作返回 task_id，输出走 task:// 事件流 */
   shell(serial: string, command: string): Promise<string> {

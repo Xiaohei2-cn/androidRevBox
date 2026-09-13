@@ -5,7 +5,7 @@
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::adapters::adb::{DeviceEntry, DeviceInfo, FileEntry};
+use crate::adapters::adb::{DeviceEntry, DeviceInfo, FileEntry, HostedBinary};
 use crate::core::error::{CoreError, CoreResult};
 use crate::services::device_service::{AdbEnvironment, DeviceChangedPayload, ForwardRule};
 
@@ -140,6 +140,47 @@ pub async fn adb_forward_remove(
         .device
         .forward_remove(&serial, local.as_deref())
         .await
+}
+
+// ===== 二进制托管（/data/local/tmp；全部 -s 绑定设备）=====
+
+/// 列出托管目录下的 ELF 文件（含执行权限）
+#[tauri::command]
+pub async fn device_binaries(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+) -> CoreResult<Vec<HostedBinary>> {
+    state.device.hosted_binaries(&serial).await
+}
+
+/// 赋予执行权限（chmod +x）
+#[tauri::command]
+pub async fn device_binary_chmod(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    name: String,
+) -> CoreResult<()> {
+    state.device.hosted_chmod(&serial, &name).await
+}
+
+/// 后台启动二进制，返回 pid
+#[tauri::command]
+pub async fn device_binary_run(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    name: String,
+) -> CoreResult<u32> {
+    state.device.hosted_run(&serial, &name).await
+}
+
+/// 终止托管进程（kill -9 <pid>）
+#[tauri::command]
+pub async fn device_binary_kill(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    pid: u32,
+) -> CoreResult<()> {
+    state.device.hosted_kill(&serial, pid).await
 }
 
 // ===== 长操作：返回 task_id =====
