@@ -159,7 +159,16 @@ pub async fn device_binary_su_check(
     state: tauri::State<'_, AppState>,
     serial: String,
 ) -> CoreResult<bool> {
-    state.device.hosted_su_check(&serial).await
+    state.device.su_available(&serial).await
+}
+
+/// 设备 Root 状态（设备信息卡横幅）：su -c id 可达 uid=0 即视为有 root
+#[tauri::command]
+pub async fn device_root_check(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+) -> CoreResult<bool> {
+    state.device.su_available(&serial).await
 }
 
 /// 赋予执行权限（chmod +x；root=true 走 su -c）

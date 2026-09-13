@@ -125,6 +125,7 @@ pub fn run() {
             commands::device::devices_watch_now,
             commands::device::device_info,
             commands::device::device_ip,
+            commands::device::device_root_check,
             commands::device::adb_forward_setup,
             commands::device::adb_forward_list,
             commands::device::adb_forward_remove,

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload } from "lucide-react";
+import { RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SubTabs } from "@/components/nav/SubTabs";
 import { TaskLaunchPanel } from "@/components/task/TaskLaunchPanel";
@@ -294,6 +294,14 @@ function DeviceFullCard({ serial, transport }: { serial: string; transport: stri
     enabled: !!serial,
     staleTime: 60_000,
   });
+  // Root 横幅：su -c id → uid=0 探测（独立查询；失败/无 root 视觉分级，醒目）
+  const { data: rooted, isError: rootProbeFailed } = useQuery({
+    queryKey: ["device", "root", serial],
+    queryFn: () => deviceApi.rootCheck(serial),
+    enabled: !!serial,
+    staleTime: 30_000,
+    retry: false,
+  });
 
   const rows: [string, string | undefined][] = [
     [t("devices.info.model"), data?.model],
@@ -307,6 +315,24 @@ function DeviceFullCard({ serial, transport }: { serial: string; transport: stri
       data?.ip ?? (data === undefined ? undefined : t("devices.info.ipUnavailable")),
     ],
   ];
+
+  const rootBanner = (() => {
+    if (rootProbeFailed || rooted === undefined) {
+      return {
+        cls: "bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/40",
+        label: t("devices.root.probing"),
+      };
+    }
+    return rooted
+      ? {
+          cls: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/50",
+          label: t("devices.root.has"),
+        }
+      : {
+          cls: "bg-red-500/15 text-red-600 dark:text-red-400 border-red-500/50",
+          label: t("devices.root.none"),
+        };
+  })();
 
   return (
     <div
@@ -324,6 +350,16 @@ function DeviceFullCard({ serial, transport }: { serial: string; transport: stri
         >
           {transport}
         </span>
+      </div>
+      <div
+        data-testid={`root-banner-${serial}`}
+        className={cn(
+          "mt-3 flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-bold tracking-wide",
+          rootBanner.cls,
+        )}
+      >
+        <ShieldCheck className="h-4 w-4 shrink-0" />
+        ROOT · {rootBanner.label}
       </div>
       <dl className="mt-3 grid grid-cols-[110px_1fr] gap-y-2 text-xs sm:grid-cols-[110px_1fr_110px_1fr]">
         {rows.map(([k, v]) => (

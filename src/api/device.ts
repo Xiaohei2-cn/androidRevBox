@@ -93,6 +93,10 @@ export const deviceApi = {
   ip(serial: string): Promise<string | null> {
     return invokeCommand<string | null>("device_ip", { serial });
   },
+  /** 设备 Root 状态（su -c id → uid=0；设备信息卡横幅用） */
+  rootCheck(serial: string): Promise<boolean> {
+    return invokeCommand<boolean>("device_root_check", { serial });
+  },
   /** 建立端口转发（adb -s <serial> forward <local> <remote>） */
   forwardSetup(serial: string, local: string, remote: string): Promise<ForwardRule> {
     return invokeCommand<ForwardRule>("adb_forward_setup", { serial, local, remote });

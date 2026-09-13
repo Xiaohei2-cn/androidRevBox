@@ -594,8 +594,9 @@ impl DeviceService {
         Ok(adb::hosted_binaries(&ls_out.stdout, &file_out.stdout))
     }
 
-    /// 探测 su 是否可用（Root 开关前置检查）：`su -c id` 输出含 uid=0。
-    pub async fn hosted_su_check(&self, serial: &str) -> CoreResult<bool> {
+    /// 探测设备 su 是否可用（`su -c id` 输出含 uid=0）。
+    /// 设备信息卡 Root 横幅与二进制托管 Root 开关共用此链路。
+    pub async fn su_available(&self, serial: &str) -> CoreResult<bool> {
         let cmd = adb::su_wrap("id");
         let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
         let out = self.run_adb(&args).await?;
