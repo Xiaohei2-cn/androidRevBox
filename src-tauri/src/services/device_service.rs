@@ -594,9 +594,19 @@ impl DeviceService {
         Ok(adb::hosted_binaries(&ls_out.stdout, &file_out.stdout))
     }
 
+    /// 探测 su 是否可用（Root 开关前置检查）：`su -c id` 输出含 uid=0。
+    pub async fn hosted_su_check(&self, serial: &str) -> CoreResult<bool> {
+        let cmd = adb::su_wrap("id");
+        let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
+        let out = self.run_adb(&args).await?;
+        Ok(out.exit_code == Some(0) && adb::is_root_probe_ok(&out.stdout))
+    }
+
     /// 赋予执行权限：`chmod +x <dir>/<name>`（name 过安全白名单校验，防注入）。
-    pub async fn hosted_chmod(&self, serial: &str, name: &str) -> CoreResult<()> {
+    /// root=true 时整体走 su -c（root 属主的文件 shell 用户 chmod 会被拒）。
+    pub async fn hosted_chmod(&self, serial: &str, name: &str, root: bool) -> CoreResult<()> {
         let cmd = Self::hosted_shell(name, "chmod +x")?;
+        let cmd = if root { adb::su_wrap(&cmd) } else { cmd };
         let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
         let out = self.run_adb(&args).await?;
         if out.exit_code != Some(0) {
@@ -608,22 +618,23 @@ impl DeviceService {
         Ok(())
     }
 
-    /// 后台启动并返回 pid：`cd <dir> && nohup ./<name> >log 2>&1 & echo $!`。
-    /// 在托管目录内以 ./name 形式执行（依赖相对路径加载库的二进制更稳）。
-    /// stdout/stderr 落盘到 `.<name>.run.log`（隐藏文件，不污染 file 列表）：
-    /// 秒退的真因（CANNOT LINK EXECUTABLE / exec format error 等）多在 stderr，
-    /// 复查失败时读日志尾部给出真实死因，而非 /dev/null 吞掉。
-    pub async fn hosted_run(&self, serial: &str, name: &str) -> CoreResult<u32> {
+    /// 后台启动并返回 pid。⚠️ 用 `;` 而非 `&&`：`&&` 的优先级低于 `&`，
+    /// 会把整个 `cd && nohup` 复合式后台化，`$!` 拿到的是子 shell pid 而非
+    /// 二进制 pid（kill/复查就全错了）；`;` 确保只有 nohup 一段进后台，
+    /// nohup exec 后 pid 即二进制 pid。
+    /// root=true 时整段经 su -c '…' 单引号包裹：外层 shell 不动 `&`/`$!`/重定向，
+    /// 由 root 内层 shell 解释（否则 su 只收到 `cd`）。
+    /// stdout/stderr 落盘 `.<name>.run.log`（隐藏文件不污染 file 列表）：
+    /// 秒退真因（CANNOT LINK / exec format / Permission denied）多在 stderr，
+    /// 复查失败时读日志尾部给出真实死因。
+    pub async fn hosted_run(&self, serial: &str, name: &str, root: bool) -> CoreResult<u32> {
         if !adb::is_safe_hosted_name(name) {
             return Err(CoreError::Internal(format!(
                 "文件名非法（仅允许字母数字与 _.-，且不以 . 开头）: {name}"
             )));
         }
         let log = adb::hosted_run_log(name);
-        let run_cmd = format!(
-            "cd {} && nohup ./{name} >{log} 2>&1 & echo $!",
-            adb::HOSTED_DIR
-        );
+        let run_cmd = adb::hosted_run_cmd(name, &log, root);
         let args = adb::build_args(Some(serial), &adb::cmd_shell(&run_cmd));
         let out = self.run_adb(&args).await?;
         if out.exit_code != Some(0) {
@@ -632,22 +643,33 @@ impl DeviceService {
                 out.stderr.trim()
             )));
         }
-        let pid = adb::parse_run_pid(&out.stdout)
-            .ok_or_else(|| CoreError::Internal(format!("未能解析启动 pid，输出: {}", out.stdout.trim())))?;
-        // 存活复查（nohup 秒退场景）
-        let check_cmd = format!("sleep 0.3; kill -0 {pid} 2>/dev/null && echo alive || echo dead");
-        let check_args = adb::build_args(Some(serial), &adb::cmd_shell(&check_cmd));
-        let check = self.run_adb(&check_args).await?;
+        let pid = adb::parse_run_pid(&out.stdout).ok_or_else(|| {
+            CoreError::Internal(format!(
+                "未能解析启动 pid，输出: {}{}",
+                out.stdout.trim(),
+                if out.stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("（stderr: {}）", out.stderr.trim())
+                }
+            ))
+        })?;
+        // 存活复查（nohup 秒退场景）。root 启动的进程 shell 用户 kill -0 会
+        // 得 EPERM 误判死亡，复查必须与启动同一身份。
+        let check = {
+            let c = format!("sleep 0.3; kill -0 {pid} 2>/dev/null && echo alive || echo dead");
+            let cmd = if root { adb::su_wrap(&c) } else { c };
+            let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
+            self.run_adb(&args).await?
+        };
         if check.stdout.trim() != "alive" {
-            // 读启动日志尾部（head -c 防超大）作为真实死因
             let cause = self
-                .read_hosted_log(serial, &log)
+                .read_hosted_log(serial, &log, root)
                 .await
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
-            let detail = adb::run_log_diagnostics(&cause).unwrap_or_else(|| {
-                format!("（无输出可参考；完整日志见 {log}）")
-            });
+            let detail = adb::run_log_diagnostics(&cause)
+                .unwrap_or_else(|| format!("（无输出可参考；完整日志见 {log}）"));
             return Err(CoreError::Internal(format!(
                 "{name} 启动后立即退出：{detail}"
             )));
@@ -655,17 +677,24 @@ impl DeviceService {
         Ok(pid)
     }
 
-    /// 读托管启动日志尾部（tail 截 2KB 防日志爆炸）。
-    async fn read_hosted_log(&self, serial: &str, log_path: &str) -> CoreResult<String> {
-        let cmd = format!("tail -c 2048 {log_path} 2>/dev/null");
+    /// 读托管启动日志尾部（tail 截 2KB 防日志爆炸；root 启动的日志同身份读）。
+    async fn read_hosted_log(
+        &self,
+        serial: &str,
+        log_path: &str,
+        root: bool,
+    ) -> CoreResult<String> {
+        let c = format!("tail -c 2048 {log_path} 2>/dev/null");
+        let cmd = if root { adb::su_wrap(&c) } else { c };
         let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
         let out = self.run_adb(&args).await?;
         Ok(out.stdout)
     }
 
-    /// 终止托管进程：`kill -9 <pid>`（pid 仅接受纯数字）。
-    pub async fn hosted_kill(&self, serial: &str, pid: u32) -> CoreResult<()> {
-        let cmd = format!("kill -9 {pid}");
+    /// 终止托管进程：`kill -9 <pid>`（pid 仅接受纯数字；root 进程需 su 终止）。
+    pub async fn hosted_kill(&self, serial: &str, pid: u32, root: bool) -> CoreResult<()> {
+        let c = format!("kill -9 {pid}");
+        let cmd = if root { adb::su_wrap(&c) } else { c };
         let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
         let out = self.run_adb(&args).await?;
         if out.exit_code != Some(0) {

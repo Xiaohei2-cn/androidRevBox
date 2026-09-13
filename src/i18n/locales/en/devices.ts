@@ -61,5 +61,9 @@ export default {
   "adb.binary.starting": "Starting…",
   "adb.binary.kill": "Kill",
   "adb.binary.killed": "Killed pid {pid}",
+  "adb.binary.rootLabel": "Run as root",
+  "adb.binary.rootHint": "When checked, chmod/run/kill all go through su -c; su availability is probed before enabling. Each hosted row locks its identity at run time; kill always uses the same context.",
+  "adb.binary.suOk": "su available: switched to root execution",
+  "adb.binary.suFail": "su unavailable (device not rooted or access denied), staying non-root",
   "adb.binary.removeRow": "Remove from hosted list",
 } as const;

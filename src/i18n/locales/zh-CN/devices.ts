@@ -61,5 +61,9 @@ export default {
   "adb.binary.starting": "启动中…",
   "adb.binary.kill": "终止",
   "adb.binary.killed": "已终止 pid {pid}",
+  "adb.binary.rootLabel": "Root 执行",
+  "adb.binary.rootHint": "勾选后 chmod/执行/终止整链路经 su -c；开启前先探测 su 是否可用。已托管行的身份在执行瞬间锁定，kill 始终同链路。",
+  "adb.binary.suOk": "su 可用：已切换 Root 执行",
+  "adb.binary.suFail": "su 不可用（未 root 或拒绝授权），保持普通执行",
   "adb.binary.removeRow": "从托管区移除",
 } as const;

@@ -370,6 +370,35 @@ pub fn hosted_run_log(name: &str) -> String {
     format!("{HOSTED_DIR}/.{name}.run.log")
 }
 
+/// 以 root 执行：`su -c '<cmd>'`（Magisk/APatch/KSU 通用形式）。
+/// 单引号包裹是必须的：adb shell 传输会把字符串交给设备端外层 shell
+/// 二次分词，不引起来 `su -c cd /x && nohup y &` 的 `&&`/`&`/重定向会被
+/// 外层解释，su 实际只收到 `cd`。调用方命令模板均不含单引号
+/// （文件名过 is_safe_hosted_name 白名单，路径/日志名固定），包裹安全。
+pub fn su_wrap(cmd: &str) -> String {
+    debug_assert!(!cmd.contains('\''), "su_wrap 命令含单引号会破坏包裹");
+    format!("su -c '{cmd}'")
+}
+
+/// 判定 `su -c id` 探测输出是否代表拿到了 root。
+pub fn is_root_probe_ok(stdout: &str) -> bool {
+    stdout.contains("uid=0")
+}
+
+/// 托管后台启动命令模板：`cd <dir>; nohup ./<name> >log 2>&1 & echo $!`。
+/// ⚠️ 用 `;` 而非 `&&`：`&&` 优先级低于 `&`，会把整个 `cd && nohup`
+/// 复合式后台化，`$!` 拿到子 shell pid 而非二进制 pid。
+/// root=true 时整段 su -c 单引号包裹（外层 shell 不动 &/$!/重定向）。
+pub fn hosted_run_cmd(name: &str, log: &str, root: bool) -> String {
+    debug_assert!(is_safe_hosted_name(name));
+    let inner = format!("cd {HOSTED_DIR}; nohup ./{name} >{log} 2>&1 & echo $!");
+    if root {
+        su_wrap(&inner)
+    } else {
+        inner
+    }
+}
+
 /// adb 版本信息（`adb version` 解析结果）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -894,6 +923,38 @@ mod tests {
     #[test]
     fn hosted_run_log_hidden_in_dir() {
         assert_eq!(hosted_run_log("test"), "/data/local/tmp/.test.run.log");
+    }
+
+    #[test]
+    fn su_wrap_quotes_whole_command() {
+        // 关键：& $! > 2>&1 等必须整体进单引号，交给 root 内层 shell 解释
+        let w = su_wrap("cd /data/local/tmp; nohup ./x >l 2>&1 & echo $!");
+        assert!(w.starts_with("su -c 'cd /data/local/tmp;"));
+        assert!(w.ends_with("echo $!'"));
+        assert_eq!(w.matches('\'').count(), 2);
+    }
+
+    #[test]
+    fn su_probe_output_recognized() {
+        assert!(is_root_probe_ok("uid=0(root) gid=0(root) groups=0 root"));
+        assert!(is_root_probe_ok("uid=0"));
+        assert!(!is_root_probe_ok("su: uid=2000(shell)"));
+        assert!(!is_root_probe_ok("su: inaccessible or not found"));
+    }
+
+    #[test]
+    fn hosted_run_cmd_uses_semicolon_not_andand() {
+        // 回归：&& 优先级低于 &，$! 会拿到子 shell 的 pid 而非二进制的
+        let log = hosted_run_log("xhmfd1656-n");
+        let cmd = hosted_run_cmd("xhmfd1656-n", &log, false);
+        assert!(cmd.starts_with("cd /data/local/tmp; nohup ./xhmfd1656-n >"));
+        assert!(cmd.ends_with("& echo $!"));
+        assert!(!cmd.contains("&& nohup"), "禁用 && 连接：{cmd}");
+        // root：整段单引号包裹（内层 & $! > 归 root shell 解释）
+        let root_cmd = hosted_run_cmd("xhmfd1656-n", &log, true);
+        assert!(root_cmd.starts_with("su -c 'cd /data/local/tmp;"));
+        assert!(root_cmd.ends_with("echo $!'"));
+        assert_eq!(root_cmd.matches('\'').count(), 2);
     }
 
     #[test]

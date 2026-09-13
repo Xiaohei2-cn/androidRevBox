@@ -59,5 +59,9 @@ export default {
   "adb.binary.starting": "起動中…",
   "adb.binary.kill": "終了",
   "adb.binary.killed": "pid {pid} を終了しました",
+  "adb.binary.rootLabel": "Root で実行",
+  "adb.binary.rootHint": "チェックすると chmod/実行/終了がすべて su -c 経由になります。有効化前に su の利用可否を調査します。各ホスト行は実行瞬間の身份で固定され、kill は常に同じコンテキストです。",
+  "adb.binary.suOk": "su 利用可：Root 実行に切替",
+  "adb.binary.suFail": "su 使用不可（未 root または拒否）、通常実行のまま",
   "adb.binary.removeRow": "ホスト一覧から削除",
 } as const;

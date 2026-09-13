@@ -101,17 +101,21 @@ export const deviceApi = {
   binaries(serial: string): Promise<HostedBinary[]> {
     return invokeCommand<HostedBinary[]>("device_binaries", { serial });
   },
-  /** 赋予执行权限（chmod +x） */
-  binaryChmod(serial: string, name: string): Promise<void> {
-    return invokeCommand<void>("device_binary_chmod", { serial, name });
+  /** 探测 su 可用性（Root 开关前置检查） */
+  binarySuCheck(serial: string): Promise<boolean> {
+    return invokeCommand<boolean>("device_binary_su_check", { serial });
   },
-  /** 后台启动二进制，返回 pid */
-  binaryRun(serial: string, name: string): Promise<number> {
-    return invokeCommand<number>("device_binary_run", { serial, name });
+  /** 赋予执行权限（chmod +x；root=true 走 su -c） */
+  binaryChmod(serial: string, name: string, root = false): Promise<void> {
+    return invokeCommand<void>("device_binary_chmod", { serial, name, root });
   },
-  /** 终止托管进程（kill -9 pid） */
-  binaryKill(serial: string, pid: number): Promise<void> {
-    return invokeCommand<void>("device_binary_kill", { serial, pid });
+  /** 后台启动二进制，返回 pid（root=true 走 su -c） */
+  binaryRun(serial: string, name: string, root = false): Promise<number> {
+    return invokeCommand<number>("device_binary_run", { serial, name, root });
+  },
+  /** 终止托管进程（kill -9 pid；root 启动的进程需 root=true） */
+  binaryKill(serial: string, pid: number, root = false): Promise<void> {
+    return invokeCommand<void>("device_binary_kill", { serial, pid, root });
   },
   /** 以下长操作返回 task_id，输出走 task:// 事件流 */
   shell(serial: string, command: string): Promise<string> {

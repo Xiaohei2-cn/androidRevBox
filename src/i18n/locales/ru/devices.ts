@@ -59,5 +59,9 @@ export default {
   "adb.binary.starting": "Запуск…",
   "adb.binary.kill": "Остановить",
   "adb.binary.killed": "pid {pid} остановлен",
+  "adb.binary.rootLabel": "От root",
+  "adb.binary.rootHint": "chmod/запуск/останов идут через su -c; доступность su проверяется перед включением. Строка фиксирует контекст в момент запуска, останов всегда тем же путём.",
+  "adb.binary.suOk": "su доступен: включено выполнение от root",
+  "adb.binary.suFail": "su недоступен (нет root или отказ), остаемся без root",
   "adb.binary.removeRow": "Убрать из списка",
 } as const;

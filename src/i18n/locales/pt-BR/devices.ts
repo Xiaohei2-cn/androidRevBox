@@ -59,5 +59,9 @@ export default {
   "adb.binary.starting": "Iniciando…",
   "adb.binary.kill": "Encerrar",
   "adb.binary.killed": "pid {pid} encerrado",
+  "adb.binary.rootLabel": "Executar como root",
+  "adb.binary.rootHint": "Marcado, chmod/exec/encerramento passam por su -c; a disponibilidade do su é sondada antes de ativar. Cada linha trava sua identidade ao executar; o encerramento usa sempre o mesmo contexto.",
+  "adb.binary.suOk": "su disponível: alternado para execução root",
+  "adb.binary.suFail": "su indisponível (sem root ou acesso negado), mantendo sem root",
   "adb.binary.removeRow": "Remover da lista hospedada",
 } as const;

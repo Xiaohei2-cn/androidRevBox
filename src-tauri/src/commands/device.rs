@@ -153,34 +153,55 @@ pub async fn device_binaries(
     state.device.hosted_binaries(&serial).await
 }
 
-/// 赋予执行权限（chmod +x）
+/// 探测 su 可用性（Root 开关前置检查）
+#[tauri::command]
+pub async fn device_binary_su_check(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+) -> CoreResult<bool> {
+    state.device.hosted_su_check(&serial).await
+}
+
+/// 赋予执行权限（chmod +x；root=true 走 su -c）
 #[tauri::command]
 pub async fn device_binary_chmod(
     state: tauri::State<'_, AppState>,
     serial: String,
     name: String,
+    root: Option<bool>,
 ) -> CoreResult<()> {
-    state.device.hosted_chmod(&serial, &name).await
+    state
+        .device
+        .hosted_chmod(&serial, &name, root.unwrap_or(false))
+        .await
 }
 
-/// 后台启动二进制，返回 pid
+/// 后台启动二进制，返回 pid（root=true 走 su -c）
 #[tauri::command]
 pub async fn device_binary_run(
     state: tauri::State<'_, AppState>,
     serial: String,
     name: String,
+    root: Option<bool>,
 ) -> CoreResult<u32> {
-    state.device.hosted_run(&serial, &name).await
+    state
+        .device
+        .hosted_run(&serial, &name, root.unwrap_or(false))
+        .await
 }
 
-/// 终止托管进程（kill -9 <pid>）
+/// 终止托管进程（kill -9 <pid>；root 启动的进程需 root=true 终止）
 #[tauri::command]
 pub async fn device_binary_kill(
     state: tauri::State<'_, AppState>,
     serial: String,
     pid: u32,
+    root: Option<bool>,
 ) -> CoreResult<()> {
-    state.device.hosted_kill(&serial, pid).await
+    state
+        .device
+        .hosted_kill(&serial, pid, root.unwrap_or(false))
+        .await
 }
 
 // ===== 长操作：返回 task_id =====

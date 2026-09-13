@@ -12,6 +12,8 @@ import { cn } from "@/lib/utils";
  *   红色 = 无执行权限（「赋予权限」按钮走 chmod +x）；
  * - 下区：托管清单——「执行」后台启动（cd 目录 + nohup ./name）并回显 pid，
  *   有 pid 时「终止」按钮走 kill -9；可移除托管行。
+ * - Root 开关：勾选时先 `su -c id` 探测，可用才开——chmod/启动/存活复查/
+ *   kill/日志读取整链路走 su -c（root 进程 shell 用户连 kill -0 都会 EPERM）。
  * 所有 adb 调用后端 -s 绑定设备。
  */
 
@@ -20,6 +22,8 @@ interface HostedRow {
   pid: number | null;
   running: boolean;
   error: string | null;
+  /** 启动时所用的 root 上下文：kill/后续操作必须同身份 */
+  root: boolean;
 }
 
 export function BinaryHosting() {
@@ -27,6 +31,8 @@ export function BinaryHosting() {
   const [deviceSerial, setDeviceSerial] = useState<string | null>(null);
   const [hosted, setHosted] = useState<HostedRow[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  const [root, setRoot] = useState(false);
+  const [probing, setProbing] = useState(false);
 
   const { data: env } = useQuery({
     queryKey: ["adb", "environment"],
@@ -60,10 +66,11 @@ export function BinaryHosting() {
     retry: false,
   });
 
-  // 设备切换：托管区清空（pid 属于旧设备）
+  // 设备切换：托管区清空（pid 属于旧设备）；Root 探测状态失效
   useEffect(() => {
     setHosted([]);
     setNotice(null);
+    setRoot(false);
   }, [deviceSerial]);
 
   const patchRow = (name: string, p: Partial<HostedRow>) =>
@@ -71,13 +78,40 @@ export function BinaryHosting() {
 
   const addHosted = (b: HostedBinary) => {
     if (!b.hasExec) return; // 红色不可双击托管（先 chmod）
-    setHosted((hs) => (hs.some((h) => h.name === b.name) ? hs : [...hs, { name: b.name, pid: null, running: false, error: null }]));
+    setHosted((hs) =>
+      hs.some((h) => h.name === b.name)
+        ? hs
+        : [...hs, { name: b.name, pid: null, running: false, error: null, root: false }],
+    );
+  };
+
+  /** 勾选 Root：先 su -c id 探测；不可用则不开启并提示 */
+  const toggleRoot = async (checked: boolean) => {
+    if (!checked) {
+      setRoot(false);
+      return;
+    }
+    if (!deviceSerial) return;
+    setProbing(true);
+    try {
+      const ok = await deviceApi.binarySuCheck(deviceSerial);
+      if (ok) {
+        setRoot(true);
+        setNotice(t("adb.binary.suOk"));
+      } else {
+        setNotice(t("adb.binary.suFail"));
+      }
+    } catch (e) {
+      setNotice(String((e as Error)?.message ?? e));
+    } finally {
+      setProbing(false);
+    }
   };
 
   const chmod = async (b: HostedBinary) => {
     if (!deviceSerial) return;
     try {
-      await deviceApi.binaryChmod(deviceSerial, b.name);
+      await deviceApi.binaryChmod(deviceSerial, b.name, root);
       setNotice(t("adb.binary.chmodOk", { name: b.name }));
       void refetch();
     } catch (e) {
@@ -87,9 +121,11 @@ export function BinaryHosting() {
 
   const run = async (row: HostedRow) => {
     if (!deviceSerial || row.running) return;
-    patchRow(row.name, { running: true, error: null });
+    // 启动身份 = 点击瞬间的 Root 开关；写回本行，kill/复查永远同链路
+    const asRoot = root;
+    patchRow(row.name, { running: true, error: null, root: asRoot });
     try {
-      const pid = await deviceApi.binaryRun(deviceSerial, row.name);
+      const pid = await deviceApi.binaryRun(deviceSerial, row.name, asRoot);
       patchRow(row.name, { pid, running: false });
     } catch (e) {
       patchRow(row.name, { running: false, error: String((e as Error)?.message ?? e) });
@@ -100,8 +136,12 @@ export function BinaryHosting() {
     if (!deviceSerial || row.pid === null) return;
     patchRow(row.name, { running: true, error: null });
     try {
-      await deviceApi.binaryKill(deviceSerial, row.pid);
-      patchRow(row.name, { pid: null, running: false, error: t("adb.binary.killed", { pid: row.pid }) });
+      await deviceApi.binaryKill(deviceSerial, row.pid, row.root);
+      patchRow(row.name, {
+        pid: null,
+        running: false,
+        error: t("adb.binary.killed", { pid: row.pid }),
+      });
     } catch (e) {
       patchRow(row.name, { running: false, error: String((e as Error)?.message ?? e) });
     }
@@ -127,6 +167,9 @@ export function BinaryHosting() {
         onSelect={setDeviceSerial}
         onRefresh={() => void refetch()}
         refreshing={isFetching}
+        root={root}
+        probing={probing}
+        onRootChange={(c) => void toggleRoot(c)}
       />
 
       {/* 上区：ELF 文件列表 */}
@@ -211,6 +254,7 @@ export function BinaryHosting() {
                     {row.pid !== null ? (
                       <span className="shrink-0 rounded bg-emerald-500/10 px-1.5 py-0.5 font-mono text-emerald-500" data-testid={`pid-${row.name}`}>
                         pid {row.pid}
+                        {row.root ? " · root" : ""}
                       </span>
                     ) : (
                       <span className="shrink-0 text-muted-foreground">{row.error ?? t("adb.binary.idle")}</span>
@@ -271,12 +315,18 @@ function DeviceBar({
   onSelect,
   onRefresh,
   refreshing,
+  root,
+  probing,
+  onRootChange,
 }: {
   online: DeviceEntry[];
   selected: string | null;
   onSelect: (s: string) => void;
   onRefresh: () => void;
   refreshing: boolean;
+  root: boolean;
+  probing: boolean;
+  onRootChange: (checked: boolean) => void;
 }) {
   const { t } = useI18n();
   return (
@@ -301,10 +351,26 @@ function DeviceBar({
           </select>
         </label>
       )}
+      <label
+        className={cn(
+          "ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground",
+          probing && "opacity-50",
+        )}
+        title={t("adb.binary.rootHint")}
+      >
+        <input
+          type="checkbox"
+          aria-label={t("adb.binary.rootLabel")}
+          disabled={probing || !selected}
+          checked={root}
+          onChange={(e) => onRootChange(e.target.checked)}
+        />
+        Root (su)
+      </label>
       <Button
         size="sm"
         variant="outline"
-        className="ml-auto h-7 gap-1 px-2"
+        className="h-7 gap-1 px-2"
         disabled={refreshing || !selected}
         onClick={onRefresh}
       >

@@ -129,6 +129,7 @@ pub fn run() {
             commands::device::adb_forward_list,
             commands::device::adb_forward_remove,
             commands::device::device_binaries,
+            commands::device::device_binary_su_check,
             commands::device::device_binary_chmod,
             commands::device::device_binary_run,
             commands::device::device_binary_kill,
