@@ -608,18 +608,20 @@ impl DeviceService {
         Ok(())
     }
 
-    /// 后台启动并返回 pid：`cd <dir> && nohup ./<name> >/dev/null 2>&1 & echo $!`。
+    /// 后台启动并返回 pid：`cd <dir> && nohup ./<name> >log 2>&1 & echo $!`。
     /// 在托管目录内以 ./name 形式执行（依赖相对路径加载库的二进制更稳）。
-    /// 启动后复查存活（短暂 sleep + kill -0）：秒退通常是缺依赖库/权限竞态，
-    /// 复查失败时返回可读错误而非假 pid。
+    /// stdout/stderr 落盘到 `.<name>.run.log`（隐藏文件，不污染 file 列表）：
+    /// 秒退的真因（CANNOT LINK EXECUTABLE / exec format error 等）多在 stderr，
+    /// 复查失败时读日志尾部给出真实死因，而非 /dev/null 吞掉。
     pub async fn hosted_run(&self, serial: &str, name: &str) -> CoreResult<u32> {
         if !adb::is_safe_hosted_name(name) {
             return Err(CoreError::Internal(format!(
                 "文件名非法（仅允许字母数字与 _.-，且不以 . 开头）: {name}"
             )));
         }
+        let log = adb::hosted_run_log(name);
         let run_cmd = format!(
-            "cd {} && nohup ./{name} >/dev/null 2>&1 & echo $!",
+            "cd {} && nohup ./{name} >{log} 2>&1 & echo $!",
             adb::HOSTED_DIR
         );
         let args = adb::build_args(Some(serial), &adb::cmd_shell(&run_cmd));
@@ -637,11 +639,28 @@ impl DeviceService {
         let check_args = adb::build_args(Some(serial), &adb::cmd_shell(&check_cmd));
         let check = self.run_adb(&check_args).await?;
         if check.stdout.trim() != "alive" {
+            // 读启动日志尾部（head -c 防超大）作为真实死因
+            let cause = self
+                .read_hosted_log(serial, &log)
+                .await
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let detail = adb::run_log_diagnostics(&cause).unwrap_or_else(|| {
+                format!("（无输出可参考；完整日志见 {log}）")
+            });
             return Err(CoreError::Internal(format!(
-                "{name} 启动后立即退出（可能缺少依赖库或权限不足），pid={pid}"
+                "{name} 启动后立即退出：{detail}"
             )));
         }
         Ok(pid)
+    }
+
+    /// 读托管启动日志尾部（tail 截 2KB 防日志爆炸）。
+    async fn read_hosted_log(&self, serial: &str, log_path: &str) -> CoreResult<String> {
+        let cmd = format!("tail -c 2048 {log_path} 2>/dev/null");
+        let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
+        let out = self.run_adb(&args).await?;
+        Ok(out.stdout)
     }
 
     /// 终止托管进程：`kill -9 <pid>`（pid 仅接受纯数字）。

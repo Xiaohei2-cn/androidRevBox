@@ -341,6 +341,35 @@ pub fn parse_run_pid(stdout: &str) -> Option<u32> {
         .and_then(|l| l.parse::<u32>().ok())
 }
 
+/// 托管启动日志尾部 → 单行诊断（最后 3 个非空行，` | ` 连接，300 字符截断）。
+/// 空日志返回 None（此时上层给出通用提示）。
+pub fn run_log_diagnostics(log_tail: &str) -> Option<String> {
+    let lines: Vec<&str> = log_tail
+        .lines()
+        .map(|l| l.trim_end_matches('\r').trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut s = lines[lines.len().saturating_sub(3)..].join(" | ");
+    if s.chars().count() > 300 {
+        let cut = s
+            .char_indices()
+            .nth(300)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        s = s[..cut].to_string() + "…";
+    }
+    Some(s)
+}
+
+/// 托管运行日志路径（`<dir>/.<name>.run.log`，点开头：`file dir/*` 的
+/// shell 通配不匹配隐藏文件，不会污染 ELF 列表）。
+pub fn hosted_run_log(name: &str) -> String {
+    format!("{HOSTED_DIR}/.{name}.run.log")
+}
+
 /// adb 版本信息（`adb version` 解析结果）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -842,6 +871,29 @@ mod tests {
         assert_eq!(parse_run_pid("nohup: redirecting stderr\n99\n"), Some(99));
         assert_eq!(parse_run_pid("not a pid"), None);
         assert_eq!(parse_run_pid(""), None);
+    }
+
+    #[test]
+    fn run_log_diagnostics_extracts_cause() {
+        // 缺依赖库的典型 stderr（真机实况形态）
+        let out = "CANNOT LINK EXECUTABLE \"./xhmfd1656-n\": library \"liblog.so\" not found: needed by main executable\n";
+        let d = run_log_diagnostics(out).expect("有日志应给出死因");
+        assert!(d.contains("CANNOT LINK EXECUTABLE"), "{d}");
+        // 多行取最后三行、' | ' 连接
+        let d = run_log_diagnostics("l1\nl2\nl3\nl4\n").unwrap();
+        assert_eq!(d, "l2 | l3 | l4");
+        // 空日志（进程静默自退）
+        assert!(run_log_diagnostics("  \n \n").is_none());
+        // 300 字符截断
+        let long = "x".repeat(500);
+        let d = run_log_diagnostics(&long).unwrap();
+        assert!(d.chars().count() <= 301, "{}", d.chars().count());
+        assert!(d.ends_with('…'));
+    }
+
+    #[test]
+    fn hosted_run_log_hidden_in_dir() {
+        assert_eq!(hosted_run_log("test"), "/data/local/tmp/.test.run.log");
     }
 
     #[test]
