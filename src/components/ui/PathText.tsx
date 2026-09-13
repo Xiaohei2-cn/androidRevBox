@@ -42,7 +42,7 @@ export function PathText({
       title={value}
       onDoubleClick={selectAll}
       className={cn(
-        "path-selectable inline-block max-w-full truncate align-bottom",
+        "path-selectable inline-block max-w-full break-all align-bottom",
         className,
       )}
     >

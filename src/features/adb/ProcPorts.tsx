@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowRightLeft, OctagonX, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { deviceApi, type PortHolder } from "@/api/device";
-import { CopyChip, DeviceBar } from "@/features/adb/BinaryHosting";
+import { DeviceBar, InfoChip } from "@/features/adb/BinaryHosting";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 
@@ -79,17 +79,6 @@ export function ProcPorts() {
     return () => window.clearTimeout(timer);
   }, [armedPid]);
 
-  const copy = useCallback(
-    async (value: string) => {
-      try {
-        await navigator.clipboard.writeText(value);
-        setNotice(t("adb.binary.copied", { value }));
-      } catch {
-        setNotice(t("adb.binary.copyFail"));
-      }
-    },
-    [t],
-  );
 
   const toggleRoot = async (checked: boolean) => {
     if (!checked) {
@@ -247,14 +236,12 @@ export function ProcPorts() {
               <ul className="divide-y">
                 {portHit.holders.map((h) => (
                   <li key={h.pid} className="flex items-center gap-2 py-1.5" data-testid={`proc-holder-${h.pid}`}>
-                    <CopyChip
-                      value={String(h.pid)}
+                    <InfoChip
                       label={`pid ${h.pid}`}
                       title={t("adb.binary.copyPid")}
                       testid={`proc-pid-${h.pid}`}
-                      onCopy={(v) => void copy(v)}
                     />
-                    <span className="min-w-0 flex-1 truncate font-mono">{h.name}</span>
+                    <span className="path-selectable min-w-0 flex-1 break-all font-mono">{h.name}</span>
                     <Button
                       size="sm"
                       variant={armedPid === h.pid ? "destructive" : "outline"}
@@ -311,13 +298,11 @@ export function ProcPorts() {
                 {pidHit.ports.map((p) => {
                   const text = `${p.address}:${p.port}`;
                   return (
-                    <CopyChip
+                    <InfoChip
                       key={`${p.family}-${text}`}
-                      value={text}
                       label={text}
                       title={t("adb.binary.copyPort", { family: p.family })}
                       testid={`proc-port-${p.port}`}
-                      onCopy={(v) => void copy(v)}
                     />
                   );
                 })}

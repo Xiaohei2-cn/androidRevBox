@@ -199,8 +199,8 @@ function DeviceListView({
               )}
             />
             <div className="min-w-0 flex-1">
-              <p className="truncate font-medium">{d.model || "未知型号"}</p>
-              <p className="truncate font-mono text-muted-foreground">{d.serial}</p>
+              <p className="break-all font-medium">{d.model || "未知型号"}</p>
+              <p className="break-all font-mono text-muted-foreground">{d.serial}</p>
             </div>
             <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
               {d.transport}
@@ -448,7 +448,7 @@ function ForegroundAppSection({ serial }: { serial: string }) {
                   <PathText value={p.path} className="shrink-0 text-foreground" />
                   <span
                     className={cn(
-                      "min-w-0 flex-1 truncate",
+                      "min-w-0 flex-1 break-all",
                       p.readable ? "text-muted-foreground" : "text-amber-500",
                     )}
                     title={p.summary ?? undefined}
@@ -552,10 +552,10 @@ function FilesView({ serial }: { serial: string | null }) {
                       setPath(joinRemote(path, f.name))
                     }
                   >
-                    <span className="truncate font-medium">{f.name}/</span>
+                    <span className="break-all font-medium">{f.name}/</span>
                   </button>
                 ) : (
-                  <span className="min-w-0 flex-1 truncate">{f.name}</span>
+                  <span className="min-w-0 flex-1 break-all">{f.name}</span>
                 )}
                 {f.symlink && <span className="text-muted-foreground">→ {f.symlink}</span>}
                 <span className="w-16 shrink-0 text-right tabular-nums text-muted-foreground">
@@ -627,7 +627,7 @@ function AppsView({ serial }: { serial: string | null }) {
                 type="button"
                 onClick={() => setSelectedPkg(pkg)}
                 className={cn(
-                  "block w-full truncate px-3 py-1.5 text-left hover:bg-accent",
+                  "block w-full break-all px-3 py-1.5 text-left hover:bg-accent",
                   pkg === selectedPkg && "bg-accent font-medium",
                 )}
               >

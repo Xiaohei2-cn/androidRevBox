@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Check, Copy, Play, RefreshCw, ShieldCheck, Square, Trash2 } from "lucide-react";
+import { Play, RefreshCw, ShieldCheck, Square, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { deviceApi, type DeviceEntry, type HostedBinary, type ListenPort } from "@/api/device";
 import { useI18n } from "@/i18n";
@@ -100,18 +100,6 @@ export function BinaryHosting() {
     );
   };
 
-  const copy = useCallback(
-    async (value: string) => {
-      try {
-        await navigator.clipboard.writeText(value);
-        setNotice(t("adb.binary.copied", { value }));
-      } catch {
-        setNotice(t("adb.binary.copyFail"));
-      }
-    },
-    [t],
-  );
-
   /** 拉取某进程 LISTEN 端口（执行后自动调用；也供手动刷新） */
   const loadPorts = useCallback(
     async (name: string, pid: number, asRoot: boolean) => {
@@ -169,7 +157,7 @@ export function BinaryHosting() {
     patchRow(row.name, { running: true, error: null, root: asRoot });
     try {
       const pid = await deviceApi.binaryRun(deviceSerial, row.name, asRoot);
-      patchRow(row.name, { pid, running: false, ports: [] });
+      patchRow(row.name, { pid, running: false, ports: [], error: null });
       // 端口可能在 listen() 前几十毫秒才绑定：立即拉一次，3s 后再补一次
       void loadPorts(row.name, pid, asRoot);
       window.setTimeout(() => void loadPorts(row.name, pid, asRoot), 3000);
@@ -228,7 +216,7 @@ export function BinaryHosting() {
         <div className="min-h-0 flex-1 overflow-auto rounded-lg border bg-card">
           {isLoading && <p className="p-3 text-xs text-muted-foreground">{t("common.loading")}</p>}
           {isError && (
-            <p className="p-3 text-xs text-destructive">
+            <p className="p-3 break-all text-xs leading-relaxed text-destructive">
               {String((listError as Error)?.message ?? listError)}
             </p>
           )}
@@ -249,7 +237,7 @@ export function BinaryHosting() {
                 >
                   <span
                     className={cn(
-                      "min-w-0 flex-1 truncate font-mono font-medium",
+                      "min-w-0 flex-1 break-all font-mono font-medium",
                       b.hasExec ? "text-emerald-500" : "text-red-500",
                     )}
                   >
@@ -296,24 +284,20 @@ export function BinaryHosting() {
                 return (
                   <li key={row.name} className="px-3 py-2" data-testid={`hosted-${row.name}`}>
                     <div className="flex items-center gap-3">
-                      <CopyChip
-                        className="min-w-0 flex-1 justify-start text-left"
-                        value={`./${row.name}`}
+                      <InfoChip
+                        className="min-w-0 flex-1 text-left"
                         label={`./${row.name}`}
                         title={t("adb.binary.copyCmd", { name: row.name })}
                         testid={`cmd-${row.name}`}
-                        onCopy={(v) => void copy(v)}
                       />
                       {row.pid !== null ? (
-                        <CopyChip
-                          value={String(row.pid)}
+                        <InfoChip
                           label={`pid ${row.pid}${row.root ? " · root" : ""}`}
                           title={t("adb.binary.copyPid")}
                           testid={`pid-${row.name}`}
-                          onCopy={(v) => void copy(v)}
                         />
                       ) : (
-                        <span className="shrink-0 text-muted-foreground">{row.error ?? t("adb.binary.idle")}</span>
+                        <span className="shrink-0 text-muted-foreground">{t("adb.binary.idle")}</span>
                       )}
                       {row.pid !== null ? (
                         <Button
@@ -361,6 +345,11 @@ export function BinaryHosting() {
                         <Trash2 className="h-3 w-3" />
                       </Button>
                     </div>
+                    {row.error && (
+                      <p className="mt-1.5 break-all text-[11px] leading-relaxed text-destructive" data-testid={`err-${row.name}`}>
+                        {row.error}
+                      </p>
+                    )}
                     {row.pid !== null && (
                       <div className="mt-1.5 flex flex-wrap items-center gap-1.5" data-testid={`ports-${row.name}`}>
                         {row.ports.length === 0 ? (
@@ -371,13 +360,11 @@ export function BinaryHosting() {
                           row.ports.map((p) => {
                             const text = `${p.address}:${p.port}`;
                             return (
-                              <CopyChip
+                              <InfoChip
                                 key={`${p.family}-${text}`}
-                                value={text}
                                 label={text}
                                 title={t("adb.binary.copyPort", { family: p.family })}
                                 testid={`port-${row.name}-${p.port}`}
-                                onCopy={(v) => void copy(v)}
                               />
                             );
                           })
@@ -393,7 +380,7 @@ export function BinaryHosting() {
       </section>
 
       {notice && (
-        <p className="shrink-0 break-all rounded-md border bg-muted/40 px-2 py-1 text-xs text-muted-foreground">
+        <p className="shrink-0 break-all rounded-md border bg-muted/40 px-2 py-1 text-xs text-muted-foreground" data-testid="binary-notice">
           {notice}
         </p>
       )}
@@ -401,41 +388,29 @@ export function BinaryHosting() {
   );
 }
 
-/** 可点击复制的 chip（pid / 端口通用）：复制成功后短暂显示对勾 */
-export function CopyChip({
-  value,
+/** 信息胶囊：纯文本可选中（path-selectable 单击全选/拖选/右键复制），非按钮 */
+export function InfoChip({
   label,
-  title,
   testid,
-  onCopy,
+  title,
   className,
 }: {
-  value: string;
   label: string;
-  title: string;
   testid: string;
-  onCopy: (value: string) => void;
+  title?: string;
   className?: string;
 }) {
-  const [ok, setOk] = useState(false);
   return (
-    <button
-      type="button"
-      title={title}
+    <span
       data-testid={testid}
+      title={title}
       className={cn(
-        "flex shrink-0 items-center gap-1 rounded bg-emerald-500/10 px-1.5 py-0.5 font-mono text-emerald-500 transition-colors hover:bg-emerald-500/20",
+        "path-selectable max-w-full break-all rounded bg-emerald-500/10 px-1.5 py-0.5 font-mono text-emerald-500",
         className,
       )}
-      onClick={() => {
-        onCopy(value);
-        setOk(true);
-        window.setTimeout(() => setOk(false), 1200);
-      }}
     >
-      <span className="min-w-0 truncate">{label}</span>
-      {ok ? <Check className="h-3 w-3 shrink-0" /> : <Copy className="h-3 w-3 shrink-0 opacity-50" />}
-    </button>
+      {label}
+    </span>
   );
 }
 

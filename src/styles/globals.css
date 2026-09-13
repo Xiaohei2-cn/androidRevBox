@@ -69,8 +69,24 @@
 
   body {
     @apply overflow-hidden bg-transparent text-foreground antialiased;
-    user-select: none;
+    /* 全项目信息文本默认可选中（P9 用户要求）；控件与拖拽区下方单独禁选 */
+    user-select: text;
     overscroll-behavior: none;
+  }
+
+  /* 窗口拖拽区：避免拖动窗口时误选标题文字 */
+  [data-tauri-drag-region] {
+    user-select: none;
+  }
+
+  /* 导航/控件类 chrome 不入选中：子标签、单选、滑杆、下拉；
+     列表信息行即使实现为 button 也保持可选中（浏览器会抑制
+     文本拖选后的 click，不会误触发导航） */
+  select,
+  [role="tab"],
+  [role="radio"],
+  [role="slider"] {
+    user-select: none;
   }
 
   input,
