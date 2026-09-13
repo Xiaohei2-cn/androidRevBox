@@ -296,9 +296,14 @@ export function BinaryHosting() {
                 return (
                   <li key={row.name} className="px-3 py-2" data-testid={`hosted-${row.name}`}>
                     <div className="flex items-center gap-3">
-                      <span className={cn("min-w-0 flex-1 truncate font-mono font-medium", (bin?.hasExec ?? true) ? "text-emerald-500" : "text-red-500")}>
-                        ./{row.name}
-                      </span>
+                      <CopyChip
+                        className="min-w-0 flex-1 justify-start text-left"
+                        value={`./${row.name}`}
+                        label={`./${row.name}`}
+                        title={t("adb.binary.copyCmd", { name: row.name })}
+                        testid={`cmd-${row.name}`}
+                        onCopy={(v) => void copy(v)}
+                      />
                       {row.pid !== null ? (
                         <CopyChip
                           value={String(row.pid)}
@@ -403,12 +408,14 @@ export function CopyChip({
   title,
   testid,
   onCopy,
+  className,
 }: {
   value: string;
   label: string;
   title: string;
   testid: string;
   onCopy: (value: string) => void;
+  className?: string;
 }) {
   const [ok, setOk] = useState(false);
   return (
@@ -418,6 +425,7 @@ export function CopyChip({
       data-testid={testid}
       className={cn(
         "flex shrink-0 items-center gap-1 rounded bg-emerald-500/10 px-1.5 py-0.5 font-mono text-emerald-500 transition-colors hover:bg-emerald-500/20",
+        className,
       )}
       onClick={() => {
         onCopy(value);
@@ -425,8 +433,8 @@ export function CopyChip({
         window.setTimeout(() => setOk(false), 1200);
       }}
     >
-      {label}
-      {ok ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3 opacity-50" />}
+      <span className="min-w-0 truncate">{label}</span>
+      {ok ? <Check className="h-3 w-3 shrink-0" /> : <Copy className="h-3 w-3 shrink-0 opacity-50" />}
     </button>
   );
 }

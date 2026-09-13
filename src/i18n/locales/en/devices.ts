@@ -79,6 +79,7 @@ export default {
   "adb.binary.starting": "Starting…",
   "adb.binary.kill": "Kill",
   "adb.binary.killed": "Killed pid {pid}",
+  "adb.binary.copyCmd": "Click to copy launch command ./{name}",
   "adb.binary.copyPid": "Click to copy PID",
   "adb.binary.copyPort": "Click to copy port ({family})",
   "adb.binary.copied": "Copied: {value}",

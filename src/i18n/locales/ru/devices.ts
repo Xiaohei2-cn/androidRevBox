@@ -77,6 +77,7 @@ export default {
   "adb.binary.starting": "Запуск…",
   "adb.binary.kill": "Остановить",
   "adb.binary.killed": "pid {pid} остановлен",
+  "adb.binary.copyCmd": "Клик — скопировать команду запуска ./{name}",
   "adb.binary.copyPid": "Клик — копировать PID",
   "adb.binary.copyPort": "Клик — копировать порт ({family})",
   "adb.binary.copied": "Скопировано: {value}",

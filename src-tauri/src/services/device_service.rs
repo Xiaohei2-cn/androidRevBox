@@ -735,9 +735,12 @@ impl DeviceService {
         self.hosted_ports(serial, pid, root).await
     }
 
-    /// 端口→PID 反查（两步链，全 -s 绑定）：
+    /// 端口→PID 反查（全 -s 绑定，三步）：
     /// ① grep 端口十六进制 → 解析取 LISTEN 且端口精确匹配的 inode；
-    /// ② inode_owner_cmd 扫 /proc/[0-9]*/fd 找持有者（同行输出 pid+comm）。
+    /// ② inode_scan_cmd 单次 `ls -l /proc/[0-9]*/fd` → 宿主侧 parse_fd_scan
+    ///    找持有这些 inode 的 pid（绝不在设备端逐进程循环——真机数百次
+    ///    ls/grep 孵化实测超过 8s 命令超时）；
+    /// ③ comm_batch_cmd 仅对命中的少量 pid 批量取进程名。
     /// ⚠️ 不开 root 时 shell 用户读不到别人的 /proc/<pid>/fd，
     /// 只能命中 shell 自属进程——前端默认引导勾选 Root。
     pub async fn pids_by_port(
@@ -751,21 +754,26 @@ impl DeviceService {
         let args =
             adb::build_args(Some(serial), &adb::cmd_shell(&wrap(adb::port_grep_cmd(port))));
         let out = self.run_adb(&args).await?;
-        let mut inodes: Vec<u64> = adb::parse_proc_net_entries(&out.stdout)
+        let inodes: std::collections::HashSet<u64> = adb::parse_proc_net_entries(&out.stdout)
             .into_iter()
             .filter(|e| e.listen && e.listen_port.port == port && e.inode != 0)
             .map(|e| e.inode)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
             .collect();
         if inodes.is_empty() {
             return Ok(Vec::new());
         }
-        inodes.sort_unstable();
+
+        let args =
+            adb::build_args(Some(serial), &adb::cmd_shell(&wrap(adb::inode_scan_cmd())));
+        let out = self.run_adb(&args).await?;
+        let holder_pids = adb::parse_fd_scan(&out.stdout, &inodes);
+        if holder_pids.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let args = adb::build_args(
             Some(serial),
-            &adb::cmd_shell(&wrap(adb::inode_owner_cmd(&inodes))),
+            &adb::cmd_shell(&wrap(adb::comm_batch_cmd(&holder_pids))),
         );
         let out = self.run_adb(&args).await?;
         Ok(adb::parse_port_holders(&out.stdout))

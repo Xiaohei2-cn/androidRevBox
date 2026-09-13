@@ -77,6 +77,7 @@ export default {
   "adb.binary.starting": "起動中…",
   "adb.binary.kill": "終了",
   "adb.binary.killed": "pid {pid} を終了しました",
+  "adb.binary.copyCmd": "起動コマンド ./{name} をクリックでコピー",
   "adb.binary.copyPid": "クリックで PID をコピー",
   "adb.binary.copyPort": "クリックでポートをコピー（{family}）",
   "adb.binary.copied": "コピーしました：{value}",

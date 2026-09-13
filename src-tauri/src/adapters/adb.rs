@@ -582,21 +582,63 @@ pub fn port_grep_cmd(port: u16) -> String {
     format!("grep \":{hex} \" /proc/net/tcp /proc/net/tcp6 2>/dev/null")
 }
 
-/// 反查第三步：给定 inode 列表，扫全设备 fd 找持有者，命中即输出
-/// `<pid> <comm>` 一行（同一循环内读 comm，省一次往返）。
-/// inodes 已由调用方过滤为纯数字。
-pub fn inode_owner_cmd(inodes: &[u64]) -> String {
-    if inodes.is_empty() {
-        return "echo ''".to_string();
+/// 反查第三步 A：一次性列出全部进程 fd 链接。
+///
+/// `ls -l /proc/[0-9]*/fd` 多目录形态：单次 ls 进程，输出为头部行
+/// `/proc/<pid>/fd:` 与链接行 `N -> socket:[INODE]` 交替，inode→pid 归属在
+/// **宿主侧**解析（parse_fd_scan）。⚠️ 绝不能在设备端用
+/// `for p in /proc/*; do ls|grep; done` 逐进程循环——数百次进程孵化实测超过
+/// 8s 超时（真机 bug 回归）。
+pub fn inode_scan_cmd() -> String {
+    "ls -l /proc/[0-9]*/fd 2>/dev/null".to_string()
+}
+
+/// 从 inode_scan_cmd 的输出解析持有指定 inode 的 pid 集合。
+/// 头部行正则宽容处理（toybox ls 多目录输出 `path:` 独占一行）；
+/// 链接行取行尾 `socket:[N]`。无权限目录只会缺条目，不报错。
+pub fn parse_fd_scan(stdout: &str, inodes: &std::collections::HashSet<u64>) -> Vec<u32> {
+    let mut current_pid: Option<u32> = None;
+    let mut hits = std::collections::HashSet::new();
+    for line in stdout.lines() {
+        let t = line.trim_end_matches('\r').trim();
+        if let Some(head) = t.strip_prefix("/proc/").and_then(|r| r.strip_suffix("/fd:")) {
+            current_pid = head.parse::<u32>().ok();
+            continue;
+        }
+        if t.is_empty() || t.starts_with("total") {
+            continue;
+        }
+        // 链接行形如：lrwx------ 1 root root 64 ... 12 -> socket:[24567]
+        let Some(rest) = t.rsplit_once("socket:[") else {
+            continue;
+        };
+        let Some(inode_str) = rest.1.strip_suffix(']') else {
+            continue;
+        };
+        if let Ok(inode) = inode_str.parse::<u64>() {
+            if inodes.contains(&inode) {
+                if let Some(pid) = current_pid {
+                    hits.insert(pid);
+                }
+            }
+        }
     }
-    let alt = inodes
+    let mut out: Vec<u32> = hits.into_iter().collect();
+    out.sort_unstable();
+    out
+}
+
+/// 反查第三步 B：仅对命中的少量 pid 批量取进程名——
+/// `for p in 123 456; do echo "$p $(cat /proc/$p/comm 2>/dev/null)"; done`
+/// （循环规模 = 持有者个数，通常 1-3，孵化开销可忽略）。
+pub fn comm_batch_cmd(pids: &[u32]) -> String {
+    debug_assert!(!pids.is_empty());
+    let list = pids
         .iter()
-        .map(|i| i.to_string())
+        .map(|p| p.to_string())
         .collect::<Vec<_>>()
-        .join("|");
-    format!(
-        "for p in /proc/[0-9]*; do ls -l $p/fd 2>/dev/null | grep -qE \"socket:\\[({alt})\\]\" && echo \"$(basename $p) $(cat $p/comm 2>/dev/null)\"; done"
-    )
+        .join(" ");
+    format!("for p in {list}; do echo \"$p $(cat /proc/$p/comm 2>/dev/null)\"; done")
 }
 
 /// 持有某端口的进程（反查结果行）。
@@ -1225,13 +1267,42 @@ mod tests {
     }
 
     #[test]
-    fn inode_owner_cmd_shape() {
-        let c = inode_owner_cmd(&[24567, 24568]);
-        assert!(c.contains("socket:\\[(24567|24568)\\]"), "{c}");
-        assert!(c.contains("basename $p"), "{c}");
-        assert!(c.contains("cat $p/comm"), "{c}");
+    fn inode_scan_cmd_shape() {
+        let c = inode_scan_cmd();
+        assert_eq!(c, "ls -l /proc/[0-9]*/fd 2>/dev/null");
+        // 单次 ls，绝不含设备端逐进程 for 循环（真机数百次孵化会超 8s 超时）
+        assert!(!c.contains("for p in"), "{c}");
         assert!(!c.contains('\''), "su 包裹安全");
-        assert_eq!(inode_owner_cmd(&[]), "echo ''");
+    }
+
+    #[test]
+    fn parse_fd_scan_maps_inodes_to_pids() {
+        let out = "\
+/proc/1/fd:
+lrwx------ 1 root root 64 2026-01-01 00:00 0 -> /dev/null
+lrwx------ 1 root root 64 2026-01-01 00:00 12 -> socket:[24567]
+/proc/30743/fd:
+lrwx------ 1 shell shell 64 2026-01-01 00:00 3 -> socket:[24567]
+lrwx------ 1 shell shell 64 2026-01-01 00:00 5 -> /data/local/tmp/x.log
+/proc/99/fd:
+total 0
+";
+        let inodes: std::collections::HashSet<u64> = [24567u64].into_iter().collect();
+        let pids = parse_fd_scan(out, &inodes);
+        assert_eq!(pids, vec![1u32, 30743]);
+        // 无命中 → 空
+        let none: std::collections::HashSet<u64> = [1u64].into_iter().collect();
+        assert!(parse_fd_scan(out, &none).is_empty());
+    }
+
+    #[test]
+    fn comm_batch_cmd_shape() {
+        let c = comm_batch_cmd(&[1, 30743]);
+        assert_eq!(
+            c,
+            "for p in 1 30743; do echo \"$p $(cat /proc/$p/comm 2>/dev/null)\"; done"
+        );
+        assert!(!c.contains('\''), "su 包裹安全");
     }
 
     #[test]

@@ -79,6 +79,7 @@ export default {
   "adb.binary.starting": "启动中…",
   "adb.binary.kill": "终止",
   "adb.binary.killed": "已终止 pid {pid}",
+  "adb.binary.copyCmd": "点击复制启动命令 ./{name}",
   "adb.binary.copyPid": "点击复制 PID",
   "adb.binary.copyPort": "点击复制端口（{family}）",
   "adb.binary.copied": "已复制：{value}",
