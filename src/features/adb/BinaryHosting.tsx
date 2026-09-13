@@ -228,7 +228,7 @@ export function BinaryHosting() {
           <h3 className="text-xs font-semibold">{t("adb.binary.listTitle")}</h3>
           <span className="text-[10px] text-muted-foreground">{t("adb.binary.listHint")}</span>
         </div>
-        <div className="min-h-0 flex-1 overflow-auto rounded-lg border bg-card">
+        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden rounded-lg border bg-card">
           {isLoading && <p className="p-3 text-xs text-muted-foreground">{t("common.loading")}</p>}
           {isError && (
             <p className="p-3 break-all text-xs leading-relaxed text-destructive">
@@ -244,7 +244,7 @@ export function BinaryHosting() {
                 <button
                   type="button"
                   className={cn(
-                    "flex w-full items-center gap-3 px-3 py-2 text-left transition-colors hover:bg-accent",
+                    "flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-accent",
                     !b.hasExec && "cursor-default hover:bg-transparent",
                   )}
                   onDoubleClick={() => addHosted(b)}
@@ -258,24 +258,29 @@ export function BinaryHosting() {
                   >
                     {b.name}
                   </span>
-                  <span className="shrink-0 font-mono text-muted-foreground">{b.perms}</span>
-                  <span className="w-14 shrink-0 text-right tabular-nums text-muted-foreground">
+                  {/* 权限/大小/操作固定列宽：无按钮行同位占格，右缘垂直对齐 */}
+                  <span className="w-[72px] shrink-0 text-right font-mono text-muted-foreground">
+                    {b.perms}
+                  </span>
+                  <span className="w-16 shrink-0 text-right tabular-nums text-muted-foreground">
                     {b.size} B
                   </span>
-                  {!b.hasExec && (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-6 shrink-0 gap-1 px-2"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void chmod(b);
-                      }}
-                    >
-                      <ShieldCheck className="h-3 w-3" />
-                      {t("adb.binary.chmod")}
-                    </Button>
-                  )}
+                  <span className="flex h-6 w-28 shrink-0 items-center justify-end">
+                    {!b.hasExec && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-6 gap-1 px-2"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void chmod(b);
+                        }}
+                      >
+                        <ShieldCheck className="h-3 w-3" />
+                        {t("adb.binary.chmod")}
+                      </Button>
+                    )}
+                  </span>
                 </button>
               </li>
             ))}
