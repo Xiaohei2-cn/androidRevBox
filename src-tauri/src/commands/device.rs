@@ -5,7 +5,7 @@
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::adapters::adb::{DeviceEntry, DeviceInfo, FileEntry, HostedBinary};
+use crate::adapters::adb::{DeviceEntry, DeviceInfo, FileEntry, HostedBinary, ListenPort};
 use crate::core::error::{CoreError, CoreResult};
 use crate::services::device_service::{AdbEnvironment, DeviceChangedPayload, ForwardRule};
 
@@ -201,6 +201,21 @@ pub async fn device_binary_kill(
     state
         .device
         .hosted_kill(&serial, pid, root.unwrap_or(false))
+        .await
+}
+
+/// 查托管进程监听端口（/proc/<pid>/fd socket inode → /proc/net/tcp(6)，
+/// 十六进制还原后仅返回 LISTEN 态、去重升序）
+#[tauri::command]
+pub async fn device_binary_ports(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    pid: u32,
+    root: Option<bool>,
+) -> CoreResult<Vec<ListenPort>> {
+    state
+        .device
+        .hosted_ports(&serial, pid, root.unwrap_or(false))
         .await
 }
 

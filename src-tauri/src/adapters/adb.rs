@@ -399,6 +399,122 @@ pub fn hosted_run_cmd(name: &str, log: &str, root: bool) -> String {
     }
 }
 
+/// 托管进程监听端口信息（/proc/net/tcp|tcp6 行解析结果）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListenPort {
+    /// 可读 IP（v4 点分；v6 压缩记法；0.0.0.0/:: 表示全网卡）
+    pub address: String,
+    pub port: u16,
+    /// 0A = LISTEN
+    pub listen: bool,
+    pub family: &'static str, // "tcp" | "tcp6"
+}
+
+/// 小端字节序 hex → IPv4 点分（"0100007F" → 127.0.0.1）。
+fn hex_ipv4(hex: &str) -> Option<String> {
+    if hex.len() != 8 {
+        return None;
+    }
+    let raw = u32::from_str_radix(hex, 16).ok()?;
+    // /proc/net 以主机序（LE）打印 in_addr：to_le_bytes 原序即网络字节序
+    let b = raw.to_le_bytes();
+    Some(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]))
+}
+
+/// 大端字节序 hex → IPv6 压缩记法（32 hex chars，按 /proc 的 4×u32 小端组）。
+fn hex_ipv6(hex: &str) -> Option<String> {
+    if hex.len() != 32 {
+        return None;
+    }
+    // 每 8 hex = 一个 u32（小端存法同 v4），4 组拼出 16 字节
+    let mut bytes = [0u8; 16];
+    for (gi, group) in hex.as_bytes().chunks(8).enumerate() {
+        let g = std::str::from_utf8(group).ok()?;
+        let raw = u32::from_str_radix(g, 16).ok()?;
+        let b = raw.to_le_bytes();
+        bytes[gi * 4..gi * 4 + 4].copy_from_slice(&b);
+    }
+    let addr = std::net::Ipv6Addr::from(bytes);
+    Some(addr.to_string())
+}
+
+/// 解析单行 `/proc/net/tcp` 或 `tcp6` 记录（可带 grep 输出的 `tcp:`/`tcp6:`
+/// 行首前缀——先剥前缀再分词，否则行头粘成 `tcp:sl` 无法解析）：
+/// `sl local_address rem_address st ...`。要求字段严格为 8/32 hex + ':' +
+/// 4 hex 形态；遇假 hex（如 IPv6 组里的 "::"）跳过继续扫，不整行放弃。
+fn parse_proc_net_line(line: &str, family: &'static str) -> Option<ListenPort> {
+    let stripped = match family {
+        "tcp6" => line.strip_prefix("tcp6:").or_else(|| line.strip_prefix("tcp:"))?,
+        _ => line.strip_prefix("tcp:")?,
+    };
+    let toks: Vec<&str> = stripped.split_whitespace().collect();
+    for (idx, tok) in toks.iter().enumerate() {
+        let Some((ip_hex, port_hex)) = tok.split_once(':') else {
+            continue;
+        };
+        let v6 = ip_hex.len() == 32;
+        if (ip_hex.len() != 8 && !v6) || port_hex.len() != 4 {
+            continue;
+        }
+        if !ip_hex.chars().all(|c| c.is_ascii_hexdigit())
+            || !port_hex.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        let Ok(port) = u16::from_str_radix(port_hex, 16) else {
+            continue;
+        };
+        let Some(address) = (if v6 { hex_ipv6(ip_hex) } else { hex_ipv4(ip_hex) }) else {
+            continue;
+        };
+        let state = toks.get(idx + 2).copied().unwrap_or("");
+        return Some(ListenPort {
+            address,
+            port,
+            listen: state.eq_ignore_ascii_case("0A"),
+            family,
+        });
+    }
+    None
+}
+
+/// 解析设备端 socket inode 匹配输出（每行形如
+/// `tcp:   0      0 0100007F:1F90 00000000:0000 0A ...` 或 `tcp6: ...`，
+/// 也兼容 grep 直接输出无 sl 前缀变体）。去重 + 只保留 LISTEN，端口升序。
+pub fn parse_listening_ports(stdout: &str) -> Vec<ListenPort> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let fam = if line.trim_start().starts_with("tcp6:") {
+            "tcp6"
+        } else if line.trim_start().starts_with("tcp:") {
+            "tcp"
+        } else {
+            continue;
+        };
+        let Some(p) = parse_proc_net_line(line, fam) else {
+            continue;
+        };
+        if !p.listen {
+            continue;
+        }
+        if seen.insert((p.port, p.address.clone(), p.family)) {
+            out.push(p);
+        }
+    }
+    out.sort_by(|a, b| a.port.cmp(&b.port).then(a.family.cmp(b.family)).then(a.address.cmp(&b.address)));
+    out
+}
+
+/// 托管二进制监听端口查询命令（用户指定）：
+/// `for i in $(ls -l /proc/<pid>/fd 2>/dev/null | sed -n "s/.*socket:\[\(.*\)\].*/\1/p"); do grep "$i" /proc/net/tcp /proc/net/tcp6; done`
+pub fn hosted_ports_cmd(pid: u32) -> String {
+    format!(
+        "for i in $(ls -l /proc/{pid}/fd 2>/dev/null | sed -n \"s/.*socket:\\[\\(.*\\)\\].*/\\1/p\"); do grep \"$i\" /proc/net/tcp /proc/net/tcp6; done"
+    )
+}
+
 /// adb 版本信息（`adb version` 解析结果）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -955,6 +1071,53 @@ mod tests {
         assert!(root_cmd.starts_with("su -c 'cd /data/local/tmp;"));
         assert!(root_cmd.ends_with("echo $!'"));
         assert_eq!(root_cmd.matches('\'').count(), 2);
+    }
+
+    #[test]
+    fn listening_ports_parses_v4_v6_and_hex() {
+        // 真机典型形态：grep 多文件带 tcp:/tcp6: 前缀，1F90=8080，27042=0x69A2
+        let out = "\
+tcp:   1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10093 0 0000000000000000 1 0
+tcp:   2: 00000000:69A2 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10093 0 0000000000000000 1 0
+tcp6:  3: 00000000000000000000000001000000:1F91 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 10093 0 0000000000000000 1 0
+";
+        let ports = parse_listening_ports(out);
+        assert_eq!(ports.len(), 3);
+        // 端口升序：8080(127.0.0.1 tcp) < 8081(::1 tcp6) < 27042(0.0.0.0 tcp)
+        assert_eq!((ports[0].port, ports[0].address.as_str()), (8080, "127.0.0.1"));
+        assert_eq!((ports[1].port, ports[1].address.as_str()), (8081, "::1"));
+        assert_eq!(ports[1].family, "tcp6");
+        assert_eq!((ports[2].port, ports[2].address.as_str()), (27042, "0.0.0.0"));
+        assert!(ports.iter().all(|p| p.listen));
+    }
+
+    #[test]
+    fn listening_ports_skips_non_listen_and_junk() {
+        let out = "\
+tcp:   1: 0100007F:1F90 0100007F:C000 01 00000000:00000000 00:00000000 00000000 10093 0 0000000000000000 1 0
+sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode
+tcp: garbage line
+";
+        // 01 = ESTABLISHED 不计入；表头与杂行跳过
+        assert!(parse_listening_ports(out).is_empty());
+        assert!(parse_listening_ports("").is_empty());
+    }
+
+    #[test]
+    fn listening_ports_dedup_across_v4_v6_mirrors() {
+        // v4-mapped 双栈常见重复行
+        let line = "tcp:   1: 00000000:69A2 00000000:0000 0A 0 0 0\n";
+        let out = format!("{line}{line}");
+        assert_eq!(parse_listening_ports(&out).len(), 1);
+    }
+
+    #[test]
+    fn hosted_ports_cmd_shape() {
+        let c = hosted_ports_cmd(30743);
+        assert!(c.starts_with("for i in $(ls -l /proc/30743/fd 2>/dev/null"));
+        assert!(c.ends_with("/proc/net/tcp /proc/net/tcp6; done"));
+        // su -c 单引号包裹安全：内部无单引号
+        assert!(!c.contains('\''));
     }
 
     #[test]

@@ -706,6 +706,24 @@ impl DeviceService {
         Ok(())
     }
 
+    /// 查托管进程监听端口：
+    /// `for i in $(ls -l /proc/<pid>/fd | sed -n ...socket...); do grep "$i" /proc/net/tcp /proc/net/tcp6; done`
+    /// （用户指定命令；root 启动的进程同身份查询）。输出经 parse_listening_ports
+    /// 还原十六进制端口/IP，只返回 LISTEN 态、去重升序。
+    pub async fn hosted_ports(
+        &self,
+        serial: &str,
+        pid: u32,
+        root: bool,
+    ) -> CoreResult<Vec<adb::ListenPort>> {
+        let c = adb::hosted_ports_cmd(pid);
+        let cmd = if root { adb::su_wrap(&c) } else { c };
+        let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
+        let out = self.run_adb(&args).await?;
+        // grep 无匹配 exit=1 是常态（进程没监听端口），不当错误
+        Ok(adb::parse_listening_ports(&out.stdout))
+    }
+
     /// 拼 `<verb> <dir>/<name>` 并做名称安全校验（所有托管文件操作共用入口）。
     fn hosted_shell(name: &str, verb: &str) -> CoreResult<String> {
         if !adb::is_safe_hosted_name(name) {

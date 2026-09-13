@@ -53,6 +53,14 @@ export interface HostedBinary {
   hasExec: boolean;
 }
 
+/** 托管进程的一个 LISTEN 端口（/proc/net/tcp(6) 十六进制已还原） */
+export interface ListenPort {
+  address: string;
+  port: number;
+  listen: boolean;
+  family: "tcp" | "tcp6";
+}
+
 export interface DeviceChangedPayload {
   serial: string;
   transport: string;
@@ -116,6 +124,10 @@ export const deviceApi = {
   /** 终止托管进程（kill -9 pid；root 启动的进程需 root=true） */
   binaryKill(serial: string, pid: number, root = false): Promise<void> {
     return invokeCommand<void>("device_binary_kill", { serial, pid, root });
+  },
+  /** 查托管进程监听端口（/proc/<pid>/fd → /proc/net/tcp(6)） */
+  binaryPorts(serial: string, pid: number, root = false): Promise<ListenPort[]> {
+    return invokeCommand<ListenPort[]>("device_binary_ports", { serial, pid, root });
   },
   /** 以下长操作返回 task_id，输出走 task:// 事件流 */
   shell(serial: string, command: string): Promise<string> {
