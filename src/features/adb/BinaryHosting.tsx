@@ -259,13 +259,13 @@ export function BinaryHosting() {
                     {b.name}
                   </span>
                   {/* 权限/大小/操作固定列宽：无按钮行同位占格，右缘垂直对齐 */}
-                  <span className="w-[72px] shrink-0 text-right font-mono text-muted-foreground">
+                  <span className="w-[78px] shrink-0 text-right font-mono text-muted-foreground">
                     {b.perms}
                   </span>
                   <span className="w-16 shrink-0 text-right tabular-nums text-muted-foreground">
                     {b.size} B
                   </span>
-                  <span className="flex h-6 w-28 shrink-0 items-center justify-end">
+                  <span className="flex h-6 w-[104px] shrink-0 items-center justify-end">
                     {!b.hasExec && (
                       <Button
                         size="sm"
