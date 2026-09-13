@@ -6,6 +6,7 @@ export default {
   "nav.aria": "メインナビゲーション",
   "nav.dashboard": "ダッシュボード",
   "nav.devices": "デバイス",
+  "nav.traffic": "トラフィック",
   "nav.terminal": "ADB",
   "nav.hook": "Hook",
   "nav.binary": "バイナリ",

@@ -6,6 +6,7 @@ import { TitleBar } from "@/components/window/TitleBar";
 import { DashboardPage } from "@/features/dashboard/DashboardPage";
 import { DevicesPage } from "@/features/devices/DevicesPage";
 import { AdbPage } from "@/features/adb/AdbPage";
+import { TrafficPage } from "@/features/traffic/TrafficPage";
 import { HookPage } from "@/features/hook/HookPage";
 import { BinaryPage } from "@/features/binary/BinaryPage";
 import { UnpackPage } from "@/features/unpack/UnpackPage";
@@ -69,6 +70,9 @@ function ShellBody() {
           </PageHost>
           <PageHost active={tab === "devices"}>
             <DevicesPage />
+          </PageHost>
+          <PageHost active={tab === "traffic"}>
+            <TrafficPage />
           </PageHost>
           <PageHost active={tab === "terminal"}>
             <AdbPage />

@@ -6,6 +6,7 @@ export default {
   "nav.aria": "Главная навигация",
   "nav.dashboard": "Панель",
   "nav.devices": "Устройства",
+  "nav.traffic": "Трафик",
   "nav.terminal": "ADB",
   "nav.hook": "Hook",
   "nav.binary": "Бинарник",

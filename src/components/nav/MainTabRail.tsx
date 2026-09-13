@@ -1,4 +1,5 @@
 import {
+  Activity,
   Binary,
   Bug,
   FileArchive,
@@ -20,6 +21,7 @@ import { cn } from "@/lib/utils";
 export type TabId =
   | "dashboard"
   | "devices"
+  | "traffic"
   | "terminal"
   | "hook"
   | "binary"
@@ -42,6 +44,7 @@ interface TabDef {
 export const MAIN_TABS: readonly TabDef[] = [
   { id: "dashboard", labelKey: "nav.dashboard", icon: LayoutDashboard },
   { id: "devices", labelKey: "nav.devices", icon: Smartphone },
+  { id: "traffic", labelKey: "nav.traffic", icon: Activity },
   { id: "terminal", labelKey: "nav.terminal", icon: Usb },
   { id: "hook", labelKey: "nav.hook", icon: Bug },
   { id: "binary", labelKey: "nav.binary", icon: Binary },

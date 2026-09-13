@@ -24,17 +24,6 @@ export function AdbPage() {
           content: <BinaryHosting />,
         },
         {
-          id: "traffic",
-          label: "流量",
-          content: (
-            <Placeholder
-              title="流量"
-              description="设备实时网速、按应用流量统计与抓包入口将在此实现"
-              phase="占位 · 规划中"
-            />
-          ),
-        },
-        {
           id: "terminal",
           label: "终端",
           content: (

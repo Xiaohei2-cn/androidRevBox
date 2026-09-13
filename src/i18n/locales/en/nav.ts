@@ -6,6 +6,7 @@ export default {
   "nav.aria": "Main navigation",
   "nav.dashboard": "Dashboard",
   "nav.devices": "Devices",
+  "nav.traffic": "Traffic",
   "nav.terminal": "ADB",
   "nav.hook": "Hook",
   "nav.binary": "Binary",
