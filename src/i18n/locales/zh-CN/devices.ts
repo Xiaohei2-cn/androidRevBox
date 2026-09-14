@@ -95,4 +95,22 @@ export default {
   "adb.binary.suOk": "su 可用：已切换 Root 执行",
   "adb.binary.suFail": "su 不可用（未 root 或拒绝授权），保持普通执行",
   "adb.binary.removeRow": "从托管区移除",
+
+  // 二进制页 · so 替换
+  "binary.so.description": "把修补后的 .so 直接写回应用安装目录（push → su -c cat → 清理），免重打包。替换前请先停止目标应用，否则覆写会失败。",
+  "binary.so.localFile": "本地文件",
+  "binary.so.pick": "选择…",
+  "binary.so.pickTitle": "选择修补后的 .so 文件",
+  "binary.so.pkg": "包名",
+  "binary.so.fromForeground": "取前台应用",
+  "binary.so.abi": "ABI 版本",
+  "binary.so.abi64": "64 位 (arm64)",
+  "binary.so.abi32": "32 位 (arm)",
+  "binary.so.target": "目标路径",
+  "binary.so.targetIdle": "填写包名后自动预览",
+  "binary.so.rootNote": "需要设备已 root（cat 写入 /data/app 安装目录）；执行时会自动探测 su。",
+  "binary.so.run": "替换",
+  "binary.so.running": "替换中…",
+  "binary.so.success": "已写入：{target}",
+  "binary.so.noForeground": "未获取到前台应用包名",
 } as const;

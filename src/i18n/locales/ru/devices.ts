@@ -93,4 +93,22 @@ export default {
   "adb.binary.suOk": "su доступен: включено выполнение от root",
   "adb.binary.suFail": "su недоступен (нет root или отказ), остаемся без root",
   "adb.binary.removeRow": "Убрать из списка",
+
+  // Страница бинарных · замена .so
+  "binary.so.description": "Запись исправленного .so прямо в каталог приложения (push → su -c cat → очистка), без переупаковки. Сначала остановите приложение, иначе перезапись не удастся.",
+  "binary.so.localFile": "Локальный файл",
+  "binary.so.pick": "Обзор…",
+  "binary.so.pickTitle": "Выберите исправленный .so",
+  "binary.so.pkg": "Пакет",
+  "binary.so.fromForeground": "Из активного",
+  "binary.so.abi": "ABI",
+  "binary.so.abi64": "64-бит (arm64)",
+  "binary.so.abi32": "32-бит (arm)",
+  "binary.so.target": "Целевой путь",
+  "binary.so.targetIdle": "Введите пакет для предпросмотра",
+  "binary.so.rootNote": "Нужен root (cat пишет в /data/app); su проверяется при запуске.",
+  "binary.so.run": "Заменить",
+  "binary.so.running": "Замена…",
+  "binary.so.success": "Записано: {target}",
+  "binary.so.noForeground": "Не удалось получить пакет активного приложения",
 } as const;

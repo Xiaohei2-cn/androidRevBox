@@ -839,6 +839,61 @@ pub fn parse_packages(stdout: &str) -> Vec<String> {
         .collect()
 }
 
+// ===== so 替换（修补后的 .so 直接写回安装目录，免重打包）=====
+
+/// 校验 Android 包名：仅字母数字与 `._-`（防拼入 shell 命令的参数注入）。
+pub fn is_safe_pkg_name(pkg: &str) -> bool {
+    !pkg.is_empty()
+        && pkg.len() <= 256
+        && pkg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// 校验设备侧绝对路径：仅允许 `/[A-Za-z0-9._~=-]+` 段。
+/// ⚠️ 该值会进 su -c 的单引号包裹，绝不能含 `'` `` ` `` 空格或 shell 元字符。
+pub fn is_safe_android_path(path: &str) -> bool {
+    path.len() <= 512
+        && path.starts_with('/')
+        && !path.contains("//")
+        && !path.ends_with('/')
+        && path.split('/').skip(1).all(|seg| {
+            !seg.is_empty()
+                && seg != "."
+                && seg != ".."
+                && seg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '=' | '-'))
+        })
+}
+
+/// dumpsys 的 legacyNativeLibraryDir → 目标 abi 的 lib 子目录。
+/// 输入形如 `/data/app/~~xxxx==/pkg-yyyy==/lib/arm64`；按用户选择把尾段
+/// 替换为 `arm64`（64 位）或 `arm`（32 位）。非 lib/ 结尾的异常路径返回 None。
+pub fn lib_dir_for_abi(legacy_native_dir: &str, abi: &str) -> Option<String> {
+    let dir = legacy_native_dir.trim();
+    let base = match dir.rsplit_once("/lib/") {
+        Some((pre, tail)) if tail == "arm64" || tail == "arm" => Some(pre),
+        _ => None,
+    }?;
+    let sub = match abi {
+        "arm64" => "arm64",
+        "arm" => "arm",
+        _ => return None,
+    };
+    Some(format!("{base}/lib/{sub}"))
+}
+
+/// `dumpsys package <pkg>` 里取 legacyNativeLibraryDir（复用 env_service 解析）。
+/// 与 abi 目录拼接后组装目标文件路径：`<libdir>/<so_name>`。
+pub fn so_target_path(legacy_native_dir: &str, abi: &str, so_name: &str) -> Option<String> {
+    let dir = lib_dir_for_abi(legacy_native_dir, abi)?;
+    if !is_safe_hosted_name(so_name) {
+        return None;
+    }
+    Some(format!("{dir}/{so_name}"))
+}
+
 /// 解析 `ip addr show wlan0` 输出中的 wlan0 IPv4 地址（inet 192.168.1.5/24）。
 /// 多块网卡/多地址时取第一个；解析不到返回 None（如设备用 eth0 或未连 Wi-Fi）。
 pub fn parse_wlan0_ip(stdout: &str) -> Option<String> {
@@ -1342,6 +1397,47 @@ tcp: garbage line
         assert!(c.ends_with("/proc/net/tcp /proc/net/tcp6; done"));
         // su -c 单引号包裹安全：内部无单引号
         assert!(!c.contains('\''));
+    }
+
+    #[test]
+    fn so_target_path_builds_per_abi() {
+        let legacy = "/data/app/~~P55Dx==/cn.rev.binary.auth-70Xa==/lib/arm64";
+        assert_eq!(
+            so_target_path(legacy, "arm64", "libauth.so").as_deref(),
+            Some("/data/app/~~P55Dx==/cn.rev.binary.auth-70Xa==/lib/arm64/libauth.so")
+        );
+        // 用户选 32 位：尾段替换为 arm
+        assert_eq!(
+            lib_dir_for_abi(legacy, "arm").as_deref(),
+            Some("/data/app/~~P55Dx==/cn.rev.binary.auth-70Xa==/lib/arm")
+        );
+        // 异常：不是 lib/ 结构 / abi 非法 / so 名带斜杠 → None
+        assert_eq!(lib_dir_for_abi("/data/local/tmp", "arm64"), None);
+        assert_eq!(lib_dir_for_abi(legacy, "x86"), None);
+        assert_eq!(so_target_path(legacy, "arm64", "a/../b.so"), None);
+        assert_eq!(so_target_path(legacy, "arm64", "a b.so"), None);
+    }
+
+    #[test]
+    fn android_path_safety_blocks_shell_meta() {
+        assert!(is_safe_android_path(
+            "/data/app/~~P55==/cn.x-70==/lib/arm64/libauth.so"
+        ));
+        assert!(!is_safe_android_path("/data/a b.so"));
+        assert!(!is_safe_android_path("/data/a'; rm -rf /; echo 'x"));
+        assert!(!is_safe_android_path("/data/`id`"));
+        assert!(!is_safe_android_path("data/relative"));
+        assert!(!is_safe_android_path("/data//double"));
+        assert!(!is_safe_android_path("/data/a/../b"));
+        assert!(!is_safe_android_path("/"));
+    }
+
+    #[test]
+    fn pkg_name_safety() {
+        assert!(is_safe_pkg_name("com.example.app_1-x"));
+        assert!(!is_safe_pkg_name(""));
+        assert!(!is_safe_pkg_name("com.example;id"));
+        assert!(!is_safe_pkg_name("com.example app"));
     }
 
     #[test]

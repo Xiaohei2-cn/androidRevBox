@@ -244,6 +244,53 @@ pub async fn device_proc_ports(
         .await
 }
 
+/// so 替换请求参数（camelCase 前端约定）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoReplaceArgs {
+    pub serial: String,
+    /// 主机侧修补好的 .so 完整路径
+    pub local_path: String,
+    /// 目标应用包名
+    pub pkg: String,
+    /// arm64(64位) | arm(32位)
+    pub abi: String,
+}
+
+/// 查询包安装 lib 目录（按 ABI，so 替换预览，只读）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PkgLibDirArgs {
+    pub serial: String,
+    pub pkg: String,
+    pub abi: String,
+}
+
+#[tauri::command]
+pub async fn device_pkg_lib_dir(
+    state: tauri::State<'_, AppState>,
+    args: PkgLibDirArgs,
+) -> CoreResult<String> {
+    state.device.pkg_lib_dir(&args.serial, &args.pkg, &args.abi).await
+}
+
+/// so 替换：push → su -c cat 写回安装目录 lib/<abi> → 清理临时。返回写入路径。
+#[tauri::command]
+pub async fn device_so_replace(
+    state: tauri::State<'_, AppState>,
+    args: SoReplaceArgs,
+) -> CoreResult<String> {
+    state
+        .device
+        .so_replace(
+            &args.serial,
+            std::path::Path::new(&args.local_path),
+            &args.pkg,
+            &args.abi,
+        )
+        .await
+}
+
 /// 端口→PID 反查（LISTEN 行 inode → 扫 /proc/[0-9]*/fd 找持有进程）
 #[tauri::command]
 pub async fn device_proc_by_port(

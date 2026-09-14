@@ -93,4 +93,22 @@ export default {
   "adb.binary.suOk": "su disponível: alternado para execução root",
   "adb.binary.suFail": "su indisponível (sem root ou acesso negado), mantendo sem root",
   "adb.binary.removeRow": "Remover da lista hospedada",
+
+  // Página binário · substituição de .so
+  "binary.so.description": "Grava o .so corrigido direto no diretório de instalação do app (push → su -c cat → limpeza), sem reempacotar. Pare o app antes, senão a sobrescrita falha.",
+  "binary.so.localFile": "Arquivo local",
+  "binary.so.pick": "Procurar…",
+  "binary.so.pickTitle": "Escolha o .so corrigido",
+  "binary.so.pkg": "Pacote",
+  "binary.so.fromForeground": "Usar 1º plano",
+  "binary.so.abi": "ABI",
+  "binary.so.abi64": "64 bits (arm64)",
+  "binary.so.abi32": "32 bits (arm)",
+  "binary.so.target": "Caminho de destino",
+  "binary.so.targetIdle": "Informe o pacote para pré-visualizar",
+  "binary.so.rootNote": "Requer root (cat grava em /data/app); su é verificado na execução.",
+  "binary.so.run": "Substituir",
+  "binary.so.running": "Substituindo…",
+  "binary.so.success": "Gravado: {target}",
+  "binary.so.noForeground": "Nenhum pacote em primeiro plano encontrado",
 } as const;

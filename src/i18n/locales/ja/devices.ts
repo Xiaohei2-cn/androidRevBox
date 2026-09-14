@@ -93,4 +93,22 @@ export default {
   "adb.binary.suOk": "su 利用可：Root 実行に切替",
   "adb.binary.suFail": "su 使用不可（未 root または拒否）、通常実行のまま",
   "adb.binary.removeRow": "ホスト一覧から削除",
+
+  // バイナリページ · so 置換
+  "binary.so.description": "修正済み .so をインストールディレクトリへ直接書き戻す（push → su -c cat → 後片付け）。再パッケージ不要。対象アプリを停止してから実行してください。",
+  "binary.so.localFile": "ローカルファイル",
+  "binary.so.pick": "選択…",
+  "binary.so.pickTitle": "修正済み .so を選択",
+  "binary.so.pkg": "パッケージ名",
+  "binary.so.fromForeground": "フォアグラウンドから",
+  "binary.so.abi": "ABI",
+  "binary.so.abi64": "64bit (arm64)",
+  "binary.so.abi32": "32bit (arm)",
+  "binary.so.target": "ターゲットパス",
+  "binary.so.targetIdle": "パッケージ名を入力するとプレビュー",
+  "binary.so.rootNote": "root 必須（cat が /data/app に書き込み）。実行時に su を自動確認します。",
+  "binary.so.run": "置換",
+  "binary.so.running": "置換中…",
+  "binary.so.success": "書き込み完了：{target}",
+  "binary.so.noForeground": "フォアグラウンドのパッケージ名が取得できません",
 } as const;

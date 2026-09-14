@@ -95,4 +95,22 @@ export default {
   "adb.binary.suOk": "su available: switched to root execution",
   "adb.binary.suFail": "su unavailable (device not rooted or access denied), staying non-root",
   "adb.binary.removeRow": "Remove from hosted list",
+
+  // Binary page · .so replace
+  "binary.so.description": "Write a patched .so straight into the app's install dir (push → su -c cat → cleanup), no re-packaging. Stop the target app first, or the overwrite fails.",
+  "binary.so.localFile": "Local file",
+  "binary.so.pick": "Browse…",
+  "binary.so.pickTitle": "Pick the patched .so",
+  "binary.so.pkg": "Package",
+  "binary.so.fromForeground": "Use foreground",
+  "binary.so.abi": "ABI",
+  "binary.so.abi64": "64-bit (arm64)",
+  "binary.so.abi32": "32-bit (arm)",
+  "binary.so.target": "Target path",
+  "binary.so.targetIdle": "Enter a package to preview",
+  "binary.so.rootNote": "Requires rooted device (cat writes to /data/app); su is probed at run time.",
+  "binary.so.run": "Replace",
+  "binary.so.running": "Replacing…",
+  "binary.so.success": "Written: {target}",
+  "binary.so.noForeground": "No foreground package found",
 } as const;

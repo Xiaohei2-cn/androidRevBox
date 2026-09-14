@@ -99,6 +99,10 @@ impl AdbEnvironment {
 const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(3);
 const SHORT_CMD_TIMEOUT: Duration = Duration::from_secs(10);
 const LIST_TIMEOUT: Duration = Duration::from_secs(8);
+/// adb push 大 so 文件用长超时（USB 下数十 MB 也留足余量）
+const PUSH_TIMEOUT: Duration = Duration::from_secs(120);
+/// su -c cat 覆写（设备内拷贝，磁盘写为主）
+const CAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ===== 真实实现：直接 tokio 进程 capture =====
 
@@ -428,11 +432,16 @@ impl DeviceService {
     }
 
     async fn run_adb(&self, args: &[String]) -> CoreResult<AdbRunOutput> {
+        self.run_adb_with(args, LIST_TIMEOUT).await
+    }
+
+    /// 带自定义超时的 adb 短命令（大文件 push 等慢操作用长档）
+    async fn run_adb_with(&self, args: &[String], timeout: Duration) -> CoreResult<AdbRunOutput> {
         let env = self.runner.environment().await;
         let path = env
             .path
             .ok_or_else(|| CoreError::Internal(env.hint.unwrap_or_else(|| "adb 不可用".into())))?;
-        self.runner.run(&path, args, LIST_TIMEOUT).await
+        self.runner.run(&path, args, timeout).await
     }
 
     /// 设备列表（adb devices -l）
@@ -777,6 +786,130 @@ impl DeviceService {
         );
         let out = self.run_adb(&args).await?;
         Ok(adb::parse_port_holders(&out.stdout))
+    }
+
+    /// 查询包安装 lib 目录（so 替换 UI 预览用，只读）：
+    /// dumpsys package → legacyNativeLibraryDir → 按 ABI 换 arm64/arm 尾段。
+    pub async fn pkg_lib_dir(
+        &self,
+        serial: &str,
+        pkg: &str,
+        abi: &str,
+    ) -> CoreResult<String> {
+        if !adb::is_safe_pkg_name(pkg) {
+            return Err(CoreError::Internal(format!("包名非法: {pkg}")));
+        }
+        if abi != "arm64" && abi != "arm" {
+            return Err(CoreError::Internal(format!("ABI 仅支持 arm64/arm: {abi}")));
+        }
+        let args = adb::build_args(
+            Some(serial),
+            &adb::cmd_shell(&format!("dumpsys package {pkg}")),
+        );
+        let out = self.run_adb(&args).await?;
+        let legacy = crate::services::env_service::parse_legacy_native_lib(&out.stdout)
+            .ok_or_else(|| {
+                CoreError::Internal(format!("未找到 {pkg} 的 legacyNativeLibraryDir（未安装？）"))
+            })?;
+        adb::lib_dir_for_abi(&legacy, abi).ok_or_else(|| {
+            CoreError::Internal(format!("lib 目录结构异常，无法按 ABI {abi} 解析: {legacy}"))
+        })
+    }
+
+    /// so 替换（免重打包）：主机侧修补好的 .so 直接写回 APK 安装目录。
+    /// 三步（用户指定底层流程）：
+    /// ① `adb push <local> /data/local/tmp/<name>`；
+    /// ② dumpsys package 查 legacyNativeLibraryDir，按所选 ABI 拼
+    ///    `.../lib/arm64`（64 位）或 `.../lib/arm`（32 位）目录，
+    ///    `su -c 'cat <tmp> > <target>'` 以 root 覆写；
+    /// ③ `rm <tmp>` 清理临时文件（尽力而为，失败不影响结果）。
+    /// 返回实际写入的目标路径。前置：设备必须已 root（cat 步写 /data/app）。
+    pub async fn so_replace(
+        &self,
+        serial: &str,
+        local: &std::path::Path,
+        pkg: &str,
+        abi: &str,
+    ) -> CoreResult<String> {
+        if !adb::is_safe_pkg_name(pkg) {
+            return Err(CoreError::Internal(format!("包名非法: {pkg}")));
+        }
+        if abi != "arm64" && abi != "arm" {
+            return Err(CoreError::Internal(format!(
+                "ABI 仅支持 arm64(64位)/arm(32位): {abi}"
+            )));
+        }
+        let name = local
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| CoreError::Internal("本地文件路径无法解析文件名".into()))?;
+        if !adb::is_safe_hosted_name(name) || !name.ends_with(".so") {
+            return Err(CoreError::Internal(format!(
+                "文件名需为 .so 且不含空格/特殊字符: {name}"
+            )));
+        }
+        if !local.is_file() {
+            return Err(CoreError::Internal(format!("本地文件不存在: {}", local.display())));
+        }
+        // 前置检查：cat 步要 root 写 /data/app——先探测 su，省得半途失败
+        if !self.su_available(serial).await? {
+            return Err(CoreError::Internal(
+                "so 替换需要 root（su -c cat 写安装目录），设备 su 不可用".into(),
+            ));
+        }
+
+        // 目标路径：dumpsys package 查 legacyNativeLibraryDir → 换 abi 子目录
+        let ds_args = adb::build_args(
+            Some(serial),
+            &adb::cmd_shell(&format!("dumpsys package {pkg}")),
+        );
+        let ds = self.run_adb(&ds_args).await?;
+        let legacy = crate::services::env_service::parse_legacy_native_lib(&ds.stdout)
+            .ok_or_else(|| {
+                CoreError::Internal(format!(
+                    "未找到 {pkg} 的 legacyNativeLibraryDir（应用未安装？包名拼错？）"
+                ))
+            })?;
+        let target = adb::so_target_path(&legacy, abi, name).ok_or_else(|| {
+            CoreError::Internal(format!("无法按 ABI {abi} 拼目标路径: {legacy}"))
+        })?;
+        let tmp = format!("{}/{}", adb::HOSTED_DIR, name);
+        if !adb::is_safe_android_path(&tmp) || !adb::is_safe_android_path(&target) {
+            return Err(CoreError::Internal("设备侧路径含非法字符，已中止".into()));
+        }
+
+        // ① push 到临时目录（长超时档）
+        let push_args = adb::build_args(
+            Some(serial),
+            &adb::cmd_push(&local.display().to_string(), &tmp),
+        );
+        let out = self.run_adb_with(&push_args, PUSH_TIMEOUT).await?;
+        if out.exit_code != Some(0) {
+            return Err(CoreError::Internal(format!(
+                "adb push 失败: {}",
+                out.stderr.trim()
+            )));
+        }
+
+        // ② su -c 'cat tmp > target'（整段单引号包裹，重定向归 root shell）
+        let cat_cmd = adb::su_wrap(&format!("cat {tmp} > {target}"));
+        let args = adb::build_args(Some(serial), &adb::cmd_shell(&cat_cmd));
+        let out = self.run_adb_with(&args, CAT_TIMEOUT).await?;
+        if out.exit_code != Some(0) {
+            return Err(CoreError::Internal(format!(
+                "cat 写入失败: {}",
+                out.stderr.trim()
+            )));
+        }
+
+        // ③ 清理临时文件（尽力而为）
+        let rm_args = adb::build_args(Some(serial), &adb::cmd_shell(&format!("rm {tmp}")));
+        if let Err(e) = self.run_adb(&rm_args).await {
+            tracing::warn!(error = %e, tmp, "so_replace 临时文件清理失败（可忽略）");
+        }
+
+        tracing::info!(serial, pkg, abi, target = %target, "so 替换完成");
+        Ok(target)
     }
 
     /// 拼 `<verb> <dir>/<name>` 并做名称安全校验（所有托管文件操作共用入口）。

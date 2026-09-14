@@ -178,6 +178,16 @@ export const deviceApi = {
   onChanged(handler: (p: DeviceChangedPayload) => void) {
     return listenEvent<DeviceChangedPayload>("device://changed", handler);
   },
+  /** so 替换预览：按 ABI 查询包安装 lib 目录（只读） */
+  pkgLibDir(serial: string, pkg: string, abi: "arm64" | "arm"): Promise<string> {
+    return invokeCommand<string>("device_pkg_lib_dir", { args: { serial, pkg, abi } });
+  },
+  /** so 替换：push → su -c cat 写回 → 清理；返回写入的目标路径 */
+  soReplace(serial: string, localPath: string, pkg: string, abi: "arm64" | "arm"): Promise<string> {
+    return invokeCommand<string>("device_so_replace", {
+      args: { serial, localPath, pkg, abi },
+    });
+  },
   /** 任务状态事件（复用 task 协议） */
   onTaskStatus(handler: (p: TaskStatusPayload) => void) {
     return listenEvent<TaskStatusPayload>("task://status", handler);
