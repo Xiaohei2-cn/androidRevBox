@@ -98,6 +98,8 @@ export default {
   "binary.so.description": "Запись исправленного .so прямо в каталог приложения (push → su -c cat → очистка), без переупаковки. Сначала остановите приложение, иначе перезапись не удастся.",
   "binary.so.localFile": "Локальный файл",
   "binary.so.pick": "Обзор…",
+  "binary.so.dragHint": "Перетащите из Finder — путь подставится",
+  "binary.so.dragPlaceholder": "Перетащите .so или введите путь",
   "binary.so.pickTitle": "Выберите исправленный .so",
   "binary.so.pkg": "Пакет",
   "binary.so.fromForeground": "Из активного",

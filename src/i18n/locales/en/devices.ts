@@ -100,6 +100,8 @@ export default {
   "binary.so.description": "Write a patched .so straight into the app's install dir (push → su -c cat → cleanup), no re-packaging. Stop the target app first, or the overwrite fails.",
   "binary.so.localFile": "Local file",
   "binary.so.pick": "Browse…",
+  "binary.so.dragHint": "Drag from Finder to fill the absolute path",
+  "binary.so.dragPlaceholder": "Drag a .so here or type the path",
   "binary.so.pickTitle": "Pick the patched .so",
   "binary.so.pkg": "Package",
   "binary.so.fromForeground": "Use foreground",

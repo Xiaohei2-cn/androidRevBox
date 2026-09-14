@@ -98,6 +98,8 @@ export default {
   "binary.so.description": "Grava o .so corrigido direto no diretório de instalação do app (push → su -c cat → limpeza), sem reempacotar. Pare o app antes, senão a sobrescrita falha.",
   "binary.so.localFile": "Arquivo local",
   "binary.so.pick": "Procurar…",
+  "binary.so.dragHint": "Arraste do Finder para preencher o caminho",
+  "binary.so.dragPlaceholder": "Arraste um .so ou digite o caminho",
   "binary.so.pickTitle": "Escolha o .so corrigido",
   "binary.so.pkg": "Pacote",
   "binary.so.fromForeground": "Usar 1º plano",

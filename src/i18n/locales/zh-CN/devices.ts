@@ -100,6 +100,8 @@ export default {
   "binary.so.description": "把修补后的 .so 直接写回应用安装目录（push → su -c cat → 清理），免重打包。替换前请先停止目标应用，否则覆写会失败。",
   "binary.so.localFile": "本地文件",
   "binary.so.pick": "选择…",
+  "binary.so.dragHint": "拖入即识别访达文件绝对路径并填入",
+  "binary.so.dragPlaceholder": "拖入 .so 或手填路径",
   "binary.so.pickTitle": "选择修补后的 .so 文件",
   "binary.so.pkg": "包名",
   "binary.so.fromForeground": "取前台应用",

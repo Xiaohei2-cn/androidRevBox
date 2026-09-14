@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { FolderInput, Play, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { deviceApi, type DeviceEntry } from "@/api/device";
 import { envApi } from "@/api/env";
 import { pickFile } from "@/api/dialog";
+import { useDragDropPath } from "@/hooks/useDragDropPath";
+import { useActiveTab } from "@/app/nav";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 
@@ -47,6 +49,17 @@ export function SoReplacePage() {
   }, [deviceSerial, online]);
 
   const soName = localPath.split(/[\\/]/).pop() ?? "";
+  const binaryActive = useActiveTab("binary");
+  const onDropSo = useCallback((path: string) => {
+    setLocalPath(path);
+    setResult(null);
+    setNotice(null);
+  }, []);
+  useDragDropPath({
+    onPath: onDropSo,
+    extensions: useMemo(() => ["so"], []),
+    enabled: binaryActive,
+  });
   const canPreview = !!deviceSerial && /^[A-Za-z0-9._-]+$/.test(pkg.trim()) && !!soName;
 
   // 目标 lib 目录预览（包名/ABI/设备变化时自动重查；只读）
@@ -143,8 +156,9 @@ export function SoReplacePage() {
           <span className="w-16 shrink-0 text-muted-foreground">{t("binary.so.localFile")}</span>
           <input
             aria-label={t("binary.so.localFile")}
-            className="path-selectable h-7 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
-            placeholder="/path/to/patched/libxxx.so"
+            title={t("binary.so.dragHint")}
+            className="path-selectable h-7 min-w-0 flex-1 rounded-md border border-dashed border-input bg-transparent px-2 font-mono text-xs hover:border-foreground/40"
+            placeholder={t("binary.so.dragPlaceholder")}
             value={localPath}
             onChange={(e) => setLocalPath(e.target.value)}
           />

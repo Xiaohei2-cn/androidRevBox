@@ -98,6 +98,8 @@ export default {
   "binary.so.description": "修正済み .so をインストールディレクトリへ直接書き戻す（push → su -c cat → 後片付け）。再パッケージ不要。対象アプリを停止してから実行してください。",
   "binary.so.localFile": "ローカルファイル",
   "binary.so.pick": "選択…",
+  "binary.so.dragHint": "Finder からドラッグで絶対パスを入力",
+  "binary.so.dragPlaceholder": ".so をドラッグまたはパスを手入力",
   "binary.so.pickTitle": "修正済み .so を選択",
   "binary.so.pkg": "パッケージ名",
   "binary.so.fromForeground": "フォアグラウンドから",
