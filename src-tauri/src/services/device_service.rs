@@ -11,6 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agent_protocol::method::DEVICE_INFO;
+use agent_protocol::{DeviceInfoParams, DeviceInfoResult};
 use async_trait::async_trait;
 use serde::Serialize;
 use tauri::Emitter;
@@ -19,6 +21,8 @@ use crate::adapters::adb::{self, AdbVersionInfo, DeviceEntry, DeviceInfo, FileEn
 use crate::core::error::{CoreError, CoreResult};
 use crate::core::ipc::{AppEvent, event_names};
 use crate::db::Db;
+use crate::models::agent::AndroidBackendSource;
+use crate::services::android_backend::{CapabilityRouter, OperationKind};
 use crate::services::config_service::ConfigService;
 use crate::services::process_service::CommandSpec;
 use crate::services::task_service::TaskService;
@@ -394,6 +398,7 @@ pub struct DeviceChangedPayload {
 
 pub struct DeviceService {
     runner: Arc<dyn AdbRunner>,
+    android: Arc<CapabilityRouter>,
     tasks: Arc<TaskService>,
     db: Arc<Db>,
     app: tauri::AppHandle,
@@ -405,12 +410,14 @@ pub struct DeviceService {
 impl DeviceService {
     pub fn new(
         runner: Arc<dyn AdbRunner>,
+        android: Arc<CapabilityRouter>,
         tasks: Arc<TaskService>,
         db: Arc<Db>,
         app: tauri::AppHandle,
     ) -> Self {
         Self {
             runner,
+            android,
             tasks,
             db,
             app,
@@ -437,17 +444,21 @@ impl DeviceService {
 
     /// 带自定义超时的 adb 短命令（大文件 push 等慢操作用长档）
     async fn run_adb_with(&self, args: &[String], timeout: Duration) -> CoreResult<AdbRunOutput> {
+        self.android.legacy().run(args, timeout).await
+    }
+
+    async fn run_transport_adb(&self, args: &[String]) -> CoreResult<AdbRunOutput> {
         let env = self.runner.environment().await;
         let path = env
             .path
             .ok_or_else(|| CoreError::Internal(env.hint.unwrap_or_else(|| "adb 不可用".into())))?;
-        self.runner.run(&path, args, timeout).await
+        self.runner.run(&path, args, LIST_TIMEOUT).await
     }
 
     /// 设备列表（adb devices -l）
     pub async fn list_devices(&self) -> CoreResult<Vec<DeviceEntry>> {
         let args = adb::build_args(None, &adb::cmd_devices());
-        let out = self.run_adb(&args).await?;
+        let out = self.run_transport_adb(&args).await?;
         if out.exit_code != Some(0) {
             return Err(CoreError::Internal(format!(
                 "adb devices 失败: {}",
@@ -459,6 +470,55 @@ impl DeviceService {
 
     /// 设备信息（getprop 常用字段 + wlan0 IP）
     pub async fn device_info(&self, serial: &str) -> CoreResult<DeviceInfo> {
+        let route = self
+            .android
+            .select(serial, DEVICE_INFO, OperationKind::ReadOnlyIdempotent)
+            .map_err(CapabilityRouter::core_error)?;
+        if route.backend == AndroidBackendSource::LegacyAdb {
+            return self.device_info_legacy(serial).await;
+        }
+
+        let agent_request = self.android.agent().request::<_, DeviceInfoResult>(
+            serial,
+            DEVICE_INFO,
+            &DeviceInfoParams {},
+            LIST_TIMEOUT,
+        );
+        let (agent_result, legacy_result) = if device_info_shadow_enabled() {
+            let legacy_request = self.device_info_legacy(serial);
+            let (agent_result, legacy_result) = tokio::join!(agent_request, legacy_request);
+            (agent_result, Some(legacy_result))
+        } else {
+            (agent_request.await, None)
+        };
+        match agent_result {
+            Ok(result) => {
+                let info = map_agent_device_info(serial, result);
+                if let Some(Ok(legacy)) = legacy_result {
+                    log_device_info_shadow_diff(serial, &info, &legacy);
+                }
+                Ok(info)
+            }
+            Err(error) => {
+                let fallback = self
+                    .android
+                    .fallback_after_agent_error(
+                        serial,
+                        DEVICE_INFO,
+                        OperationKind::ReadOnlyIdempotent,
+                        &error,
+                    )
+                    .map_err(CapabilityRouter::core_error)?;
+                debug_assert_eq!(fallback.backend, AndroidBackendSource::LegacyAdb);
+                match legacy_result {
+                    Some(result) => result,
+                    None => self.device_info_legacy(serial).await,
+                }
+            }
+        }
+    }
+
+    async fn device_info_legacy(&self, serial: &str) -> CoreResult<DeviceInfo> {
         let args = adb::build_args(Some(serial), &adb::cmd_getprop());
         let out = self.run_adb(&args).await?;
         if out.exit_code != Some(0) {
@@ -469,7 +529,7 @@ impl DeviceService {
         }
         let mut info = adb::device_info_from_props(serial, &adb::parse_getprop(&out.stdout));
         // IP 读取尽力而为：失败（未连 Wi-Fi/旧 ROM）不影响 info 其他字段
-        info.ip = self.device_ip(serial).await.ok().flatten();
+        info.ip = self.device_ip_legacy(serial).await.ok().flatten();
         Ok(info)
     }
 
@@ -502,6 +562,10 @@ impl DeviceService {
     /// 设备 wlan0 IPv4：`adb -s <serial> shell ip addr show wlan0`
     /// （用户指定命令；解析不到返回 None——未连 Wi-Fi / 双卡数据流量）
     pub async fn device_ip(&self, serial: &str) -> CoreResult<Option<String>> {
+        self.device_ip_legacy(serial).await
+    }
+
+    async fn device_ip_legacy(&self, serial: &str) -> CoreResult<Option<String>> {
         let args = adb::build_args(Some(serial), &adb::cmd_ip_addr());
         let out = self.run_adb(&args).await?;
         if out.exit_code != Some(0) {
@@ -531,7 +595,7 @@ impl DeviceService {
             )));
         }
         let args = adb::build_args(Some(serial), &adb::cmd_forward(&local, &remote));
-        let out = self.run_adb(&args).await?;
+        let out = self.run_transport_adb(&args).await?;
         if out.exit_code != Some(0) {
             return Err(CoreError::Internal(format!(
                 "adb forward 失败: {}",
@@ -544,7 +608,7 @@ impl DeviceService {
     /// 列出该设备当前全部转发规则。
     pub async fn forward_list(&self, serial: &str) -> CoreResult<Vec<ForwardRule>> {
         let args = adb::build_args(Some(serial), &adb::cmd_forward_list());
-        let out = self.run_adb(&args).await?;
+        let out = self.run_transport_adb(&args).await?;
         if out.exit_code != Some(0) {
             return Err(CoreError::Internal(format!(
                 "adb forward --list 失败: {}",
@@ -553,7 +617,11 @@ impl DeviceService {
         }
         Ok(adb::parse_forward_list(&out.stdout)
             .into_iter()
-            .map(|(s, l, r)| ForwardRule { serial: s, local: l, remote: r })
+            .map(|(s, l, r)| ForwardRule {
+                serial: s,
+                local: l,
+                remote: r,
+            })
             .collect())
     }
 
@@ -566,7 +634,7 @@ impl DeviceService {
             }
         }
         let args = adb::build_args(Some(serial), &adb::cmd_forward_remove(local.as_deref()));
-        let out = self.run_adb(&args).await?;
+        let out = self.run_transport_adb(&args).await?;
         if out.exit_code != Some(0) {
             return Err(CoreError::Internal(format!(
                 "adb forward --remove 失败: {}",
@@ -760,8 +828,10 @@ impl DeviceService {
     ) -> CoreResult<Vec<adb::PortHolder>> {
         let wrap = |c: String| if root { adb::su_wrap(&c) } else { c };
 
-        let args =
-            adb::build_args(Some(serial), &adb::cmd_shell(&wrap(adb::port_grep_cmd(port))));
+        let args = adb::build_args(
+            Some(serial),
+            &adb::cmd_shell(&wrap(adb::port_grep_cmd(port))),
+        );
         let out = self.run_adb(&args).await?;
         let inodes: std::collections::HashSet<u64> = adb::parse_proc_net_entries(&out.stdout)
             .into_iter()
@@ -772,8 +842,7 @@ impl DeviceService {
             return Ok(Vec::new());
         }
 
-        let args =
-            adb::build_args(Some(serial), &adb::cmd_shell(&wrap(adb::inode_scan_cmd())));
+        let args = adb::build_args(Some(serial), &adb::cmd_shell(&wrap(adb::inode_scan_cmd())));
         let out = self.run_adb(&args).await?;
         let holder_pids = adb::parse_fd_scan(&out.stdout, &inodes);
         if holder_pids.is_empty() {
@@ -790,12 +859,7 @@ impl DeviceService {
 
     /// 查询包安装 lib 目录（so 替换 UI 预览用，只读）：
     /// dumpsys package → legacyNativeLibraryDir → 按 ABI 换 arm64/arm 尾段。
-    pub async fn pkg_lib_dir(
-        &self,
-        serial: &str,
-        pkg: &str,
-        abi: &str,
-    ) -> CoreResult<String> {
+    pub async fn pkg_lib_dir(&self, serial: &str, pkg: &str, abi: &str) -> CoreResult<String> {
         if !adb::is_safe_pkg_name(pkg) {
             return Err(CoreError::Internal(format!("包名非法: {pkg}")));
         }
@@ -809,7 +873,9 @@ impl DeviceService {
         let out = self.run_adb(&args).await?;
         let legacy = crate::services::env_service::parse_legacy_native_lib(&out.stdout)
             .ok_or_else(|| {
-                CoreError::Internal(format!("未找到 {pkg} 的 legacyNativeLibraryDir（未安装？）"))
+                CoreError::Internal(format!(
+                    "未找到 {pkg} 的 legacyNativeLibraryDir（未安装？）"
+                ))
             })?;
         adb::lib_dir_for_abi(&legacy, abi).ok_or_else(|| {
             CoreError::Internal(format!("lib 目录结构异常，无法按 ABI {abi} 解析: {legacy}"))
@@ -849,7 +915,10 @@ impl DeviceService {
             )));
         }
         if !local.is_file() {
-            return Err(CoreError::Internal(format!("本地文件不存在: {}", local.display())));
+            return Err(CoreError::Internal(format!(
+                "本地文件不存在: {}",
+                local.display()
+            )));
         }
         // 前置检查：cat 步要 root 写 /data/app——先探测 su，省得半途失败
         if !self.su_available(serial).await? {
@@ -864,15 +933,14 @@ impl DeviceService {
             &adb::cmd_shell(&format!("dumpsys package {pkg}")),
         );
         let ds = self.run_adb(&ds_args).await?;
-        let legacy = crate::services::env_service::parse_legacy_native_lib(&ds.stdout)
-            .ok_or_else(|| {
+        let legacy =
+            crate::services::env_service::parse_legacy_native_lib(&ds.stdout).ok_or_else(|| {
                 CoreError::Internal(format!(
                     "未找到 {pkg} 的 legacyNativeLibraryDir（应用未安装？包名拼错？）"
                 ))
             })?;
-        let target = adb::so_target_path(&legacy, abi, name).ok_or_else(|| {
-            CoreError::Internal(format!("无法按 ABI {abi} 拼目标路径: {legacy}"))
-        })?;
+        let target = adb::so_target_path(&legacy, abi, name)
+            .ok_or_else(|| CoreError::Internal(format!("无法按 ABI {abi} 拼目标路径: {legacy}")))?;
         let tmp = format!("{}/{}", adb::HOSTED_DIR, name);
         if !adb::is_safe_android_path(&tmp) || !adb::is_safe_android_path(&target) {
             return Err(CoreError::Internal("设备侧路径含非法字符，已中止".into()));
@@ -935,6 +1003,7 @@ impl DeviceService {
             cwd: None,
             timeout: None, // 长任务不设超时，由用户取消
             env_extra: HashMap::new(),
+            ..Default::default()
         };
         self.tasks.start(spec)
     }
@@ -1007,7 +1076,16 @@ impl DeviceService {
         let env = self.runner.environment().await;
         if !env.installed {
             // adb 不可用：清空已知快照（下次装好会重新报上线），不发噪音事件
-            self.known.lock().expect("known lock").clear();
+            let disconnected: Vec<_> = self
+                .known
+                .lock()
+                .expect("known lock")
+                .drain()
+                .map(|(serial, _)| serial)
+                .collect();
+            for serial in disconnected {
+                self.android.device_disconnected(&serial).await;
+            }
             return Ok(Vec::new());
         }
         let devices = match self.list_devices().await {
@@ -1021,39 +1099,46 @@ impl DeviceService {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let mut known = self.known.lock().expect("known lock");
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut events = Vec::new();
-        for d in &devices {
-            let prev = known.get(&d.serial);
-            if prev != Some(&d.state) {
+        let events = {
+            let mut known = self.known.lock().expect("known lock");
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut events = Vec::new();
+            for d in &devices {
+                let prev = known.get(&d.serial);
+                if prev != Some(&d.state) {
+                    events.push(DeviceChangedPayload {
+                        serial: d.serial.clone(),
+                        transport: d.transport.clone(),
+                        present: true,
+                        state: d.state.clone(),
+                        last_seen: now,
+                    });
+                }
+                known.insert(d.serial.clone(), d.state.clone());
+                seen.insert(d.serial.clone());
+            }
+            for gone in known
+                .keys()
+                .filter(|s| !seen.contains(*s))
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                known.remove(&gone);
                 events.push(DeviceChangedPayload {
-                    serial: d.serial.clone(),
-                    transport: d.transport.clone(),
-                    present: true,
-                    state: d.state.clone(),
+                    serial: gone,
+                    transport: String::new(),
+                    present: false,
+                    state: "offline".into(),
                     last_seen: now,
                 });
             }
-            known.insert(d.serial.clone(), d.state.clone());
-            seen.insert(d.serial.clone());
+            events
+        };
+        for event in &events {
+            if !event.present || event.state != "device" {
+                self.android.device_disconnected(&event.serial).await;
+            }
         }
-        for gone in known
-            .keys()
-            .filter(|s| !seen.contains(*s))
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            known.remove(&gone);
-            events.push(DeviceChangedPayload {
-                serial: gone,
-                transport: String::new(),
-                present: false,
-                state: "offline".into(),
-                last_seen: now,
-            });
-        }
-        drop(known);
         self.persist_devices_cache(&devices, now);
         for evt_payload in &events {
             let evt = AppEvent::new(event_names::DEVICE_CHANGED, evt_payload);
@@ -1082,6 +1167,61 @@ impl DeviceService {
                 Ok(())
             });
         }
+    }
+}
+
+fn map_agent_device_info(serial: &str, result: DeviceInfoResult) -> DeviceInfo {
+    DeviceInfo {
+        model: result.model.unwrap_or_default(),
+        manufacturer: result.manufacturer.unwrap_or_default(),
+        android_version: result.android_version.unwrap_or_default(),
+        sdk_int: result
+            .api_level
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        serial: serial.to_owned(),
+        ip: result.wlan_ipv4,
+    }
+}
+
+fn device_info_shadow_enabled() -> bool {
+    !std::env::var("APP_REVERSE_TOOLS_DEVICE_INFO_SHADOW")
+        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
+}
+
+fn log_device_info_shadow_diff(serial: &str, agent: &DeviceInfo, legacy: &DeviceInfo) {
+    let mut differing_fields = Vec::new();
+    if agent.model.trim() != legacy.model.trim() {
+        differing_fields.push("model");
+    }
+    if agent.manufacturer.trim() != legacy.manufacturer.trim() {
+        differing_fields.push("manufacturer");
+    }
+    if agent.android_version.trim() != legacy.android_version.trim() {
+        differing_fields.push("android_version");
+    }
+    if agent.sdk_int.trim() != legacy.sdk_int.trim() {
+        differing_fields.push("sdk_int");
+    }
+    if agent.serial.trim() != legacy.serial.trim() {
+        differing_fields.push("serial");
+    }
+    if agent.ip != legacy.ip {
+        differing_fields.push("ip");
+    }
+    if differing_fields.is_empty() {
+        tracing::debug!(
+            serial,
+            method = DEVICE_INFO,
+            "Agent/Legacy shadow compare matched"
+        );
+    } else {
+        tracing::warn!(
+            serial,
+            method = DEVICE_INFO,
+            fields = ?differing_fields,
+            "Agent/Legacy shadow compare differed"
+        );
     }
 }
 
@@ -1143,6 +1283,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.exit_code, Some(-1));
+    }
+
+    #[tokio::test]
+    async fn legacy_device_and_package_query_outputs_remain_parseable() {
+        let runner = MockAdbRunner::new(true)
+            .with_script(
+                &["getprop"],
+                MockAdbRunner::ok_output(
+                    "[ro.product.model]: [Test Device]\r\n[ro.build.version.sdk]: [35]\r\n",
+                ),
+            )
+            .with_script(
+                &["pm", "list", "packages", "-3"],
+                MockAdbRunner::ok_output("package:com.example.one\r\npackage:com.example.two\r\n"),
+            );
+
+        let getprop_args = adb::build_args(Some("SERIAL_REDACTED"), &adb::cmd_getprop());
+        let props_out = runner
+            .run("/mock/adb", &getprop_args, LIST_TIMEOUT)
+            .await
+            .unwrap();
+        let info =
+            adb::device_info_from_props("SERIAL_REDACTED", &adb::parse_getprop(&props_out.stdout));
+        assert_eq!(info.model, "Test Device");
+        assert_eq!(info.sdk_int, "35");
+        assert_eq!(info.manufacturer, "");
+
+        let package_args = adb::build_args(Some("SERIAL_REDACTED"), &adb::cmd_list_packages(true));
+        let packages_out = runner
+            .run("/mock/adb", &package_args, LIST_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(
+            adb::parse_packages(&packages_out.stdout),
+            ["com.example.one", "com.example.two"]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_runner_preserves_permission_and_missing_command_failures() {
+        let runner = MockAdbRunner::new(true).with_script(
+            &["pm", "list", "packages"],
+            AdbRunOutput {
+                stdout: String::new(),
+                stderr: "Security exception: Permission denied".into(),
+                exit_code: Some(1),
+            },
+        );
+        let args = adb::build_args(Some("SERIAL_REDACTED"), &adb::cmd_list_packages(true));
+        let denied = runner.run("/mock/adb", &args, LIST_TIMEOUT).await.unwrap();
+        assert_eq!(denied.exit_code, Some(1));
+        assert!(denied.stderr.contains("Permission denied"));
+        assert!(adb::parse_packages(&denied.stdout).is_empty());
+
+        let missing = runner
+            .run(
+                "/mock/adb",
+                &adb::build_args(
+                    Some("SERIAL_REDACTED"),
+                    &adb::cmd_shell("definitely_missing_command"),
+                ),
+                LIST_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.exit_code, Some(-1));
+        assert_eq!(missing.stderr, "mock: unmatched args");
+    }
+
+    #[test]
+    fn agent_device_info_maps_optional_protocol_fields_to_existing_command_dto() {
+        let info = map_agent_device_info(
+            "SERIAL-1",
+            DeviceInfoResult {
+                serial: Some("device-property-serial".into()),
+                model: Some("Pixel Test".into()),
+                manufacturer: None,
+                android_version: Some("16".into()),
+                api_level: Some(36),
+                primary_abi: Some("arm64-v8a".into()),
+                wlan_ipv4: Some("192.0.2.4".into()),
+            },
+        );
+        assert_eq!(info.serial, "SERIAL-1");
+        assert_eq!(info.model, "Pixel Test");
+        assert_eq!(info.manufacturer, "");
+        assert_eq!(info.android_version, "16");
+        assert_eq!(info.sdk_int, "36");
+        assert_eq!(info.ip.as_deref(), Some("192.0.2.4"));
     }
 
     #[test]

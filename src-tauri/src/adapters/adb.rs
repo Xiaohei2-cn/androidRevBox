@@ -298,10 +298,7 @@ pub fn is_elf_file_output(output: &str) -> bool {
 /// - `file_lines`：`file <dir>/*` 的输出行（每行 `<path>: <type>`）。
 ///
 /// 只保留被 file 判定为 ELF 的文件。
-pub fn hosted_binaries(
-    ls_stdout: &str,
-    file_stdout: &str,
-) -> Vec<HostedBinary> {
+pub fn hosted_binaries(ls_stdout: &str, file_stdout: &str) -> Vec<HostedBinary> {
     // 收集 ELF 命中的绝对路径集合
     let elf_paths: std::collections::HashSet<String> = file_stdout
         .lines()
@@ -311,7 +308,9 @@ pub fn hosted_binaries(
         .collect();
     let mut out: Vec<HostedBinary> = Vec::new();
     for line in ls_stdout.lines() {
-        let Some(fe) = parse_ls_long(line) else { continue };
+        let Some(fe) = parse_ls_long(line) else {
+            continue;
+        };
         if fe.is_dir {
             continue;
         }
@@ -354,11 +353,7 @@ pub fn run_log_diagnostics(log_tail: &str) -> Option<String> {
     }
     let mut s = lines[lines.len().saturating_sub(3)..].join(" | ");
     if s.chars().count() > 300 {
-        let cut = s
-            .char_indices()
-            .nth(300)
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
+        let cut = s.char_indices().nth(300).map(|(i, _)| i).unwrap_or(s.len());
         s = s[..cut].to_string() + "…";
     }
     Some(s)
@@ -392,11 +387,7 @@ pub fn is_root_probe_ok(stdout: &str) -> bool {
 pub fn hosted_run_cmd(name: &str, log: &str, root: bool) -> String {
     debug_assert!(is_safe_hosted_name(name));
     let inner = format!("cd {HOSTED_DIR}; nohup ./{name} >{log} 2>&1 & echo $!");
-    if root {
-        su_wrap(&inner)
-    } else {
-        inner
-    }
+    if root { su_wrap(&inner) } else { inner }
 }
 
 /// 托管进程监听端口信息（/proc/net/tcp|tcp6 行解析结果）。
@@ -490,7 +481,11 @@ fn parse_proc_net_body(toks: &[&str], family: &'static str) -> Option<ProcNetEnt
         let Ok(port) = u16::from_str_radix(port_hex, 16) else {
             continue;
         };
-        let Some(address) = (if v6 { hex_ipv6(ip_hex) } else { hex_ipv4(ip_hex) }) else {
+        let Some(address) = (if v6 {
+            hex_ipv6(ip_hex)
+        } else {
+            hex_ipv4(ip_hex)
+        }) else {
             continue;
         };
         let state = toks.get(idx + 2).copied().unwrap_or("");
@@ -557,7 +552,12 @@ pub fn parse_proc_net_entries(stdout: &str) -> Vec<ProcNetEntry> {
         let Some(e) = parse_proc_net_body(&toks, fam) else {
             continue;
         };
-        if seen.insert((e.family, e.listen_port.address.clone(), e.listen_port.port, e.inode)) {
+        if seen.insert((
+            e.family,
+            e.listen_port.address.clone(),
+            e.listen_port.port,
+            e.inode,
+        )) {
             out.push(e);
         }
     }
@@ -601,7 +601,10 @@ pub fn parse_fd_scan(stdout: &str, inodes: &std::collections::HashSet<u64>) -> V
     let mut hits = std::collections::HashSet::new();
     for line in stdout.lines() {
         let t = line.trim_end_matches('\r').trim();
-        if let Some(head) = t.strip_prefix("/proc/").and_then(|r| r.strip_suffix("/fd:")) {
+        if let Some(head) = t
+            .strip_prefix("/proc/")
+            .and_then(|r| r.strip_suffix("/fd:"))
+        {
             current_pid = head.parse::<u32>().ok();
             continue;
         }
@@ -663,7 +666,11 @@ pub fn parse_port_holders(stdout: &str) -> Vec<PortHolder> {
         if seen.insert(pid) {
             out.push(PortHolder {
                 pid,
-                name: if name.is_empty() { "?".to_string() } else { name },
+                name: if name.is_empty() {
+                    "?".to_string()
+                } else {
+                    name
+                },
             });
         }
     }
@@ -744,6 +751,9 @@ pub fn cmd_version() -> Vec<String> {
 }
 pub fn cmd_devices() -> Vec<String> {
     vec!["devices".into(), "-l".into()]
+}
+pub fn cmd_get_state() -> Vec<String> {
+    vec!["get-state".into()]
 }
 pub fn cmd_getprop() -> Vec<String> {
     vec!["shell".into(), "getprop".into()]
@@ -868,18 +878,22 @@ pub fn is_safe_android_path(path: &str) -> bool {
 }
 
 /// dumpsys 的 legacyNativeLibraryDir → 目标 abi 的 lib 子目录。
-/// 输入形如 `/data/app/~~xxxx==/pkg-yyyy==/lib/arm64`；按用户选择把尾段
-/// 替换为 `arm64`（64 位）或 `arm`（32 位）。非 lib/ 结尾的异常路径返回 None。
+/// Android 版本/ROM 可能返回 `<base>/lib` 或 `<base>/lib/arm64|arm`；统一按用户
+/// 选择得到 `arm64`（64 位）或 `arm`（32 位）。其他目录形态返回 None。
 pub fn lib_dir_for_abi(legacy_native_dir: &str, abi: &str) -> Option<String> {
     let dir = legacy_native_dir.trim();
-    let base = match dir.rsplit_once("/lib/") {
-        Some((pre, tail)) if tail == "arm64" || tail == "arm" => Some(pre),
-        _ => None,
-    }?;
     let sub = match abi {
         "arm64" => "arm64",
         "arm" => "arm",
         _ => return None,
+    };
+    let base = if let Some(pre) = dir.strip_suffix("/lib") {
+        pre
+    } else {
+        match dir.rsplit_once("/lib/") {
+            Some((pre, tail)) if tail == "arm64" || tail == "arm" => pre,
+            _ => return None,
+        }
     };
     Some(format!("{base}/lib/{sub}"))
 }
@@ -926,7 +940,10 @@ pub fn is_valid_forward_spec(spec: &str) -> bool {
             .then_some(())
             .is_some(),
         "localabstract" | "localreserved" => {
-            !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+            !value.is_empty()
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
         }
         _ => false,
     }
@@ -958,6 +975,19 @@ pub fn parse_forward_list(stdout: &str) -> Vec<(String, String, String)> {
             ))
         })
         .collect()
+}
+
+/// 解析 `adb forward tcp:0 ...` 返回的宿主动态端口。
+pub fn parse_dynamic_forward_port(stdout: &str) -> Option<u16> {
+    let port = stdout.trim().parse::<u16>().ok()?;
+    (port > 0).then_some(port)
+}
+
+/// 解析 Android `sha256sum PATH` 输出的首个十六进制摘要。
+pub fn parse_sha256(stdout: &str) -> Option<String> {
+    let digest = stdout.split_whitespace().next()?;
+    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| digest.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -1295,10 +1325,16 @@ mod tests {
         let ports = parse_listening_ports(out);
         assert_eq!(ports.len(), 3);
         // 端口升序：8080(127.0.0.1 tcp) < 8081(::1 tcp6) < 27042(0.0.0.0 tcp)
-        assert_eq!((ports[0].port, ports[0].address.as_str()), (8080, "127.0.0.1"));
+        assert_eq!(
+            (ports[0].port, ports[0].address.as_str()),
+            (8080, "127.0.0.1")
+        );
         assert_eq!((ports[1].port, ports[1].address.as_str()), (8081, "::1"));
         assert_eq!(ports[1].family, "tcp6");
-        assert_eq!((ports[2].port, ports[2].address.as_str()), (27042, "0.0.0.0"));
+        assert_eq!(
+            (ports[2].port, ports[2].address.as_str()),
+            (27042, "0.0.0.0")
+        );
         assert!(ports.iter().all(|p| p.listen));
         // 兼容裸 tcp: 前缀（部分 shell 省略路径）
         let bare = out.replace("/proc/net/", "");
@@ -1402,9 +1438,18 @@ tcp: garbage line
     #[test]
     fn so_target_path_builds_per_abi() {
         let legacy = "/data/app/~~P55Dx==/cn.rev.binary.auth-70Xa==/lib/arm64";
+        let android_14_legacy = "/data/app/~~P55Dx==/cn.rev.binary.auth-70Xa==/lib";
         assert_eq!(
             so_target_path(legacy, "arm64", "libauth.so").as_deref(),
             Some("/data/app/~~P55Dx==/cn.rev.binary.auth-70Xa==/lib/arm64/libauth.so")
+        );
+        assert_eq!(
+            lib_dir_for_abi(android_14_legacy, "arm64").as_deref(),
+            Some("/data/app/~~P55Dx==/cn.rev.binary.auth-70Xa==/lib/arm64")
+        );
+        assert_eq!(
+            so_target_path(android_14_legacy, "arm", "libauth.so").as_deref(),
+            Some("/data/app/~~P55Dx==/cn.rev.binary.auth-70Xa==/lib/arm/libauth.so")
         );
         // 用户选 32 位：尾段替换为 arm
         assert_eq!(
@@ -1484,20 +1529,50 @@ tcp: garbage line
         let out = "ABC123 tcp:8080 tcp:9000\r\nABC123 tcp:5555 localabstract:foo\r\n";
         let rows = parse_forward_list(out);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], ("ABC123".into(), "tcp:8080".into(), "tcp:9000".into()));
+        assert_eq!(
+            rows[0],
+            ("ABC123".into(), "tcp:8080".into(), "tcp:9000".into())
+        );
         assert_eq!(rows[1].2, "localabstract:foo");
         assert!(parse_forward_list("").is_empty());
     }
 
     #[test]
+    fn parse_dynamic_forward_port_accepts_only_a_real_tcp_port() {
+        assert_eq!(parse_dynamic_forward_port("43210\r\n"), Some(43210));
+        assert_eq!(parse_dynamic_forward_port("0\n"), None);
+        assert_eq!(parse_dynamic_forward_port("65536\n"), None);
+        assert_eq!(parse_dynamic_forward_port("tcp:43210\n"), None);
+    }
+
+    #[test]
+    fn parse_sha256_accepts_toybox_shape_and_rejects_malformed_digest() {
+        let digest = "EC02D29CE68CBA5CA6ABE0256D4A5766F70D684BE2A77554E2433D94CBC0CA9B";
+        assert_eq!(
+            parse_sha256(&format!("{digest}  /data/local/tmp/agent\r\n")),
+            Some(digest.to_ascii_lowercase())
+        );
+        assert_eq!(parse_sha256("abc /tmp/agent\n"), None);
+        assert_eq!(
+            parse_sha256("not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex\n"),
+            None
+        );
+        assert_eq!(parse_sha256(""), None);
+    }
+
+    #[test]
     fn forward_command_builders() {
+        assert_eq!(cmd_get_state(), ["get-state"]);
         assert_eq!(cmd_ip_addr(), ["shell", "ip addr show wlan0"]);
         assert_eq!(
             cmd_forward("tcp:8080", "tcp:9000"),
             ["forward", "tcp:8080", "tcp:9000"]
         );
         assert_eq!(cmd_forward_list(), ["forward", "--list"]);
-        assert_eq!(cmd_forward_remove(Some("tcp:1")), ["forward", "--remove", "tcp:1"]);
+        assert_eq!(
+            cmd_forward_remove(Some("tcp:1")),
+            ["forward", "--remove", "tcp:1"]
+        );
         assert_eq!(cmd_forward_remove(None), ["forward", "--remove-all"]);
         // -s 绑定组合（多设备隔离的关键）
         assert_eq!(
@@ -1505,5 +1580,63 @@ tcp: garbage line
             ["-s", "s1", "forward", "--list"]
         );
     }
-}
 
+    #[test]
+    fn legacy_device_and_package_parsers_cover_crlf_missing_and_empty_output() {
+        let props = parse_getprop(
+            "[ro.product.model]: [Pixel Test]\r\n\
+             [ro.product.manufacturer]: [Example]\r\n\
+             [ro.build.version.release]: [15]\r\n",
+        );
+        let info = device_info_from_props("SERIAL_REDACTED", &props);
+        assert_eq!(info.model, "Pixel Test");
+        assert_eq!(info.manufacturer, "Example");
+        assert_eq!(info.android_version, "15");
+        assert_eq!(info.sdk_int, "", "缺失属性保持空串的 Legacy 语义");
+        assert_eq!(info.serial, "SERIAL_REDACTED");
+        assert_eq!(info.ip, None);
+
+        assert_eq!(
+            parse_packages("package:com.example.alpha\r\npackage:com.example.beta\r\n"),
+            ["com.example.alpha", "com.example.beta"]
+        );
+        assert!(parse_getprop("").is_empty());
+        assert!(parse_packages("").is_empty());
+    }
+
+    #[test]
+    fn legacy_parsers_do_not_invent_rows_from_permission_or_command_errors() {
+        let errors = [
+            "Permission denied\r\n",
+            "/system/bin/sh: pm: inaccessible or not found\r\n",
+            "error: closed\r\n",
+        ];
+        for output in errors {
+            assert!(parse_getprop(output).is_empty(), "{output:?}");
+            assert!(parse_packages(output).is_empty(), "{output:?}");
+            assert!(parse_listening_ports(output).is_empty(), "{output:?}");
+            assert!(parse_proc_net_entries(output).is_empty(), "{output:?}");
+            assert!(parse_port_holders(output).is_empty(), "{output:?}");
+            assert!(hosted_binaries(output, output).is_empty(), "{output:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_proc_parsers_accept_toybox_crlf_shapes() {
+        let tcp = "/proc/net/tcp: 1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10234 0 45678 1 0\r\n";
+        let ports = parse_listening_ports(tcp);
+        assert_eq!(ports.len(), 1);
+        assert_eq!(
+            (ports[0].address.as_str(), ports[0].port),
+            ("127.0.0.1", 8080)
+        );
+
+        let scan = "/proc/4242/fd:\r\nlrwx------ 1 u0_a1 u0_a1 64 2026-01-01 00:00 7 -> socket:[45678]\r\n";
+        let inodes = [45678_u64].into_iter().collect();
+        assert_eq!(parse_fd_scan(scan, &inodes), [4242]);
+        assert_eq!(
+            parse_port_holders("4242 test process\r\n")[0].name,
+            "test process"
+        );
+    }
+}

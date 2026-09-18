@@ -105,7 +105,7 @@ function MainTabButton({
       className={cn(
         "app-surface group relative flex h-10 shrink-0 select-none items-center justify-center rounded-l-xl border border-r-0 border-border/60",
         active
-          ? "max-w-24 bg-primary px-2.5 text-primary-foreground shadow-sm"
+          ? "max-w-24 bg-primary px-2.5 text-primary-foreground"
           : "w-7 text-muted-foreground hover:w-8 hover:text-foreground",
       )}
     >

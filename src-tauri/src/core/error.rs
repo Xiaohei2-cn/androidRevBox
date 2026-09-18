@@ -16,6 +16,15 @@ pub enum CoreError {
 
     #[error("内部错误: {0}")]
     Internal(String),
+
+    #[error("Agent 不可用: {0}")]
+    AgentUnavailable(String),
+
+    #[error("Agent 版本不兼容: {0}")]
+    AgentIncompatible(String),
+
+    #[error("Agent 传输断开: {0}")]
+    AgentTransportLost(String),
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;
@@ -28,6 +37,9 @@ impl CoreError {
             CoreError::Serialization(_) => "SERIALIZATION",
             CoreError::Database(_) => "DATABASE",
             CoreError::Internal(_) => "INTERNAL",
+            CoreError::AgentUnavailable(_) => "AGENT_UNAVAILABLE",
+            CoreError::AgentIncompatible(_) => "AGENT_INCOMPATIBLE",
+            CoreError::AgentTransportLost(_) => "AGENT_TRANSPORT_LOST",
         }
     }
 }

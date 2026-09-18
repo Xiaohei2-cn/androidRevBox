@@ -111,10 +111,7 @@ pub async fn adb_forward_setup(
     local: String,
     remote: String,
 ) -> CoreResult<ForwardRule> {
-    let (s, l, r) = state
-        .device
-        .forward_setup(&serial, &local, &remote)
-        .await?;
+    let (s, l, r) = state.device.forward_setup(&serial, &local, &remote).await?;
     Ok(ForwardRule {
         serial: s,
         local: l,
@@ -138,10 +135,7 @@ pub async fn adb_forward_remove(
     serial: String,
     local: Option<String>,
 ) -> CoreResult<()> {
-    state
-        .device
-        .forward_remove(&serial, local.as_deref())
-        .await
+    state.device.forward_remove(&serial, local.as_deref()).await
 }
 
 // ===== 二进制托管（/data/local/tmp；全部 -s 绑定设备）=====
@@ -271,7 +265,10 @@ pub async fn device_pkg_lib_dir(
     state: tauri::State<'_, AppState>,
     args: PkgLibDirArgs,
 ) -> CoreResult<String> {
-    state.device.pkg_lib_dir(&args.serial, &args.pkg, &args.abi).await
+    state
+        .device
+        .pkg_lib_dir(&args.serial, &args.pkg, &args.abi)
+        .await
 }
 
 /// so 替换：push → su -c cat 写回安装目录 lib/<abi> → 清理临时。返回写入路径。

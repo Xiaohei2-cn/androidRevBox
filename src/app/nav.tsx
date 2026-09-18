@@ -30,6 +30,11 @@ interface AppNav {
   /** 设备页子 tab 请求（列表/信息；null = 用默认） */
   pendingDevicesTab: "list" | "info" | null;
   gotoDeviceList: () => void;
+  /** ADB 页子 tab 请求（端口转发/二进制托管；P10 frida 前置检查修复深链） */
+  pendingAdbTab: "forward" | "binary-hosting" | null;
+  gotoAdbSubTab: (tab: "forward" | "binary-hosting") => void;
+  /** 任务中心（P10 会话头「跳任务中心」） */
+  gotoTasks: () => void;
 }
 
 const DEFAULT_NAV: AppNav = {
@@ -43,6 +48,9 @@ const DEFAULT_NAV: AppNav = {
   clearPendingDevice: () => undefined,
   pendingDevicesTab: null,
   gotoDeviceList: () => undefined,
+  pendingAdbTab: null,
+  gotoAdbSubTab: () => undefined,
+  gotoTasks: () => undefined,
 };
 
 const NavContext = createContext<AppNav>(DEFAULT_NAV);
@@ -52,6 +60,7 @@ export function AppNavProvider({ children }: { children: ReactNode }) {
   const [pendingConfigKey, setPendingConfigKey] = useState<string | null>(null);
   const [pendingDeviceSerial, setPendingDeviceSerial] = useState<string | null>(null);
   const [pendingDevicesTab, setPendingDevicesTab] = useState<"list" | "info" | null>(null);
+  const [pendingAdbTab, setPendingAdbTab] = useState<"forward" | "binary-hosting" | null>(null);
 
   const gotoConfig = useCallback((key: string) => {
     setTab("settings");
@@ -71,6 +80,13 @@ export function AppNavProvider({ children }: { children: ReactNode }) {
     setPendingDevicesTab("list");
   }, []);
 
+  const gotoAdbSubTab = useCallback((next: "forward" | "binary-hosting") => {
+    setTab("terminal");
+    setPendingAdbTab(next);
+  }, []);
+
+  const gotoTasks = useCallback(() => setTab("tasks"), []);
+
   const value = useMemo<AppNav>(
     () => ({
       tab,
@@ -83,6 +99,9 @@ export function AppNavProvider({ children }: { children: ReactNode }) {
       clearPendingDevice,
       pendingDevicesTab,
       gotoDeviceList,
+      pendingAdbTab,
+      gotoAdbSubTab,
+      gotoTasks,
     }),
     [
       tab,
@@ -94,6 +113,9 @@ export function AppNavProvider({ children }: { children: ReactNode }) {
       clearPendingDevice,
       pendingDevicesTab,
       gotoDeviceList,
+      pendingAdbTab,
+      gotoAdbSubTab,
+      gotoTasks,
     ],
   );
   return <NavContext.Provider value={value}>{children}</NavContext.Provider>;

@@ -1,12 +1,29 @@
+import { SubTabs } from "@/components/nav/SubTabs";
 import { Placeholder } from "@/components/nav/Placeholder";
+import { FridaPage } from "@/features/hook/frida/FridaPage";
+import { useI18n } from "@/i18n";
 
-/** Hook 页占位：Frida/注入类 Hook 管理将在后续阶段实现 */
+/**
+ * Hook 主标签（P10）：子标签化——frida 会话工作台 + 其余能力后续追加。
+ */
 export function HookPage() {
+  const { t } = useI18n();
   return (
-    <Placeholder
-      title="Hook"
-      description="Frida 脚本管理、注入注入点配置、Hook 会话与日志将在此实现"
-      phase="占位 · 规划中"
+    <SubTabs
+      tabs={[
+        { id: "frida", label: t("hook.frida.tab"), content: <FridaPage /> },
+        {
+          id: "more",
+          label: t("hook.more.tab"),
+          content: (
+            <Placeholder
+              title={t("hook.more.title")}
+              description={t("hook.more.desc")}
+              phase={t("common.phasePlaceholder")}
+            />
+          ),
+        },
+      ]}
     />
   );
 }

@@ -56,7 +56,7 @@ function ShellBody() {
       <MainTabRail />
       <div
         data-testid="window-body"
-        className="app-surface relative flex h-full min-w-0 flex-1 flex-col overflow-hidden rounded-r-xl border border-l-0 border-border/60 shadow-[0_8px_40px_rgba(0,0,0,0.35)]"
+        className="app-surface relative flex h-full min-w-0 flex-1 flex-col overflow-hidden rounded-xl border border-border/60"
       >
         <TitleBar />
         {/* keep-mounted 切页（P7 闪烁二次修复）：

@@ -44,9 +44,30 @@ impl TaskService {
 
     /// 起一个 shell/命令任务，返回 task_id（立即返回，不阻塞）。
     pub fn start(&self, spec: CommandSpec) -> CoreResult<String> {
+        self.start_with_kind("shell", spec)
+    }
+
+    /// 指定 task_type 的任务（P10：frida 会话复用同一生命周期/事件流/日志回放，
+    /// 仅 kind 不同——kind 参数化，不迁 schema）。
+    pub fn start_with_kind(&self, kind: &str, spec: CommandSpec) -> CoreResult<String> {
         let name = build_task_name(&spec);
+        self.start_with_kind_named(kind, &name, spec)
+    }
+
+    /// kind + 自定义可读任务名（frida 会话名「spawn com.x · hook.js」式）。
+    pub fn start_with_kind_named(
+        &self,
+        kind: &str,
+        name: &str,
+        spec: CommandSpec,
+    ) -> CoreResult<String> {
+        let name = if name.trim().is_empty() {
+            build_task_name(&spec)
+        } else {
+            truncate_name(name)
+        };
         let id = Uuid::new_v4().to_string();
-        task_repo::insert(&self.db, &id, "shell", &name, "pending")?;
+        task_repo::insert(&self.db, &id, kind, &name, "pending")?;
 
         let token = CancellationToken::default();
         self.lock_running().insert(id.clone(), token.clone());
@@ -174,6 +195,12 @@ fn build_task_name(spec: &CommandSpec) -> String {
         name.push(' ');
         name.push_str(arg);
     }
+    truncate_name(&name)
+}
+
+/// 按字节上限截断到字符边界（任务名统一收口）。
+fn truncate_name(name: &str) -> String {
+    let mut name = name.to_string();
     if name.len() > MAX_NAME_LEN {
         let mut cut = MAX_NAME_LEN;
         while cut > 0 && !name.is_char_boundary(cut) {
@@ -193,18 +220,14 @@ mod tests {
         let spec = CommandSpec {
             executable: "/bin/echo".into(),
             args: vec!["hello".into(), "world".into()],
-            cwd: None,
-            timeout: None,
-            env_extra: HashMap::new(),
+            ..Default::default()
         };
         assert_eq!(build_task_name(&spec), "echo hello world");
 
         let long = CommandSpec {
             executable: "/usr/bin/env".into(),
             args: vec!["x".repeat(500)],
-            cwd: None,
-            timeout: None,
-            env_extra: HashMap::new(),
+            ..Default::default()
         };
         let name = build_task_name(&long);
         assert!(name.len() <= MAX_NAME_LEN);

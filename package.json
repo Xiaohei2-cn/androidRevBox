@@ -1,7 +1,7 @@
 {
   "name": "app-reverse-tools",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -19,6 +19,7 @@
     "@radix-ui/react-tabs": "^1.1.2",
     "@radix-ui/react-tooltip": "^1.1.6",
     "@tanstack/react-query": "^5.62.0",
+    "@tanstack/react-virtual": "^3.14.12",
     "@tauri-apps/api": "^2.5.0",
     "@tauri-apps/plugin-dialog": "^2.7.3",
     "class-variance-authority": "^0.7.1",

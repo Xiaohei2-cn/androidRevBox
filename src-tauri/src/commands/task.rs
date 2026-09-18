@@ -44,6 +44,7 @@ pub fn task_run(state: tauri::State<'_, AppState>, args: TaskRunArgs) -> CoreRes
         cwd: args.cwd,
         timeout: args.timeout_ms.map(Duration::from_millis),
         env_extra: args.env,
+        ..Default::default()
     };
     state.task.start(spec)
 }

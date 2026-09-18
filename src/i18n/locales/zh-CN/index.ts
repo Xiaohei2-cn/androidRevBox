@@ -1,6 +1,7 @@
 import common from "./common";
 import dashboard from "./dashboard";
 import devices from "./devices";
+import hook from "./hook";
 import nav from "./nav";
 import settings from "./settings";
 
@@ -11,4 +12,5 @@ export default {
   ...dashboard,
   ...devices,
   ...settings,
+  ...hook,
 } as Record<string, string>;

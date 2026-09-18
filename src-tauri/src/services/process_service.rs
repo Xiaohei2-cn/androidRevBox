@@ -38,13 +38,15 @@ impl StreamKind {
 }
 
 /// 结构化命令规格（CommandSpec）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CommandSpec {
     pub executable: String,
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub timeout: Option<Duration>,
     pub env_extra: HashMap<String, String>,
+    /// Windows：spawn 时加 CREATE_NO_WINDOW（长驻子进程如 frida runner 防黑窗）
+    pub hide_window: bool,
 }
 
 /// 取消令牌：watch 通道实现，可 await 取消信号（无竞态丢通知问题）。
@@ -104,6 +106,11 @@ pub async fn execute(
         .kill_on_drop(true);
     if let Some(cwd) = &spec.cwd {
         cmd.current_dir(cwd);
+    }
+    #[cfg(windows)]
+    if spec.hide_window {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     for (k, v) in &spec.env_extra {
         cmd.env(k, v);
@@ -180,9 +187,7 @@ pub async fn execute(
         // exit_code 已知说明进程已退出被 reap，跳过信号。
         if !force_sent {
             if let Some(at) = terminate_sent_at {
-                if exit_code.is_none()
-                    && tokio::time::Instant::now() - at >= GRACE_AFTER_TERM
-                {
+                if exit_code.is_none() && tokio::time::Instant::now() - at >= GRACE_AFTER_TERM {
                     force_kill_handle(&mut child, pid);
                     force_sent = true;
                 }
@@ -312,6 +317,7 @@ mod tests {
             cwd: None,
             timeout,
             env_extra: HashMap::new(),
+            hide_window: false,
         }
     }
 

@@ -1,0 +1,202 @@
+use std::env;
+use std::ffi::OsString;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command as StdCommand, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
+
+use agent_protocol::{ErrorCode, HealthStatus};
+use app_reverse_tools_lib::agent_client::{AgentClient, AgentClientError};
+use app_reverse_tools_lib::agent_transport::FramedAgentTransport;
+use serde_json::json;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::TcpStream;
+use tokio::process::{Child, Command};
+
+const AUTH_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn workspace_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("src-tauri must be inside the workspace")
+}
+
+fn cargo_program() -> OsString {
+    env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"))
+}
+
+fn build_agent_binary() -> PathBuf {
+    let metadata = StdCommand::new(cargo_program())
+        .current_dir(workspace_root())
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .output()
+        .expect("run cargo metadata");
+    assert!(
+        metadata.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&metadata.stdout).expect("parse cargo metadata");
+    let target_dir = metadata["target_directory"]
+        .as_str()
+        .map(PathBuf::from)
+        .expect("cargo metadata target_directory");
+
+    let build = StdCommand::new(cargo_program())
+        .current_dir(workspace_root())
+        .args(["build", "-p", "android-agent", "--bin", "android-agent"])
+        .output()
+        .expect("build host android-agent");
+    assert!(
+        build.status.success(),
+        "android-agent build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let binary = target_dir
+        .join("debug")
+        .join(format!("android-agent{}", env::consts::EXE_SUFFIX));
+    assert!(
+        binary.is_file(),
+        "agent binary missing: {}",
+        binary.display()
+    );
+    binary
+}
+
+fn token_file() -> tempfile::NamedTempFile {
+    let mut file = tempfile::NamedTempFile::new().expect("create auth token file");
+    file.write_all(AUTH_TOKEN.as_bytes())
+        .expect("write auth token");
+    file.flush().expect("flush auth token");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .expect("set auth token permissions");
+    }
+    file
+}
+
+async fn start_agent() -> (Child, String, tempfile::NamedTempFile) {
+    let binary = build_agent_binary();
+    let token = token_file();
+    let mut child = Command::new(binary)
+        .args(["--listen", "127.0.0.1:0", "--auth-token-file"])
+        .arg(token.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn host android-agent");
+    let stdout = child.stdout.take().expect("capture agent stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(10), stdout.read_line(&mut line))
+        .await
+        .expect("agent startup timed out")
+        .expect("read agent listen address");
+    let address = line
+        .trim()
+        .strip_prefix("LISTENING ")
+        .expect("agent must print LISTENING address")
+        .to_owned();
+    assert!(
+        !token.path().exists(),
+        "agent must remove the token file after reading it"
+    );
+    (child, address, token)
+}
+
+async fn connect_client(address: &str) -> AgentClient {
+    let stream = TcpStream::connect(address)
+        .await
+        .expect("connect to host android-agent");
+    AgentClient::new(Arc::new(FramedAgentTransport::new(stream)))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_agent_full_lifecycle() {
+    let (mut child, address, _token) = start_agent().await;
+
+    for _ in 0..100 {
+        let client = connect_client(&address).await;
+        let hello = client
+            .hello(AUTH_TOKEN, "desktop-e2e", Duration::from_secs(2))
+            .await
+            .expect("hello must succeed");
+        assert_eq!(hello.protocol_version, 1);
+        assert_eq!(hello.providers.len(), 2);
+        assert_eq!(hello.capabilities.len(), 4);
+        assert!(
+            hello
+                .capabilities
+                .iter()
+                .any(|capability| capability.method == agent_protocol::method::DEVICE_INFO)
+        );
+        let health = client
+            .health(Duration::from_secs(2))
+            .await
+            .expect("health must succeed");
+        assert_eq!(health.status, HealthStatus::Ready);
+    }
+
+    let client = connect_client(&address).await;
+    client
+        .hello(AUTH_TOKEN, "desktop-e2e", Duration::from_secs(2))
+        .await
+        .expect("hello before concurrent requests");
+    let mut concurrent = Vec::new();
+    for _ in 0..16 {
+        let client = client.clone();
+        concurrent.push(tokio::spawn(async move {
+            client.health(Duration::from_secs(2)).await
+        }));
+    }
+    for request in concurrent {
+        assert_eq!(request.await.unwrap().unwrap().status, HealthStatus::Ready);
+    }
+
+    let unknown = client
+        .request_value("unknown.method", json!({}), Duration::from_secs(2))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        unknown,
+        AgentClientError::Remote(ref error) if error.code == ErrorCode::UnsupportedMethod
+    ));
+    assert_eq!(
+        client
+            .health(Duration::ZERO)
+            .await
+            .expect_err("zero deadline must fail locally"),
+        AgentClientError::DeadlineExceeded
+    );
+    assert_eq!(
+        client
+            .health(Duration::from_secs(2))
+            .await
+            .expect("connection remains usable after local deadline")
+            .status,
+        HealthStatus::Ready
+    );
+
+    child.kill().await.expect("kill host android-agent");
+    let status = child.wait().await.expect("reap host android-agent");
+    assert!(
+        !status.success(),
+        "killed agent should not exit successfully"
+    );
+    let disconnected = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.health(Duration::from_secs(10)),
+    )
+    .await
+    .expect("disconnect must wake client without waiting for request deadline")
+    .unwrap_err();
+    assert!(matches!(disconnected, AgentClientError::TransportLost(_)));
+}

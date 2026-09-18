@@ -1,4 +1,4 @@
-//! 应用入口：分层结构见 docs/PHASES.md。
+//! 应用入口：当前重构计划与分层边界见 docs/android_agent_refactor_phases.md。
 //! - commands: IPC 边界，只做参数校验与调用
 //! - services: 业务服务层（P1: config/log）
 //! - core:     通用核心类型/事件/错误
@@ -15,14 +15,24 @@ mod models;
 pub mod plugins; // pub 供集成测试（tests/plugin_abi_e2e.rs）访问
 mod services;
 
+pub use adapters::agent_transport;
+pub use models::agent;
+pub use services::agent_client;
+pub use services::agent_manager;
+pub use services::android_backend;
+
 use std::sync::Arc;
 
 use tauri::Manager;
 
 use crate::db::Db;
+use crate::services::agent_artifact::{AGENT_RESOURCE_ARM64, AgentArtifactResolver};
+use crate::services::agent_manager::AgentManager;
+use crate::services::android_backend::{CapabilityRouter, default_legacy_capabilities};
 use crate::services::config_service::ConfigService;
 use crate::services::device_service::{AdbRunner, DeviceService, RealAdbRunner};
 use crate::services::env_service::EnvService;
+use crate::services::hook_service::HookService;
 use crate::services::log_service::{self, LogService};
 use crate::services::plugin_service::PluginService;
 use crate::services::task_service::TaskService;
@@ -35,6 +45,9 @@ pub struct AppState {
     pub device: Arc<DeviceService>,
     pub plugins: Arc<PluginService>,
     pub env: Arc<EnvService>,
+    pub hook: Arc<HookService>,
+    pub agent: Arc<AgentManager>,
+    pub android: Arc<CapabilityRouter>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -59,8 +72,21 @@ pub fn run() {
             // 4) DeviceService：adb 能力（P3）。runner 为 trait 对象，DeviceService 与
             //    EnvService（P7）共享同一实例（环境缓存只解析一次）
             let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+            let agent_resource = app
+                .path()
+                .resolve(AGENT_RESOURCE_ARM64, tauri::path::BaseDirectory::Resource)
+                .ok();
+            let agent_artifacts =
+                Arc::new(AgentArtifactResolver::new(config.clone(), agent_resource));
+            let agent = Arc::new(AgentManager::new(runner.clone(), agent_artifacts));
+            let android = Arc::new(CapabilityRouter::new(
+                agent.clone(),
+                runner.clone(),
+                default_legacy_capabilities(),
+            ));
             let device = Arc::new(DeviceService::new(
                 runner.clone(),
+                android.clone(),
                 task_service.clone(),
                 db.clone(),
                 app.handle().clone(),
@@ -69,6 +95,14 @@ pub fn run() {
 
             // 4.5) EnvService：仪表盘环境/工具探测（P7），复用同一 adb runner
             let env = Arc::new(EnvService::new(config.clone(), runner.clone()));
+
+            // 4.6) HookService：Frida 会话工作台（P10）——js 扫描/runner 组装/前置检查
+            let hook = Arc::new(HookService::new(
+                config.clone(),
+                env.clone(),
+                task_service.clone(),
+                app.handle().clone(),
+            ));
 
             // 5) PluginService：受控目录 app_data/plugins，启动即扫描加载（P4/P6）
             let plugin_root = data_dir.join("plugins");
@@ -101,6 +135,9 @@ pub fn run() {
                 device,
                 plugins,
                 env,
+                hook,
+                agent,
+                android,
             });
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -111,6 +148,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::system::system_ping,
+            commands::agent::agent_status,
+            commands::agent::agent_statuses,
+            commands::agent::agent_install,
+            commands::agent::agent_restart,
+            commands::agent::agent_diagnostics,
             commands::config::config_snapshot,
             commands::config::config_get,
             commands::config::config_set,
@@ -164,7 +206,10 @@ pub fn run() {
             commands::plugins::plugins_install,
             commands::plugins::plugins_rollback,
             commands::plugins::plugins_uninstall,
-            commands::plugins::plugins_set_enabled
+            commands::plugins::plugins_set_enabled,
+            commands::hook::hook_js_list,
+            commands::hook::hook_preflight,
+            commands::hook::hook_session_start
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

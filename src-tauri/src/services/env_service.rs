@@ -274,8 +274,16 @@ impl EnvService {
         self.frida_after(py).await
     }
 
+    /// Python + Frida 一次探测（P10 前置检查链复用：frida 依赖 python 结果，
+    /// 合并成一条链避免重复起 --version 子进程）。
+    pub async fn python_and_frida(&self) -> (PythonEnv, FridaEnv) {
+        let py = self.python().await;
+        let frida = self.frida_after(py.clone()).await;
+        (py, frida)
+    }
+
     /// frida 探测（复用已探测的 Python 环境，避免 overview 里重复起子进程）
-    async fn frida_after(&self, py: PythonEnv) -> FridaEnv {
+    pub async fn frida_after(&self, py: PythonEnv) -> FridaEnv {
         if !py.ready {
             return FridaEnv {
                 python_ready: false,
@@ -424,7 +432,9 @@ impl EnvService {
                         .map(|rd| {
                             rd.flatten()
                                 .map(|e| e.path())
-                                .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some("Versions"))
+                                .filter(|p| {
+                                    p.file_name().and_then(|n| n.to_str()) == Some("Versions")
+                                })
                                 .flat_map(|versions| {
                                     std::fs::read_dir(versions)
                                         .map(|vd| {
@@ -1214,7 +1224,8 @@ mod tests {
     #[test]
     fn parse_foreground_window_pkg_containing_null_literal() {
         // 回归：整行 contains("null") 的旧判法会把包名含 null 的窗口误当空行跳过
-        let out = "  mCurrentFocus: Window{abc u0 com.nullpoint.app/com.nullpoint.app.MainActivity}\n";
+        let out =
+            "  mCurrentFocus: Window{abc u0 com.nullpoint.app/com.nullpoint.app.MainActivity}\n";
         let (pkg, act) = parse_foreground_window(out).expect("包名含 null 的窗口应正常解析");
         assert_eq!(pkg, "com.nullpoint.app");
         assert_eq!(act, "com.nullpoint.app.MainActivity");
@@ -1271,8 +1282,10 @@ mod tests {
     struct ScriptedAdb {
         installed: bool,
         path: Option<String>,
-        /// 命令关键词 → 返回 stdout（按顺序 pop，默认空）
-        script: std::sync::Mutex<Vec<(&'static str, String)>>,
+        /// 命令关键词 → 返回结果（按顺序 pop，默认成功空输出）
+        script: std::sync::Mutex<Vec<(&'static str, AdbRunOutput)>>,
+        /// 命令关键词 → runner 执行错误（spawn/timeout/transport 类）
+        failures: std::sync::Mutex<Vec<(&'static str, String)>>,
         /// 每次实际 run() 调用的命令关键词记录
         calls: std::sync::Mutex<Vec<String>>,
     }
@@ -1283,15 +1296,38 @@ mod tests {
                 installed,
                 path: installed.then(|| "/fake/adb".to_string()),
                 script: std::sync::Mutex::new(Vec::new()),
+                failures: std::sync::Mutex::new(Vec::new()),
                 calls: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn expect(&self, keyword: &'static str, stdout: &str) -> &Self {
-            self.script
+            self.expect_output(keyword, stdout, "", Some(0))
+        }
+
+        fn expect_output(
+            &self,
+            keyword: &'static str,
+            stdout: &str,
+            stderr: &str,
+            exit_code: Option<i32>,
+        ) -> &Self {
+            self.script.lock().unwrap().push((
+                keyword,
+                AdbRunOutput {
+                    stdout: stdout.to_string(),
+                    stderr: stderr.to_string(),
+                    exit_code,
+                },
+            ));
+            self
+        }
+
+        fn fail(&self, keyword: &'static str, message: &str) -> &Self {
+            self.failures
                 .lock()
                 .unwrap()
-                .push((keyword, stdout.to_string()));
+                .push((keyword, message.to_string()));
             self
         }
 
@@ -1310,20 +1346,19 @@ mod tests {
         ) -> CoreResult<AdbRunOutput> {
             let joined = args.join(" ");
             self.calls.lock().unwrap().push(joined.clone());
+            let mut failures = self.failures.lock().unwrap();
+            if let Some(idx) = failures.iter().position(|(kw, _)| joined.contains(kw)) {
+                let (_, message) = failures.remove(idx);
+                return Err(crate::core::error::CoreError::Internal(message));
+            }
+            drop(failures);
             let mut script = self.script.lock().unwrap();
             let out = script
                 .iter()
                 .position(|(kw, _)| joined.contains(kw))
-                .map(|idx| {
-                    let (_, s) = script.remove(idx);
-                    s
-                })
+                .map(|idx| script.remove(idx).1)
                 .unwrap_or_default();
-            Ok(AdbRunOutput {
-                stdout: out,
-                stderr: String::new(),
-                exit_code: Some(0),
-            })
+            Ok(out)
         }
 
         async fn environment(&self) -> AdbEnvironment {
@@ -1422,6 +1457,59 @@ mod tests {
         assert_eq!(fg.state, "no_foreground");
         assert!(fg.hint.is_some());
         assert!(fg.error.is_none(), "空态不是错误");
+    }
+
+    #[tokio::test]
+    async fn foreground_nonzero_shell_exit_keeps_legacy_empty_state_semantics() {
+        let mock = Arc::new(ScriptedAdb::new(true));
+        mock.expect("devices", "SERIAL_REDACTED\tdevice\r\n");
+        mock.expect_output(
+            "dumpsys window",
+            "",
+            "Security exception: Permission denied",
+            Some(1),
+        );
+        let svc = svc_with(mock);
+
+        let fg = svc.foreground_auto().await;
+        assert_eq!(fg.state, "no_foreground");
+        assert!(fg.error.is_none());
+        assert!(fg.hint.as_deref().is_some_and(|h| h.contains("未解析到")));
+    }
+
+    #[tokio::test]
+    async fn foreground_runner_failure_is_a_structured_error_state() {
+        let mock = Arc::new(ScriptedAdb::new(true));
+        mock.expect("devices", "SERIAL_REDACTED\tdevice\n");
+        mock.fail("dumpsys window", "adb transport lost");
+        let svc = svc_with(mock);
+
+        let fg = svc.foreground_auto().await;
+        assert_eq!(fg.state, "error");
+        assert_eq!(fg.serial.as_deref(), Some("SERIAL_REDACTED"));
+        assert!(
+            fg.error
+                .as_deref()
+                .is_some_and(|e| e.contains("transport lost"))
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_optional_probe_failures_keep_ready_with_missing_fields() {
+        let mock = Arc::new(ScriptedAdb::new(true));
+        mock.expect("dumpsys window", FIXTURE_WINDOW);
+        mock.fail("pidof", "pidof: inaccessible or not found");
+        mock.fail("legacyNativeLibraryDir", "dumpsys: Permission denied");
+        mock.fail("pm list packages -3", "pm: inaccessible or not found");
+        let svc = svc_with(mock);
+
+        let fg = svc.foreground_on(Some("SERIAL_REDACTED".to_string())).await;
+        assert_eq!(fg.state, "ready");
+        assert_eq!(fg.package.as_deref(), Some("com.target.app"));
+        assert_eq!(fg.pid, None);
+        assert_eq!(fg.native_lib_dir, None);
+        assert_eq!(fg.package_kind, "unknown");
+        assert!(fg.proc_paths.is_empty());
     }
 
     #[test]

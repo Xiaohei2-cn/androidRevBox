@@ -1,18 +1,28 @@
+import { useEffect, useState } from "react";
 import { SubTabs } from "@/components/nav/SubTabs";
 import { ForwardManager } from "@/features/adb/ForwardManager";
 import { BinaryHosting } from "@/features/adb/BinaryHosting";
 import { ProcPorts } from "@/features/adb/ProcPorts";
 import { Placeholder } from "@/components/nav/Placeholder";
+import { useAppNav } from "@/app/nav";
 
 /**
  * ADB 页（原「终端」主 tab 改造）：多个子标签。
  * - 端口转发：五行默认行 + 可增行，每行独立建立/删除/验证；
  * - 二进制托管：/data/local/tmp 下 ELF 的浏览/授权/后台执行/终止；
  * - 终端等后续能力继续追加为子标签。
+ * P10：frida 前置检查失败时经 pendingAdbTab 深链切到转发/托管 tab。
  */
 export function AdbPage() {
+  const { pendingAdbTab } = useAppNav();
+  const [subTab, setSubTab] = useState("forward");
+  useEffect(() => {
+    if (pendingAdbTab) setSubTab(pendingAdbTab);
+  }, [pendingAdbTab]);
   return (
     <SubTabs
+      value={subTab}
+      onValueChange={setSubTab}
       tabs={[
         {
           id: "forward",

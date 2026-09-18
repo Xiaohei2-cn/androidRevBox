@@ -12,6 +12,10 @@ export const configApi = {
   snapshot(): Promise<AppSettingDto[]> {
     return invokeCommand<AppSettingDto[]>("config_snapshot");
   },
+  /** 读单键（缺失返回 default；值语义校验在后端） */
+  get(key: string, fallback = ""): Promise<string> {
+    return invokeCommand<string>("config_get", { key, default: fallback });
+  },
   /** 写单个键；非法键/值会被后端以 {code,message} 拒绝 */
   set(key: string, value: string): Promise<null> {
     return invokeCommand<null>("config_set", { args: { key, value } });

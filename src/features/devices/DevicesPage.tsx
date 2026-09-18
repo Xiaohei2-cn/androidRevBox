@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck, Cpu } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SubTabs } from "@/components/nav/SubTabs";
 import { TaskLaunchPanel } from "@/components/task/TaskLaunchPanel";
 import { TaskSessionView } from "@/components/task/TaskSessionView";
 import { deviceApi, type DeviceEntry } from "@/api/device";
+import { agentApi, type AgentSessionState } from "@/api/agent";
 import { envApi } from "@/api/env";
 import { useAppNav } from "@/app/nav";
 import { useI18n } from "@/i18n";
@@ -378,6 +379,8 @@ function DeviceFullCard({ serial, transport }: { serial: string; transport: stri
         </p>
       )}
 
+      <AgentSessionSection serial={serial} />
+
       {/* 分割线 */}
       <hr className="my-4 border-border" />
 
@@ -386,6 +389,97 @@ function DeviceFullCard({ serial, transport }: { serial: string; transport: stri
     </div>
   );
 }
+
+function AgentSessionSection({ serial }: { serial: string }) {
+  const { t } = useI18n();
+  const queryClient = useQueryClient();
+  const queryKey = ["agent", "diagnostics", serial] as const;
+  const { data } = useQuery({
+    queryKey,
+    queryFn: () => agentApi.diagnostics(serial),
+    refetchInterval: 10_000,
+    retry: false,
+  });
+  const refresh = () => void queryClient.invalidateQueries({ queryKey });
+  const install = useMutation({ mutationFn: () => agentApi.install(serial), onSettled: refresh });
+  const restart = useMutation({ mutationFn: () => agentApi.restart(serial), onSettled: refresh });
+  const status = data?.status;
+  const latestRoute = data?.routes?.[0];
+  const state = status?.state ?? "disconnected";
+  const available = status?.capabilities.filter((capability) => capability.available).length ?? 0;
+  const mutationError = install.error ?? restart.error;
+  const busy = install.isPending || restart.isPending;
+
+  return (
+    <section className="mt-4 border-t pt-3" data-testid={`agent-status-${serial}`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <Cpu className="h-4 w-4 text-muted-foreground" />
+        <span className="text-xs font-semibold">Android Agent</span>
+        <span className={cn("rounded px-1.5 py-0.5 text-xs font-medium", AGENT_STATE_CLASS[state])}>
+          {t(`devices.agent.state.${state}`)}
+        </span>
+        <div className="ml-auto flex items-center gap-1.5">
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 px-2 text-xs"
+            disabled={busy}
+            onClick={() => (state === "disconnected" ? install.mutate() : restart.mutate())}
+          >
+            <RefreshCw className={cn("h-3.5 w-3.5", busy && "animate-spin")} />
+            {state === "disconnected" ? t("devices.agent.install") : t("devices.agent.restart")}
+          </Button>
+        </div>
+      </div>
+      {status && state !== "disconnected" && (
+        <dl className="mt-2 grid grid-cols-[90px_1fr] gap-y-1 text-xs sm:grid-cols-[90px_1fr_90px_1fr]">
+          <div className="contents">
+            <dt className="text-muted-foreground">{t("devices.agent.version")}</dt>
+            <dd className="font-mono">{status.agentVersion ?? "-"}</dd>
+          </div>
+          <div className="contents">
+            <dt className="text-muted-foreground">{t("devices.agent.protocol")}</dt>
+            <dd className="font-mono">{status.protocolVersion ?? "-"}</dd>
+          </div>
+          <div className="contents">
+            <dt className="text-muted-foreground">{t("devices.agent.providers")}</dt>
+            <dd>{status.providers.length}</dd>
+          </div>
+          <div className="contents">
+            <dt className="text-muted-foreground">{t("devices.agent.capabilities")}</dt>
+            <dd>{available}/{status.capabilities.length}</dd>
+          </div>
+        </dl>
+      )}
+      {latestRoute && (
+        <div className="mt-2 flex min-w-0 items-center gap-2 text-xs">
+          <span className="shrink-0 text-muted-foreground">{t("devices.agent.route")}</span>
+          <span className="truncate font-mono" title={latestRoute.method}>{latestRoute.method}</span>
+          <span className="shrink-0 text-muted-foreground">
+            {t(`devices.agent.backend.${latestRoute.backend}`)}
+            {latestRoute.fallbackReason ? ` (${latestRoute.fallbackReason})` : ""}
+          </span>
+        </div>
+      )}
+      {(mutationError || status?.lastError || data?.healthError) && (
+        <p className="mt-2 break-all text-xs text-destructive">
+          {String((mutationError as Error | undefined)?.message ?? status?.lastError ?? data?.healthError)}
+        </p>
+      )}
+    </section>
+  );
+}
+
+const AGENT_STATE_CLASS: Record<AgentSessionState, string> = {
+  disconnected: "bg-muted text-muted-foreground",
+  adb_online: "bg-sky-500/15 text-sky-600 dark:text-sky-400",
+  installing: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
+  starting: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
+  handshaking: "bg-sky-500/15 text-sky-600 dark:text-sky-400",
+  ready: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
+  degraded: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
+  incompatible: "bg-red-500/15 text-red-600 dark:text-red-400",
+};
 
 /** 设备卡下半部：该设备当前前台应用 + /proc 关键路径（复用仪表盘数据链） */
 function ForegroundAppSection({ serial }: { serial: string }) {

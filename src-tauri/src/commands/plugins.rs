@@ -43,8 +43,7 @@ pub struct PluginScanError {
 #[tauri::command]
 pub async fn plugins_scan(state: tauri::State<'_, AppState>) -> CoreResult<PluginsScanResult> {
     let plugins = state.plugins.clone();
-    let report =
-        join_core(tauri::async_runtime::spawn_blocking(move || plugins.scan())).await?;
+    let report = join_core(tauri::async_runtime::spawn_blocking(move || plugins.scan())).await?;
     Ok(PluginsScanResult {
         loaded: report.loaded,
         errors: report
@@ -75,11 +74,10 @@ pub async fn plugins_call(
 ) -> CoreResult<PluginCallResult> {
     let plugins = state.plugins.clone();
     let id_for_err = id.clone();
-    let (code, bytes) =
-        join_core(tauri::async_runtime::spawn_blocking(move || {
-            plugins.call(&id, input.as_bytes())
-        }))
-        .await?;
+    let (code, bytes) = join_core(tauri::async_runtime::spawn_blocking(move || {
+        plugins.call(&id, input.as_bytes())
+    }))
+    .await?;
     match String::from_utf8(bytes) {
         Ok(output) => Ok(PluginCallResult { code, output }),
         Err(_) => Err(CoreError::Internal(format!(
@@ -110,16 +108,19 @@ pub async fn plugins_rollback(
     id: String,
 ) -> CoreResult<PluginView> {
     let plugins = state.plugins.clone();
-    join_core(tauri::async_runtime::spawn_blocking(move || plugins.rollback(&id))).await
+    join_core(tauri::async_runtime::spawn_blocking(move || {
+        plugins.rollback(&id)
+    }))
+    .await
 }
 
 #[tauri::command]
-pub async fn plugins_uninstall(
-    state: tauri::State<'_, AppState>,
-    id: String,
-) -> CoreResult<()> {
+pub async fn plugins_uninstall(state: tauri::State<'_, AppState>, id: String) -> CoreResult<()> {
     let plugins = state.plugins.clone();
-    join_core(tauri::async_runtime::spawn_blocking(move || plugins.uninstall(&id))).await
+    join_core(tauri::async_runtime::spawn_blocking(move || {
+        plugins.uninstall(&id)
+    }))
+    .await
 }
 
 #[tauri::command]
