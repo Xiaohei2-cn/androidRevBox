@@ -130,8 +130,14 @@ async fn host_agent_full_lifecycle() {
             .await
             .expect("hello must succeed");
         assert_eq!(hello.protocol_version, 1);
-        assert_eq!(hello.providers.len(), 3);
-        assert_eq!(hello.capabilities.len(), 9);
+        assert_eq!(hello.providers.len(), 4);
+        assert_eq!(hello.capabilities.len(), 10);
+        assert!(
+            hello.capabilities.iter().any(|capability| capability.method
+                == agent_protocol::method::ACTIVITY_FOREGROUND
+                && capability.available),
+            "activity.foreground 应由 activity provider 宣告可用"
+        );
         assert!(
             hello
                 .capabilities

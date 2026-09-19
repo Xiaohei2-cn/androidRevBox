@@ -13,8 +13,13 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::process::Command;
 
+use agent_protocol::method::ACTIVITY_FOREGROUND;
+use agent_protocol::{ActivityForegroundParams, ActivityForegroundResult};
+
 use crate::adapters::adb as adb_adapter;
 use crate::core::error::CoreResult;
+use crate::models::agent::AndroidBackendSource;
+use crate::services::android_backend::{CapabilityRouter, OperationKind};
 use crate::services::config_service::{
     ConfigService, KEY_IDA_MCP_PORT, KEY_JADX_MCP_PORT, KEY_NODE_PATH, KEY_PYTHON_PATH,
 };
@@ -46,11 +51,21 @@ pub fn parse_frida_versions(stdout: &str) -> (Option<String>, Option<String>) {
 pub struct EnvService {
     config: Arc<ConfigService>,
     adb: Arc<dyn AdbRunner>,
+    /// AR6.1：前台应用优先走 Agent typed API，Legacy shell 拼接仅作为回退路径保留。
+    android: Arc<CapabilityRouter>,
 }
 
 impl EnvService {
-    pub fn new(config: Arc<ConfigService>, adb: Arc<dyn AdbRunner>) -> Self {
-        Self { config, adb }
+    pub fn new(
+        config: Arc<ConfigService>,
+        adb: Arc<dyn AdbRunner>,
+        android: Arc<CapabilityRouter>,
+    ) -> Self {
+        Self {
+            config,
+            adb,
+            android,
+        }
     }
 
     fn u16_config(&self, key: &str, default: u16) -> u16 {
@@ -693,8 +708,24 @@ impl EnvService {
         }
         let adb_path = env.path.clone().unwrap_or_default();
 
+        // AR6.1：Agent 可用时一次 typed RPC 取回全部结构化字段；
+        // 只有路由明确选择 Legacy（Agent 未连接或旧版无此方法）才走 shell 拼接路径。
+        let use_agent = matches!(
+            self.android
+                .select(&serial, ACTIVITY_FOREGROUND, OperationKind::ReadOnlyIdempotent),
+            Ok(decision) if decision.backend == AndroidBackendSource::Agent
+        );
+        if use_agent {
+            return self.foreground_via_agent(serial, adb_path).await;
+        }
+        self.foreground_legacy(serial, &adb_path).await
+    }
+
+    /// Legacy ADB 路径（仅作回退）：多条 shell 字符串拼接 + 宿主机文本解析。
+    /// 删除条件见 Legacy 能力表（AR12.1 after AR6.1 且两次稳定阶段回归）。
+    async fn foreground_legacy(&self, serial: String, adb_path: &str) -> ForegroundApp {
         // 前台窗口
-        let win_out = match self.shell(&adb_path, &serial, "dumpsys window").await {
+        let win_out = match self.shell(adb_path, &serial, "dumpsys window").await {
             Ok(o) => o,
             Err(e) => {
                 return ForegroundApp {
@@ -722,9 +753,9 @@ impl EnvService {
             "pm list packages -3 | grep -q package:{package} && echo third_party || echo not_third_party"
         );
         let (pid_res, lib_res, pkg3_res) = tokio::join!(
-            self.shell(&adb_path, &serial, &pid_cmd),
-            self.shell(&adb_path, &serial, &lib_cmd),
-            self.shell(&adb_path, &serial, &pkg3_cmd),
+            self.shell(adb_path, &serial, &pid_cmd),
+            self.shell(adb_path, &serial, &lib_cmd),
+            self.shell(adb_path, &serial, &pkg3_cmd),
         );
         let package_kind = pkg3_res
             .ok()
@@ -741,7 +772,7 @@ impl EnvService {
         let proc_paths = if pid.is_empty() {
             Vec::new()
         } else {
-            self.probe_proc_paths(&adb_path, &serial, &pid).await
+            self.probe_proc_paths(adb_path, &serial, &pid).await
         };
 
         ForegroundApp {
@@ -755,6 +786,59 @@ impl EnvService {
             proc_paths,
             hint: None,
             error: None,
+        }
+    }
+
+    /// Agent 路径：`activity.foreground` 一次请求；失败时按只读幂等规则回退 Legacy。
+    async fn foreground_via_agent(&self, serial: String, adb_path: String) -> ForegroundApp {
+        let params = ActivityForegroundParams::default();
+        let agent_request = self.android.agent().request::<_, ActivityForegroundResult>(
+            &serial,
+            ACTIVITY_FOREGROUND,
+            &params,
+            Duration::from_secs(10),
+        );
+        let (agent_result, legacy_result) = if foreground_shadow_enabled() {
+            let legacy = self.foreground_legacy(serial.clone(), &adb_path);
+            let (agent, legacy) = tokio::join!(agent_request, legacy);
+            (agent, Some(legacy))
+        } else {
+            (agent_request.await, None)
+        };
+
+        match agent_result {
+            Ok(result) => {
+                let mapped = map_agent_foreground(&serial, result);
+                if let Some(legacy) = legacy_result {
+                    log_foreground_shadow_diff(&serial, &mapped, &legacy);
+                }
+                mapped
+            }
+            Err(error) => {
+                let allowed = self
+                    .android
+                    .fallback_after_agent_error(
+                        &serial,
+                        ACTIVITY_FOREGROUND,
+                        OperationKind::ReadOnlyIdempotent,
+                        &error,
+                    )
+                    .is_ok();
+                if allowed {
+                    tracing::warn!(serial, "activity.foreground 回退 Legacy ADB");
+                    if let Some(legacy) = legacy_result {
+                        return legacy;
+                    }
+                    return self.foreground_legacy(serial, &adb_path).await;
+                }
+                // transport_lost 与业务错误一律不回退，直接暴露错误状态
+                ForegroundApp {
+                    state: FgState::Error.as_str().into(),
+                    serial: Some(serial),
+                    error: Some(format!("Agent activity.foreground 失败: {error}")),
+                    ..ForegroundApp::default()
+                }
+            }
         }
     }
 
@@ -963,6 +1047,90 @@ fn non_empty(s: String) -> Option<String> {
 
 /// dumpsys window → (包名, Activity)。
 /// 兼容 mCurrentFocus / mFocusedWindow；null → None。
+fn foreground_shadow_enabled() -> bool {
+    !std::env::var("APP_REVERSE_TOOLS_ACTIVITY_SHADOW")
+        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
+}
+
+/// Agent 结果 -> 现有前端契约（`pid` 保持字符串，proc 摘要字段名不变）。
+pub fn map_agent_foreground(serial: &str, result: ActivityForegroundResult) -> ForegroundApp {
+    if !result.found {
+        return ForegroundApp {
+            state: FgState::NoForeground.as_str().into(),
+            serial: Some(serial.to_owned()),
+            hint: result
+                .hint
+                .clone()
+                .or_else(|| Some("未解析到前台窗口（可能锁屏、弹窗或系统版本输出差异）。".into())),
+            ..ForegroundApp::default()
+        };
+    }
+    let package_kind = serde_json::to_value(result.package_kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into());
+    ForegroundApp {
+        state: FgState::Ready.as_str().into(),
+        serial: Some(serial.to_owned()),
+        package: result.package_name,
+        package_kind,
+        activity: result.activity,
+        pid: result.pid.map(|pid| pid.to_string()),
+        native_lib_dir: result.native_lib_dir,
+        proc_paths: result
+            .proc
+            .into_iter()
+            .map(|entry| ProcPath {
+                name: entry.name,
+                path: entry.path,
+                summary: entry.summary,
+                readable: entry.readable,
+            })
+            .collect(),
+        hint: None,
+        error: None,
+    }
+}
+
+/// 迁移期差异只写日志（Agent 为准），便于发现 ROM 输出差异导致的解析偏差。
+fn log_foreground_shadow_diff(serial: &str, agent: &ForegroundApp, legacy: &ForegroundApp) {
+    let mut differing = Vec::new();
+    if agent.state != legacy.state {
+        differing.push("state");
+    }
+    if agent.package != legacy.package {
+        differing.push("package");
+    }
+    if agent.activity != legacy.activity {
+        differing.push("activity");
+    }
+    if agent.pid != legacy.pid {
+        differing.push("pid");
+    }
+    if agent.package_kind != legacy.package_kind {
+        differing.push("package_kind");
+    }
+    if agent.native_lib_dir != legacy.native_lib_dir {
+        differing.push("native_lib_dir");
+    }
+    if differing.is_empty() {
+        tracing::debug!(
+            serial,
+            method = ACTIVITY_FOREGROUND,
+            "Agent/Legacy foreground matched"
+        );
+    } else {
+        tracing::warn!(
+            serial,
+            method = ACTIVITY_FOREGROUND,
+            fields = ?differing,
+            agent = ?(agent.package.as_deref(), agent.pid.as_deref(), agent.package_kind.as_str()),
+            legacy = ?(legacy.package.as_deref(), legacy.pid.as_deref(), legacy.package_kind.as_str()),
+            "Agent/Legacy foreground shadow compare differed"
+        );
+    }
+}
+
 pub fn parse_foreground_window(stdout: &str) -> Option<(String, String)> {
     // ⚠️ 某些 ROM 的 dumpsys window 会输出【多行】mCurrentFocus（如先 null 后真实窗口，
     //    或桌面/弹窗交替）。见到 null 必须跳过该行继续找，不能提前返回 None——
@@ -1382,7 +1550,27 @@ mod tests {
     fn svc_with(mock: Arc<ScriptedAdb>) -> EnvService {
         let db = Arc::new(crate::db::Db::in_memory().unwrap());
         let config = Arc::new(ConfigService::new(db));
-        EnvService::new(config, mock)
+        svc_with_config(config, mock)
+    }
+
+    /// 测试内统一构造：Agent 永不在线，因此 `activity.foreground` 会按只读规则
+    /// 回退到 Legacy 分支，保持这些既有前台探测测试的语义不变。
+    fn svc_with_config(config: Arc<ConfigService>, mock: Arc<ScriptedAdb>) -> EnvService {
+        // Agent 永不在线 -> activity.foreground 走 Legacy 分支，保持这些测试的既有语义
+        let runner: Arc<dyn AdbRunner> = mock.clone();
+        let agent = Arc::new(crate::services::agent_manager::AgentManager::new(
+            runner.clone(),
+            Arc::new(crate::services::agent_artifact::AgentArtifactResolver::new(
+                config.clone(),
+                None,
+            )),
+        ));
+        let android = Arc::new(crate::services::android_backend::CapabilityRouter::new(
+            agent,
+            runner,
+            crate::services::android_backend::default_legacy_capabilities(),
+        ));
+        EnvService::new(config, mock, android)
     }
 
     const FIXTURE_WINDOW: &str =
@@ -1533,7 +1721,7 @@ mod tests {
         // §10 剪枝：Python 未配置 → frida 不发起任何子进程，直接返回剪枝态
         let db = Arc::new(crate::db::Db::in_memory().unwrap());
         let config = Arc::new(ConfigService::new(db));
-        let svc = EnvService::new(config, Arc::new(ScriptedAdb::new(false)));
+        let svc = svc_with_config(config, Arc::new(ScriptedAdb::new(false)));
         let frida = svc.frida().await;
         assert!(!frida.python_ready);
         assert!(!frida.installed);
@@ -1552,7 +1740,7 @@ mod tests {
         }
         let db = Arc::new(crate::db::Db::in_memory().unwrap());
         let config = Arc::new(ConfigService::new(db));
-        let svc = EnvService::new(config, Arc::new(ScriptedAdb::new(false)));
+        let svc = svc_with_config(config, Arc::new(ScriptedAdb::new(false)));
         let r = svc.resolve_interpreter(base).await;
         eprintln!(
             "picked={} resolved={} how={}",
@@ -1578,7 +1766,7 @@ mod tests {
         }
         let db = Arc::new(crate::db::Db::in_memory().unwrap());
         let config = Arc::new(ConfigService::new(db));
-        let svc = EnvService::new(config, Arc::new(ScriptedAdb::new(false)));
+        let svc = svc_with_config(config, Arc::new(ScriptedAdb::new(false)));
         for name in ["python", "python3"] {
             let picked = format!("{venv_bin}/{name}");
             let r = svc.resolve_interpreter(&picked).await;
@@ -1608,7 +1796,7 @@ mod tests {
         config
             .set(KEY_PYTHON_PATH, "/nonexistent/python/binary")
             .unwrap();
-        let svc = EnvService::new(config.clone(), Arc::new(ScriptedAdb::new(false)));
+        let svc = svc_with_config(config.clone(), Arc::new(ScriptedAdb::new(false)));
         let env = svc.python().await;
         assert!(!env.ready);
         assert!(env.hint.unwrap_or_default().contains("执行失败"));
@@ -1633,13 +1821,128 @@ mod tests {
         let _ = detect_jadx_cli().await;
     }
 
+    /// AR6.1 真机腿：同一个前台应用，Agent typed API 与 Legacy shell 路径必须给出
+    /// 一致的结构化结果（包名、PID、三方判定、native lib 目录）。
+    #[tokio::test]
+    #[ignore = "需要真机；AR6_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_foreground_matches_legacy -- --ignored --nocapture"]
+    async fn real_agent_foreground_matches_legacy() {
+        use crate::services::agent_artifact::AgentArtifactResolver;
+        use crate::services::agent_manager::AgentManager;
+        use crate::services::android_backend::{CapabilityRouter, default_legacy_capabilities};
+        use crate::services::config_service::ConfigService;
+        use crate::services::device_service::{AdbRunner, RealAdbRunner};
+
+        let serial = std::env::var("AR6_TEST_SERIAL").expect("AR6_TEST_SERIAL is required");
+        let db = Arc::new(crate::db::Db::in_memory().unwrap());
+        let config = Arc::new(ConfigService::new(db));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let agent = Arc::new(AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        ));
+        agent
+            .connect_resolved(&serial)
+            .await
+            .expect("Agent 安装/连接失败");
+        let android = Arc::new(CapabilityRouter::new(
+            agent,
+            runner.clone(),
+            default_legacy_capabilities(),
+        ));
+        let svc = EnvService::new(config.clone(), runner.clone(), android);
+
+        // 亮屏 + 解锁 + 拉起一个确定在前台的页面（系统设置）。
+        // 注意：不这样做会撞上既有解析限制——launcher 的焦点窗口是
+        // `Window{… com.google.android.apps.nexuslauncher}`（没有 /activity 段），
+        // 现行解析器判为 no_foreground（Agent 与 Legacy 同行为，见 D025）。
+        for step in [
+            ["shell", "input keyevent KEYCODE_WAKEUP"],
+            ["shell", "wm dismiss-keyguard"],
+            ["shell", "am start -a android.settings.SETTINGS"],
+        ] {
+            let mut args = vec!["-s".to_string(), serial.clone()];
+            args.extend(step.iter().map(|value| value.to_string()));
+            let _ = tokio::process::Command::new("adb")
+                .args(&args)
+                .output()
+                .await;
+            tokio::time::sleep(Duration::from_millis(900)).await;
+        }
+
+        let via_agent = svc.foreground_on(Some(serial.clone())).await;
+        // 第二把路由从不连接 Agent，必然落到 Legacy 分支
+        let offline_agent = Arc::new(AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        ));
+        let legacy_router = Arc::new(CapabilityRouter::new(
+            offline_agent,
+            runner.clone(),
+            default_legacy_capabilities(),
+        ));
+        let legacy_svc = EnvService::new(config, runner, legacy_router);
+        let via_legacy = legacy_svc.foreground_on(Some(serial.clone())).await;
+
+        eprintln!(
+            "[activity.foreground] agent_state={} pkg={:?} pid={:?} kind={} lib={:?} | legacy_state={} pkg={:?} pid={:?}",
+            via_agent.state,
+            via_agent.package,
+            via_agent.pid,
+            via_agent.package_kind,
+            via_agent.native_lib_dir,
+            via_legacy.state,
+            via_legacy.package,
+            via_legacy.pid,
+        );
+        assert_eq!(via_agent.state, "ready", "Agent 前台探测应拿到完整结果");
+        assert_eq!(
+            via_legacy.state, "ready",
+            "Legacy 侧也应解析到前台（否则对照无效）"
+        );
+        assert_eq!(
+            via_agent.package.as_deref(),
+            Some("com.android.settings"),
+            "测试前提：前台应是系统设置"
+        );
+        assert_eq!(via_agent.package, via_legacy.package, "包名必须一致");
+        assert_eq!(via_agent.activity, via_legacy.activity, "Activity 必须一致");
+        assert_eq!(via_agent.pid, via_legacy.pid, "PID 必须一致");
+        assert_eq!(
+            via_agent.package_kind, via_legacy.package_kind,
+            "三方/系统判定必须一致"
+        );
+        assert_eq!(
+            via_agent.native_lib_dir, via_legacy.native_lib_dir,
+            "legacyNativeLibraryDir 必须一致"
+        );
+        assert!(
+            matches!(
+                via_agent.package_kind.as_str(),
+                "third_party" | "system" | "unknown"
+            ),
+            "package_kind 取值受限: {}",
+            via_agent.package_kind
+        );
+        assert!(
+            !via_agent.proc_paths.is_empty(),
+            "有 PID 时必须带 /proc 摘要条目"
+        );
+        assert!(
+            via_agent
+                .proc_paths
+                .iter()
+                .all(|entry| entry.readable == entry.summary.is_some()),
+            "/proc 条目的 readable 必须与 summary 是否为空一致，不得用空串伪装可读"
+        );
+    }
+
     #[tokio::test]
     async fn mcp_port_probe_reports_unreachable_without_panic() {
         // 用一个大概率没人监听的端口
         let svc = {
             let db = Arc::new(crate::db::Db::in_memory().unwrap());
             let config = Arc::new(ConfigService::new(db));
-            EnvService::new(config, Arc::new(ScriptedAdb::new(false)))
+            svc_with_config(config, Arc::new(ScriptedAdb::new(false)))
         };
         let env = svc.jadx_mcp().await;
         // 端口默认值来自配置默认

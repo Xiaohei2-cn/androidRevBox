@@ -9,6 +9,7 @@ pub mod method {
     pub const DEVICE_INFO: &str = "device.info";
     pub const PACKAGE_LIST: &str = "package.list";
     pub const PACKAGE_LIST_LOCALIZED: &str = "package.list_localized";
+    pub const ACTIVITY_FOREGROUND: &str = "activity.foreground";
     pub const PACKAGE_EXPORT_APK: &str = "package.export_apk";
     pub const PACKAGE_EXPORT_CLEAN: &str = "package.export_clean";
     pub const ZYGISK_STATUS: &str = "zygisk.status";
@@ -98,6 +99,51 @@ pub struct CapabilityListResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct DeviceInfoParams {}
+
+/// 前台应用（AR6.1）：`dumpsys window`/`pidof`/`/proc` 的解析全部在设备端完成，
+/// Desktop 不再拼 shell 字符串。读不到的字段保持 `None`，不用空串或 0 伪装成功。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageKind {
+    ThirdParty,
+    System,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ActivityForegroundParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcEntrySummary {
+    /// maps | cmdline | status
+    pub name: String,
+    pub path: String,
+    /// maps=行数、cmdline=命令行（截断）、status=头几行；不可读为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub readable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityForegroundResult {
+    /// false = 未解析到前台窗口（锁屏、弹窗或 ROM 输出差异），不算错误
+    pub found: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub package_kind: PackageKind,
+    /// `legacyNativeLibraryDir`：部分 ROM 不再输出该字段，缺失即 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_lib_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proc: Vec<ProcEntrySummary>,
+    /// 无前台时的原因提示，便于 UI 直接展示
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfoResult {
@@ -253,6 +299,47 @@ mod tests {
         assert_eq!(value["items"][0].get("resolved_locale"), None);
         assert_eq!(value.get("warnings"), None);
         assert_eq!(value["success_count"], json!(1));
+    }
+
+    #[test]
+    fn foreground_result_is_snake_case_and_omits_absent_fields() {
+        let result = ActivityForegroundResult {
+            found: true,
+            package_name: Some("com.target.app".into()),
+            activity: Some("com.target.app.ui.HomeActivity".into()),
+            pid: Some(4321),
+            package_kind: PackageKind::ThirdParty,
+            native_lib_dir: None,
+            proc: vec![ProcEntrySummary {
+                name: "maps".into(),
+                path: "/proc/4321/maps".into(),
+                summary: Some("118".into()),
+                readable: true,
+            }],
+            hint: None,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["package_name"], "com.target.app");
+        assert_eq!(value["package_kind"], "third_party");
+        assert_eq!(value["proc"][0]["readable"], true);
+        assert_eq!(value.get("native_lib_dir"), None);
+        assert_eq!(value.get("hint"), None);
+
+        let empty = ActivityForegroundResult {
+            found: false,
+            package_name: None,
+            activity: None,
+            pid: None,
+            package_kind: PackageKind::Unknown,
+            native_lib_dir: None,
+            proc: Vec::new(),
+            hint: Some("未解析到前台窗口".into()),
+        };
+        let value = serde_json::to_value(empty).unwrap();
+        assert_eq!(value["package_kind"], "unknown");
+        assert_eq!(value.get("proc"), None);
+        let parsed: ActivityForegroundResult = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.package_kind, PackageKind::Unknown);
     }
 
     #[test]

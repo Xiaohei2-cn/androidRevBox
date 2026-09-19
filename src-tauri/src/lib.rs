@@ -98,7 +98,11 @@ pub fn run() {
                 Arc::new(ZygiskApplistService::new(android.clone(), runner.clone()));
 
             // 4.5) EnvService：仪表盘环境/工具探测（P7），复用同一 adb runner
-            let env = Arc::new(EnvService::new(config.clone(), runner.clone()));
+            let env = Arc::new(EnvService::new(
+                config.clone(),
+                runner.clone(),
+                android.clone(),
+            ));
 
             // 4.6) HookService：Frida 会话工作台（P10）——js 扫描/runner 组装/前置检查
             let hook = Arc::new(HookService::new(

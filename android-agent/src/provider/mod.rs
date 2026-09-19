@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod device;
 pub mod system;
 pub mod zygisk;
