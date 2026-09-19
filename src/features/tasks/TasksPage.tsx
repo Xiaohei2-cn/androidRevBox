@@ -42,6 +42,20 @@ export function TasksPage() {
     void queryClient.invalidateQueries({ queryKey: ["tasks", "list"] });
   }, [queryClient]);
 
+  /**
+   * 任务类型必须显式可读，才能判断「跑完后设备侧文件变了没有」：DeviceService 现在
+   * 给长操作打了 `adb.push` / `adb.install` 这类 kind（AR7.4），不再解析可读任务名。
+   * 传完不刷新，文件页与托管列表看到的就是 Agent 侧的旧快照。
+   */
+  const tasksRef = useRef(tasks);
+  tasksRef.current = tasks;
+  const refreshAgentFileViews = useCallback(() => {
+    // 三个视图都由 Agent typed API 提供：目录列表、托管 ELF 列表、托管运行表
+    void queryClient.invalidateQueries({ queryKey: ["device", "ls"] });
+    void queryClient.invalidateQueries({ queryKey: ["device", "binaries"] });
+    void queryClient.invalidateQueries({ queryKey: ["adb", "hosted-runs"] });
+  }, [queryClient]);
+
   // 全局订阅：输出事件进缓冲，状态事件驱动列表刷新
   useEffect(() => {
     const unsubs: Array<() => void> = [];
@@ -64,12 +78,21 @@ export function TasksPage() {
         });
       }),
     );
-    subscribe(taskApi.onStatus(() => refreshList()));
+    subscribe(
+      taskApi.onStatus((p) => {
+        refreshList();
+        if (p.status !== "success") return;
+        const finished = tasksRef.current.find((t) => t.id === p.taskId);
+        if (finished?.taskType === "adb.push" || finished?.taskType === "adb.install") {
+          refreshAgentFileViews();
+        }
+      }),
+    );
     return () => {
       alive = false;
       unsubs.forEach((un) => un());
     };
-  }, [refreshList]);
+  }, [refreshList, refreshAgentFileViews]);
 
   const runMutation = useMutation({
     mutationFn: async () => {

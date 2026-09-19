@@ -1042,7 +1042,7 @@ impl DeviceService {
     /// （CANNOT LINK / exec format / Permission denied）几乎只存在于 stderr。
     pub async fn hosted_run(&self, serial: &str, name: &str, root: bool) -> CoreResult<u32> {
         if root {
-            return self.hosted_run_legacy(serial, name, true).await;
+            return self.hosted_run_as_root(serial, name).await;
         }
         // AR7.2：非 root 启动走 Agent。Agent 侧用参数数组 exec，PID 与
         // `/proc/<pid>/stat` 的 start time 一起构成身份，记录落盘可跨重启对账；
@@ -1164,12 +1164,16 @@ impl DeviceService {
             .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))
     }
 
-    /// Legacy 启动路径（仅 root 支路使用）。⚠️ 用 `;` 而非 `&&`：`&&` 的优先级低于 `&`，
-    /// 会把整个 `cd && nohup` 复合式后台化，`$!` 拿到的是子 shell pid 而非二进制 pid
-    /// （kill/复查就全错了）；`;` 确保只有 nohup 一段进后台，nohup exec 后 pid 即二进制 pid。
-    /// root=true 时整段经 su -c 单引号包裹：外层 shell 不动 `&`/`$!`/重定向，
-    /// 由 root 内层 shell 解释（否则 su 只收到 `cd`）。
-    async fn hosted_run_legacy(&self, serial: &str, name: &str, root: bool) -> CoreResult<u32> {
+    /// Legacy 的 root 启动路径（AR7.4 起只剩这一条）：非 root 启动已由 Agent
+    /// `hosted.start` 接管，且写操作不自动回退（D028），所以这里不再有 non-root 分支，
+    /// 免得留下「看着像两条等价实现」的死路。
+    ///
+    /// ⚠️ 用 `;` 而非 `&&`：`&&` 的优先级低于 `&`，会把整个 `cd && nohup` 复合式后台化，
+    /// `$!` 拿到的是子 shell pid 而非二进制 pid（kill/复查就全错了）；`;` 确保只有
+    /// nohup 一段进后台，nohup exec 后 pid 即二进制 pid。整段经 su -c 单引号包裹：
+    /// 外层 shell 不动 `&`/`$!`/重定向，由 root 内层 shell 解释（否则 su 只收到 `cd`）。
+    async fn hosted_run_as_root(&self, serial: &str, name: &str) -> CoreResult<u32> {
+        let root = true;
         if !adb::is_safe_hosted_name(name) {
             return Err(CoreError::Internal(format!(
                 "文件名非法（仅允许字母数字与 _.-，且不以 . 开头）: {name}"
@@ -1257,6 +1261,8 @@ impl DeviceService {
             }
             // 日志可能还没生成（进程刚起）：预览失败按「无日志」处理，交给调用方兜底文案
         }
+        // Agent 可用时上面已经走 filesystem.preview；这里只剩 root 日志与
+        // 「Agent 不在线」两种局面，非 root 的那条保持原命令形状。
         let c = format!("tail -c 2048 {log_path} 2>/dev/null");
         let cmd = if root { adb::su_wrap(&c) } else { c };
         let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
@@ -1744,7 +1750,15 @@ impl DeviceService {
 
     // ===== 长操作：全部生成 TaskService 任务（事件流 + 历史）=====
 
-    async fn adb_task(&self, serial: Option<&str>, subcommand: &[String]) -> CoreResult<String> {
+    /// 长操作统一入口。`kind` 会写进任务的 `task_type`：AR7.4 起前端要按类型判断
+    /// 「这个任务完成后设备侧文件变了没有」（push/install/uninstall），不能再靠
+    /// 解析可读任务名猜，所以类型必须显式且唯一。
+    async fn adb_task(
+        &self,
+        kind: &str,
+        serial: Option<&str>,
+        subcommand: &[String],
+    ) -> CoreResult<String> {
         let env = self.runner.environment().await;
         let path = env
             .path
@@ -1757,42 +1771,47 @@ impl DeviceService {
             env_extra: HashMap::new(),
             ..Default::default()
         };
-        self.tasks.start(spec)
+        self.tasks.start_with_kind(kind, spec)
     }
 
     pub async fn start_shell(&self, serial: &str, command: &str) -> CoreResult<String> {
-        self.adb_task(Some(serial), &adb::cmd_shell(command)).await
+        self.adb_task("adb.shell", Some(serial), &adb::cmd_shell(command))
+            .await
     }
 
     pub async fn start_install(&self, serial: &str, local_apk: &str) -> CoreResult<String> {
-        self.adb_task(Some(serial), &adb::cmd_install(local_apk))
+        self.adb_task("adb.install", Some(serial), &adb::cmd_install(local_apk))
             .await
     }
 
     pub async fn start_uninstall(&self, serial: &str, pkg: &str) -> CoreResult<String> {
-        self.adb_task(Some(serial), &adb::cmd_uninstall(pkg)).await
+        self.adb_task("adb.uninstall", Some(serial), &adb::cmd_uninstall(pkg))
+            .await
     }
 
     pub async fn start_launch(&self, serial: &str, pkg: &str) -> CoreResult<String> {
-        self.adb_task(Some(serial), &adb::cmd_launch(pkg)).await
+        self.adb_task("adb.launch", Some(serial), &adb::cmd_launch(pkg))
+            .await
     }
 
     pub async fn start_force_stop(&self, serial: &str, pkg: &str) -> CoreResult<String> {
-        self.adb_task(Some(serial), &adb::cmd_force_stop(pkg)).await
+        self.adb_task("adb.force_stop", Some(serial), &adb::cmd_force_stop(pkg))
+            .await
     }
 
     pub async fn start_push(&self, serial: &str, local: &str, remote: &str) -> CoreResult<String> {
-        self.adb_task(Some(serial), &adb::cmd_push(local, remote))
+        self.adb_task("adb.push", Some(serial), &adb::cmd_push(local, remote))
             .await
     }
 
     pub async fn start_pull(&self, serial: &str, remote: &str, local: &str) -> CoreResult<String> {
-        self.adb_task(Some(serial), &adb::cmd_pull(remote, local))
+        self.adb_task("adb.pull", Some(serial), &adb::cmd_pull(remote, local))
             .await
     }
 
     pub async fn start_logcat(&self, serial: &str, filter: Option<&str>) -> CoreResult<String> {
-        self.adb_task(Some(serial), &adb::cmd_logcat(filter)).await
+        self.adb_task("adb.logcat", Some(serial), &adb::cmd_logcat(filter))
+            .await
     }
 
     // ===== 热插拔轮询（仪表盘「新开线程轮询 adb 链接」）=====
