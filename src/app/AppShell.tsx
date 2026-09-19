@@ -5,6 +5,7 @@ import { MainTabRail } from "@/components/nav/MainTabRail";
 import { TitleBar } from "@/components/window/TitleBar";
 import { DashboardPage } from "@/features/dashboard/DashboardPage";
 import { DevicesPage } from "@/features/devices/DevicesPage";
+import { AppsPage } from "@/features/apps/AppsPage";
 import { AdbPage } from "@/features/adb/AdbPage";
 import { TrafficPage } from "@/features/traffic/TrafficPage";
 import { HookPage } from "@/features/hook/HookPage";
@@ -70,6 +71,9 @@ function ShellBody() {
           </PageHost>
           <PageHost active={tab === "devices"}>
             <DevicesPage />
+          </PageHost>
+          <PageHost active={tab === "apps"}>
+            <AppsPage />
           </PageHost>
           <PageHost active={tab === "traffic"}>
             <TrafficPage />

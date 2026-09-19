@@ -13,3 +13,4 @@ pub mod log_service;
 pub mod plugin_service;
 pub mod process_service;
 pub mod task_service;
+pub mod zygisk_applist;

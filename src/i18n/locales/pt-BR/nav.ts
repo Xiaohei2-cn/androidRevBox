@@ -6,6 +6,7 @@ export default {
   "nav.aria": "Navegação principal",
   "nav.dashboard": "Painel",
   "nav.devices": "Dispositivos",
+  "nav.apps": "Aplicativos",
   "nav.traffic": "Tráfego",
   "nav.terminal": "ADB",
   "nav.hook": "Hook",

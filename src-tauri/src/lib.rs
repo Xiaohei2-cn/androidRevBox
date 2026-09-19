@@ -36,6 +36,7 @@ use crate::services::hook_service::HookService;
 use crate::services::log_service::{self, LogService};
 use crate::services::plugin_service::PluginService;
 use crate::services::task_service::TaskService;
+use crate::services::zygisk_applist::ZygiskApplistService;
 
 /// 全局共享状态：Service 实例（Arc 化，供各 command 经 tauri::State 取用）
 pub struct AppState {
@@ -48,6 +49,7 @@ pub struct AppState {
     pub hook: Arc<HookService>,
     pub agent: Arc<AgentManager>,
     pub android: Arc<CapabilityRouter>,
+    pub zygisk_applist: Arc<ZygiskApplistService>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -92,6 +94,7 @@ pub fn run() {
                 app.handle().clone(),
             ));
             device.clone().start_watch();
+            let zygisk_applist = Arc::new(ZygiskApplistService::new(runner.clone()));
 
             // 4.5) EnvService：仪表盘环境/工具探测（P7），复用同一 adb runner
             let env = Arc::new(EnvService::new(config.clone(), runner.clone()));
@@ -138,6 +141,7 @@ pub fn run() {
                 hook,
                 agent,
                 android,
+                zygisk_applist,
             });
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -161,6 +165,9 @@ pub fn run() {
             commands::task::task_cancel,
             commands::task::task_list,
             commands::task::task_logs,
+            commands::zygisk::zygisk_applist,
+            commands::zygisk::zygisk_apk_manifest,
+            commands::zygisk::zygisk_applist_export,
             commands::device::adb_environment,
             commands::device::adb_set_path,
             commands::device::devices_list,

@@ -1,0 +1,6 @@
+id=applist
+name=Applist Zygisk (学习示例)
+version=v1.0
+versionCode=1
+author=learning
+description=Zygisk companion demo: PC 端接口获取全部已安装应用的包名与中文名

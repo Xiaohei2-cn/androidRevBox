@@ -22,12 +22,12 @@ function renderRail() {
 }
 
 describe("MainTabRail", () => {
-  it("渲染全部 13 个总 tab（默认 zh-CN 标签）", () => {
+  it("渲染全部 14 个总 tab（默认 zh-CN 标签）", () => {
     renderRail();
     for (const tab of MAIN_TABS) {
       expect(screen.getByRole("button", { name: ZH_LABELS[tab.labelKey] })).toBeInTheDocument();
     }
-    expect(MAIN_TABS).toHaveLength(13);
+    expect(MAIN_TABS).toHaveLength(14);
   });
 
   it("点击 tab 切换激活态（context 驱动）", async () => {

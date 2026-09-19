@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck, Cpu } from "lucide-react";
+import { Copy, RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck, Cpu, Save } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SubTabs } from "@/components/nav/SubTabs";
 import { TaskLaunchPanel } from "@/components/task/TaskLaunchPanel";
 import { TaskSessionView } from "@/components/task/TaskSessionView";
 import { deviceApi, type DeviceEntry } from "@/api/device";
+import { zygiskApi, type ZygiskAppItem } from "@/api/zygisk";
 import { agentApi, type AgentSessionState } from "@/api/agent";
 import { envApi } from "@/api/env";
 import { useAppNav } from "@/app/nav";
@@ -13,6 +14,7 @@ import { useI18n } from "@/i18n";
 import { PathText } from "@/components/ui/PathText";
 import { BrandIcon } from "@/components/ui/BrandIcon";
 import { cn } from "@/lib/utils";
+import { pickDirectory } from "@/api/dialog";
 
 /**
  * 设备页（P3）：设备列表/信息/Shell/文件/应用/Logcat 六个分 tab。
@@ -687,58 +689,149 @@ function FilesView({ serial }: { serial: string | null }) {
   );
 }
 
-function AppsView({ serial }: { serial: string | null }) {
-  const [selectedPkg, setSelectedPkg] = useState<string | null>(null);
+export function AppsView({ serial }: { serial: string | null }) {
+  const { t } = useI18n();
+  const [selectedApp, setSelectedApp] = useState<ZygiskAppItem | null>(null);
   const [apkPath, setApkPath] = useState("");
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["device", "packages", serial],
-    queryFn: () => deviceApi.packages(serial!),
+  const [context, setContext] = useState<{ x: number; y: number; app: ZygiskAppItem } | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const { data, isLoading, error, refetch } = useQuery({
+    queryKey: ["zygisk", "applist", serial],
+    queryFn: () => zygiskApi.list(serial!),
     enabled: !!serial,
   });
   const [action, setAction] = useState<{ kind: string; taskId: string } | null>(null);
 
-  if (!serial) return <Empty text="未选择设备" />;
-  if (isLoading) return <Empty text="加载应用列表…" />;
-  if (error) return <Empty text={`加载失败：${String((error as Error)?.message ?? error)}`} />;
+  if (!serial) return <Empty text={t("apps.noDevice")} />;
+  if (isLoading) return <Empty text={t("apps.loading")} />;
+  if (error) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-xs">
+        <p className="font-medium text-destructive">{t("apps.unavailable")}</p>
+        <p className="max-w-lg text-muted-foreground">{String((error as Error)?.message ?? error)}</p>
+        <p className="max-w-lg text-muted-foreground">{t("apps.unavailableHint")}</p>
+        <Button size="sm" variant="outline" onClick={() => void refetch()}>
+          <RefreshCw className="h-3.5 w-3.5" />
+          {t("apps.retry")}
+        </Button>
+      </div>
+    );
+  }
+
+  const apps = [...(data ?? [])].sort((a, b) =>
+    a.label.localeCompare(b.label, undefined, { sensitivity: "base" }),
+  );
 
   const runAction = async (fn: () => Promise<string>, kind: string) => {
     try {
       const id = await fn();
       setAction({ kind, taskId: id });
     } catch (e) {
-      setAction({ kind: `${kind} 失败: ${String((e as Error).message ?? e)}`, taskId: "" });
+      setAction({ kind: kind + " 失败: " + String((e as Error).message ?? e), taskId: "" });
+    }
+  };
+
+  const copy = async (value: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setNotice(t("apps.copied", { field: label }));
+    } catch (e) {
+      setNotice(t("apps.copyFailed", { error: String((e as Error)?.message ?? e) }));
+    }
+    setContext(null);
+  };
+
+  const saveApk = async (app: ZygiskAppItem) => {
+    setContext(null);
+    const destination = await pickDirectory(t("apps.pickDestination"));
+    if (!destination) return;
+    setExporting(true);
+    setNotice(null);
+    try {
+      const report = await zygiskApi.exportPackage(serial, app.packageName, destination);
+      setNotice(t("apps.saved", { count: report.files.length, size: formatSize(report.bytes) }));
+    } catch (e) {
+      setNotice(t("apps.saveFailed", { error: String((e as Error)?.message ?? e) }));
+    } finally {
+      setExporting(false);
     }
   };
 
   return (
-    <div className="flex h-full min-h-0 gap-4">
-      <div className="min-h-0 w-64 shrink-0 overflow-auto rounded-lg border">
-        {(data ?? []).length === 0 && <Empty text="无第三方应用" />}
-        <ul className="text-xs">
-          {(data ?? []).map((pkg) => (
-            <li key={pkg}>
+    <div className="relative flex h-full min-h-0 gap-4" onClick={() => setContext(null)}>
+      <div className="flex min-h-0 w-80 shrink-0 flex-col gap-2">
+        <div className="flex shrink-0 items-center gap-2">
+          <span className="text-xs font-medium">{t("apps.zygiskList")}</span>
+          <span className="text-[11px] text-muted-foreground">{t("apps.count", { count: apps.length })}</span>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="ml-auto h-7 px-2"
+            disabled={exporting}
+            onClick={(event) => {
+              event.stopPropagation();
+              void refetch();
+            }}
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            {t("apps.refresh")}
+          </Button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto rounded-lg border">
+          {apps.length === 0 && <Empty text={t("apps.empty")} />}
+          <ul className="text-xs">
+            {apps.map((app) => (
+            <li
+              key={app.packageName}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setSelectedApp(app);
+                setContext({ x: event.clientX, y: event.clientY, app });
+              }}
+            >
               <button
                 type="button"
-                onClick={() => setSelectedPkg(pkg)}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setSelectedApp(app);
+                  setContext(null);
+                }}
                 className={cn(
-                  "block w-full break-all px-3 py-1.5 text-left hover:bg-accent",
-                  pkg === selectedPkg && "bg-accent font-medium",
+                  "block w-full px-3 py-2 text-left hover:bg-accent",
+                  app.packageName === selectedApp?.packageName && "bg-accent font-medium",
                 )}
               >
-                {pkg}
+                <span className="block truncate">{app.label || app.packageName}</span>
+                <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
+                  {app.packageName}
+                </span>
               </button>
             </li>
           ))}
-        </ul>
+          </ul>
+        </div>
       </div>
       <div className="flex min-w-0 flex-1 flex-col gap-3">
+        <div className="rounded-lg border p-3 text-xs">
+          <div className="font-medium">{selectedApp?.label ?? t("apps.noSelection")}</div>
+          <div className="mt-1 break-all font-mono text-muted-foreground">
+            {selectedApp?.packageName ?? t("apps.contextHint")}
+          </div>
+          {selectedApp && (
+            <div className="mt-1 text-muted-foreground">
+              {t("apps.version", { version: selectedApp.versionName || t("apps.unknown"), code: selectedApp.versionCode })}
+            </div>
+          )}
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button
             size="sm"
             variant="outline"
-            disabled={!selectedPkg}
+            disabled={!selectedApp}
             onClick={() =>
-              selectedPkg && void runAction(() => deviceApi.launch(serial, selectedPkg), "启动")
+              selectedApp && void runAction(() => deviceApi.launch(serial, selectedApp.packageName), "启动")
             }
           >
             <Rocket className="h-3.5 w-3.5" />
@@ -747,10 +840,10 @@ function AppsView({ serial }: { serial: string | null }) {
           <Button
             size="sm"
             variant="outline"
-            disabled={!selectedPkg}
+            disabled={!selectedApp}
             onClick={() =>
-              selectedPkg &&
-              void runAction(() => deviceApi.forceStop(serial, selectedPkg), "强停")
+              selectedApp &&
+              void runAction(() => deviceApi.forceStop(serial, selectedApp.packageName), "强停")
             }
           >
             <CircleStop className="h-3.5 w-3.5" />
@@ -759,10 +852,10 @@ function AppsView({ serial }: { serial: string | null }) {
           <Button
             size="sm"
             variant="destructive"
-            disabled={!selectedPkg}
+            disabled={!selectedApp}
             onClick={() =>
-              selectedPkg &&
-              void runAction(() => deviceApi.uninstall(serial, selectedPkg), "卸载")
+              selectedApp &&
+              void runAction(() => deviceApi.uninstall(serial, selectedApp.packageName), "卸载")
             }
           >
             <PackageOpen className="h-3.5 w-3.5" />
@@ -785,6 +878,7 @@ function AppsView({ serial }: { serial: string | null }) {
             安装
           </Button>
         </div>
+        {notice && <p className="text-xs text-muted-foreground">{notice}</p>}
         <div className="min-h-0 flex-1">
           {action ? (
             action.taskId ? (
@@ -799,6 +893,39 @@ function AppsView({ serial }: { serial: string | null }) {
           )}
         </div>
       </div>
+      {context && (
+        <div
+          className="fixed z-50 min-w-44 rounded-md border bg-popover p-1 text-xs shadow-lg"
+          style={{ left: context.x, top: context.y }}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-accent"
+            onClick={() => void copy(context.app.label, t("apps.appName"))}
+          >
+            <Copy className="h-3.5 w-3.5" />
+            {t("apps.copyAppName")}
+          </button>
+          <button
+            type="button"
+            className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-accent"
+            onClick={() => void copy(context.app.packageName, t("apps.packageName"))}
+          >
+            <Copy className="h-3.5 w-3.5" />
+            {t("apps.copyPackageName")}
+          </button>
+          <button
+            type="button"
+            disabled={exporting}
+            className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-accent disabled:opacity-50"
+            onClick={() => void saveApk(context.app)}
+          >
+            <Save className="h-3.5 w-3.5" />
+            {t("apps.saveApk")}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

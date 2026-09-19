@@ -42,6 +42,17 @@ Thumbs.db
 # 文档仅本地保留，不入远端（用户要求 2026-09-07）
 /docs/
 *.md
+!android-zygisk/**/*.md
+
+# Zygisk module build outputs (the source/template stays tracked)
+android-zygisk/**/obj/
+android-zygisk/**/libs/
+android-zygisk/**/helper/build/
+android-zygisk/**/pkg/helper.dex
+android-zygisk/**/pkg/zygisk/*.so
+android-zygisk/**/*.zip
+android-zygisk/**/apks/
+android-zygisk/**/apps.json
 
 # 个人配置预防性忽略
 .vscode/

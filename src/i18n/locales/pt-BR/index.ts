@@ -1,4 +1,5 @@
 import common from "./common";
+import apps from "./apps";
 import dashboard from "./dashboard";
 import devices from "./devices";
 import hook from "./hook";
@@ -8,6 +9,7 @@ import settings from "./settings";
 /** Português (Brasil) */
 export default {
   ...common,
+  ...apps,
   ...nav,
   ...dashboard,
   ...devices,
