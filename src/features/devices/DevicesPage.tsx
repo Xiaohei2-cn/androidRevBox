@@ -609,10 +609,23 @@ function Field({
 
 function FilesView({ serial }: { serial: string | null }) {
   const [path, setPath] = useState("/sdcard");
+  /** 选中待预览/查看元数据的文件（AR7.1：filesystem.stat + filesystem.preview） */
+  const [selected, setSelected] = useState<string | null>(null);
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["device", "ls", serial, path],
     queryFn: () => deviceApi.ls(serial!, path),
     enabled: !!serial,
+  });
+  const selectedPath = selected ? joinRemote(path, selected) : null;
+  const stat = useQuery({
+    queryKey: ["device", "file-stat", serial, selectedPath],
+    queryFn: () => deviceApi.fileStat(serial!, selectedPath!),
+    enabled: !!serial && !!selectedPath,
+  });
+  const preview = useQuery({
+    queryKey: ["device", "file-preview", serial, selectedPath],
+    queryFn: () => deviceApi.filePreview(serial!, selectedPath!, { maxBytes: 64 * 1024 }),
+    enabled: !!serial && !!selectedPath,
   });
 
   if (!serial) return <Empty text="未选择设备" />;
@@ -644,16 +657,32 @@ function FilesView({ serial }: { serial: string | null }) {
                   <button
                     type="button"
                     className="flex min-w-0 flex-1 items-center gap-2 text-left hover:underline"
-                    onClick={() =>
-                      setPath(joinRemote(path, f.name))
-                    }
+                    onClick={() => {
+                      setSelected(null);
+                      setPath(joinRemote(path, f.name));
+                    }}
                   >
                     <span className="break-all font-medium">{f.name}/</span>
                   </button>
                 ) : (
-                  <span className="min-w-0 flex-1 break-all">{f.name}</span>
+                  <button
+                    type="button"
+                    className={cn(
+                      "min-w-0 flex-1 break-all text-left hover:underline",
+                      selected === f.name && "font-medium text-foreground underline",
+                    )}
+                    title="查看元数据与受限预览"
+                    onClick={() => setSelected(selected === f.name ? null : f.name)}
+                  >
+                    {f.name}
+                  </button>
                 )}
                 {f.symlink && <span className="text-muted-foreground">→ {f.symlink}</span>}
+                {f.perms && (
+                  <span className="hidden shrink-0 font-mono text-muted-foreground sm:inline">
+                    {f.perms}
+                  </span>
+                )}
                 <span className="w-16 shrink-0 text-right tabular-nums text-muted-foreground">
                   {f.isDir ? "-" : formatSize(f.size)}
                 </span>
@@ -662,6 +691,53 @@ function FilesView({ serial }: { serial: string | null }) {
           </ul>
         )}
       </div>
+      {selectedPath && (
+        <div className="shrink-0 rounded-lg border p-3 text-xs">
+          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            <span className="font-medium">{selected}</span>
+            <PathText value={stat.data?.path ?? selectedPath} testid="files-stat-path" className="font-mono text-muted-foreground" />
+          </div>
+          {stat.isLoading && <p className="mt-1 text-muted-foreground">读取元数据…</p>}
+          {stat.error && (
+            <p className="mt-1 text-destructive">
+              元数据读取失败：{String((stat.error as Error)?.message ?? stat.error)}
+            </p>
+          )}
+          {stat.data && (
+            <p className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
+              <span className="font-mono">{stat.data.stat.modeText}</span>
+              <span>{stat.data.stat.kind}</span>
+              <span>uid:gid {stat.data.stat.uid}:{stat.data.stat.gid}</span>
+              <span>{formatSize(stat.data.stat.size)}</span>
+              <span>mtime {formatEpoch(stat.data.stat.mtimeUnix)}</span>
+              <span className={stat.data.stat.readable ? undefined : "text-destructive"}>
+                {stat.data.stat.readable ? "可读" : "不可读（权限不足，不代表内容为空）"}
+              </span>
+            </p>
+          )}
+          {preview.error && (
+            <p className="mt-2 text-destructive">
+              预览失败：{String((preview.error as Error)?.message ?? preview.error)}
+            </p>
+          )}
+          {preview.data && (
+            <div className="mt-2">
+              <p className="text-muted-foreground">
+                预览 {preview.data.returnedBytes} / {formatSize(preview.data.size)}
+                {preview.data.offset > 0 && `（偏移 ${preview.data.offset}）`}
+                {preview.data.truncated && "，已截断"}
+                {preview.data.encoding === "hex" && "，二进制按 hex 显示"}
+                {preview.data.detail && `（${preview.data.detail}）`}
+              </p>
+              <pre className="mt-1 max-h-48 overflow-auto rounded-md bg-muted/40 p-2 font-mono whitespace-pre-wrap break-all">
+                {preview.data.encoding === "hex"
+                  ? preview.data.hex
+                  : preview.data.text}
+              </pre>
+            </div>
+          )}
+        </div>
+      )}
       <div className="flex shrink-0 gap-2">
         <Button
           size="sm"
@@ -1054,6 +1130,12 @@ function joinRemote(dir: string, name: string): string {
 }
 
 /** 文件大小人类可读（B/KB/MB/GB） */
+/** Unix epoch 秒 → 本地时间（协议固定单位，前端只做展示格式化） */
+function formatEpoch(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "-";
+  return new Date(seconds * 1000).toLocaleString();
+}
+
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
   const units = ["KB", "MB", "GB"];

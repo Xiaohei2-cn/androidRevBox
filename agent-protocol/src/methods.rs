@@ -13,6 +13,9 @@ pub mod method {
     pub const PROCESS_PORTS: &str = "process.ports";
     pub const PROCESS_BY_PORT: &str = "process.by_port";
     pub const PROCESS_KILL: &str = "process.kill";
+    pub const FILESYSTEM_LIST: &str = "filesystem.list";
+    pub const FILESYSTEM_STAT: &str = "filesystem.stat";
+    pub const FILESYSTEM_PREVIEW: &str = "filesystem.preview";
     pub const PACKAGE_EXPORT_APK: &str = "package.export_apk";
     pub const PACKAGE_EXPORT_CLEAN: &str = "package.export_clean";
     pub const ZYGISK_STATUS: &str = "zygisk.status";
@@ -283,6 +286,194 @@ pub struct ProcessKillResult {
     pub detail: Option<String>,
 }
 
+/// AR7.1：设备端文件 API。Desktop 不再解析 `ls -l` 文本，也不再 `head -c` 拉正文；
+/// 类型/权限/属主/时间戳全部由 Agent 用 `lstat`+`readlink` 直接取，时间固定 Unix epoch 秒。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileKind {
+    Dir,
+    File,
+    Symlink,
+    Socket,
+    Fifo,
+    Block,
+    Char,
+    Other,
+}
+
+impl FileKind {
+    /// `ls -l` 权限串首字符，便于与 Legacy 输出逐字对照。
+    pub fn type_char(self) -> char {
+        match self {
+            Self::Dir => 'd',
+            Self::File => '-',
+            Self::Symlink => 'l',
+            Self::Socket => 's',
+            Self::Fifo => 'p',
+            Self::Block => 'b',
+            Self::Char => 'c',
+            Self::Other => '?',
+        }
+    }
+
+    /// 由 `st_mode` 的文件类型位（S_IFMT）判定；未知类型归 `other`，绝不猜成普通文件。
+    /// 用裸掩码而不是 `std::os::unix`，协议 crate 在三平台（含 Windows 宿主编译）都可用。
+    pub fn from_mode(mode: u32) -> Self {
+        match mode & S_IFMT {
+            S_IFDIR => Self::Dir,
+            S_IFREG => Self::File,
+            S_IFLNK => Self::Symlink,
+            S_IFSOCK => Self::Socket,
+            S_IFIFO => Self::Fifo,
+            S_IFBLK => Self::Block,
+            S_IFCHR => Self::Char,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// POSIX `st_mode` 文件类型位与特殊权限位（与 libc 常量同值，避免协议 crate 依赖平台扩展）。
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFLNK: u32 = 0o120000;
+pub const S_IFSOCK: u32 = 0o140000;
+pub const S_IFIFO: u32 = 0o010000;
+pub const S_IFBLK: u32 = 0o060000;
+pub const S_IFCHR: u32 = 0o020000;
+pub const S_ISUID: u32 = 0o4000;
+pub const S_ISGID: u32 = 0o2000;
+pub const S_ISVTX: u32 = 0o1000;
+/// `FileStat.mode` 只保留权限位（含 setuid/setgid/sticky），不含文件类型位。
+pub const PERMISSION_BITS: u32 = 0o7777;
+
+/// 渲染 `ls -l` 风格的权限串（`-rwxr-xr-x`、`drwxrwx--x`、`lrwxrwxrwx`、`-rwsr-xr-x`、`drwxrwxrwt`）。
+/// Agent 与 Desktop 共用同一实现，shadow 对照才不会把渲染差异当成结果差异。
+///
+/// setuid/setgid/sticky 按 `ls` 的规则覆盖对应三元的执行位：有执行位用小写 `s`/`t`，
+/// 没有执行位用大写 `S`/`T`。少了这一步，`/system/bin` 下的 setuid 文件会与
+/// Legacy `ls -lA` 输出对不上，shadow 会把渲染差异误报成结果差异（同 AR6.2 的 IPv6 记法坑）。
+pub fn render_mode_text(kind: FileKind, mode: u32) -> String {
+    let mut text = String::with_capacity(10);
+    text.push(kind.type_char());
+    for (triplet, special, marker) in [
+        ((mode >> 6) & 0o7, mode & S_ISUID, 's'),
+        ((mode >> 3) & 0o7, mode & S_ISGID, 's'),
+        (mode & 0o7, mode & S_ISVTX, 't'),
+    ] {
+        text.push(if triplet & 0o4 != 0 { 'r' } else { '-' });
+        text.push(if triplet & 0o2 != 0 { 'w' } else { '-' });
+        text.push(match (triplet & 0o1 != 0, special != 0) {
+            (true, true) => marker,
+            (true, false) => 'x',
+            (false, true) => marker.to_ascii_uppercase(),
+            (false, false) => '-',
+        });
+    }
+    text
+}
+
+/// 单条目录项 / 单文件元数据。`symlink_target` 是 `readlink` 原值（未解析），
+/// 与 `ls -l` 显示一致；`kind` 也按 lstat 判定，指向目录的符号链接仍是 `symlink`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStat {
+    pub name: String,
+    pub kind: FileKind,
+    /// 权限位（不含文件类型位，含 setuid/setgid/sticky），如 0o755、0o4755
+    pub mode: u32,
+    /// `-rwxr-xr-x` 形式，首字符为类型字符
+    pub mode_text: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    /// Unix epoch 秒；固定单位与时区，不返回本地格式字符串
+    pub mtime_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
+    /// 当前 Agent 身份能否读内容（目录=能否列举）。读不到时 size/mtime 仍可能有效，
+    /// 但不能把「读不到」当成「空文件/空目录」
+    pub readable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FilesystemListParams {
+    pub path: String,
+    /// `true` = 含隐藏项（`ls -lA` 语义）；`false`（缺省）= 只返回非隐藏项。
+    /// 两种取值都不含 `.` 与 `..`。要与 Legacy `ls -lA` 对齐的调用方必须显式传 `true`。
+    #[serde(default)]
+    pub include_hidden: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemListResult {
+    /// 规范化（符号链接已解析）后的目录路径
+    pub path: String,
+    pub entries: Vec<FileStat>,
+    /// 超过上限被截断时为 true，调用方必须知道列表不完整
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// 逐项失败证据（单项 lstat 失败不影响整目录）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FilesystemStatParams {
+    pub path: String,
+    /// true = 解析符号链接后取目标元数据（stat），false = lstat 语义
+    #[serde(default)]
+    pub follow_symlink: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemStatResult {
+    /// 调用方原始输入，审计与排障用
+    pub requested_path: String,
+    /// 规范化后的真实路径（符号链接已解析）
+    pub path: String,
+    pub stat: FileStat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewEncoding {
+    /// 合法 UTF-8（或 ASCII）文本
+    Utf8,
+    /// 含 NUL 或非法 UTF-8：小写十六进制，不用 base64（可直接肉眼比对且不引入额外字母表）
+    Hex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FilesystemPreviewParams {
+    pub path: String,
+    /// 缺省 64 KiB，硬上限 256 KiB：大文件绝不整块塞进 JSON
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u32>,
+    /// true = 从文件尾读取（日志尾读语义，替代 `tail -c`）
+    #[serde(default)]
+    pub from_end: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemPreviewResult {
+    pub path: String,
+    /// 文件总大小
+    pub size: u64,
+    /// 本次返回内容在文件中的起始偏移
+    pub offset: u64,
+    pub returned_bytes: u32,
+    pub encoding: PreviewEncoding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hex: Option<String>,
+    /// 文件比返回内容大（受 max_bytes 限制）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfoResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -501,6 +692,101 @@ mod tests {
         assert_eq!(value["module_id"], "applist");
         assert_eq!(value["sub_protocol_version"], 1);
         assert_eq!(value.get("detail"), None);
+    }
+
+    #[test]
+    fn file_kind_and_mode_text_match_ls_conventions() {
+        assert_eq!(FileKind::from_mode(0o040755), FileKind::Dir);
+        assert_eq!(FileKind::from_mode(0o100644), FileKind::File);
+        assert_eq!(FileKind::from_mode(0o120777), FileKind::Symlink);
+        assert_eq!(FileKind::from_mode(0o140777), FileKind::Socket);
+        // 未知类型位不得猜成普通文件
+        assert_eq!(FileKind::from_mode(0o170000), FileKind::Other);
+        assert_eq!(render_mode_text(FileKind::Dir, 0o755), "drwxr-xr-x");
+        assert_eq!(render_mode_text(FileKind::File, 0o640), "-rw-r-----");
+        assert_eq!(render_mode_text(FileKind::Symlink, 0o777), "lrwxrwxrwx");
+        // 未知类型用 ls 的 `?` 前缀，不伪装成普通文件
+        assert_eq!(render_mode_text(FileKind::Other, 0o000), "?---------");
+        // setuid/setgid/sticky 必须按 ls 规则改写执行位，否则与 `ls -lA` 对不上
+        assert_eq!(render_mode_text(FileKind::File, 0o4755), "-rwsr-xr-x");
+        assert_eq!(render_mode_text(FileKind::File, 0o2755), "-rwxr-sr-x");
+        assert_eq!(render_mode_text(FileKind::Dir, 0o1777), "drwxrwxrwt");
+        // 没有执行位时用大写 S/T（ls 同规则）
+        assert_eq!(render_mode_text(FileKind::File, 0o4644), "-rwSr--r--");
+        // setgid 与 sticky 同时命中无执行位：大写 S/T 各自归位
+        assert_eq!(render_mode_text(FileKind::Dir, 0o3666), "drw-rwSrwT");
+        // mode 只保留权限位：类型位不得渗进渲染结果
+        assert_eq!(
+            render_mode_text(FileKind::File, 0o100755 & PERMISSION_BITS),
+            "-rwxr-xr-x"
+        );
+    }
+
+    #[test]
+    fn filesystem_list_result_defaults_keep_absent_evidence_out_of_the_wire() {
+        let result = FilesystemListResult {
+            path: "/data/local/tmp".into(),
+            entries: vec![FileStat {
+                name: "a b.txt".into(),
+                kind: FileKind::File,
+                mode: 0o644,
+                mode_text: render_mode_text(FileKind::File, 0o644),
+                uid: 2000,
+                gid: 2000,
+                size: 12,
+                mtime_unix: 1_760_000_000,
+                symlink_target: None,
+                readable: true,
+            }],
+            truncated: false,
+            unreadable: vec![],
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["entries"][0]["kind"], "file");
+        assert_eq!(value["entries"][0]["mode"], json!(420));
+        assert_eq!(value["entries"][0]["mtime_unix"], json!(1_760_000_000));
+        assert_eq!(value["entries"][0].get("symlink_target"), None);
+        assert_eq!(value.get("truncated"), None);
+        assert_eq!(value.get("unreadable"), None);
+
+        let parsed: FilesystemListResult = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.entries[0].name, "a b.txt");
+        assert!(!parsed.truncated && parsed.unreadable.is_empty());
+    }
+
+    #[test]
+    fn preview_params_cap_and_tail_semantics_are_explicit() {
+        let params: FilesystemPreviewParams =
+            serde_json::from_value(json!({ "path": "/data/local/tmp/x.log" })).unwrap();
+        assert_eq!(params.max_bytes, None);
+        assert!(!params.from_end);
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value.get("max_bytes"), None);
+        assert_eq!(value["from_end"], json!(false));
+
+        let result = FilesystemPreviewResult {
+            path: "/data/local/tmp/x.log".into(),
+            size: 4096,
+            offset: 3072,
+            returned_bytes: 1024,
+            encoding: PreviewEncoding::Hex,
+            text: None,
+            hex: Some("7f454c46".into()),
+            truncated: true,
+            detail: Some("binary_detected".into()),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["encoding"], "hex");
+        assert_eq!(value.get("text"), None);
+        assert_eq!(value["truncated"], json!(true));
+        // 旧报文缺 truncated/detail 时必须按「未截断」解析，不能默认成截断
+        let legacy: FilesystemPreviewResult = serde_json::from_value(json!({
+            "path": "/p", "size": 3, "offset": 0, "returned_bytes": 3,
+            "encoding": "utf8", "text": "abc"
+        }))
+        .unwrap();
+        assert!(!legacy.truncated);
+        assert_eq!(legacy.detail, None);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! 短查询直接返回结果；长操作（shell/install/logcat/push/pull）一律返回
 //! task_id，输出走 task://* 事件流（PHASES §1.3 不阻塞 IPC）。
 
+use agent_protocol::{FilesystemPreviewResult, FilesystemStatResult};
 use serde::Deserialize;
 
 use crate::AppState;
@@ -208,6 +209,37 @@ pub async fn device_binary_kill(
     state
         .device
         .process_kill(&serial, pid, expected_name, root.unwrap_or(false))
+        .await
+}
+
+/// 单路径元数据（AR7.1，Agent only）：type/mode/uid/gid/size/mtime/link target 结构化返回。
+/// `follow_symlink=false` 是 lstat 语义（链接本身），true 时取解析后的目标。
+#[tauri::command]
+pub async fn device_file_stat(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    path: String,
+    follow_symlink: Option<bool>,
+) -> CoreResult<FilesystemStatResult> {
+    state
+        .device
+        .file_stat(&serial, &path, follow_symlink.unwrap_or(false))
+        .await
+}
+
+/// 受限预览（AR7.1，Agent only）：文本按 utf8 返回，二进制按小写 hex；
+/// `from_end=true` 是日志尾读语义。字节上限由 Agent 侧夹住（默认 64 KiB，最大 256 KiB）。
+#[tauri::command]
+pub async fn device_file_preview(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    path: String,
+    max_bytes: Option<u32>,
+    from_end: Option<bool>,
+) -> CoreResult<FilesystemPreviewResult> {
+    state
+        .device
+        .file_preview(&serial, &path, max_bytes, from_end.unwrap_or(false))
         .await
 }
 

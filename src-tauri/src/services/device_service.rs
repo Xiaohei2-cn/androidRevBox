@@ -12,11 +12,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_protocol::method::{
-    DEVICE_INFO, PACKAGE_LIST, PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
+    DEVICE_INFO, FILESYSTEM_LIST, FILESYSTEM_PREVIEW, FILESYSTEM_STAT, PACKAGE_LIST,
+    PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
 };
 use agent_protocol::{
-    DeviceInfoParams, DeviceInfoResult, KillSignal, ListeningPort, PackageListParams,
-    PackageListResult, PackageScope, PortHoldingProcess, ProcessByPortParams, ProcessByPortResult,
+    DeviceInfoParams, DeviceInfoResult, FileKind, FilesystemListParams, FilesystemListResult,
+    FilesystemPreviewParams, FilesystemPreviewResult, FilesystemStatParams, FilesystemStatResult,
+    KillSignal, ListeningPort, PackageListParams, PackageListResult, PackageScope,
+    PortHoldingProcess, PreviewEncoding, ProcessByPortParams, ProcessByPortResult,
     ProcessKillParams, ProcessKillResult, ProcessPortsParams, ProcessPortsResult, SocketFamily,
 };
 use async_trait::async_trait;
@@ -109,6 +112,8 @@ impl AdbEnvironment {
 const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(3);
 const SHORT_CMD_TIMEOUT: Duration = Duration::from_secs(10);
 const LIST_TIMEOUT: Duration = Duration::from_secs(8);
+/// 托管启动日志尾读长度（与 Legacy `tail -c 2048` 等价，迁移期保持一致便于对照）。
+const HOSTED_LOG_TAIL_BYTES: u32 = 2048;
 /// AR6.2 端口互查：Agent 要扫 `/proc/*/fd` 建 inode→pid 索引，进程数多时比
 /// 单条 shell 慢，超时给到 15 s（Legacy 侧同量级：真机非 root 全量 ls 约 2~4 s）。
 const PORT_SCAN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -542,8 +547,137 @@ impl DeviceService {
         Ok(info)
     }
 
-    /// 设备侧目录列表（短命令 ls -lA）
+    /// 设备侧目录列表。AR7.1 起默认走 Agent `filesystem.list`：条目由设备端 `lstat`
+    /// 直接产出（type/mode/uid/gid/size/mtime/link target 全在），Desktop 不再解析
+    /// `ls -l` 文本；只读幂等，Agent 不可用时回退 Legacy（删除条件见能力表 AR12.1）。
     pub async fn list_files(&self, serial: &str, path: &str) -> CoreResult<Vec<FileEntry>> {
+        let route = self
+            .android
+            .select(serial, FILESYSTEM_LIST, OperationKind::ReadOnlyIdempotent)
+            .map_err(CapabilityRouter::core_error)?;
+        if route.backend == AndroidBackendSource::LegacyAdb {
+            return self.list_files_legacy(serial, path).await;
+        }
+
+        // Legacy 用的是 `ls -lA`：含隐藏项、不含 `.`/`..`，Agent 侧必须同语义才可比
+        let params = FilesystemListParams {
+            path: path.to_owned(),
+            include_hidden: true,
+        };
+        let agent_request = self.android.agent().request::<_, FilesystemListResult>(
+            serial,
+            FILESYSTEM_LIST,
+            &params,
+            LIST_TIMEOUT,
+        );
+        let (agent_result, legacy_result) = if filesystem_shadow_enabled() {
+            let legacy = self.list_files_legacy(serial, path);
+            let (agent, legacy) = tokio::join!(agent_request, legacy);
+            (agent, Some(legacy))
+        } else {
+            (agent_request.await, None)
+        };
+
+        match agent_result {
+            Ok(result) => {
+                if !result.unreadable.is_empty() || result.truncated {
+                    tracing::debug!(
+                        serial,
+                        path = %result.path,
+                        method = FILESYSTEM_LIST,
+                        unreadable = ?result.unreadable,
+                        truncated = result.truncated,
+                        "filesystem.list 有不可读或被截断的条目：空/短列表不等于空目录"
+                    );
+                }
+                let entries = map_agent_file_entries(&result);
+                if let Some(Ok(legacy)) = legacy_result {
+                    log_filesystem_list_shadow_diff(serial, path, &entries, &legacy);
+                }
+                Ok(entries)
+            }
+            Err(error) => {
+                let fallback = self
+                    .android
+                    .fallback_after_agent_error(
+                        serial,
+                        FILESYSTEM_LIST,
+                        OperationKind::ReadOnlyIdempotent,
+                        &error,
+                    )
+                    .map_err(CapabilityRouter::core_error)?;
+                debug_assert_eq!(fallback.backend, AndroidBackendSource::LegacyAdb);
+                tracing::warn!(serial, path, "filesystem.list 回退 Legacy ADB");
+                match legacy_result {
+                    Some(result) => result,
+                    None => self.list_files_legacy(serial, path).await,
+                }
+            }
+        }
+    }
+
+    /// 单路径元数据（Agent only）：Legacy 侧没有等价能力（`ls -l` 文本不算），
+    /// 因此不注册回退；Agent 不可用时直接返回结构化错误，绝不用 shell 拼一个。
+    pub async fn file_stat(
+        &self,
+        serial: &str,
+        path: &str,
+        follow_symlink: bool,
+    ) -> CoreResult<FilesystemStatResult> {
+        let route = self
+            .android
+            .select(serial, FILESYSTEM_STAT, OperationKind::ReadOnlyIdempotent)
+            .map_err(CapabilityRouter::core_error)?;
+        debug_assert_eq!(route.backend, AndroidBackendSource::Agent);
+        let params = FilesystemStatParams {
+            path: path.to_owned(),
+            follow_symlink,
+        };
+        self.android
+            .agent()
+            .request::<_, FilesystemStatResult>(serial, FILESYSTEM_STAT, &params, LIST_TIMEOUT)
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))
+    }
+
+    /// 受限预览（Agent only）：替代 `head -c` / `tail -c`，正文按文本或 hex 返回，
+    /// 大文件由 Agent 侧硬上限夹住，不会把几十 MB 塞进 JSON 帧。
+    pub async fn file_preview(
+        &self,
+        serial: &str,
+        path: &str,
+        max_bytes: Option<u32>,
+        from_end: bool,
+    ) -> CoreResult<FilesystemPreviewResult> {
+        let route = self
+            .android
+            .select(
+                serial,
+                FILESYSTEM_PREVIEW,
+                OperationKind::ReadOnlyIdempotent,
+            )
+            .map_err(CapabilityRouter::core_error)?;
+        debug_assert_eq!(route.backend, AndroidBackendSource::Agent);
+        let params = FilesystemPreviewParams {
+            path: path.to_owned(),
+            max_bytes,
+            from_end,
+        };
+        self.android
+            .agent()
+            .request::<_, FilesystemPreviewResult>(
+                serial,
+                FILESYSTEM_PREVIEW,
+                &params,
+                LIST_TIMEOUT,
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))
+    }
+
+    /// Legacy 目录列表（仅作回退）：`ls -lA` + 宿主侧按空格切列解析。
+    /// 文件名带空格只能靠「第 8 列之后全拼回去」猜，uid/gid 数值与 mtime 时间戳丢失。
+    async fn list_files_legacy(&self, serial: &str, path: &str) -> CoreResult<Vec<FileEntry>> {
         let args = adb::build_args(Some(serial), &adb::cmd_ls(path));
         let out = self.run_adb(&args).await?;
         if out.exit_code != Some(0) {
@@ -820,13 +954,44 @@ impl DeviceService {
         Ok(pid)
     }
 
-    /// 读托管启动日志尾部（tail 截 2KB 防日志爆炸；root 启动的日志同身份读）。
+    /// 读托管启动日志尾部（截 2KB 防日志爆炸）。
+    ///
+    /// AR7.1：Agent 可用时走 `filesystem.preview{from_end:true}`——设备端 seek 后只读
+    /// 尾块，正文按字节返回，不再让路径进 shell；`root=true` 的日志（root 启动的进程写的）
+    /// 仍走 Legacy `su -c tail`，因为 Agent 以 shell 身份运行读不到（同 D026 身份边界）。
     async fn read_hosted_log(
         &self,
         serial: &str,
         log_path: &str,
         root: bool,
     ) -> CoreResult<String> {
+        if !root
+            && matches!(
+                self.android
+                    .select(serial, FILESYSTEM_PREVIEW, OperationKind::ReadOnlyIdempotent),
+                Ok(decision) if decision.backend == AndroidBackendSource::Agent
+            )
+        {
+            let params = FilesystemPreviewParams {
+                path: log_path.to_owned(),
+                max_bytes: Some(HOSTED_LOG_TAIL_BYTES),
+                from_end: true,
+            };
+            if let Ok(preview) = self
+                .android
+                .agent()
+                .request::<_, FilesystemPreviewResult>(
+                    serial,
+                    FILESYSTEM_PREVIEW,
+                    &params,
+                    LIST_TIMEOUT,
+                )
+                .await
+            {
+                return Ok(preview_text(&preview));
+            }
+            // 日志可能还没生成（进程刚起）：预览失败按「无日志」处理，交给调用方兜底文案
+        }
         let c = format!("tail -c 2048 {log_path} 2>/dev/null");
         let cmd = if root { adb::su_wrap(&c) } else { c };
         let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
@@ -1563,6 +1728,102 @@ fn audit_process_kill(
     }
 }
 
+/// AR7.1 文件列表的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。
+fn filesystem_shadow_enabled() -> bool {
+    !std::env::var("APP_REVERSE_TOOLS_FILESYSTEM_SHADOW")
+        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
+}
+
+/// Agent `filesystem.list` → 前端既有 `FileEntry[]` 契约。
+/// 目录判定与 Legacy 一致：指向目录的符号链接仍算链接（`ls -l` 看首字符 `l`）。
+fn map_agent_file_entries(result: &FilesystemListResult) -> Vec<FileEntry> {
+    let mut entries: Vec<FileEntry> = result
+        .entries
+        .iter()
+        .map(|entry| FileEntry {
+            name: entry.name.clone(),
+            is_dir: entry.kind == FileKind::Dir,
+            // 目录项大小不会超过 i64；真超了就夹住，不用负数冒充
+            size: i64::try_from(entry.size).unwrap_or(i64::MAX),
+            symlink: entry.symlink_target.clone(),
+            perms: entry.mode_text.clone(),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
+/// 预览结果还原成字符串：文本直接给，hex 先解回字节再 lossy 转文本
+/// （日志尾读只关心可读内容；二进制日志本来 Legacy 也是 lossy 输出）。
+pub(crate) fn preview_text(preview: &FilesystemPreviewResult) -> String {
+    match (&preview.encoding, &preview.text, &preview.hex) {
+        (PreviewEncoding::Utf8, Some(text), _) => text.clone(),
+        (PreviewEncoding::Hex, _, Some(hex)) => {
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .filter_map(|index| u8::from_str_radix(&hex[index..index + 2], 16).ok())
+                .collect::<Vec<u8>>();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        // 协议保证二者必有其一；真出现空结果就返回空串，不编造内容
+        _ => String::new(),
+    }
+}
+
+/// Agent 与 Legacy 的目录项差异只写日志，不影响返回值（迁移期观测用）。
+/// 判据沿用 D024 的思路：按名字集合比较，逐项再比 is_dir/size/symlink/perms。
+fn log_filesystem_list_shadow_diff(
+    serial: &str,
+    path: &str,
+    agent: &[FileEntry],
+    legacy: &[FileEntry],
+) {
+    let agent_names: HashSet<&str> = agent.iter().map(|entry| entry.name.as_str()).collect();
+    let legacy_names: HashSet<&str> = legacy.iter().map(|entry| entry.name.as_str()).collect();
+    let only_agent: Vec<&str> = agent_names.difference(&legacy_names).copied().collect();
+    let only_legacy: Vec<&str> = legacy_names.difference(&agent_names).copied().collect();
+    let mut field_diffs: Vec<String> = Vec::new();
+    for legacy_entry in legacy {
+        let Some(agent_entry) = agent.iter().find(|entry| entry.name == legacy_entry.name) else {
+            continue;
+        };
+        if agent_entry.is_dir != legacy_entry.is_dir {
+            field_diffs.push(format!("{}:is_dir", legacy_entry.name));
+        }
+        if agent_entry.size != legacy_entry.size {
+            field_diffs.push(format!("{}:size", legacy_entry.name));
+        }
+        if agent_entry.symlink != legacy_entry.symlink {
+            field_diffs.push(format!("{}:symlink", legacy_entry.name));
+        }
+        // 权限串只在两侧都非空时比：Legacy 解析失败会给空串，那是对照方的缺陷不是差异
+        if !legacy_entry.perms.is_empty() && agent_entry.perms != legacy_entry.perms {
+            field_diffs.push(format!(
+                "{}:perms({}!={})",
+                legacy_entry.name, agent_entry.perms, legacy_entry.perms
+            ));
+        }
+    }
+    if only_agent.is_empty() && only_legacy.is_empty() && field_diffs.is_empty() {
+        tracing::debug!(
+            serial,
+            path,
+            method = FILESYSTEM_LIST,
+            "filesystem.list matched"
+        );
+        return;
+    }
+    tracing::warn!(
+        serial,
+        path,
+        method = FILESYSTEM_LIST,
+        agent_only = ?only_agent,
+        legacy_only = ?only_legacy,
+        field_diffs = ?field_diffs,
+        "Agent/Legacy filesystem.list shadow compare differed"
+    );
+}
+
 /// AR6.2 端口互查的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。
 fn process_ports_shadow_enabled() -> bool {
     !std::env::var("APP_REVERSE_TOOLS_PROCESS_PORTS_SHADOW")
@@ -1763,6 +2024,111 @@ mod tests {
             inode: 1,
             uid: 0,
         }
+    }
+
+    fn file_stat(
+        name: &str,
+        kind: FileKind,
+        mode: u32,
+        size: u64,
+        symlink_target: Option<&str>,
+    ) -> agent_protocol::FileStat {
+        agent_protocol::FileStat {
+            name: name.to_owned(),
+            kind,
+            mode,
+            mode_text: agent_protocol::render_mode_text(kind, mode),
+            uid: 2000,
+            gid: 2000,
+            size,
+            mtime_unix: 1_760_000_000,
+            symlink_target: symlink_target.map(str::to_string),
+            readable: true,
+        }
+    }
+
+    /// AR7.1 等价性：Agent 的结构化条目映射后必须与 Legacy `ls -lA` 解析结果同形，
+    /// 包括「指向目录的符号链接不算目录」这条 Legacy 也遵守的规则。
+    #[test]
+    fn agent_file_entries_match_legacy_parser_output() {
+        const RAW: &str = concat!(
+            "total 24\n",
+            "drwxrwx--x 2 root root 3452 2024-01-01 08:00 storage\n",
+            "-rw-rw---- 1 u0_a1 u0_a1 1024 2024-01-01 08:00 my file.txt\n",
+            "lrwxrwxrwx 1 root root 11 2024-01-01 08:00 init -> /init\n",
+        );
+        // Legacy 保留 `ls` 的输出顺序，Agent 侧固定按名字排序；顺序不是契约
+        // （shadow 判据是名字集合 + 逐项字段，见 log_filesystem_list_shadow_diff），
+        // 所以把对照方也排序后再比，免得把排序差异当成迁移缺陷。
+        let mut legacy = RAW
+            .lines()
+            .filter_map(adb::parse_ls_long)
+            .collect::<Vec<_>>();
+        legacy.sort_by(|a, b| a.name.cmp(&b.name));
+        let result = FilesystemListResult {
+            path: "/data/local/tmp".into(),
+            entries: vec![
+                file_stat("init", FileKind::Symlink, 0o777, 11, Some("/init")),
+                file_stat("my file.txt", FileKind::File, 0o660, 1024, None),
+                file_stat("storage", FileKind::Dir, 0o771, 3452, None),
+            ],
+            truncated: false,
+            unreadable: vec![],
+        };
+        let agent = map_agent_file_entries(&result);
+        assert_eq!(agent, legacy, "映射结果必须与 Legacy 解析逐项相等");
+        // 名字带空格、符号链接目标、目录判定这三处是 Legacy 文本解析最容易错的地方
+        assert_eq!(agent[1].name, "my file.txt");
+        assert_eq!(agent[0].symlink.as_deref(), Some("/init"));
+        assert!(!agent[0].is_dir, "指向文件的链接不是目录");
+        assert!(agent[2].is_dir);
+        assert_eq!(agent[2].perms, "drwxrwx--x");
+    }
+
+    #[test]
+    fn agent_file_entries_keep_unreadable_and_truncation_visible() {
+        let result = FilesystemListResult {
+            path: "/proc".into(),
+            entries: vec![file_stat("1", FileKind::Dir, 0o555, 0, None)],
+            truncated: true,
+            unreadable: vec!["kcore: permission_denied".into()],
+        };
+        let entries = map_agent_file_entries(&result);
+        assert_eq!(entries.len(), 1);
+        // 截断与不可读不会体现在 FileEntry 数组里，必须靠日志留证（见 list_files）
+        assert!(result.truncated && !result.unreadable.is_empty());
+    }
+
+    #[test]
+    fn preview_text_decodes_hex_and_never_invents_content() {
+        let text = FilesystemPreviewResult {
+            path: "/data/local/tmp/a.log".into(),
+            size: 12,
+            offset: 0,
+            returned_bytes: 12,
+            encoding: PreviewEncoding::Utf8,
+            text: Some("line-1\nline-2\n".into()),
+            hex: None,
+            truncated: false,
+            detail: None,
+        };
+        assert_eq!(preview_text(&text), "line-1\nline-2\n");
+
+        // "hi\n" 的 hex 形式：尾读日志时二进制内容也要还原成同样的字节
+        let binary = FilesystemPreviewResult {
+            encoding: PreviewEncoding::Hex,
+            text: None,
+            hex: Some("68690a".into()),
+            ..text.clone()
+        };
+        assert_eq!(preview_text(&binary), "hi\n");
+
+        let empty = FilesystemPreviewResult {
+            text: None,
+            hex: None,
+            ..text
+        };
+        assert_eq!(preview_text(&empty), "", "两者都缺时返回空串，不编造内容");
     }
 
     /// AR6.2 等价性：Agent 已还原的结构化端口经 Desktop 映射后，必须与 Legacy

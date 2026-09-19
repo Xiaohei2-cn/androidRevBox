@@ -1363,6 +1363,299 @@ mod tests {
         manager.disconnect(&serial).await.unwrap();
     }
 
+    /// AR7.1 真机腿：设备端文件 API 与 Legacy `ls -lA` 文本解析必须同结论，
+    /// 且路径策略（允许根、`..` 拒止、符号链接逃逸）在真机上真的挡得住。
+    #[tokio::test]
+    #[ignore = "需要真机；AR7_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_filesystem -- --ignored --nocapture"]
+    async fn real_agent_filesystem_list_stat_preview_and_path_policy() {
+        use agent_protocol::method::{FILESYSTEM_LIST, FILESYSTEM_PREVIEW, FILESYSTEM_STAT};
+        use agent_protocol::{
+            ErrorCode, FileKind, FilesystemListParams, FilesystemListResult,
+            FilesystemPreviewParams, FilesystemPreviewResult, FilesystemStatParams,
+            FilesystemStatResult, PreviewEncoding,
+        };
+
+        async fn adb_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        fn agent_error(
+            error: crate::services::agent_client::AgentClientError,
+        ) -> agent_protocol::AgentError {
+            match error {
+                crate::services::agent_client::AgentClientError::Remote(error) => error,
+                other => panic!("期望 Agent 结构化错误，实际 {other:?}"),
+            }
+        }
+
+        let serial = std::env::var("AR7_TEST_SERIAL").expect("AR7_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        let status = manager.connect_resolved(&serial).await.unwrap();
+        for method in [FILESYSTEM_LIST, FILESYSTEM_STAT, FILESYSTEM_PREVIEW] {
+            assert!(
+                status
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.method == method && capability.available),
+                "Agent 未发布 {method} capability"
+            );
+        }
+        let client = manager.client(&serial).unwrap();
+
+        // 造一个已知内容的小文本文件 + 一个指向白名单外的符号链接
+        adb_shell(
+            &serial,
+            "printf 'line-1\\nline-2\\n' > /data/local/tmp/ar71_probe.txt",
+        )
+        .await;
+        adb_shell(
+            &serial,
+            "ln -sf /data/data/com.android.providers.contacts/databases /data/local/tmp/ar71_escape",
+        )
+        .await;
+
+        // ① list：与 Legacy `ls -lA` 解析结果同名同类型
+        let params = FilesystemListParams {
+            path: "/data/local/tmp".into(),
+            include_hidden: true,
+        };
+        let listed: FilesystemListResult = client
+            .request(FILESYSTEM_LIST, &params, Duration::from_secs(20))
+            .await
+            .unwrap();
+        assert_eq!(listed.path, "/data/local/tmp");
+        assert!(!listed.truncated, "托管目录不应触发截断");
+        let environment = runner.environment().await;
+        let adb_path = environment.path.unwrap();
+        let legacy = runner
+            .run(
+                &adb_path,
+                &adb::build_args(Some(&serial), &adb::cmd_ls("/data/local/tmp")),
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+        let legacy_entries: Vec<adb::FileEntry> = legacy
+            .stdout
+            .lines()
+            .filter_map(adb::parse_ls_long)
+            .collect();
+        let legacy_names: std::collections::HashSet<&str> = legacy_entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        let agent_names: std::collections::HashSet<&str> = listed
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(
+            agent_names, legacy_names,
+            "Agent 与 Legacy 的目录项集合必须一致（差异即迁移缺陷）"
+        );
+        for legacy_entry in &legacy_entries {
+            let agent_entry = listed
+                .entries
+                .iter()
+                .find(|entry| entry.name == legacy_entry.name)
+                .unwrap();
+            assert_eq!(
+                agent_entry.kind == FileKind::Dir,
+                legacy_entry.is_dir,
+                "{} 的目录判定不一致",
+                legacy_entry.name
+            );
+            assert_eq!(
+                agent_entry.symlink_target, legacy_entry.symlink,
+                "{} 的符号链接目标不一致",
+                legacy_entry.name
+            );
+            if agent_entry.kind == FileKind::File {
+                assert_eq!(
+                    agent_entry.size as i64, legacy_entry.size,
+                    "{} 大小不一致",
+                    legacy_entry.name
+                );
+            }
+        }
+        let probe = listed
+            .entries
+            .iter()
+            .find(|entry| entry.name == "ar71_probe.txt")
+            .expect("探测文件应在列表里");
+        assert_eq!(probe.kind, FileKind::File);
+        assert_eq!(probe.size, 14);
+        assert_eq!(probe.uid, 2000, "探测文件由 shell 创建");
+        assert!(probe.readable && probe.mtime_unix > 1_700_000_000);
+        eprintln!(
+            "[filesystem.list] entries={} mode_text={} mtime={}",
+            listed.entries.len(),
+            probe.mode_text,
+            probe.mtime_unix
+        );
+
+        // ② stat：lstat 与 follow 两种语义
+        let params = FilesystemStatParams {
+            path: "/data/local/tmp/ar71_escape".into(),
+            follow_symlink: false,
+        };
+        let stated: FilesystemStatResult = client
+            .request(FILESYSTEM_STAT, &params, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(stated.stat.kind, FileKind::Symlink);
+        assert_eq!(
+            stated.stat.symlink_target.as_deref(),
+            Some("/data/data/com.android.providers.contacts/databases")
+        );
+        assert_eq!(stated.requested_path, "/data/local/tmp/ar71_escape");
+
+        // ③ preview：文本按 utf8 返回，且与设备侧 `cat` 完全一致
+        let params = FilesystemPreviewParams {
+            path: "/data/local/tmp/ar71_probe.txt".into(),
+            max_bytes: Some(4096),
+            from_end: false,
+        };
+        let previewed: FilesystemPreviewResult = client
+            .request(FILESYSTEM_PREVIEW, &params, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(previewed.encoding, PreviewEncoding::Utf8);
+        assert_eq!(previewed.text.as_deref(), Some("line-1\nline-2\n"));
+        assert_eq!(previewed.returned_bytes, 14);
+        assert!(!previewed.truncated);
+
+        // ④ preview：ELF 走 hex，不落 base64，也不当文本
+        let params = FilesystemPreviewParams {
+            path: "/data/local/tmp/app_reverse_tools_agent".into(),
+            max_bytes: Some(16),
+            from_end: false,
+        };
+        let elf: FilesystemPreviewResult = client
+            .request(FILESYSTEM_PREVIEW, &params, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(elf.encoding, PreviewEncoding::Hex);
+        assert!(
+            elf.hex.as_deref().unwrap().starts_with("7f454c46"),
+            "ELF magic 应出现在 hex 预览开头，实际 {:?}",
+            elf.hex
+        );
+        assert!(elf.text.is_none());
+        assert!(elf.truncated, "只取 16 字节时必须标截断");
+
+        // ⑤ preview from_end：日志尾读语义（替代 `tail -c`）
+        let params = FilesystemPreviewParams {
+            path: "/data/local/tmp/ar71_probe.txt".into(),
+            max_bytes: Some(7),
+            from_end: true,
+        };
+        let tail: FilesystemPreviewResult = client
+            .request(FILESYSTEM_PREVIEW, &params, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(tail.offset, 7);
+        assert_eq!(tail.text.as_deref(), Some("line-2\n"));
+
+        // ⑥ 路径策略：`..` 拒止、白名单外拒止、符号链接逃逸拒止
+        let traversal = agent_error(
+            client
+                .request::<_, FilesystemListResult>(
+                    FILESYSTEM_LIST,
+                    &FilesystemListParams {
+                        path: "/data/local/tmp/../../data/data".into(),
+                        include_hidden: false,
+                    },
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect_err("含 .. 的路径必须被拒"),
+        );
+        assert_eq!(traversal.code, ErrorCode::InvalidRequest);
+        assert_eq!(
+            traversal.details.expect("必须带 reason")["reason"],
+            "parent_escape"
+        );
+
+        // 其他应用私有目录：Agent 以 shell 身份运行，内核 DAC 直接挡住。
+        // 未配置 APP_REVERSE_TOOLS_AGENT_FS_ROOTS 时理由是 permission_denied（真实边界在内核）；
+        // 配了白名单则会是 path_not_allowed。两者都必须是「拒绝 + 有 reason」，不能返回空目录。
+        let outside = agent_error(
+            client
+                .request::<_, FilesystemListResult>(
+                    FILESYSTEM_LIST,
+                    &FilesystemListParams {
+                        path: "/data/data/com.android.providers.contacts".into(),
+                        include_hidden: false,
+                    },
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect_err("其他应用私有目录必须被拒"),
+        );
+        assert_eq!(outside.code, ErrorCode::PermissionDenied, "{outside:?}");
+        let reason = outside.details.expect("必须带 reason")["reason"].clone();
+        assert!(
+            reason == "permission_denied" || reason == "path_not_allowed",
+            "拒绝原因必须可区分，实际 {reason}"
+        );
+
+        let escape = agent_error(
+            client
+                .request::<_, FilesystemStatResult>(
+                    FILESYSTEM_STAT,
+                    &FilesystemStatParams {
+                        path: "/data/local/tmp/ar71_escape".into(),
+                        follow_symlink: true,
+                    },
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect_err("符号链接逃逸必须被拒"),
+        );
+        assert_eq!(escape.code, ErrorCode::PermissionDenied, "{escape:?}");
+        assert!(
+            escape.details.expect("必须带 reason")["reason"].is_string(),
+            "符号链接逃逸也要给出可区分理由"
+        );
+
+        // ⑦ 符号链接根：/sdcard 解析成 /storage/emulated/0 后仍在允许范围内
+        let sdcard: FilesystemListResult = client
+            .request(
+                FILESYSTEM_LIST,
+                &FilesystemListParams {
+                    path: "/sdcard".into(),
+                    include_hidden: false,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("/sdcard 必须可列（否则文件浏览页直接废掉）");
+        assert_eq!(sdcard.path, "/storage/emulated/0");
+        eprintln!(
+            "[filesystem.list] /sdcard -> {} entries={}",
+            sdcard.path,
+            sdcard.entries.len()
+        );
+
+        adb_shell(
+            &serial,
+            "rm -f /data/local/tmp/ar71_probe.txt /data/local/tmp/ar71_escape",
+        )
+        .await;
+        manager.disconnect(&serial).await.unwrap();
+    }
+
     /// AR6.2 真机腿：Agent 端口互查与 Legacy shell 路径必须给出同一结论。
     ///
     /// 用 `toybox nc` 起一个 shell 自己属主的监听端口，这样两条路径都以 shell 身份

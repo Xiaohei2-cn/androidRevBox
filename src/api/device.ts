@@ -35,6 +35,59 @@ export interface FileEntry {
   isDir: boolean;
   size: number;
   symlink?: string | null;
+  /** `ls -l` 风格权限串（如 `-rw-rw-rw-`、`drwxr-xr-x`、`-rwsr-xr-x`）；Legacy 解析失败时为空 */
+  perms?: string;
+}
+
+/** 设备端文件类型（AR7.1 `filesystem.*`，由 lstat 判定，不靠猜） */
+export type FileKind =
+  | "dir"
+  | "file"
+  | "symlink"
+  | "socket"
+  | "fifo"
+  | "block"
+  | "char"
+  | "other";
+
+export interface FileStat {
+  name: string;
+  kind: FileKind;
+  /** 权限位数值（含 setuid/setgid/sticky，不含文件类型位），如 0o755 = 493 */
+  mode: number;
+  modeText: string;
+  uid: number;
+  gid: number;
+  size: number;
+  /** Unix epoch 秒；固定单位与时区，前端自己格式化 */
+  mtimeUnix: number;
+  symlinkTarget?: string | null;
+  /** 当前 Agent 身份能否读内容（目录=能否列举）。false 时不要把 size=0 当成空文件 */
+  readable: boolean;
+}
+
+export interface FileStatResult {
+  /** 调用方原始输入 */
+  requestedPath: string;
+  /** 规范化（符号链接已解析）后的真实路径 */
+  path: string;
+  stat: FileStat;
+}
+
+export type PreviewEncoding = "utf8" | "hex";
+
+export interface FilePreviewResult {
+  path: string;
+  size: number;
+  /** 本次内容在文件中的起始偏移（尾读时非 0） */
+  offset: number;
+  returnedBytes: number;
+  encoding: PreviewEncoding;
+  text?: string | null;
+  /** 含 NUL 或非法 UTF-8 时给小写十六进制，不做 lossy 文本转换 */
+  hex?: string | null;
+  truncated: boolean;
+  detail?: string | null;
 }
 
 /** 一条端口转发规则（adb forward --list 行） */
@@ -91,6 +144,37 @@ export const deviceApi = {
   },
   ls(serial: string, path: string): Promise<FileEntry[]> {
     return invokeCommand<FileEntry[]>("device_ls", { serial, path });
+  },
+  /**
+   * 单路径元数据（AR7.1，Agent only）。`followSymlink=false` 是 lstat 语义（链接本身），
+   * true 时取解析后的目标；路径含 `..` 或不在允许范围内会被设备端结构化拒绝。
+   */
+  fileStat(
+    serial: string,
+    path: string,
+    followSymlink = false,
+  ): Promise<FileStatResult> {
+    return invokeCommand<FileStatResult>("device_file_stat", {
+      serial,
+      path,
+      followSymlink,
+    });
+  },
+  /**
+   * 受限预览（AR7.1，Agent only）：文本按 utf8、二进制按 hex 返回；
+   * `fromEnd=true` 为日志尾读语义。字节上限由设备端夹住（默认 64 KiB，最大 256 KiB）。
+   */
+  filePreview(
+    serial: string,
+    path: string,
+    options?: { maxBytes?: number; fromEnd?: boolean },
+  ): Promise<FilePreviewResult> {
+    return invokeCommand<FilePreviewResult>("device_file_preview", {
+      serial,
+      path,
+      maxBytes: options?.maxBytes ?? null,
+      fromEnd: options?.fromEnd ?? false,
+    });
   },
   packages(serial: string): Promise<string[]> {
     return invokeCommand<string[]>("device_packages", { serial });
