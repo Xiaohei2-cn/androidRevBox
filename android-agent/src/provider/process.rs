@@ -7,18 +7,22 @@
 //! 不把「没权限看」说成「没有端口」。
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
-use agent_protocol::method::{PROCESS_BY_PORT, PROCESS_PORTS};
+use agent_protocol::method::{PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS};
 use agent_protocol::{
-    AgentError, ErrorCode, ListeningPort, PortHoldingProcess, ProcessByPortParams,
-    ProcessByPortResult, ProcessPortsParams, ProcessPortsResult, ProviderHealth, ProviderInfo,
-    SocketFamily,
+    AgentError, ErrorCode, KillOutcome, KillSignal, ListeningPort, PortHoldingProcess,
+    ProcessByPortParams, ProcessByPortResult, ProcessKillParams, ProcessKillResult,
+    ProcessPortsParams, ProcessPortsResult, ProviderHealth, ProviderInfo, SocketFamily,
 };
 use serde_json::Value;
 
 use super::{Provider, ProviderFuture, RequestContext};
 
-const PROCESS_METHODS: &[&str] = &[PROCESS_PORTS, PROCESS_BY_PORT];
+const PROCESS_METHODS: &[&str] = &[PROCESS_PORTS, PROCESS_BY_PORT, PROCESS_KILL];
+/// 终止后的确认轮询：有界，不做无界等待（卡住的写操作比慢的更危险）。
+const KILL_VERIFY_TIMEOUT: Duration = Duration::from_millis(1_500);
+const KILL_VERIFY_POLL: Duration = Duration::from_millis(50);
 const NET_FILES: [(&str, SocketFamily); 2] = [
     ("/proc/net/tcp", SocketFamily::Ipv4),
     ("/proc/net/tcp6", SocketFamily::Ipv6),
@@ -55,6 +59,7 @@ impl Provider for ProcessesProvider {
             match method {
                 PROCESS_PORTS => self.ports(params).await,
                 PROCESS_BY_PORT => self.by_port(params).await,
+                PROCESS_KILL => self.kill(params).await,
                 _ => Err(AgentError::new(
                     ErrorCode::UnsupportedMethod,
                     format!("unsupported process method: {method}"),
@@ -195,6 +200,253 @@ impl ProcessesProvider {
             skipped,
         })
     }
+
+    /// PID -> 终止信号（AR6.3，写操作）。
+    ///
+    /// 三条硬规则：
+    /// 1. **执行前重读身份**：Desktop 传来的 PID 只是意图，先读 `/proc/<pid>/comm`
+    ///    与 cmdline，和 `expected_comm` 对不上就以 `precondition_failed` 拒止——
+    ///    PID 复用窗口里盲发信号等于随机杀进程；
+    /// 2. **不越权**：`require_root=true` 而 Agent 不是 root 时直接 `permission_denied`，
+    ///    不去 `kill` 一下看运气（EPERM 的错误信息会让 UI 把权限问题说成进程问题）；
+    /// 3. **幂等**：目标本来就不存在算 `already_gone` 成功返回，重复点击不报错。
+    ///
+    /// 信号用 `libc::kill` 直发，不孵化 `sh -c "kill -9 x"`；errno 映射成结构化错误码。
+    /// 发完信号后有界轮询 `/proc/<pid>` 确认，确认不到只说「未确认」，不谎报已死。
+    async fn kill(&self, params: Value) -> Result<Value, AgentError> {
+        let params: ProcessKillParams = parse_params(params)?;
+        // 先拒掉「一发信号打死一大片」的输入：pid=0 在 kill(2) 里是整进程组，
+        // pid=1 是 init，pid=自身会把会话杀掉——三者都不允许经 Agent 发起。
+        if params.pid == 0 {
+            return Err(AgentError::new(
+                ErrorCode::InvalidRequest,
+                "pid=0 会命中整个进程组，禁止通过 Agent 终止",
+            ));
+        }
+        if params.pid == 1 {
+            return Err(AgentError::new(
+                ErrorCode::InvalidRequest,
+                "禁止终止 init（pid=1）",
+            ));
+        }
+        if params.pid == std::process::id() {
+            return Err(AgentError::new(
+                ErrorCode::InvalidRequest,
+                "禁止终止 Agent 自身，请使用 Agent 管理入口停止会话",
+            ));
+        }
+        let ran_as_root = effective_uid() == Some(0);
+        if params.require_root && !ran_as_root {
+            return Err(AgentError::new(
+                ErrorCode::PermissionDenied,
+                "终止该进程需要 root，Agent 当前以 shell 身份运行",
+            )
+            .with_details(serde_json::json!({
+                "reason": "root_required",
+                "agent_uid": effective_uid().unwrap_or(u32::MAX),
+            })));
+        }
+        let identity = read_process_identity(params.pid).await;
+        guard_identity(params.pid, &params, identity.as_ref())?;
+        let comm = identity
+            .as_ref()
+            .and_then(|value| value.comm.clone())
+            .unwrap_or_default();
+        let uid = identity.as_ref().and_then(|value| value.uid);
+        if identity.is_none() {
+            // 目标本来就不在：幂等成功，重复点击不报错
+            audit(&params, "already_gone", None, "-", ran_as_root);
+        }
+        let outcome = match send_signal(params.pid, params.signal) {
+            // 竞态窗口里进程刚好退出：与「本来就没了」同一处理，保持幂等
+            SignalResult::Gone => KillOutcome::AlreadyGone,
+            SignalResult::Denied => {
+                audit(
+                    &params,
+                    "permission_denied",
+                    uid,
+                    comm.as_str(),
+                    ran_as_root,
+                );
+                return Err(AgentError::new(
+                    ErrorCode::PermissionDenied,
+                    format!("无权限终止 pid={}", params.pid),
+                )
+                .with_details(serde_json::json!({
+                    "reason": "not_owner",
+                    "target_uid": uid,
+                    "agent_uid": effective_uid().unwrap_or(u32::MAX),
+                })));
+            }
+            SignalResult::Failed(errno) => {
+                audit(
+                    &params,
+                    &format!("errno={errno}"),
+                    uid,
+                    comm.as_str(),
+                    ran_as_root,
+                );
+                return Err(AgentError::new(
+                    ErrorCode::Internal,
+                    format!("kill 失败 pid={} errno={}", params.pid, errno),
+                )
+                .with_details(serde_json::json!({ "comm": comm, "uid": uid })));
+            }
+            SignalResult::Sent => {
+                audit(&params, "signaled", uid, comm.as_str(), ran_as_root);
+                KillOutcome::Signaled
+            }
+        };
+        let verified_dead = match outcome {
+            KillOutcome::AlreadyGone => true,
+            KillOutcome::Signaled => confirm_dead(params.pid).await,
+        };
+        // 身份证据取「发信号之前」那一次：进程一死就读不到了，而审计要的正是
+        // 「我们到底杀了谁」，不是事后空值。
+        serialize(ProcessKillResult {
+            pid: params.pid,
+            signal: params.signal,
+            outcome,
+            comm: identity.as_ref().and_then(|value| value.comm.clone()),
+            cmdline: identity.as_ref().and_then(|value| value.cmdline.clone()),
+            uid: identity.as_ref().and_then(|value| value.uid),
+            ran_as_root,
+            verified_dead,
+            detail: match (outcome, verified_dead) {
+                (KillOutcome::Signaled, false) => Some("signal_sent_not_confirmed".to_string()),
+                (KillOutcome::Signaled, true) => Some("signal_sent_confirmed".to_string()),
+                (KillOutcome::AlreadyGone, _) => Some("process_not_running".to_string()),
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProcessIdentity {
+    comm: Option<String>,
+    cmdline: Option<String>,
+    uid: Option<u32>,
+}
+
+/// 执行前重读 `/proc/<pid>`；`None` 表示进程不存在（幂等分支）。
+async fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    let comm = read_trimmed(&format!("{PROC}/{pid}/comm")).await;
+    let cmdline = read_cmdline(&format!("{PROC}/{pid}/cmdline")).await;
+    let status = tokio::fs::read_to_string(format!("{PROC}/{pid}/status"))
+        .await
+        .ok();
+    let uid = status.as_deref().and_then(parse_status_uid);
+    if comm.is_none() && cmdline.is_none() && uid.is_none() {
+        return None;
+    }
+    Some(ProcessIdentity { comm, cmdline, uid })
+}
+
+fn parse_status_uid(status: &str) -> Option<u32> {
+    status.lines().find_map(|line| {
+        line.strip_prefix("Uid:")
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    })
+}
+
+/// 身份校验：只有调用方给了 `expected_comm` 才比对；不匹配即拒止（PID 复用防护）。
+fn guard_identity(
+    pid: u32,
+    params: &ProcessKillParams,
+    identity: Option<&ProcessIdentity>,
+) -> Result<(), AgentError> {
+    let Some(raw) = params.expected_comm.as_deref() else {
+        return Ok(());
+    };
+    let expected = raw.trim();
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let Some(identity) = identity else {
+        // 进程不存在：无需比对，交给幂等分支
+        return Ok(());
+    };
+    let actual = identity.comm.clone().unwrap_or_default();
+    let program = identity
+        .cmdline
+        .as_deref()
+        .and_then(|line| line.split_whitespace().next())
+        .map(|path| path.rsplit('/').next().unwrap_or(path).to_owned())
+        .unwrap_or_default();
+    if actual == expected || program == expected {
+        return Ok(());
+    }
+    Err(AgentError::new(
+        ErrorCode::PreconditionFailed,
+        format!("pid={pid} 的身份与预期不符，已拒绝终止"),
+    )
+    .with_details(serde_json::json!({
+        "reason": "identity_mismatch",
+        "expected": expected,
+        "actual_comm": actual,
+        "actual_program": program,
+    })))
+}
+
+enum SignalResult {
+    Sent,
+    Gone,
+    Denied,
+    Failed(i32),
+}
+
+fn send_signal(pid: u32, signal: KillSignal) -> SignalResult {
+    let raw = pid.try_into().map_err(|_| ()).unwrap_or(0_i32);
+    if raw <= 0 {
+        return SignalResult::Failed(libc::EINVAL);
+    }
+    let code = unsafe { libc::kill(raw, signal.number()) };
+    if code == 0 {
+        return SignalResult::Sent;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => SignalResult::Gone,
+        Some(libc::EPERM) | Some(libc::EACCES) => SignalResult::Denied,
+        Some(errno) => SignalResult::Failed(errno),
+        None => SignalResult::Failed(-1),
+    }
+}
+
+/// 有界确认：`/proc/<pid>` 消失或只剩僵尸态（父进程未收割）算确认死亡。
+async fn confirm_dead(pid: u32) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if !std::path::Path::new(&format!("{PROC}/{pid}")).exists() {
+            return true;
+        }
+        if let Ok(status) = tokio::fs::read_to_string(format!("{PROC}/{pid}/status")).await
+            && status.lines().any(|line| line.starts_with("State:	Z"))
+        {
+            return true;
+        }
+        if started.elapsed() >= KILL_VERIFY_TIMEOUT {
+            return false;
+        }
+        tokio::time::sleep(KILL_VERIFY_POLL).await;
+    }
+}
+
+fn effective_uid() -> Option<u32> {
+    let uid = std::fs::read_to_string(format!("{PROC}/self/status")).ok();
+    uid.as_deref().and_then(parse_status_uid)
+}
+
+/// 设备侧审计行：只写身份与结论，不含令牌、路径正文或大块数据。
+fn audit(params: &ProcessKillParams, outcome: &str, uid: Option<u32>, comm: &str, root: bool) {
+    eprintln!(
+        "audit method={PROCESS_KILL} pid={} signal={} expected_comm={:?} target_uid={:?} comm={:?} outcome={outcome} ran_as_root={root}",
+        params.pid,
+        params.signal.number(),
+        params.expected_comm.as_deref().unwrap_or("-"),
+        uid,
+        if comm.is_empty() { "-" } else { comm },
+    );
 }
 
 #[derive(Debug, Default)]
@@ -474,6 +726,78 @@ mod tests {
             .await
             .expect("own fd dir must be readable");
         assert!(inodes.is_empty());
+    }
+
+    fn kill_params(expected: Option<&str>, require_root: bool) -> ProcessKillParams {
+        ProcessKillParams {
+            pid: 4321,
+            expected_comm: expected.map(str::to_string),
+            signal: KillSignal::Kill,
+            require_root,
+        }
+    }
+
+    fn identity(comm: &str, cmdline: &str) -> ProcessIdentity {
+        ProcessIdentity {
+            comm: Some(comm.to_string()),
+            cmdline: Some(cmdline.to_string()),
+            uid: Some(2000),
+        }
+    }
+
+    /// PID 复用防护：身份对不上时必须在发信号之前就拒止，且错误里带上两侧证据。
+    #[test]
+    fn identity_guard_refuses_mismatch_before_signalling() {
+        let error = guard_identity(
+            4321,
+            &kill_params(Some("my-hosted-tool"), false),
+            Some(&identity("mediaserver", "/system/bin/mediaserver")),
+        )
+        .expect_err("身份不匹配必须拒止");
+        assert_eq!(error.code, ErrorCode::PreconditionFailed);
+        let details = error.details.expect("必须带回身份证据");
+        assert_eq!(details["reason"], "identity_mismatch");
+        assert_eq!(details["expected"], "my-hosted-tool");
+        assert_eq!(details["actual_comm"], "mediaserver");
+    }
+
+    /// comm 会被内核截断到 15 字符，所以 cmdline 的程序名也要能匹配上。
+    #[test]
+    fn identity_guard_accepts_comm_or_program_match() {
+        guard_identity(
+            4321,
+            &kill_params(Some("toybox"), false),
+            Some(&identity("toybox", "/system/bin/toybox nc -L -p 24567")),
+        )
+        .expect("comm 命中应放行");
+        guard_identity(
+            4321,
+            &kill_params(Some("long-hosted-binary-name"), false),
+            Some(&identity(
+                "long-hosted-bina",
+                "/data/local/tmp/long-hosted-binary-name --serve",
+            )),
+        )
+        .expect("comm 被截断时应按 cmdline 程序名放行");
+        guard_identity(4321, &kill_params(None, false), None).expect("不给预期名时不阻断幂等分支");
+    }
+
+    #[test]
+    fn signals_use_fixed_numbers_and_pid_zero_never_reaches_kill() {
+        assert_eq!(KillSignal::Term.number(), 15);
+        assert_eq!(KillSignal::Kill.number(), 9);
+        // pid=0 在 kill(2) 里是「发给整个进程组」，绝不能透传下去
+        assert!(matches!(
+            send_signal(0, KillSignal::Term),
+            SignalResult::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn status_uid_reads_the_real_uid_column() {
+        let status = "Name:\ttask\nState:\tS (sleeping)\nTgid:\t4321\nUid:\t2000\t2000\t2000\t2000\nGid:\t2000\t2000\t2000\t2000\n";
+        assert_eq!(parse_status_uid(status), Some(2000));
+        assert_eq!(parse_status_uid("Uid:\t\t"), None);
     }
 
     #[tokio::test]

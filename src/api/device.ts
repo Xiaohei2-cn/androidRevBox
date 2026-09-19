@@ -131,9 +131,24 @@ export const deviceApi = {
   binaryRun(serial: string, name: string, root = false): Promise<number> {
     return invokeCommand<number>("device_binary_run", { serial, name, root });
   },
-  /** 终止托管进程（kill -9 pid；root 启动的进程需 root=true） */
-  binaryKill(serial: string, pid: number, root = false): Promise<void> {
-    return invokeCommand<void>("device_binary_kill", { serial, pid, root });
+  /**
+   * 终止进程（AR6.3 写操作）。默认走 Agent process.kill：设备端发信号前会重读
+   * /proc/<pid> 身份，`expectedName` 与实到身份不符时以 precondition_failed
+   * 拒止（防 PID 复用误杀），所以列表里拿到名字就要带上。
+   * root=true 仍走 Legacy su -c；Agent 不可用时不自动回退，直接报错。
+   */
+  binaryKill(
+    serial: string,
+    pid: number,
+    root = false,
+    expectedName?: string,
+  ): Promise<void> {
+    return invokeCommand<void>("device_binary_kill", {
+      serial,
+      pid,
+      root,
+      expectedName: expectedName || undefined,
+    });
   },
   /** 查托管进程监听端口（/proc/<pid>/fd → /proc/net/tcp(6)） */
   binaryPorts(serial: string, pid: number, root = false): Promise<ListenPort[]> {

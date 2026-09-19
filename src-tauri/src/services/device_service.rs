@@ -11,11 +11,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_protocol::method::{DEVICE_INFO, PACKAGE_LIST, PROCESS_BY_PORT, PROCESS_PORTS};
+use agent_protocol::method::{
+    DEVICE_INFO, PACKAGE_LIST, PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
+};
 use agent_protocol::{
-    DeviceInfoParams, DeviceInfoResult, ListeningPort, PackageListParams, PackageListResult,
-    PackageScope, PortHoldingProcess, ProcessByPortParams, ProcessByPortResult, ProcessPortsParams,
-    ProcessPortsResult, SocketFamily,
+    DeviceInfoParams, DeviceInfoResult, KillSignal, ListeningPort, PackageListParams,
+    PackageListResult, PackageScope, PortHoldingProcess, ProcessByPortParams, ProcessByPortResult,
+    ProcessKillParams, ProcessKillResult, ProcessPortsParams, ProcessPortsResult, SocketFamily,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -26,7 +28,7 @@ use crate::core::error::{CoreError, CoreResult};
 use crate::core::ipc::{AppEvent, event_names};
 use crate::db::Db;
 use crate::models::agent::AndroidBackendSource;
-use crate::services::android_backend::{CapabilityRouter, OperationKind};
+use crate::services::android_backend::{CapabilityRouter, OperationKind, RouteError};
 use crate::services::config_service::ConfigService;
 use crate::services::process_service::CommandSpec;
 use crate::services::task_service::TaskService;
@@ -832,10 +834,104 @@ impl DeviceService {
         Ok(out.stdout)
     }
 
-    /// 终止托管进程：`kill -9 <pid>`（pid 仅接受纯数字；root 进程需 su 终止）。
-    pub async fn hosted_kill(&self, serial: &str, pid: u32, root: bool) -> CoreResult<()> {
-        let c = format!("kill -9 {pid}");
-        let cmd = if root { adb::su_wrap(&c) } else { c };
+    /// 终止进程（AR6.3，写操作）。路由规则与只读能力**不同**：
+    ///
+    /// - `root=false` → Agent `process.kill`，Agent 不可用即失败，
+    ///   **绝不自动回退 Legacy**（§3.6：写操作重复执行会留下半途状态）；
+    /// - `root=true` → 继续 Legacy `su -c kill -9`，因为 Agent 由 adb shell 以 shell
+    ///   身份启动，对 root 属主进程只会 EPERM（同 D026 的身份边界）；
+    /// - 两条路径都写 `target = "audit"` 的结构化审计行（§3.7），成功与失败都记。
+    ///
+    /// `expected_comm` 是 PID 复用防护：Agent 在发信号前重读 `/proc/<pid>` 身份，
+    /// 对不上以 `precondition_failed` 拒止；前端把列表里显示的进程名带过来即可。
+    pub async fn process_kill(
+        &self,
+        serial: &str,
+        pid: u32,
+        expected_comm: Option<String>,
+        root: bool,
+    ) -> CoreResult<()> {
+        if root {
+            let result = self.hosted_kill_legacy(serial, pid).await;
+            audit_process_kill(
+                serial,
+                pid,
+                expected_comm.as_deref(),
+                "legacy_adb",
+                &result
+                    .as_ref()
+                    .map(|_| "ok".to_string())
+                    .map_err(|error| error.to_string()),
+            );
+            return result;
+        }
+        // 写操作要求 Agent 在线：这里不静默安装，也不回退 adb shell，
+        // 而是给可执行指引（设备页 → 安装/连接 Agent），避免用户以为进程已被杀。
+        if !matches!(
+            self.android.agent_status(serial).state,
+            crate::models::agent::AgentSessionState::Ready
+                | crate::models::agent::AgentSessionState::Degraded
+        ) {
+            let error = CoreError::AgentUnavailable(
+                "终止进程需要 Agent 在线（设备页 → 安装/连接 Agent）；写操作不自动回退 adb shell"
+                    .to_string(),
+            );
+            audit_process_kill(
+                serial,
+                pid,
+                expected_comm.as_deref(),
+                "agent_unavailable",
+                &Err(error.to_string()),
+            );
+            return Err(error);
+        }
+        let route = self
+            .android
+            .select(serial, PROCESS_KILL, OperationKind::Mutating)
+            .map_err(CapabilityRouter::core_error)?;
+        if route.backend != AndroidBackendSource::Agent {
+            // 路由层已禁止 Mutating 回退；真走到这里说明注册表被改坏，宁可拒执行
+            let error = CoreError::Internal(
+                "process.kill 只允许 Agent 通道，拒绝在非 Agent 后端执行写操作".to_string(),
+            );
+            audit_process_kill(
+                serial,
+                pid,
+                expected_comm.as_deref(),
+                "rejected",
+                &Err(error.to_string()),
+            );
+            return Err(error);
+        }
+        let params = ProcessKillParams {
+            pid,
+            expected_comm: expected_comm.clone(),
+            signal: KillSignal::Kill,
+            require_root: false,
+        };
+        let result = self
+            .android
+            .agent()
+            .request::<_, ProcessKillResult>(serial, PROCESS_KILL, &params, SHORT_CMD_TIMEOUT)
+            .await;
+        let summary = match &result {
+            Ok(value) => Ok(match value.outcome {
+                agent_protocol::KillOutcome::Signaled => {
+                    format!("signaled verified_dead={}", value.verified_dead)
+                }
+                agent_protocol::KillOutcome::AlreadyGone => "already_gone".to_string(),
+            }),
+            Err(error) => Err(error.to_string()),
+        };
+        audit_process_kill(serial, pid, expected_comm.as_deref(), "agent", &summary);
+        result
+            .map(|_| ())
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))
+    }
+
+    /// Legacy 终止路径（仅 root 支路使用）：`su -c kill -9 <pid>`。
+    async fn hosted_kill_legacy(&self, serial: &str, pid: u32) -> CoreResult<()> {
+        let cmd = adb::su_wrap(&format!("kill -9 {pid}"));
         let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
         let out = self.run_adb(&args).await?;
         if out.exit_code != Some(0) {
@@ -845,6 +941,11 @@ impl DeviceService {
             )));
         }
         Ok(())
+    }
+
+    /// 兼容入口：托管页仍按 (pid, root) 调用，内部转 `process_kill`。
+    pub async fn hosted_kill(&self, serial: &str, pid: u32, root: bool) -> CoreResult<()> {
+        self.process_kill(serial, pid, None, root).await
     }
 
     /// 查托管进程监听端口：
@@ -1424,6 +1525,41 @@ fn log_package_list_shadow_diff(serial: &str, agent: &[String], legacy: &[String
             legacy_only = ?only_legacy,
             "Agent/Legacy package list shadow compare differed"
         );
+    }
+}
+
+/// §3.7 写操作审计：一条结构化 `target="audit"` 事件，成功与失败都记。
+/// 只含 serial/pid/预期身份/通道/结论，不含命令正文、路径与任何令牌。
+fn audit_process_kill(
+    serial: &str,
+    pid: u32,
+    expected_comm: Option<&str>,
+    backend: &str,
+    outcome: &Result<String, String>,
+) {
+    match outcome {
+        Ok(summary) => tracing::info!(
+            target: "audit",
+            serial,
+            method = PROCESS_KILL,
+            pid,
+            signal = "kill",
+            expected_comm = expected_comm.unwrap_or("-"),
+            backend,
+            outcome = %summary,
+            "process.kill 已执行"
+        ),
+        Err(reason) => tracing::warn!(
+            target: "audit",
+            serial,
+            method = PROCESS_KILL,
+            pid,
+            signal = "kill",
+            expected_comm = expected_comm.unwrap_or("-"),
+            backend,
+            error = %reason,
+            "process.kill 失败"
+        ),
     }
 }
 

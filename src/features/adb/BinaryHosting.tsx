@@ -185,7 +185,7 @@ export function BinaryHosting() {
     if (!deviceSerial || row.pid === null) return;
     patchRow(row.name, { running: true, error: null });
     try {
-      await deviceApi.binaryKill(deviceSerial, row.pid, row.root);
+      await deviceApi.binaryKill(deviceSerial, row.pid, row.root, row.name);
       patchRow(row.name, {
         pid: null,
         running: false,

@@ -1175,6 +1175,194 @@ mod tests {
         );
     }
 
+    /// AR6.3 真机腿：`process.kill` 的身份拒止、幂等与 root 边界。
+    ///
+    /// 全程只用 shell 自属进程（Agent 也是 shell 启动），验证的是**语义**而不是权限：
+    /// 名字对不上必须拒止且进程还活着；名字对得上必须真杀掉；重复杀是幂等成功；
+    /// 声明需要 root 时必须显式拒绝而不是先去 `kill` 一下看运气。
+    #[tokio::test]
+    #[ignore = "需要真机；AR6_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_process_kill -- --ignored --nocapture"]
+    async fn real_agent_process_kill_refuses_mismatch_and_is_idempotent() {
+        use agent_protocol::method::PROCESS_KILL;
+        use agent_protocol::{
+            AgentError, ErrorCode, KillOutcome, KillSignal, ProcessKillParams, ProcessKillResult,
+        };
+
+        fn agent_error(error: crate::services::agent_client::AgentClientError) -> AgentError {
+            match error {
+                crate::services::agent_client::AgentClientError::Remote(error) => error,
+                other => panic!("期望 Agent 结构化错误，实际 {other:?}"),
+            }
+        }
+
+        const PROBE_PORT: u16 = 24568;
+
+        async fn adb_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        let serial = std::env::var("AR6_TEST_SERIAL").expect("AR6_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+
+        let started = adb_shell(
+            &serial,
+            &format!("nohup toybox nc -4 -L -s 127.0.0.1 -p {PROBE_PORT} </dev/null >/dev/null 2>&1 & echo ok"),
+        )
+        .await;
+        assert!(started.contains("ok"), "未能拉起探测进程: {started}");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let pid: u32 = adb_shell(
+            &serial,
+            &format!("pgrep -f 'nc -4 -L -s 127.0.0.1 -p {PROBE_PORT}'"),
+        )
+        .await
+        .lines()
+        .next()
+        .and_then(|line| line.trim().parse().ok())
+        .expect("探测进程应在运行");
+
+        // ① 身份不符：必须 precondition_failed 拒止，且进程仍然存活
+        let mismatch = client
+            .request::<_, ProcessKillResult>(
+                PROCESS_KILL,
+                &ProcessKillParams {
+                    pid,
+                    expected_comm: Some("definitely-not-this".into()),
+                    signal: KillSignal::Kill,
+                    require_root: false,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect_err("PID 复用场景必须拒止，不能硬发信号");
+        let mismatch = agent_error(mismatch);
+        assert_eq!(mismatch.code, ErrorCode::PreconditionFailed, "{mismatch:?}");
+        let details = mismatch.details.expect("拒止必须带回身份证据");
+        assert_eq!(details["reason"], "identity_mismatch");
+        assert_eq!(details["expected"], "definitely-not-this");
+        assert_eq!(details["actual_comm"], "toybox");
+        assert!(
+            adb_shell(&serial, &format!("kill -0 {pid} 2>/dev/null && echo alive"))
+                .await
+                .contains("alive"),
+            "拒止后进程必须还活着"
+        );
+
+        // ② 声明需要 root 而 Agent 是 shell：显式 permission_denied，不去试 kill
+        let rootless = client
+            .request::<_, ProcessKillResult>(
+                PROCESS_KILL,
+                &ProcessKillParams {
+                    pid,
+                    expected_comm: Some("toybox".into()),
+                    signal: KillSignal::Kill,
+                    require_root: true,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect_err("Agent 以 shell 运行，不能假装满足 root 要求");
+        let rootless = agent_error(rootless);
+        assert_eq!(rootless.code, ErrorCode::PermissionDenied, "{rootless:?}");
+        assert!(
+            adb_shell(&serial, &format!("kill -0 {pid} 2>/dev/null && echo alive"))
+                .await
+                .contains("alive"),
+            "root 拒止后进程必须还活着"
+        );
+
+        // ③ 正常终止：signaled + verified_dead，且 shell 复核确实没了
+        let killed: ProcessKillResult = client
+            .request(
+                PROCESS_KILL,
+                &ProcessKillParams {
+                    pid,
+                    expected_comm: Some("toybox".into()),
+                    signal: KillSignal::Kill,
+                    require_root: false,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("终止 shell 自属进程应成功");
+        eprintln!(
+            "[process.kill] pid={} comm={:?} uid={:?} outcome={:?} verified_dead={} detail={:?}",
+            killed.pid,
+            killed.comm,
+            killed.uid,
+            killed.outcome,
+            killed.verified_dead,
+            killed.detail
+        );
+        assert_eq!(killed.outcome, KillOutcome::Signaled);
+        assert_eq!(killed.comm.as_deref(), Some("toybox"));
+        assert!(killed.verified_dead, "SIGKILL 后应能确认进程消失");
+        assert!(!killed.ran_as_root);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !adb_shell(
+                &serial,
+                &format!("pgrep -f 'nc -4 -L -s 127.0.0.1 -p {PROBE_PORT}'")
+            )
+            .await
+            .contains(&pid.to_string()),
+            "设备上探测进程应已退出"
+        );
+
+        // ④ 幂等：再杀一次是 already_gone，不报错
+        let again: ProcessKillResult = client
+            .request(
+                PROCESS_KILL,
+                &ProcessKillParams {
+                    pid,
+                    expected_comm: Some("toybox".into()),
+                    signal: KillSignal::Term,
+                    require_root: false,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("重复终止应作为幂等成功返回");
+        assert_eq!(again.outcome, KillOutcome::AlreadyGone);
+        assert_eq!(again.signal, KillSignal::Term);
+
+        // ⑤ 保留给未来的危险输入：pid=0（kill(2) 语义是整组）与 pid=1 必须被拒
+        for pid in [0_u32, 1] {
+            let refused = client
+                .request::<_, ProcessKillResult>(
+                    PROCESS_KILL,
+                    &ProcessKillParams {
+                        pid,
+                        expected_comm: None,
+                        signal: KillSignal::Kill,
+                        require_root: false,
+                    },
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect_err(&format!("pid={pid} 不得接受"));
+            let refused = agent_error(refused);
+            assert_eq!(
+                refused.code,
+                ErrorCode::InvalidRequest,
+                "pid={pid}: {refused:?}"
+            );
+        }
+        manager.disconnect(&serial).await.unwrap();
+    }
+
     /// AR6.2 真机腿：Agent 端口互查与 Legacy shell 路径必须给出同一结论。
     ///
     /// 用 `toybox nc` 起一个 shell 自己属主的监听端口，这样两条路径都以 shell 身份

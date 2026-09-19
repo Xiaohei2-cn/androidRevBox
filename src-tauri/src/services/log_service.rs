@@ -23,8 +23,10 @@ pub struct LogService {
 }
 
 fn build_filter(level: &str) -> EnvFilter {
-    // 本 crate 按指定级别输出，其余库保持 warn，避免依赖日志刷屏
-    EnvFilter::try_new(format!("app_reverse_tools_lib={level},warn"))
+    // 本 crate 按指定级别输出，其余库保持 warn，避免依赖日志刷屏；
+    // 独立的 "audit" target 恒为 info：§3.7 要求写操作（kill/安装/SO 替换等）
+    // 一定有结构化审计记录，不能因为用户把日志级别调到 warn 就丢失。
+    EnvFilter::try_new(format!("app_reverse_tools_lib={level},audit=info,warn"))
         .unwrap_or_else(|_| EnvFilter::new("info"))
 }
 

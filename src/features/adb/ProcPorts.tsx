@@ -152,7 +152,9 @@ export function ProcPorts() {
     setArmedPid(null);
     setKilling(true);
     try {
-      await deviceApi.binaryKill(deviceSerial, pid, root);
+      // 把列表里显示的进程名一并带上，Agent 会用它做 PID 复用校验（读不到的名字不传）
+      const shown = portHit?.holders.find((h) => h.pid === pid)?.name;
+      await deviceApi.binaryKill(deviceSerial, pid, root, shown && shown !== "?" ? shown : undefined);
       setNotice(t("adb.proc.killed", { pid }));
       if (portHit) {
         setPortHit({

@@ -12,6 +12,7 @@ pub mod method {
     pub const ACTIVITY_FOREGROUND: &str = "activity.foreground";
     pub const PROCESS_PORTS: &str = "process.ports";
     pub const PROCESS_BY_PORT: &str = "process.by_port";
+    pub const PROCESS_KILL: &str = "process.kill";
     pub const PACKAGE_EXPORT_APK: &str = "package.export_apk";
     pub const PACKAGE_EXPORT_CLEAN: &str = "package.export_clean";
     pub const ZYGISK_STATUS: &str = "zygisk.status";
@@ -219,6 +220,69 @@ pub struct ProcessByPortResult {
     pub skipped: Vec<String>,
 }
 
+/// AR6.3：写操作 `process.kill`。Desktop 传进来的 PID 只是「意图」，Agent 执行前
+/// 必须重读 `/proc/<pid>` 身份，对不上就拒止（PID 复用可能杀掉刚起来的无关进程）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KillSignal {
+    #[default]
+    Term,
+    /// 对应 `kill -9`：Legacy 托管进程停止用的就是它，迁移期保持等价
+    Kill,
+}
+
+impl KillSignal {
+    pub fn number(self) -> i32 {
+        match self {
+            Self::Term => 15,
+            Self::Kill => 9,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProcessKillParams {
+    pub pid: u32,
+    /// 期望进程名（`comm` 或 cmdline 可执行文件名）；缺省表示不做身份校验
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_comm: Option<String>,
+    #[serde(default)]
+    pub signal: KillSignal,
+    /// 调用方声明这次终止必须 root。Agent 以 shell 身份运行时应显式拒绝，
+    /// 不得「试一下失败再说」——那会让 UI 把权限问题当成进程问题。
+    #[serde(default)]
+    pub require_root: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KillOutcome {
+    /// 信号已送达
+    Signaled,
+    /// 目标本来就不存在（幂等成功：重复点击不该报错）
+    AlreadyGone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessKillResult {
+    pub pid: u32,
+    pub signal: KillSignal,
+    pub outcome: KillOutcome,
+    /// 执行前重读到的身份证据
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    pub ran_as_root: bool,
+    /// 发信号后是否确认进程消失；`false` 只代表「没确认到」，不代表「一定还活着」
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verified_dead: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfoResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,6 +391,7 @@ pub struct PackageListLocalizedResult {
 
 #[cfg(test)]
 mod tests {
+    use crate::{AgentError, ErrorCode};
     use serde_json::json;
 
     use super::*;
@@ -436,6 +501,56 @@ mod tests {
         assert_eq!(value["module_id"], "applist");
         assert_eq!(value["sub_protocol_version"], 1);
         assert_eq!(value.get("detail"), None);
+    }
+
+    #[test]
+    fn kill_params_default_to_term_and_keep_identity_evidence_optional() {
+        let params: ProcessKillParams = serde_json::from_value(json!({ "pid": 4321 })).unwrap();
+        assert_eq!(params.signal, KillSignal::Term);
+        assert!(!params.require_root);
+        assert_eq!(params.expected_comm, None);
+
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["signal"], "term");
+        assert_eq!(value.get("expected_comm"), None);
+        assert_eq!(value["require_root"], json!(false));
+        assert_eq!(KillSignal::Kill.number(), 9);
+        assert_eq!(KillSignal::Term.number(), 15);
+    }
+
+    #[test]
+    fn kill_result_reports_outcome_without_faking_death() {
+        let result = ProcessKillResult {
+            pid: 4321,
+            signal: KillSignal::Kill,
+            outcome: KillOutcome::Signaled,
+            comm: Some("toybox".into()),
+            cmdline: None,
+            uid: Some(2000),
+            ran_as_root: false,
+            verified_dead: false,
+            detail: Some("signal_sent_not_confirmed".into()),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["outcome"], "signaled");
+        assert_eq!(value["signal"], "kill");
+        assert_eq!(value.get("cmdline"), None);
+        // 「没确认到」必须能被上层看见，缺字段解析时按 false 处理而不是 true
+        let parsed: ProcessKillResult = serde_json::from_value(json!({
+            "pid": 1, "signal": "term", "outcome": "already_gone", "ran_as_root": false
+        }))
+        .unwrap();
+        assert!(!parsed.verified_dead);
+        assert_eq!(parsed.outcome, KillOutcome::AlreadyGone);
+    }
+
+    #[test]
+    fn precondition_failed_code_survives_the_wire() {
+        let error = AgentError::new(ErrorCode::PreconditionFailed, "身份不匹配");
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(value["code"], "precondition_failed");
+        let parsed: AgentError = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.code, ErrorCode::PreconditionFailed);
     }
 
     #[test]

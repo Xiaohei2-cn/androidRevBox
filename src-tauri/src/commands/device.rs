@@ -195,17 +195,19 @@ pub async fn device_binary_run(
         .await
 }
 
-/// 终止托管进程（kill -9 <pid>；root 启动的进程需 root=true 终止）
+/// 终止进程（AR6.3 写操作）。默认走 Agent "process.kill"（发信号前重读身份防 PID 复用）；
+/// root=true 走 Legacy su -c；Agent 不可用时**不自动回退**，直接报错。
 #[tauri::command]
 pub async fn device_binary_kill(
     state: tauri::State<'_, AppState>,
     serial: String,
     pid: u32,
     root: Option<bool>,
+    expected_name: Option<String>,
 ) -> CoreResult<()> {
     state
         .device
-        .hosted_kill(&serial, pid, root.unwrap_or(false))
+        .process_kill(&serial, pid, expected_name, root.unwrap_or(false))
         .await
 }
 

@@ -131,7 +131,7 @@ async fn host_agent_full_lifecycle() {
             .expect("hello must succeed");
         assert_eq!(hello.protocol_version, 1);
         assert_eq!(hello.providers.len(), 5);
-        assert_eq!(hello.capabilities.len(), 12);
+        assert_eq!(hello.capabilities.len(), 13);
         assert!(
             hello.capabilities.iter().any(|capability| capability.method
                 == agent_protocol::method::ACTIVITY_FOREGROUND
@@ -148,6 +148,7 @@ async fn host_agent_full_lifecycle() {
         for method in [
             agent_protocol::method::PROCESS_PORTS,
             agent_protocol::method::PROCESS_BY_PORT,
+            agent_protocol::method::PROCESS_KILL,
         ] {
             let capability = hello
                 .capabilities
