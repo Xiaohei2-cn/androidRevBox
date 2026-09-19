@@ -95,7 +95,7 @@ fn select_variant(pro: ProState, demo_alive: bool) -> Selection {
             variant: Variant::Demo,
             pro_locale: None,
             note: Some(
-                "v2 模块在监听但 Agent 读不到令牌（需要 root），已退回 v1 demo 通道：                 指定 locale 与 labelSource 证据不可用"
+                "v2 模块在监听但 Agent 读不到令牌（需要 root），已退回 v1 demo 通道：指定 locale 与 labelSource 证据不可用"
                     .to_owned(),
             ),
         },
@@ -117,7 +117,12 @@ fn select_variant(pro: ProState, demo_alive: bool) -> Selection {
         ProState::Dead if demo_alive => Selection {
             variant: Variant::Demo,
             pro_locale: None,
-            note: None,
+            // 「v2 从来没装」也是一种不可用，理由同样必须给出来：UI 上要能区分
+            // 「装了但拿不到令牌」与「压根没装」，否则用户不知道该去装模块还是去授权
+            note: Some(
+                "未检测到 v2 模块（未安装或未监听），已退回 v1 demo 通道：指定 locale 与 labelSource 证据不可用"
+                    .to_owned(),
+            ),
         },
         ProState::Dead => Selection {
             variant: Variant::Absent,
@@ -1939,6 +1944,53 @@ mod tests {
             select_variant(ProState::Dead, false).variant,
             Variant::Absent
         );
+    }
+
+    /// D021 的完整矩阵：三条「退回 v1」的路径都必须自带理由，
+    /// 只有真正用上 v2 或彻底没通道时才允许 note 为空。
+    #[test]
+    fn every_demo_fallback_carries_its_reason() {
+        let cases = [
+            (ProState::NeedsToken, "需要 root"),
+            (
+                ProState::HandshakeFailed("v2 握手未通过".into()),
+                "v2 握手未通过",
+            ),
+            (ProState::Dead, "未检测到 v2 模块"),
+        ];
+        for (pro, needle) in cases {
+            let selection = select_variant(pro, true);
+            assert_eq!(selection.variant, Variant::Demo, "{needle} 时应退回 demo");
+            let note = selection
+                .note
+                .clone()
+                .unwrap_or_else(|| panic!("退回 v1 必须带理由：{needle}"));
+            assert!(note.contains(needle), "理由要能指向下一步：{note}");
+            assert!(
+                note.contains("指定 locale") && note.contains("不可用"),
+                "必须同时说明 v1 缺什么能力：{note}"
+            );
+            assert!(!note.contains("  "), "理由文案不能有整段空格残留：{note:?}");
+            // 退回后不得再声称能按请求 locale 解析
+            assert!(selection.pro_locale.is_none());
+        }
+        // v2 可用：不带 note（没有降级要解释）
+        let ready = select_variant(
+            ProState::Ready(ProHello {
+                version: "v2.0".into(),
+                version_code: 2,
+                locale: "zh-Hans-CN".into(),
+                capabilities: vec!["list".into()],
+            }),
+            true,
+        );
+        assert_eq!(ready.variant, Variant::Pro);
+        assert!(ready.note.is_none() && ready.pro_locale.as_deref() == Some("zh-Hans-CN"));
+        // v2 不可用且 v1 也不活：不是「退回」，不得伪装成 Demo 通道
+        for pro in [ProState::NeedsToken, ProState::Dead] {
+            let selection = select_variant(pro, false);
+            assert_ne!(selection.variant, Variant::Demo);
+        }
     }
 
     #[test]

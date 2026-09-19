@@ -693,8 +693,12 @@ mod tests {
         // applistpro 已安装时公共能力必须走 v2（指定 locale 与来源标注只有 v2 有）；
         // 未安装时才允许退回 demo v1，两种情况都要能自证。
         eprintln!(
-            "[zygisk.channel] module={:?} sub_protocol={} version={:?}",
-            status.module_id, status.sub_protocol_version, status.module_version
+            "[zygisk.channel] module={:?} sub_protocol={} version={:?} root={} detail={:?}",
+            status.module_id,
+            status.sub_protocol_version,
+            status.module_version,
+            status.root_available,
+            status.detail
         );
         assert!(
             matches!(status.sub_protocol_version, 1 | 2),
@@ -882,6 +886,130 @@ mod tests {
             !forwards.stdout.contains(":11500"),
             "Desktop 不应再直连模块端口: {}",
             forwards.stdout
+        );
+    }
+
+    /// AR5.6 / D021 第三腿：模块装着、v2 bridge 在监听，但 **adb shell 被撤销 root 授权**
+    /// （KernelSU 里把 Shell 设为不允许），于是 Agent 读不到令牌。
+    ///
+    /// 这条腿的意义是证明「降级是显式的」：不能因为拿不到令牌就把 v2 当成可用，
+    /// 也不能悄悄换成 v1 让用户以为指定 locale 生效了。前提不满足时明确跳过，
+    /// 避免把「跑错状态」伪装成代码回归。
+    #[tokio::test]
+    #[ignore = "需要已装 applistpro 且已撤销 Shell root 的真机；APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_zygisk_v2_locked -- --ignored --nocapture"]
+    async fn real_agent_zygisk_v2_locked_falls_back_to_v1_with_reason() {
+        use crate::services::device_service::RealAdbRunner;
+
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(Arc::new(
+            crate::services::config_service::ConfigService::new(Arc::new(
+                crate::db::Db::in_memory().unwrap(),
+            )),
+        )));
+        let (android, agent) = router_with_agent(runner.clone());
+        let service = ZygiskApplistService::new(android, runner.clone());
+        agent
+            .connect_resolved(&serial)
+            .await
+            .expect("Agent 安装/连接失败");
+        let environment = runner.environment().await;
+        let adb_path = environment.path.unwrap();
+
+        // 前提一：v2 模块确实在监听（否则这是「v2 没装」那条腿，不是本腿）
+        let ports = runner
+            .run(
+                &adb_path,
+                &adb::build_args(
+                    Some(&serial),
+                    &adb::cmd_shell("netstat -tln 2>/dev/null | grep -c 11501 || true"),
+                ),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        // 前提二：Agent 拿不到 root（撤销 Shell 授权后成立）
+        let status = service.status(&serial).await.unwrap();
+        eprintln!(
+            "[zygisk.v2locked] v2_port_listening={} root={} bridge={} sub_protocol={} module={:?} detail={:?}",
+            ports.stdout.trim(),
+            status.root_available,
+            status.bridge_ready,
+            status.sub_protocol_version,
+            status.module_id,
+            status.detail
+        );
+        if ports.stdout.trim() == "0" {
+            eprintln!(
+                "[跳过] 设备上没有 v2 bridge 在监听（11501），本腿需要已安装并启用 applistpro"
+            );
+            return;
+        }
+        if status.root_available {
+            eprintln!("[跳过] Agent 仍有 root（请在 KernelSU 撤销 Shell 授权后重跑本腿）");
+            return;
+        }
+
+        // root 撤销 + 端口活着 ⇒ 必须走 v1，且理由要同时说清「为什么不是 v2」和「v1 缺什么」
+        assert!(
+            status.bridge_ready,
+            "v1 demo 通道应仍可用: {:?}",
+            status.detail
+        );
+        assert_eq!(
+            status.sub_protocol_version, 1,
+            "读不到令牌却报了 v2，等于假装鉴权成功"
+        );
+        assert_eq!(status.module_id.as_deref(), Some("applist"));
+        let detail = status.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("令牌") || detail.contains("root"),
+            "必须说明为何用不了 v2: {detail}"
+        );
+        assert!(
+            detail.contains("v1") || detail.contains("demo"),
+            "必须说明现在走的是 v1: {detail}"
+        );
+        assert!(
+            detail.contains("指定 locale") && detail.contains("不可用"),
+            "必须说明 v1 缺的能力: {detail}"
+        );
+        assert!(
+            !detail.contains("  "),
+            "文案里不应有整段空格残留: {detail:?}"
+        );
+
+        let list = service
+            .list(&serial, Some("en-US".into()), LocalizedScope::User, false)
+            .await
+            .expect("v1 通道应仍能给出清单");
+        assert_eq!(list.channel, "zygisk_v1", "通道必须如实标成 v1");
+        assert!(!list.items.is_empty(), "v1 清单不应为空");
+        assert!(
+            list.items
+                .iter()
+                .all(|item| item.requested_locale == "en-US"),
+            "requested_locale 仍要回显请求值，不能改写"
+        );
+        // v1 只能给设备默认语言的名字：resolved_locale 必须是设备真实 locale，
+        // 绝不允许等于「请求的」locale（那等于假装按请求解析了）。
+        let device = status.device_locale.clone().unwrap_or_default();
+        assert!(!device.is_empty(), "status 应带回设备真实 locale");
+        assert!(
+            list.items
+                .iter()
+                .all(|item| item.resolved_locale.as_deref() == Some(device.as_str())),
+            "v1 的 resolved_locale 只能是设备真实 locale {device}"
+        );
+        assert!(
+            list.items
+                .iter()
+                .all(|item| item.resolved_locale.as_deref() != Some("en-US")),
+            "请求 en-US 但走 v1，绝不能声称解析成了 en-US"
+        );
+        assert!(
+            list.warnings.iter().any(|w| w.code == "locale_not_honored"),
+            "v1 无法满足指定 locale，必须显式给 warning: {:?}",
+            list.warnings
         );
     }
 
