@@ -119,10 +119,12 @@ adb shell su -c 'ls /data/adb/modules | grep applistpro'   # -> 空
 模块运行期只新增一个文件 `<module_dir>/token`（0600 root），不写系统分区、不放常驻
 service；禁用/卸载后不留外部痕迹。`/data/local/tmp` 下只有安装用的 ZIP，可自行删除。
 
-注意：`su -c sha256sum /data/adb/modules/applistpro/helper.dex` 在 Zygisk Next 下会被
-SELinux 标签拒（`ls` 目录可见、读文件被拒），而 root companion 自身读取正常（查询与
-导出均可用）。因此**热替换 `helper.dex` 的免重启路径在本机不可用**，迭代一律走
-`ksud module install` + 重启；校验安装包完整性请比对 ZIP 内文件的 SHA，而不是设备侧读回。
+关于热替换 `helper.dex`（实测结论，别照抄旧判断）：`su -c cp` **写得进去，模块也会加载新 dex**
+（替换后查询仍正常），但紧接着 su 域自己对该文件 `ls`/`sha256sum` 全部 `Permission denied`
+（替换前同一文件可读）。也就是说写进去的到底是什么，写入方自己读不回、无法校验。
+所以迭代请一律 `ksud module install` + 重启，完整性比对 ZIP 内文件的 SHA；
+不要用「cp 覆盖 + 观察行为」这种不可自证的回路。要修这个可观测性问题，需要给模块加自校验
+（启动时打印 dex 摘要到 logcat）或换 Unix socket 方案，见阶段文档 D020。
 
 ## 尚未验证（必须真机确认，不能凭编译通过当成功）
 
