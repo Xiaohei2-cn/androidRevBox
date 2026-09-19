@@ -24,6 +24,7 @@ pub mod method {
     pub const PACKAGE_EXPORT_APK: &str = "package.export_apk";
     pub const PACKAGE_EXPORT_CLEAN: &str = "package.export_clean";
     pub const ZYGISK_STATUS: &str = "zygisk.status";
+    pub const PACKAGE_NATIVE_LIB_DIR: &str = "package.native_lib_dir";
 }
 
 /// Zygisk 模块生命周期。`installed_reboot_required` / `loaded` / `bridge_ready` 必须区分，
@@ -604,6 +605,49 @@ pub struct HostedStatusResult {
     pub reconciled: bool,
 }
 
+/// AR8.3：包安装目录里的 native lib 路径解析（只读）。Desktop 之前是
+/// `dumpsys package <pkg>` 全文回宿主再按字符串找 `legacyNativeLibraryDir=`，
+/// 这里改为 Agent 侧解析并给出可核对的来源证据。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PackageNativeLibDirParams {
+    pub package: String,
+    /// `arm64` | `arm`；缺省时按包声明的 `primaryCpuAbi` 判定
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abi: Option<String>,
+    /// 多用户安装时指定 user id；缺省取第一个可见实例
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<u32>,
+}
+
+/// 路径是怎么来的必须能区分：Framework 明确给了 `legacyNativeLibraryDir`，
+/// 和我们从 `codePath` 推出来，可信度不是一回事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeLibDirSource {
+    FrameworkField,
+    DerivedFromCodePath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageNativeLibDirResult {
+    pub package: String,
+    pub native_lib_dir: String,
+    /// 最终采用的 ABI 口径（`arm64` | `arm`）
+    pub abi: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_cpu_abi: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_path: Option<String>,
+    /// 命中的 split APK 路径（无 split 时为空数组，不省略字段：区分「没有」与「没看」）
+    pub splits: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<u32>,
+    pub source: NativeLibDirSource,
+    /// 多个用户实例给出不同目录等情况下，说明我们是怎么选的
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfoResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -936,6 +980,41 @@ mod tests {
             exit_code: None,
             detail: None,
         }
+    }
+
+    /// AR8.3：`splits` 必须是数组而不是 Option——「没有 split」与「没看 split」
+    /// 在 SO 替换页面上是两个完全不同的提示。
+    #[test]
+    fn native_lib_dir_result_keeps_source_and_empty_splits_visible() {
+        let params: PackageNativeLibDirParams =
+            serde_json::from_value(json!({ "package": "com.x" })).unwrap();
+        assert_eq!(params.abi, None);
+        assert_eq!(params.user, None);
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value.get("abi"), None);
+
+        let result = PackageNativeLibDirResult {
+            package: "com.x".into(),
+            native_lib_dir: "/data/app/~~x/com.y-==/lib/arm64".into(),
+            abi: "arm64".into(),
+            primary_cpu_abi: Some("arm64-v8a".into()),
+            code_path: Some("/data/app/~~x/com.y-==".into()),
+            splits: vec![],
+            user: Some(0),
+            source: NativeLibDirSource::FrameworkField,
+            detail: Some("multiple_package_blocks=2".into()),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["source"], "framework_field");
+        assert_eq!(value["splits"].as_array().map(Vec::len), Some(0));
+        assert_eq!(value["user"], json!(0));
+        let parsed: PackageNativeLibDirResult = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.source, NativeLibDirSource::FrameworkField);
+        assert!(parsed.splits.is_empty());
+        assert_eq!(
+            serde_json::to_value(NativeLibDirSource::DerivedFromCodePath).unwrap(),
+            json!("derived_from_code_path")
+        );
     }
 
     #[test]

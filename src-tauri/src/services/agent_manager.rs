@@ -1363,6 +1363,199 @@ mod tests {
         manager.disconnect(&serial).await.unwrap();
     }
 
+    /// AR8.3 真机腿：`package.native_lib_dir` 必须与 Legacy 的 dumpsys 解析同结论，
+    /// 而且要把 Legacy 只能报错的两种情况（framework 形态目录、多实例块）分开说清。
+    #[tokio::test]
+    #[ignore = "需要真机；AR8_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_native_lib_dir -- --ignored --nocapture"]
+    async fn real_agent_native_lib_dir_matches_legacy_and_explains_itself() {
+        use agent_protocol::method::PACKAGE_NATIVE_LIB_DIR;
+        use agent_protocol::{
+            ErrorCode, NativeLibDirSource, PackageNativeLibDirParams, PackageNativeLibDirResult,
+        };
+
+        let serial = std::env::var("AR8_TEST_SERIAL").expect("AR8_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        let status = manager.connect_resolved(&serial).await.unwrap();
+        assert!(
+            status
+                .capabilities
+                .iter()
+                .any(|capability| capability.method == PACKAGE_NATIVE_LIB_DIR
+                    && capability.available),
+            "Agent 未发布 package.native_lib_dir"
+        );
+        let client = manager.client(&serial).unwrap();
+        let environment = runner.environment().await;
+        let adb_path = environment.path.unwrap();
+
+        let dumpsys = |pkg: &str| {
+            let runner = runner.clone();
+            let adb_path = adb_path.clone();
+            let serial = serial.clone();
+            let pkg = pkg.to_string();
+            async move {
+                runner
+                    .run(
+                        &adb_path,
+                        &adb::build_args(
+                            Some(&serial),
+                            &adb::cmd_shell(&format!("dumpsys package {pkg}")),
+                        ),
+                        Duration::from_secs(20),
+                    )
+                    .await
+                    .unwrap()
+                    .stdout
+            }
+        };
+
+        // ① 普通三方/系统应用：与 Legacy 换算逐项一致（arm64 与 arm 两个方向）
+        for pkg in ["com.android.chrome", "com.termux"] {
+            for abi in ["arm64", "arm"] {
+                let params = PackageNativeLibDirParams {
+                    package: pkg.into(),
+                    abi: Some(abi.into()),
+                    user: None,
+                };
+                let result: PackageNativeLibDirResult = client
+                    .request(PACKAGE_NATIVE_LIB_DIR, &params, Duration::from_secs(15))
+                    .await
+                    .unwrap();
+                let legacy = adb::lib_dir_for_abi(
+                    &crate::services::env_service::parse_legacy_native_lib(&dumpsys(pkg).await)
+                        .expect("对照样本应有 legacyNativeLibraryDir"),
+                    abi,
+                )
+                .expect("对照样本应能按 ABI 换算");
+                assert_eq!(
+                    result.native_lib_dir, legacy,
+                    "{pkg}/{abi} 必须与 Legacy 一致"
+                );
+                assert_eq!(result.abi, abi);
+                assert_eq!(result.source, NativeLibDirSource::FrameworkField);
+                assert!(result.code_path.is_some(), "codePath 应一并回传");
+                assert!(result.primary_cpu_abi.is_some());
+                eprintln!(
+                    "[native_lib_dir] {pkg}/{abi} = {} splits={} detail={:?}",
+                    result.native_lib_dir,
+                    result.splits.len(),
+                    result.detail
+                );
+            }
+        }
+
+        // ② split 清单：chrome 有 base + split，字段必须是数组且非空
+        let params = PackageNativeLibDirParams {
+            package: "com.android.chrome".into(),
+            abi: None,
+            user: Some(0),
+        };
+        let result: PackageNativeLibDirResult = client
+            .request(PACKAGE_NATIVE_LIB_DIR, &params, Duration::from_secs(15))
+            .await
+            .unwrap();
+        assert!(
+            result.splits.iter().any(|split| split == "base"),
+            "splits 必须带 base，实际 {:?}",
+            result.splits
+        );
+        assert_eq!(result.user, Some(0), "user 要回显，调用方才知道查的是谁");
+        assert_eq!(
+            result.abi, "arm64",
+            "未指定 ABI 时要按 primaryCpuAbi 判定，实际 {:?}",
+            result.primary_cpu_abi
+        );
+
+        // ③ framework 包：Legacy 只能报「lib 目录结构异常」，Agent 按原值返回并说明没换算
+        let framework = client
+            .request::<_, PackageNativeLibDirResult>(
+                PACKAGE_NATIVE_LIB_DIR,
+                &PackageNativeLibDirParams {
+                    package: "android".into(),
+                    abi: Some("arm64".into()),
+                    user: None,
+                },
+                Duration::from_secs(15),
+            )
+            .await
+            .expect("framework 包不应被当成错误");
+        assert!(
+            framework.native_lib_dir.contains("/lib64/")
+                || framework.native_lib_dir.ends_with("/lib"),
+            "framework 包应按 Framework 原值返回，实际 {}",
+            framework.native_lib_dir
+        );
+        eprintln!(
+            "[native_lib_dir] android = {} source={:?} detail={:?} primary={:?} splits={}",
+            framework.native_lib_dir,
+            framework.source,
+            framework.detail,
+            framework.primary_cpu_abi,
+            framework.splits.len()
+        );
+        assert_eq!(framework.source, NativeLibDirSource::FrameworkField);
+        assert_eq!(
+            framework.detail.as_deref(),
+            Some("native_lib_dir_not_substitutable"),
+            "没做 ABI 换算必须显式说明: {:?}",
+            framework.detail
+        );
+        assert!(
+            adb::lib_dir_for_abi(&framework.native_lib_dir, "arm64").is_none(),
+            "样本必须真的是 Legacy 会报错的形态，否则这条断言没意义"
+        );
+        let raw = dumpsys("android").await;
+        assert_eq!(
+            crate::services::env_service::parse_legacy_native_lib(&raw).as_deref(),
+            Some(framework.native_lib_dir.as_str()),
+            "必须确认回传的就是 Framework dumpsys 里的原值"
+        );
+
+        // ④ 未安装与非法 ABI：都是可分辨的结构化错误
+        let missing = client
+            .request::<_, PackageNativeLibDirResult>(
+                PACKAGE_NATIVE_LIB_DIR,
+                &PackageNativeLibDirParams {
+                    package: "com.definitely.not.installed.pkg".into(),
+                    abi: None,
+                    user: None,
+                },
+                Duration::from_secs(15),
+            )
+            .await
+            .expect_err("未安装的包必须报错");
+        let missing = match missing {
+            crate::services::agent_client::AgentClientError::Remote(error) => error,
+            other => panic!("期望结构化错误，实际 {other:?}"),
+        };
+        assert_eq!(missing.code, ErrorCode::NotFound);
+        assert_eq!(missing.details.unwrap()["reason"], "package_not_found");
+
+        let bad_abi = client
+            .request::<_, PackageNativeLibDirResult>(
+                PACKAGE_NATIVE_LIB_DIR,
+                &PackageNativeLibDirParams {
+                    package: "com.android.chrome".into(),
+                    abi: Some("x86".into()),
+                    user: None,
+                },
+                Duration::from_secs(15),
+            )
+            .await
+            .expect_err("非法 ABI 必须拒");
+        let bad_abi = match bad_abi {
+            crate::services::agent_client::AgentClientError::Remote(error) => error,
+            other => panic!("期望结构化错误，实际 {other:?}"),
+        };
+        assert_eq!(bad_abi.code, ErrorCode::InvalidRequest);
+        manager.disconnect(&serial).await.unwrap();
+    }
+
     /// AR7.3 真机腿：按句柄停止必须先核身份（PID 易主时拒止且不动手），
     /// 停止结果要能区分「已确认消失」与「发了信号但没确认到」，
     /// 端口方向则复用 AR6.2 的 `process.ports`（不再有 `ls -l` fd + grep 那条链）。

@@ -106,7 +106,7 @@ pub fn default_legacy_capabilities() -> Vec<LegacyCapability> {
         ),
         (
             "package.native_lib_dir",
-            "AR12.1 after AR8.1 and two stable phase regressions",
+            "AR12.1 after AR8.3 and two stable phase regressions",
         ),
     ]
     .into_iter()

@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use agent_protocol::method::{
     DEVICE_INFO, FILESYSTEM_LIST, FILESYSTEM_PREVIEW, FILESYSTEM_STAT, HOSTED_CHMOD, HOSTED_LIST,
-    HOSTED_START, HOSTED_STATUS, HOSTED_STOP, PACKAGE_LIST, PROCESS_BY_PORT, PROCESS_KILL,
-    PROCESS_PORTS,
+    HOSTED_START, HOSTED_STATUS, HOSTED_STOP, PACKAGE_LIST, PACKAGE_NATIVE_LIB_DIR,
+    PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
 };
 use agent_protocol::{
     DeviceInfoParams, DeviceInfoResult, FileKind, FilesystemListParams, FilesystemListResult,
@@ -22,9 +22,9 @@ use agent_protocol::{
     HostedBinaryInfo, HostedChmodParams, HostedChmodResult, HostedListParams, HostedListResult,
     HostedRunRecord, HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams,
     HostedStatusResult, HostedStopParams, HostedStopResult, KillSignal, ListeningPort,
-    PackageListParams, PackageListResult, PackageScope, PortHoldingProcess, PreviewEncoding,
-    ProcessByPortParams, ProcessByPortResult, ProcessKillParams, ProcessKillResult,
-    ProcessPortsParams, ProcessPortsResult, SocketFamily,
+    PackageListParams, PackageListResult, PackageNativeLibDirParams, PackageNativeLibDirResult,
+    PackageScope, PortHoldingProcess, PreviewEncoding, ProcessByPortParams, ProcessByPortResult,
+    ProcessKillParams, ProcessKillResult, ProcessPortsParams, ProcessPortsResult, SocketFamily,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -1615,8 +1615,11 @@ impl DeviceService {
         Ok(adb::parse_port_holders(&out.stdout))
     }
 
-    /// 查询包安装 lib 目录（so 替换 UI 预览用，只读）：
-    /// dumpsys package → legacyNativeLibraryDir → 按 ABI 换 arm64/arm 尾段。
+    /// 查询包安装 lib 目录（SO 替换页只读预览）。AR8.3 起默认走 Agent
+    /// `package.native_lib_dir`：`dumpsys package` 在设备端解析，不再把几十 KB 文本
+    /// 拖回宿主；ABI 换算规则与 Legacy `lib_dir_for_abi` 一致，但 framework 包那种
+    /// 非 `<pkg>/lib/<abi>` 形态的目录不再当异常报错，而是按原值返回并标注来源。
+    /// 只读幂等，Agent 不可用时回退 Legacy（删除条件见能力表 AR12.1）。
     pub async fn pkg_lib_dir(&self, serial: &str, pkg: &str, abi: &str) -> CoreResult<String> {
         if !adb::is_safe_pkg_name(pkg) {
             return Err(CoreError::Internal(format!("包名非法: {pkg}")));
@@ -1624,6 +1627,89 @@ impl DeviceService {
         if abi != "arm64" && abi != "arm" {
             return Err(CoreError::Internal(format!("ABI 仅支持 arm64/arm: {abi}")));
         }
+        let route = self
+            .android
+            .select(
+                serial,
+                PACKAGE_NATIVE_LIB_DIR,
+                OperationKind::ReadOnlyIdempotent,
+            )
+            .map_err(CapabilityRouter::core_error)?;
+        if route.backend == AndroidBackendSource::LegacyAdb {
+            return self.pkg_lib_dir_legacy(serial, pkg, abi).await;
+        }
+        let params = PackageNativeLibDirParams {
+            package: pkg.to_owned(),
+            abi: Some(abi.to_owned()),
+            user: None,
+        };
+        let agent_request = self
+            .android
+            .agent()
+            .request::<_, PackageNativeLibDirResult>(
+                serial,
+                PACKAGE_NATIVE_LIB_DIR,
+                &params,
+                LIST_TIMEOUT,
+            );
+        let (agent_result, legacy_result) = if native_lib_shadow_enabled() {
+            let legacy = self.pkg_lib_dir_legacy(serial, pkg, abi);
+            let (agent, legacy) = tokio::join!(agent_request, legacy);
+            (agent, Some(legacy))
+        } else {
+            (agent_request.await, None)
+        };
+        match agent_result {
+            Ok(result) => {
+                let dir = result.native_lib_dir.clone();
+                if let Some(Ok(legacy)) = legacy_result {
+                    if legacy != dir {
+                        tracing::warn!(
+                            serial,
+                            pkg,
+                            abi,
+                            method = PACKAGE_NATIVE_LIB_DIR,
+                            agent = %dir,
+                            legacy = %legacy,
+                            source = ?result.source,
+                            detail = ?result.detail,
+                            "Agent/Legacy native lib dir 不一致（Legacy 报错时这里是改进，不是缺陷）"
+                        );
+                    }
+                } else if let Some(Err(error)) = legacy_result {
+                    tracing::debug!(
+                        serial,
+                        pkg,
+                        abi,
+                        method = PACKAGE_NATIVE_LIB_DIR,
+                        legacy_error = %error,
+                        "Legacy 解析失败而 Agent 给出结果：framework 包属预期差异"
+                    );
+                }
+                Ok(dir)
+            }
+            Err(error) => {
+                let fallback = self
+                    .android
+                    .fallback_after_agent_error(
+                        serial,
+                        PACKAGE_NATIVE_LIB_DIR,
+                        OperationKind::ReadOnlyIdempotent,
+                        &error,
+                    )
+                    .map_err(CapabilityRouter::core_error)?;
+                debug_assert_eq!(fallback.backend, AndroidBackendSource::LegacyAdb);
+                tracing::warn!(serial, pkg, "package.native_lib_dir 回退 Legacy ADB");
+                match legacy_result {
+                    Some(result) => result,
+                    None => self.pkg_lib_dir_legacy(serial, pkg, abi).await,
+                }
+            }
+        }
+    }
+
+    /// Legacy 解析（仅作回退）：`dumpsys package` 全文回宿主 + 字符串找字段。
+    async fn pkg_lib_dir_legacy(&self, serial: &str, pkg: &str, abi: &str) -> CoreResult<String> {
         let args = adb::build_args(
             Some(serial),
             &adb::cmd_shell(&format!("dumpsys package {pkg}")),
@@ -2068,6 +2154,12 @@ fn audit_process_kill(
             "process.kill 失败"
         ),
     }
+}
+
+/// AR8.3 native lib 目录的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。
+fn native_lib_shadow_enabled() -> bool {
+    !std::env::var("APP_REVERSE_TOOLS_NATIVE_LIB_SHADOW")
+        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
 }
 
 /// AR7.2 托管列表的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。

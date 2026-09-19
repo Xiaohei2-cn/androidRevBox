@@ -302,7 +302,9 @@ pub fn classify_package_kind(stdout: &str, package: &str) -> PackageKind {
     }
 }
 
-fn is_safe_package_name(package: &str) -> bool {
+/// 包名字符集白名单（防注入）。Activity 与 Package 两个 provider 共用同一份规则，
+/// 免得两处对「什么叫合法包名」理解不一致（例如 framework 资源包 `android` 没有点号）。
+pub(crate) fn is_safe_package_name(package: &str) -> bool {
     !package.is_empty()
         && package.len() <= 256
         && package
