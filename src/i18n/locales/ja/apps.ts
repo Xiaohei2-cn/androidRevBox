@@ -1,9 +1,5 @@
 export default {
-  "apps.title": "アプリ一覧",
-  "apps.devicesLoading": "デバイスを検出中…",
-  "apps.selectDevice": "デバイスを選択",
   "apps.noDevice": "デバイスが選択されていません",
-  "apps.refreshDevices": "デバイスを更新",
   "apps.loading": "アプリ一覧を読み込み中…",
   "apps.unavailable": "Zygisk アプリ一覧を利用できません",
   "apps.unavailableHint": "モジュールのインストール、Zygisk の有効化、system_server の再起動を確認してください。",

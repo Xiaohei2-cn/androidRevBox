@@ -1,9 +1,5 @@
 export default {
-  "apps.title": "Приложения",
-  "apps.devicesLoading": "Поиск устройств…",
-  "apps.selectDevice": "Выбрать устройство",
   "apps.noDevice": "Устройство не выбрано",
-  "apps.refreshDevices": "Обновить устройства",
   "apps.loading": "Загрузка приложений…",
   "apps.unavailable": "Список приложений Zygisk недоступен",
   "apps.unavailableHint": "Проверьте установку модуля, включение Zygisk и перезапуск system_server.",

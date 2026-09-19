@@ -6,7 +6,6 @@ export default {
   "nav.aria": "主导航",
   "nav.dashboard": "仪表盘",
   "nav.devices": "设备",
-  "nav.apps": "应用",
   "nav.traffic": "流量",
   "nav.terminal": "ADB",
   "nav.hook": "Hook",

@@ -1,9 +1,5 @@
 export default {
-  "apps.title": "应用清单",
-  "apps.devicesLoading": "检测设备…",
-  "apps.selectDevice": "选择设备",
   "apps.noDevice": "未选择设备",
-  "apps.refreshDevices": "刷新设备",
   "apps.loading": "加载应用列表…",
   "apps.unavailable": "Zygisk 应用清单不可用",
   "apps.unavailableHint": "请确认模块已安装、Zygisk 已启用并完成 system_server 重启。",

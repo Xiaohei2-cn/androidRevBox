@@ -1,9 +1,5 @@
 export default {
-  "apps.title": "Aplicativos",
-  "apps.devicesLoading": "Detectando dispositivos…",
-  "apps.selectDevice": "Selecionar dispositivo",
   "apps.noDevice": "Nenhum dispositivo selecionado",
-  "apps.refreshDevices": "Atualizar dispositivos",
   "apps.loading": "Carregando aplicativos…",
   "apps.unavailable": "Lista de aplicativos do Zygisk indisponível",
   "apps.unavailableHint": "Confirme se o módulo está instalado, o Zygisk está ativo e o system_server foi reiniciado.",
