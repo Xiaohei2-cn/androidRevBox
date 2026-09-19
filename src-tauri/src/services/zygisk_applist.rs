@@ -456,6 +456,8 @@ fn safe_filename(name: &str) -> CoreResult<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use agent_protocol::{LabelSource, LocalizedPackageItem, PackageWarning};
 
     use super::*;
@@ -638,7 +640,20 @@ mod tests {
         );
         assert!(status.bridge_ready, "bridge 未就绪: {:?}", status.detail);
         assert_eq!(status.lifecycle, "bridge_ready");
-        assert_eq!(status.sub_protocol_version, 1);
+        // applistpro 已安装时公共能力必须走 v2（指定 locale 与来源标注只有 v2 有）；
+        // 未安装时才允许退回 demo v1，两种情况都要能自证。
+        eprintln!(
+            "[zygisk.channel] module={:?} sub_protocol={} version={:?}",
+            status.module_id, status.sub_protocol_version, status.module_version
+        );
+        assert!(
+            matches!(status.sub_protocol_version, 1 | 2),
+            "子协议版本异常: {}",
+            status.sub_protocol_version
+        );
+        if status.sub_protocol_version == 2 {
+            assert_eq!(status.module_id.as_deref(), Some("applistpro"));
+        }
 
         let user = service
             .list(&serial, Some("zh-CN".into()), LocalizedScope::User, false)
@@ -661,6 +676,65 @@ mod tests {
                 .all(|pair| pair[0].label.cmp(&pair[1].label) != std::cmp::Ordering::Greater),
             "清单必须按 label 稳定排序，否则 UI 刷新抖动"
         );
+
+        if status.sub_protocol_version == 2 {
+            let zh = service
+                .list(&serial, Some("zh-CN".into()), LocalizedScope::All, false)
+                .await
+                .unwrap();
+            let en = service
+                .list(&serial, Some("en-US".into()), LocalizedScope::All, false)
+                .await
+                .unwrap();
+            let zh_map: HashMap<&str, &crate::services::zygisk_applist::ZygiskAppItem> = zh
+                .items
+                .iter()
+                .map(|i| (i.package_name.as_str(), i))
+                .collect();
+            let differing = en
+                .items
+                .iter()
+                .filter(|item| {
+                    zh_map
+                        .get(item.package_name.as_str())
+                        .is_some_and(|z| z.label != item.label)
+                })
+                .count();
+            assert!(
+                differing > 20,
+                "v2 必须能按请求 locale 返回不同名称，实际只有 {differing} 个包不同"
+            );
+            assert!(
+                en.items.iter().all(|item| item.requested_locale == "en-US"),
+                "requested_locale 必须回显请求值"
+            );
+            // 诚实性：无跨语言证据的条目不得自称命中请求 locale
+            let echo = en.items.iter().filter(|item| {
+                item.resolved_locale.as_deref() == Some("en-US")
+                    && zh_map
+                        .get(item.package_name.as_str())
+                        .is_some_and(|z| z.label == item.label)
+            });
+            assert_eq!(echo.count(), 0, "resolved_locale 出现回声");
+            assert!(
+                en.warnings.iter().any(|w| w.code == "locale_unproven"),
+                "无证据条目必须汇总成 warning: {:?}",
+                en.warnings
+            );
+
+            let with_disabled = service
+                .list(&serial, None, LocalizedScope::All, true)
+                .await
+                .unwrap();
+            assert!(
+                with_disabled.items.len() >= zh.items.len(),
+                "include_disabled 不得减少条目"
+            );
+            assert!(
+                with_disabled.items.iter().any(|item| !item.enabled),
+                "v2 应能枚举停用应用并标 enabled=false"
+            );
+        }
 
         let all = service
             .list(&serial, None, LocalizedScope::All, false)

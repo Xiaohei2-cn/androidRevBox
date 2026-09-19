@@ -25,6 +25,7 @@ export default {
   "apps.scopeAll": "All",
   "apps.scopeUser": "3rd-party",
   "apps.scopeSystem": "System",
+  "apps.includeDisabled": "Include disabled",
   "apps.badgeSystem": "system",
   "apps.badgeUser": "3rd",
   "apps.badgeDisabled": "disabled",

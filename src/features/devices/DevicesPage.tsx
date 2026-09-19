@@ -697,9 +697,10 @@ export function AppsView({ serial }: { serial: string | null }) {
   const [exporting, setExporting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [scope, setScope] = useState<ZygiskScope>("all");
+  const [includeDisabled, setIncludeDisabled] = useState(false);
   const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ["zygisk", "applist", serial, scope],
-    queryFn: () => zygiskApi.list(serial!, scope),
+    queryKey: ["zygisk", "applist", serial, scope, includeDisabled],
+    queryFn: () => zygiskApi.list(serial!, scope, { includeDisabled }),
     enabled: !!serial,
   });
   // 清单失败时再取一次模块生命周期，区分「Agent 未连接 / 未安装 / 未启用 / 需重启」
@@ -809,6 +810,19 @@ export function AppsView({ serial }: { serial: string | null }) {
             </button>
           ))}
         </div>
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            setIncludeDisabled((v) => !v);
+          }}
+          className={cn(
+            "w-fit shrink-0 rounded-full border px-2 py-0.5 text-[11px] hover:bg-accent",
+            includeDisabled ? "border-primary text-foreground" : "text-muted-foreground",
+          )}
+        >
+          {t("apps.includeDisabled")}
+        </button>
         {data && data.fallbackCount > 0 && (
           <p className="shrink-0 text-[11px] text-muted-foreground">
             {t("apps.fallbackCount", { count: data.fallbackCount })}

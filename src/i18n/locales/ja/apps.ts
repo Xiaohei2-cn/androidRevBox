@@ -25,6 +25,7 @@ export default {
   "apps.scopeAll": "すべて",
   "apps.scopeUser": "サードパーティアプリ",
   "apps.scopeSystem": "システム",
+  "apps.includeDisabled": "無効アプリを含む",
   "apps.badgeSystem": "システム",
   "apps.badgeUser": "3rd",
   "apps.badgeDisabled": "無効",

@@ -25,6 +25,7 @@ export default {
   "apps.scopeAll": "Все",
   "apps.scopeUser": "Сторонние",
   "apps.scopeSystem": "Системные",
+  "apps.includeDisabled": "Включая отключённые",
   "apps.badgeSystem": "система",
   "apps.badgeUser": "3-я",
   "apps.badgeDisabled": "отключено",

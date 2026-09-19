@@ -25,6 +25,7 @@ export default {
   "apps.scopeAll": "全部",
   "apps.scopeUser": "三方",
   "apps.scopeSystem": "系统",
+  "apps.includeDisabled": "含停用应用",
   "apps.badgeSystem": "系统",
   "apps.badgeUser": "三方",
   "apps.badgeDisabled": "停用",

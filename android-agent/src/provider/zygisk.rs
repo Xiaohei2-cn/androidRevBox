@@ -32,13 +32,23 @@ const ZYGISK_METHODS: &[&str] = &[
     PACKAGE_EXPORT_CLEAN,
 ];
 
-/// 模块标识：决定 `/data/adb/modules/<MODULE_ID>` 与 bridge 语义。
-pub const MODULE_ID: &str = "applist";
-/// Agent <-> 模块私有子协议版本（Q/E/D 线协议冻结为 1）。
-pub const SUB_PROTOCOL_VERSION: u32 = 1;
+/// 学习 demo 模块（v1 线协议 `Q/E/D`，端口 11500，无鉴权）。
+pub const DEMO_MODULE_ID: &str = "applist";
+/// 自有基线模块（v2 线协议，端口 11501，令牌握手 + 指定 locale）。
+pub const PRO_MODULE_ID: &str = "applistpro";
+pub const PRO_SUB_PROTOCOL_VERSION: u32 = 2;
+pub const DEMO_SUB_PROTOCOL_VERSION: u32 = 1;
+
+/// 兼容旧常量名：AR5.3 台账与文档里 v1 冻结为子协议 1。
+pub const MODULE_ID: &str = DEMO_MODULE_ID;
+pub const SUB_PROTOCOL_VERSION: u32 = DEMO_SUB_PROTOCOL_VERSION;
 
 const MODULE_HOST: &str = "127.0.0.1";
 const MODULE_PORT: u16 = 11_500;
+const PRO_PORT: u16 = 11_501;
+const DEMO_PORT: u16 = MODULE_PORT;
+const PRO_TOKEN_PATH: &str = "/data/adb/modules/applistpro/token";
+const PRO_TOKEN_TTL: Duration = Duration::from_secs(300);
 /// 模块内部响应缓冲 4 MiB，留出余量后作为单行上限。
 const MAX_LINE_BYTES: u64 = 6 * 1024 * 1024;
 const MAX_APK_BYTES: u64 = 512 * 1024 * 1024;
@@ -52,26 +62,153 @@ const ROOT_TIMEOUT: Duration = Duration::from_millis(2500);
 
 pub struct ZygiskProvider {
     probe: Mutex<Option<Probe>>,
+    pro_token: Mutex<Option<(String, Instant)>>,
 }
 
-#[derive(Debug, Clone)]
-struct RootFacts {
-    module_installed: bool,
+/// Agent 实际要用的模块通道。优先级：v2 自有模块 > v1 demo > 不可用。
+/// v2 模块探测结果：端口可达之外，还要区分「拿得到令牌」与「握手真的成功」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProState {
+    Ready(ProHello),
+    NeedsToken,
+    HandshakeFailed(String),
+    Dead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Selection {
+    variant: Variant,
+    pro_locale: Option<String>,
+    note: Option<String>,
+}
+
+/// 通道选择矩阵：v2 握手成功优先；v2 因缺 root 令牌或握手失败不可用时，
+/// 若 demo v1 活着就显式退回（note 说明指定 locale 不可用），两者都不行才 Absent。
+fn select_variant(pro: ProState, demo_alive: bool) -> Selection {
+    match pro {
+        ProState::Ready(hello) => Selection {
+            variant: Variant::Pro,
+            pro_locale: Some(hello.locale),
+            note: None,
+        },
+        ProState::NeedsToken if demo_alive => Selection {
+            variant: Variant::Demo,
+            pro_locale: None,
+            note: Some(
+                "v2 模块在监听但 Agent 读不到令牌（需要 root），已退回 v1 demo 通道：                 指定 locale 与 labelSource 证据不可用"
+                    .to_owned(),
+            ),
+        },
+        ProState::NeedsToken => Selection {
+            variant: Variant::ProLocked,
+            pro_locale: None,
+            note: None,
+        },
+        ProState::HandshakeFailed(reason) if demo_alive => Selection {
+            variant: Variant::Demo,
+            pro_locale: None,
+            note: Some(format!("{reason}；已退回 v1 demo 通道，指定 locale 不可用")),
+        },
+        ProState::HandshakeFailed(reason) => Selection {
+            variant: Variant::ProLocked,
+            pro_locale: None,
+            note: Some(reason),
+        },
+        ProState::Dead if demo_alive => Selection {
+            variant: Variant::Demo,
+            pro_locale: None,
+            note: None,
+        },
+        ProState::Dead => Selection {
+            variant: Variant::Absent,
+            pro_locale: None,
+            note: None,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    /// v2 可达且令牌可用：清单/导出走 applistpro
+    Pro,
+    /// v2 端口活但读不到令牌（Agent 非 root）：不能假装能鉴权
+    ProLocked,
+    /// 只有 demo 模块
+    Demo,
+    /// 两个都不活
+    Absent,
+}
+
+impl Variant {
+    fn sub_protocol(self) -> u32 {
+        match self {
+            Self::Pro | Self::ProLocked => PRO_SUB_PROTOCOL_VERSION,
+            Self::Demo => DEMO_SUB_PROTOCOL_VERSION,
+            Self::Absent => 0,
+        }
+    }
+
+    fn module_id(self) -> &'static str {
+        match self {
+            Self::Pro | Self::ProLocked => PRO_MODULE_ID,
+            Self::Demo => DEMO_MODULE_ID,
+            Self::Absent => "",
+        }
+    }
+}
+
+/// v2 `L` 帧条目（模块侧 camelCase）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProItem {
+    pkg: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    label_source: String,
+    #[serde(default)]
+    resolved_locale: Option<String>,
+    #[serde(default)]
+    fallback_reason: Option<String>,
+    #[serde(default)]
+    version_name: String,
+    #[serde(default)]
+    version_code: Option<i64>,
+    #[serde(default)]
+    uid: Option<u32>,
+    #[serde(default)]
+    is_system: bool,
+    #[serde(default)]
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModuleFacts {
+    installed: bool,
     pending_update: bool,
     disabled_marker: bool,
     remove_marker: bool,
-    zygisk_impl: Option<String>,
-    module_version: Option<String>,
-    module_version_code: Option<u32>,
+    version: Option<String>,
+    version_code: Option<u32>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RootFacts {
+    pro: ModuleFacts,
+    demo: ModuleFacts,
+    zygisk_impl: Option<String>,
+}
+
+/// 令牌是敏感物：只缓存在内存里，绝不进 Probe/日志/错误信息。
 #[derive(Debug, Clone)]
 struct Probe {
     at: Instant,
     lifecycle: ZygiskLifecycle,
+    variant: Variant,
     bridge_ready: bool,
     root: Option<RootFacts>,
     device_locale: Option<String>,
+    pro_locale: Option<String>,
     probe_latency_ms: u64,
     detail: Option<String>,
 }
@@ -86,6 +223,7 @@ impl ZygiskProvider {
     pub fn new() -> Self {
         Self {
             probe: Mutex::new(None),
+            pro_token: Mutex::new(None),
         }
     }
 
@@ -106,21 +244,81 @@ impl ZygiskProvider {
 
     async fn probe_now(&self) -> Probe {
         let started = Instant::now();
-        let bridge_ready = bridge_alive(CONNECT_TIMEOUT).await;
+        // v2 优先：端口活 + 拿得到令牌 + 握手真的成功，才算可用（不是“文件装着”）。
+        // v2 探测：端口 -> 令牌 -> 真实握手，三段都过才算可用。
+        let pro_state = if connect_port(PRO_PORT, CONNECT_TIMEOUT).await.is_err() {
+            ProState::Dead
+        } else {
+            match self.pro_token().await {
+                None => ProState::NeedsToken,
+                Some(token) => match handshake_pro(&token).await {
+                    Ok(hello) => ProState::Ready(hello),
+                    Err(error) => ProState::HandshakeFailed(error.message),
+                },
+            }
+        };
+        let demo_alive = !matches!(pro_state, ProState::Ready(_))
+            && bridge_alive(DEMO_PORT, CONNECT_TIMEOUT).await;
+        let selected = select_variant(pro_state, demo_alive);
+        let variant = selected.variant;
+        let pro_locale = selected.pro_locale;
+        let pro_error = selected.note;
+        let bridge_ready = matches!(variant, Variant::Pro | Variant::Demo);
         let root = probe_root().await;
         let device_locale = detect_device_locale().await;
-        let lifecycle = classify_lifecycle(root.as_ref(), bridge_ready);
+        let mut lifecycle = classify_lifecycle(variant, root.as_ref());
+        if let Some(reason) = pro_error {
+            lifecycle.1 = Some(format!("{reason}；v2 握手未通过"));
+        }
         let probe = Probe {
             at: Instant::now(),
             lifecycle: lifecycle.0,
+            variant,
             bridge_ready,
             root,
             device_locale,
+            pro_locale,
             probe_latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             detail: lifecycle.1,
         };
         self.store(probe.clone());
         probe
+    }
+
+    /// 令牌只驻留内存（不进 Probe/日志/错误信息），模块升级后按 TTL 重读。
+    async fn pro_token(&self) -> Option<String> {
+        let cached = self
+            .pro_token
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .filter(|(_, at)| at.elapsed() < PRO_TOKEN_TTL);
+        if let Some((token, _)) = cached {
+            return Some(token);
+        }
+        let script = format!("cat {PRO_TOKEN_PATH}");
+        let output = with_timeout(
+            ROOT_TIMEOUT,
+            Command::new("su").args(["-c", &script]).output(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let valid = token.len() == 128
+            && token
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+        if !valid {
+            return None;
+        }
+        if let Ok(mut guard) = self.pro_token.lock() {
+            *guard = Some((token.clone(), Instant::now()));
+        }
+        Some(token)
     }
 
     async fn probe(&self) -> Probe {
@@ -133,25 +331,35 @@ impl ZygiskProvider {
     }
 
     fn status(&self, probe: &Probe) -> ZygiskStatusResult {
+        let facts = probe.root.as_ref();
+        let module = match probe.variant {
+            Variant::Pro | Variant::ProLocked => facts.map(|f| &f.pro),
+            Variant::Demo => facts.map(|f| &f.demo),
+            Variant::Absent => facts.map(|f| if f.pro.installed { &f.pro } else { &f.demo }),
+        };
+        let module_id = match probe.variant {
+            Variant::Pro | Variant::ProLocked => Some(PRO_MODULE_ID),
+            Variant::Demo => Some(DEMO_MODULE_ID),
+            Variant::Absent => facts.and_then(|f| {
+                if f.pro.installed {
+                    Some(PRO_MODULE_ID)
+                } else if f.demo.installed {
+                    Some(DEMO_MODULE_ID)
+                } else {
+                    None
+                }
+            }),
+        };
         ZygiskStatusResult {
             lifecycle: probe.lifecycle,
             bridge_ready: probe.bridge_ready,
             root_available: probe.root.is_some(),
-            module_id: Some(MODULE_ID.to_owned()),
-            module_version: probe
-                .root
-                .as_ref()
-                .and_then(|facts| facts.module_version.clone()),
-            module_version_code: probe
-                .root
-                .as_ref()
-                .and_then(|facts| facts.module_version_code),
-            zygisk_impl: probe
-                .root
-                .as_ref()
-                .and_then(|facts| facts.zygisk_impl.clone()),
+            module_id: module_id.map(str::to_owned),
+            module_version: module.and_then(|m| m.version.clone()),
+            module_version_code: module.and_then(|m| m.version_code),
+            zygisk_impl: facts.and_then(|f| f.zygisk_impl.clone()),
             device_locale: probe.device_locale.clone(),
-            sub_protocol_version: SUB_PROTOCOL_VERSION,
+            sub_protocol_version: probe.variant.sub_protocol(),
             probe_latency_ms: Some(probe.probe_latency_ms),
             detail: probe.detail.clone(),
         }
@@ -167,6 +375,16 @@ impl ZygiskProvider {
         let params: PackageListLocalizedParams = parse_params(params)?;
         let probe = self.probe().await;
         require_bridge(&probe)?;
+
+        if probe.variant == Variant::Pro {
+            let token = self.pro_token().await.ok_or_else(|| {
+                provider_unavailable(
+                    "v2 模块令牌不可用（Agent 需要 root 才能读令牌）",
+                    Some("pro_token_missing"),
+                )
+            })?;
+            return self.handle_list_pro(&params, &token, &probe).await;
+        }
 
         let apps = request_module_line(b"Q")
             .await
@@ -331,6 +549,91 @@ impl ZygiskProvider {
         })
     }
 
+    /// v2：一次 `L` 就拿到带来源标注的完整条目，无需再跑 E/pm 拼接。
+    async fn handle_list_pro(
+        &self,
+        params: &PackageListLocalizedParams,
+        token: &str,
+        probe: &Probe,
+    ) -> Result<Value, AgentError> {
+        let locale_arg = params.locale.clone().unwrap_or_else(|| "-".to_owned());
+        let scope = match params.scope {
+            PackageScope::All => "all",
+            PackageScope::User => "user",
+            PackageScope::System => "system",
+        };
+        let request = format!(
+            "L {locale_arg} {scope} {}\n",
+            u8::from(params.include_disabled)
+        );
+        let frames = pro_command_frames_with_token(token, &request)
+            .await
+            .inspect_err(|error| self.mark_faulted(error))?;
+        let final_frame = frames
+            .iter()
+            .rev()
+            .find(|value| value.get("final").and_then(serde_json::Value::as_bool) == Some(true));
+        let device_locale = probe
+            .pro_locale
+            .clone()
+            .or_else(|| probe.device_locale.clone())
+            .unwrap_or_else(|| String::from("unknown"));
+        let requested_locale = params
+            .locale
+            .clone()
+            .unwrap_or_else(|| device_locale.clone());
+
+        let (mut items, unproven_locale) = map_pro_items(&frames, &requested_locale)?;
+        items.sort_by(|left, right| {
+            (&left.label, &left.package_name).cmp(&(&right.label, &right.package_name))
+        });
+
+        let fallback_count = u32::try_from(
+            items
+                .iter()
+                .filter(|item| item.label_source != LabelSource::Framework)
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        let mut warnings = Vec::new();
+        if let Some(final_frame) = final_frame {
+            let reported = final_frame.get("count").and_then(serde_json::Value::as_u64);
+            if reported.is_some_and(|count| usize::try_from(count) != Ok(items.len())) {
+                warnings.push(PackageWarning {
+                    package_name: None,
+                    code: "count_mismatch".into(),
+                    message: format!(
+                        "模块自报 {} 条，实际解析 {} 条",
+                        reported.unwrap_or_default(),
+                        items.len()
+                    ),
+                });
+            }
+        }
+        if unproven_locale > 0 {
+            warnings.push(PackageWarning {
+                package_name: None,
+                code: "locale_unproven".into(),
+                message: format!(
+                    "{unproven_locale} 个应用无法确认是否按 {requested_locale} 命中资源                     （Android 不导出资源匹配结果），已按 labelSource/resolvedLocale 如实标注"
+                ),
+            });
+        }
+        if params.include_disabled {
+            warnings.push(PackageWarning {
+                package_name: None,
+                code: "disabled_included".into(),
+                message: "清单含停用应用，条目以 enabled=false 标注".into(),
+            });
+        }
+        serialize(&PackageListLocalizedResult {
+            success_count: items.len() as u32 - fallback_count,
+            fallback_count,
+            items,
+            warnings,
+        })
+    }
+
     async fn handle_export(&self, params: Value) -> Result<Value, AgentError> {
         let params: PackageExportApkParams = parse_params(params)?;
         validate_package_name(&params.package_name)?;
@@ -341,9 +644,24 @@ impl ZygiskProvider {
         let staging_dir = format!("{STAGING_ROOT}-{session}");
         create_private_dir(&staging_dir).await?;
 
-        let mut stream = connect_bridge_stream(CONNECT_TIMEOUT).await?;
-        let staged = stage_package_export(&mut stream, &params.package_name, &staging_dir).await;
-        drop(stream);
+        let staged = match probe.variant {
+            Variant::Pro => {
+                let token = self.pro_token().await.ok_or_else(|| {
+                    provider_unavailable(
+                        "v2 模块令牌不可用（Agent 需要 root 才能读令牌）",
+                        Some("pro_token_missing"),
+                    )
+                })?;
+                stage_pro_export(&token, &params.package_name, &staging_dir).await
+            }
+            _ => {
+                let mut stream = connect_bridge_stream(CONNECT_TIMEOUT).await?;
+                let result =
+                    stage_package_export(&mut stream, &params.package_name, &staging_dir).await;
+                drop(stream);
+                result
+            }
+        };
         let (files, bytes) = match staged {
             Ok(value) => value,
             Err(error) => {
@@ -430,7 +748,13 @@ impl Provider for ZygiskProvider {
         };
         ProviderInfo {
             name: "zygisk".into(),
-            version: format!("sub-{SUB_PROTOCOL_VERSION}"),
+            version: {
+                let variant = self
+                    .cached()
+                    .map(|probe| probe.variant)
+                    .unwrap_or(Variant::Absent);
+                format!("{}-sub-{}", variant.module_id(), variant.sub_protocol())
+            },
             health,
             required_permissions: vec!["zygisk_module".into()],
             last_error,
@@ -449,12 +773,12 @@ impl Provider for ZygiskProvider {
         match self.cached() {
             None => Some("zygisk bridge 尚未探测完成".to_owned()),
             Some(probe) if probe.bridge_ready => None,
-            Some(probe) => Some(
-                probe
-                    .detail
-                    .clone()
-                    .unwrap_or_else(|| format!("Zygisk 模块状态为 {:?}", probe.lifecycle)),
-            ),
+            Some(probe) => Some(probe.detail.clone().unwrap_or_else(|| {
+                format!(
+                    "Zygisk 模块状态为 {:?}（通道 {:?}）",
+                    probe.lifecycle, probe.variant
+                )
+            })),
         }
     }
 
@@ -502,12 +826,17 @@ struct ModuleApk {
     path: String,
 }
 
-async fn bridge_alive(timeout: Duration) -> bool {
-    matches!(connect_bridge_stream(timeout).await, Ok(_stream))
+async fn bridge_alive(port: u16, timeout: Duration) -> bool {
+    matches!(connect_port(port, timeout).await, Ok(_stream))
 }
 
 async fn connect_bridge_stream(timeout: Duration) -> Result<TcpStream, AgentError> {
-    let address = format!("{MODULE_HOST}:{MODULE_PORT}");
+    connect_port(MODULE_PORT, timeout).await
+}
+
+/// 连接指定模块端口（v1=11500 / v2=11501）。
+async fn connect_port(port: u16, timeout: Duration) -> Result<TcpStream, AgentError> {
+    let address = format!("{MODULE_HOST}:{port}");
     with_timeout(timeout, TcpStream::connect(&address))
         .await
         .map_err(|_| {
@@ -522,6 +851,94 @@ async fn connect_bridge_stream(timeout: Duration) -> Result<TcpStream, AgentErro
                 Some("bridge_connect_failed"),
             )
         })
+}
+
+/// v2 导出：握手后 `E <pkg>`，按 `F/T/ERR/DONE` 行协议流式写入暂存目录。
+async fn stage_pro_export(
+    token: &str,
+    package_name: &str,
+    staging_dir: &str,
+) -> Result<(Vec<StagedApkFile>, u64), AgentError> {
+    let mut stream = connect_port(PRO_PORT, CONNECT_TIMEOUT).await?;
+    let mut reader = LineReader::new(&mut stream);
+    let hello = format!("H {PRO_SUB_PROTOCOL_VERSION} {token}\n");
+    reader.write_line(&hello, LINE_TIMEOUT).await?;
+    let hello_line = reader
+        .next_line(LINE_TIMEOUT)
+        .await?
+        .ok_or_else(|| provider_unavailable("v2 导出握手无应答", Some("pro_handshake_eof")))?;
+    parse_pro_hello(&String::from_utf8_lossy(&hello_line))?;
+
+    let request = format!("E {package_name}\n");
+    reader.write_line(&request, LINE_TIMEOUT).await?;
+
+    let mut files = Vec::new();
+    let mut total = 0_u64;
+    let mut skipped = Vec::new();
+    loop {
+        let Some(line) = reader.next_line(LINE_TIMEOUT).await? else {
+            return Err(provider_unavailable(
+                "v2 导出连接提前结束",
+                Some("export_truncated"),
+            ));
+        };
+        if line == b"DONE".as_slice() {
+            if files.is_empty() {
+                return Err(AgentError::new(
+                    ErrorCode::NotFound,
+                    format!(
+                        "模块未返回 {package_name} 的任何 APK 文件                             （跳过: {}）",
+                        skipped.join(",")
+                    ),
+                ));
+            }
+            return Ok((files, total));
+        }
+        if let Some(text) = line
+            .get(..4)
+            .filter(|head| *head == b"ERR ")
+            .map(|_| String::from_utf8_lossy(&line).to_string())
+        {
+            let (code, message) = parse_pro_error(text.trim_end())
+                .unwrap_or_else(|| ("helper_failed".to_owned(), String::new()));
+            return Err(pro_error_to_agent(&code, &message));
+        }
+        if line.first() == Some(&b'T') {
+            // T <size> <pkg> <name> too_large：显式记录，不静默丢文件
+            skipped.push(String::from_utf8_lossy(&line).into_owned());
+            continue;
+        }
+        if line.first() != Some(&b'F') {
+            continue;
+        }
+        let (size, pkg, name) = parse_export_header(&line)?;
+        if pkg != package_name {
+            return Err(incompatible(
+                "v2 模块导出了非请求包的文件",
+                Some("export_pkg_mismatch"),
+            ));
+        }
+        validate_file_name(&name)?;
+        if size > MAX_APK_BYTES || total.saturating_add(size) > MAX_EXPORT_BYTES {
+            return Err(internal("导出 APK 超过体积上限"));
+        }
+        let remote_path = format!("{staging_dir}/{name}");
+        let mut file = tokio::fs::File::create(&remote_path)
+            .await
+            .map_err(|error| internal(format!("创建暂存文件失败: {error}")))?;
+        let copied = reader.read_exact_into(&mut file, size, CHUNK_TIMEOUT).await;
+        drop(file);
+        if let Err(error) = copied {
+            let _cleanup = tokio::fs::remove_file(&remote_path).await;
+            return Err(error);
+        }
+        total = total.saturating_add(size);
+        files.push(StagedApkFile {
+            name,
+            size,
+            remote_path,
+        });
+    }
 }
 
 async fn request_module_line(payload: &[u8]) -> Result<Vec<u8>, AgentError> {
@@ -611,6 +1028,197 @@ async fn stage_package_export(
     }
 }
 
+// ===== v2（applistpro）客户端：令牌握手 + 长度前缀分帧 =====
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProHello {
+    version: String,
+    version_code: u32,
+    locale: String,
+    capabilities: Vec<String>,
+}
+
+/// `H 2 <token>` -> `OK 2 <version> <versionCode> <deviceLocale> <caps...>`
+fn parse_pro_hello(line: &str) -> Result<ProHello, AgentError> {
+    let mut parts = line.split_whitespace();
+    if parts.next() != Some("OK") {
+        return Err(incompatible(
+            format!("v2 模块握手应答异常: {line}"),
+            Some("pro_handshake_shape"),
+        ));
+    }
+    let proto: u32 = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| incompatible("v2 握手缺少协议版本", Some("pro_handshake_proto")))?;
+    if proto != PRO_SUB_PROTOCOL_VERSION {
+        return Err(incompatible(
+            format!("v2 模块协议版本不匹配: {proto}"),
+            Some("pro_handshake_version"),
+        ));
+    }
+    let version = parts.next().unwrap_or_default().to_owned();
+    let version_code = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    // 设备 locale 可能整体含空格？协议里它是单个 BCP-47 标签，安全按字段取
+    let locale = parts.next().unwrap_or_default().to_owned();
+    let capabilities = parts.map(str::to_owned).collect();
+    Ok(ProHello {
+        version,
+        version_code,
+        locale,
+        capabilities,
+    })
+}
+
+/// `ERR <code>[ <消息>]`：无消息时模块侧会留一个尾随空格，必须按空白切分而不是整串比较。
+fn parse_pro_error(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix("ERR ")?;
+    let mut parts = rest.splitn(2, ' ');
+    let code = parts.next()?.to_owned();
+    let message = parts.next().unwrap_or_default().trim().to_owned();
+    Some((code, message))
+}
+
+fn pro_error_to_agent(code: &str, message: &str) -> AgentError {
+    let detail = if message.is_empty() {
+        format!("v2 模块返回 {code}")
+    } else {
+        format!("v2 模块返回 {code}: {message}")
+    };
+    match code {
+        "auth_failed" | "auth_required" => AgentError::new(ErrorCode::PermissionDenied, detail),
+        "unsupported_protocol" => incompatible(detail, Some("pro_protocol_mismatch")),
+        "no_files" => AgentError::new(ErrorCode::NotFound, detail),
+        "bad_package" | "bad_scope" | "bad_locale" | "bad_request" | "bad_handshake" => {
+            AgentError::new(ErrorCode::InvalidRequest, detail)
+        }
+        _ => internal(detail),
+    }
+}
+
+async fn handshake_pro(token: &str) -> Result<ProHello, AgentError> {
+    let mut stream = connect_port(PRO_PORT, CONNECT_TIMEOUT).await?;
+    let request = format!("H {PRO_SUB_PROTOCOL_VERSION} {token}\n");
+    with_timeout(LINE_TIMEOUT, stream.write_all(request.as_bytes()))
+        .await
+        .map_err(|_| deadline("v2 握手写入超时"))?
+        .map_err(|error| internal(format!("v2 握手写入失败: {error}")))?;
+    let mut reader = LineReader::new(&mut stream);
+    let line = reader
+        .next_line(LINE_TIMEOUT)
+        .await?
+        .ok_or_else(|| provider_unavailable("v2 模块握手无应答", Some("pro_handshake_eof")))?;
+    // 不回显令牌：错误信息里只带模块返回的状态行
+    parse_pro_hello(&String::from_utf8_lossy(&line))
+}
+
+/// 发一条 v2 命令并读完分帧响应（末帧 `{"final":true}`）；ERR 行转成结构化错误。
+/// 令牌必须由 provider 显式传入：它不进日志、不进错误信息。
+async fn pro_command_frames_with_token(
+    token: &str,
+    request: &str,
+) -> Result<Vec<serde_json::Value>, AgentError> {
+    let mut stream = connect_port(PRO_PORT, CONNECT_TIMEOUT).await?;
+    let mut reader = LineReader::new(&mut stream);
+    let hello_request = format!("H {PRO_SUB_PROTOCOL_VERSION} {token}\n");
+    reader.write_line(&hello_request, LINE_TIMEOUT).await?;
+    let hello = reader
+        .next_line(LINE_TIMEOUT)
+        .await?
+        .ok_or_else(|| provider_unavailable("v2 模块握手无应答", Some("pro_handshake_eof")))?;
+    parse_pro_hello(&String::from_utf8_lossy(&hello))?;
+
+    reader.write_line(request, LINE_TIMEOUT).await?;
+
+    let mut frames = Vec::new();
+    loop {
+        let mut head = [0_u8; 4];
+        with_timeout(LINE_TIMEOUT, stream.read_exact(&mut head))
+            .await
+            .map_err(|_| deadline("等待 v2 响应帧头超时"))?
+            .map_err(|error| {
+                provider_unavailable(format!("读取 v2 帧头失败: {error}"), Some("pro_frame_head"))
+            })?;
+        let len = u32::from_be_bytes(head) as usize;
+        if len > MAX_LINE_BYTES as usize {
+            return Err(internal("v2 响应单帧超过大小上限"));
+        }
+        let mut body = vec![0_u8; len];
+        with_timeout(LINE_TIMEOUT, stream.read_exact(&mut body))
+            .await
+            .map_err(|_| deadline("等待 v2 响应帧体超时"))?
+            .map_err(|error| internal(format!("读取 v2 帧体失败: {error}")))?;
+        let text = String::from_utf8_lossy(&body).to_string();
+        if let Some((code, message)) = parse_pro_error(text.trim_end()) {
+            return Err(pro_error_to_agent(&code, &message));
+        }
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+            incompatible(
+                format!("v2 响应帧不是合法 JSON: {error}"),
+                Some("pro_frame_json"),
+            )
+        })?;
+        let final_frame = value.get("final").and_then(serde_json::Value::as_bool) == Some(true);
+        frames.push(value);
+        if final_frame {
+            return Ok(frames);
+        }
+    }
+}
+
+/// 把 v2 清单帧转成公共条目：保留模块给出的 labelSource / resolvedLocale / fallbackReason，
+/// 并统计「无法证明按请求 locale 命中」的条目数（Android 不导出资源匹配结果）。
+fn map_pro_items(
+    frames: &[serde_json::Value],
+    requested_locale: &str,
+) -> Result<(Vec<LocalizedPackageItem>, u32), AgentError> {
+    let mut items = Vec::with_capacity(frames.len());
+    let mut unproven_locale = 0_u32;
+    for value in frames
+        .iter()
+        .filter(|value| value.get("final").and_then(serde_json::Value::as_bool) != Some(true))
+    {
+        let item: ProItem = serde_json::from_value(value.clone()).map_err(|error| {
+            incompatible(
+                format!("v2 清单条目字段不兼容: {error}"),
+                Some("pro_item_schema"),
+            )
+        })?;
+        let label_source = match item.label_source.as_str() {
+            "framework" => LabelSource::Framework,
+            "manifest" => LabelSource::Manifest,
+            _ => LabelSource::PackageName,
+        };
+        if item
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("locale_"))
+            || label_source == LabelSource::PackageName
+        {
+            unproven_locale += 1;
+        }
+        items.push(LocalizedPackageItem {
+            package_name: item.pkg,
+            label: item.label,
+            version_name: Some(item.version_name).filter(|value| !value.is_empty()),
+            version_code: item
+                .version_code
+                .and_then(|value| u64::try_from(value).ok()),
+            requested_locale: requested_locale.to_owned(),
+            resolved_locale: item.resolved_locale,
+            label_source,
+            fallback_reason: item.fallback_reason,
+            uid: item.uid,
+            is_system: item.is_system,
+            enabled: item.enabled,
+        });
+    }
+    Ok((items, unproven_locale))
+}
+
 fn parse_apps(bytes: &[u8]) -> Result<Vec<ModuleApp>, AgentError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|error| {
         incompatible(
@@ -670,6 +1278,15 @@ fn parse_export_header(line: &[u8]) -> Result<(u64, String, String), AgentError>
 
 struct LineReader<'a> {
     stream: &'a mut TcpStream,
+}
+
+impl LineReader<'_> {
+    async fn write_line(&mut self, text: &str, timeout: Duration) -> Result<(), AgentError> {
+        with_timeout(timeout, self.stream.write_all(text.as_bytes()))
+            .await
+            .map_err(|_| deadline("写入模块请求超时"))?
+            .map_err(|error| internal(format!("写入模块请求失败: {error}")))
+    }
 }
 
 impl<'a> LineReader<'a> {
@@ -741,16 +1358,19 @@ async fn with_timeout<T>(
 // ===== 设备侧探测 =====
 
 /// 单条固定脚本，无任何外部输入拼接；root 不可用时返回 None（不猜测模块状态）。
+// 一次固定脚本探测两个模块（无任何外部输入拼接）；root 不可用时整块失败。
 const ROOT_PROBE_SCRIPT: &str = concat!(
     "echo ROOT=1;",
-    "if [ -d /data/adb/modules/applist ]; then echo MODULE=1; fi;",
-    "if [ -d /data/adb/modules_update/applist ]; then echo PENDING_UPDATE=1; fi;",
-    "if [ -f /data/adb/modules/applist/disable ]; then echo DISABLED=1; fi;",
-    "if [ -f /data/adb/modules/applist/remove ]; then echo REMOVING=1; fi;",
+    "for m in applistpro applist; do",
+    " if [ -d \"/data/adb/modules/$m\" ]; then echo \"INSTALLED $m\"; fi;",
+    " if [ -d \"/data/adb/modules_update/$m\" ]; then echo \"PENDING $m\"; fi;",
+    " if [ -f \"/data/adb/modules/$m/disable\" ]; then echo \"DISABLED $m\"; fi;",
+    " if [ -f \"/data/adb/modules/$m/remove\" ]; then echo \"REMOVING $m\"; fi;",
+    " if [ -f \"/data/adb/modules/$m/module.prop\" ]; then echo \"PROP_BEGIN $m\";",
+    " cat \"/data/adb/modules/$m/module.prop\"; echo \"PROP_END\"; fi;",
+    " done;",
     "for d in /data/adb/zygisksu /data/adb/zygisk /data/adb/ap/zygisk /data/adb/kzygisk; do",
     " if [ -e \"$d\" ]; then echo \"ZYGIMPL=$(basename \"$d\")\"; fi; done;",
-    "if [ -f /data/adb/modules/applist/module.prop ]; then echo PROP_BEGIN;",
-    " cat /data/adb/modules/applist/module.prop; echo PROP_END; fi;",
     "echo PROBE_DONE=1",
 );
 
@@ -771,110 +1391,164 @@ async fn probe_root() -> Option<RootFacts> {
 }
 
 fn classify_root_output(text: &str) -> RootFacts {
-    let mut facts = RootFacts {
-        module_installed: false,
-        pending_update: false,
-        disabled_marker: false,
-        remove_marker: false,
-        zygisk_impl: None,
-        module_version: None,
-        module_version_code: None,
-    };
-    let mut in_prop = false;
+    let mut facts = RootFacts::default();
+    let mut prop_owner: Option<&str> = None;
     for line in text.lines().map(str::trim) {
-        if in_prop {
-            if line == "PROP_END" {
-                in_prop = false;
-                continue;
-            }
+        if let Some(rest) = line.strip_prefix("PROP_BEGIN ") {
+            prop_owner = Some(rest);
+            continue;
+        }
+        if line == "PROP_END" {
+            prop_owner = None;
+            continue;
+        }
+        if let Some(owner) = prop_owner {
             if let Some((key, value)) = line.split_once('=') {
-                match key {
-                    "version" => facts.module_version = Some(value.to_owned()),
-                    "versionCode" => facts.module_version_code = value.parse().ok(),
-                    _ => {}
+                let target = match owner {
+                    "applistpro" => Some(&mut facts.pro),
+                    "applist" => Some(&mut facts.demo),
+                    _ => None,
+                };
+                if let Some(module) = target {
+                    match key {
+                        "version" => module.version = Some(value.to_owned()),
+                        "versionCode" => module.version_code = value.parse().ok(),
+                        _ => {}
+                    }
                 }
             }
             continue;
         }
-        match line {
-            "MODULE=1" => facts.module_installed = true,
-            "PENDING_UPDATE=1" => facts.pending_update = true,
-            "DISABLED=1" => facts.disabled_marker = true,
-            "REMOVING=1" => facts.remove_marker = true,
-            "PROP_BEGIN" => in_prop = true,
-            other => {
-                if let Some(value) = other.strip_prefix("ZYGIMPL=") {
-                    if facts.zygisk_impl.is_none() && !value.is_empty() {
-                        facts.zygisk_impl = Some(value.to_owned());
-                    }
+        let mut parts = line.splitn(2, ' ');
+        let marker = parts.next().unwrap_or("");
+        let target = match marker {
+            "INSTALLED" | "PENDING" | "DISABLED" | "REMOVING" => match parts.next() {
+                Some("applistpro") => Some(&mut facts.pro),
+                Some("applist") => Some(&mut facts.demo),
+                _ => None,
+            },
+            _ => None,
+        };
+        match (marker, target) {
+            ("INSTALLED", Some(module)) => module.installed = true,
+            ("PENDING", Some(module)) => module.pending_update = true,
+            ("DISABLED", Some(module)) => module.disabled_marker = true,
+            ("REMOVING", Some(module)) => module.remove_marker = true,
+            _ => {
+                if let Some(value) = line.strip_prefix("ZYGIMPL=")
+                    && facts.zygisk_impl.is_none()
+                    && !value.is_empty()
+                {
+                    facts.zygisk_impl = Some(value.to_owned());
                 }
             }
         }
     }
     facts
 }
-
+/// 生命周期判定：先由「实际探测到的通道」决定，再用 root 事实细化原因。
+/// v2 可达但没令牌（ProLocked）不能冒充可用，报成 installed_reboot_required 之外
+/// 最贴近的状态：模块已装但 Agent 无法鉴权 -> faulted + 明确 detail。
 fn classify_lifecycle(
+    variant: Variant,
     root: Option<&RootFacts>,
-    bridge_ready: bool,
 ) -> (ZygiskLifecycle, Option<String>) {
-    let Some(facts) = root else {
-        return if bridge_ready {
+    let facts = match root {
+        None => {
+            return match variant {
+                Variant::Pro => (
+                    ZygiskLifecycle::BridgeReady,
+                    Some("root 不可用，模块安装状态未探测；v2 握手已成功".to_owned()),
+                ),
+                Variant::Demo => (
+                    ZygiskLifecycle::BridgeReady,
+                    Some("root 不可用，模块安装状态未探测；v1 bridge 已响应".to_owned()),
+                ),
+                Variant::ProLocked => (
+                    ZygiskLifecycle::Faulted,
+                    Some("v2 模块在监听但 Agent 读不到令牌（需要 root）".to_owned()),
+                ),
+                Variant::Absent => (
+                    ZygiskLifecycle::Faulted,
+                    Some(
+                        "root 不可用且两个模块端口均未响应，无法区分未安装/未启用/需重启"
+                            .to_owned(),
+                    ),
+                ),
+            };
+        }
+        Some(facts) => facts,
+    };
+    let module = match variant.module_id() {
+        PRO_MODULE_ID => &facts.pro,
+        _ => &facts.demo,
+    };
+    match variant {
+        Variant::Pro => {
+            if facts.demo.pending_update || facts.pro.pending_update {
+                return (
+                    ZygiskLifecycle::InstalledRebootRequired,
+                    Some("检测到模块待更新：当前应答的仍是重启前已加载的版本".to_owned()),
+                );
+            }
+            (ZygiskLifecycle::BridgeReady, None)
+        }
+        Variant::Demo => {
+            if facts.demo.pending_update {
+                return (
+                    ZygiskLifecycle::InstalledRebootRequired,
+                    Some("demo 模块已安装/升级，需重启加载新的 zygisk .so".to_owned()),
+                );
+            }
             (
                 ZygiskLifecycle::BridgeReady,
-                Some("root 不可用，模块安装状态未探测；bridge 已响应".to_owned()),
+                Some("仅 v1 demo 模块可用（无鉴权、无法按指定 locale 解析）".to_owned()),
             )
-        } else {
-            (
-                ZygiskLifecycle::Faulted,
-                Some("root 不可用且 bridge 未响应，无法区分未安装/未启用/需重启".to_owned()),
-            )
-        };
-    };
-    if bridge_ready {
-        if facts.pending_update {
-            return (
-                ZygiskLifecycle::InstalledRebootRequired,
-                Some("模块有新版本待重启加载（bridge 仍是旧 .so）".to_owned()),
-            );
         }
-        return (ZygiskLifecycle::BridgeReady, None);
-    }
-    if facts.remove_marker {
-        return (
-            ZygiskLifecycle::NotInstalled,
-            Some("模块已标记删除，将在下次启动移除".to_owned()),
-        );
-    }
-    if !facts.module_installed {
-        return (
-            ZygiskLifecycle::NotInstalled,
+        Variant::ProLocked => (
+            ZygiskLifecycle::Faulted,
             Some(format!(
-                "/data/adb/modules/{MODULE_ID} 不存在，需安装模块 ZIP"
+                "/data/adb/modules/{PRO_MODULE_ID}/token 读不到：Agent 需要 root 才能取令牌，                 而 v1 demo 模块也不在监听"
             )),
-        );
+        ),
+        Variant::Absent => {
+            if module.remove_marker {
+                return (
+                    ZygiskLifecycle::NotInstalled,
+                    Some("模块已标记删除，将在下次启动移除".to_owned()),
+                );
+            }
+            if !facts.pro.installed && !facts.demo.installed {
+                return (
+                    ZygiskLifecycle::NotInstalled,
+                    Some("applistpro/applist 均未安装，需要推送并安装模块 ZIP".to_owned()),
+                );
+            }
+            if facts.pro.disabled_marker
+                || facts.demo.disabled_marker
+                || facts.zygisk_impl.is_none()
+            {
+                return (
+                    ZygiskLifecycle::ZygiskDisabled,
+                    Some("模块或 Zygisk 实现被禁用（检查 KernelSU/Magisk 的 Zygisk 开关与模块 enable）".to_owned()),
+                );
+            }
+            if facts.pro.pending_update || facts.demo.pending_update {
+                return (
+                    ZygiskLifecycle::InstalledRebootRequired,
+                    Some("模块已安装/升级，需重启加载新的 zygisk .so".to_owned()),
+                );
+            }
+            (
+                ZygiskLifecycle::Loaded,
+                Some(
+                    "模块已安装但 bridge 未监听（system_server 侧握手未完成或模块异常退出）"
+                        .to_owned(),
+                ),
+            )
+        }
     }
-    if facts.disabled_marker || facts.zygisk_impl.is_none() {
-        return (
-            ZygiskLifecycle::ZygiskDisabled,
-            Some(
-                "模块或 Zygisk 实现被禁用（检查 KernelSU/Magisk 的 Zygisk 开关与模块 enable）"
-                    .to_owned(),
-            ),
-        );
-    }
-    if facts.pending_update {
-        return (
-            ZygiskLifecycle::InstalledRebootRequired,
-            Some("模块已安装/升级，需重启加载新的 zygisk .so".to_owned()),
-        );
-    }
-    (
-        ZygiskLifecycle::Loaded,
-        Some("模块已加载但 bridge 未监听（system_server 侧握手未完成）".to_owned()),
-    )
 }
-
 async fn detect_device_locale() -> Option<String> {
     let property = run("/system/bin/getprop", &["persist.sys.locale"]).await?;
     let property = property.trim().to_owned();
@@ -1133,76 +1807,222 @@ mod tests {
 
     use super::*;
 
-    const PROP_SAMPLE: &str = concat!(
+    const ROOT_SAMPLE: &str = concat!(
         "ROOT=1\n",
-        "MODULE=1\n",
-        "ZYGIMPL=zygisksu\n",
-        "PROP_BEGIN\n",
-        "id=applist\n",
-        "name=Applist Zygisk\n",
-        "version=v1.0\n",
-        "versionCode=1\n",
+        "INSTALLED applistpro\n",
+        "PENDING applistpro\n",
+        "INSTALLED applist\n",
+        "PROP_BEGIN applistpro\n",
+        "id=applistpro\nversion=v2.0\nversionCode=2\n",
         "PROP_END\n",
+        "PROP_BEGIN applist\n",
+        "id=applist\nversion=v1.0\nversionCode=1\n",
+        "PROP_END\n",
+        "ZYGIMPL=zygisksu\n",
         "PROBE_DONE=1\n",
     );
 
     #[test]
-    fn root_probe_parses_markers_and_module_prop() {
-        let facts = classify_root_output(PROP_SAMPLE);
-        assert!(facts.module_installed);
-        assert!(!facts.pending_update);
+    fn root_probe_reads_both_modules_from_one_script() {
+        let facts = classify_root_output(ROOT_SAMPLE);
+        assert!(facts.pro.installed && facts.pro.pending_update);
+        assert_eq!(facts.pro.version.as_deref(), Some("v2.0"));
+        assert_eq!(facts.pro.version_code, Some(2));
+        assert!(facts.demo.installed && !facts.demo.pending_update);
+        assert_eq!(facts.demo.version.as_deref(), Some("v1.0"));
+        assert_eq!(facts.demo.version_code, Some(1));
         assert_eq!(facts.zygisk_impl.as_deref(), Some("zygisksu"));
-        assert_eq!(facts.module_version.as_deref(), Some("v1.0"));
-        assert_eq!(facts.module_version_code, Some(1));
     }
 
     #[test]
-    fn pending_update_outweighs_bridge_readiness() {
-        let facts = classify_root_output(
-            &PROP_SAMPLE
-                .to_string()
-                .replace("MODULE=1", "MODULE=1\nPENDING_UPDATE=1"),
-        );
-        assert!(facts.pending_update);
-        let (lifecycle, detail) = classify_lifecycle(Some(&facts), true);
+    fn pending_update_on_either_channel_reports_reboot_required() {
+        let facts = classify_root_output(ROOT_SAMPLE);
+        // v2 端口活着但 modules_update 里还有新版本 -> 当前应答来自重启前的 .so
+        let (lifecycle, detail) = classify_lifecycle(Variant::Pro, Some(&facts));
         assert_eq!(lifecycle, ZygiskLifecycle::InstalledRebootRequired);
-        assert!(detail.unwrap().contains("旧 .so"));
+        assert!(detail.unwrap().contains("重启前"));
 
-        let (loaded, _) = classify_lifecycle(Some(&facts), false);
-        assert_eq!(loaded, ZygiskLifecycle::InstalledRebootRequired);
+        let mut clean = facts.clone();
+        clean.pro.pending_update = false;
+        assert_eq!(
+            classify_lifecycle(Variant::Pro, Some(&clean)).0,
+            ZygiskLifecycle::BridgeReady
+        );
     }
 
     #[test]
     fn lifecycle_without_root_stays_honest() {
-        let (ready, detail) = classify_lifecycle(None, true);
+        let (ready, detail) = classify_lifecycle(Variant::Pro, None);
         assert_eq!(ready, ZygiskLifecycle::BridgeReady);
         assert!(detail.unwrap().contains("root 不可用"));
-        let (unknown, detail) = classify_lifecycle(None, false);
+
+        let (locked, detail) = classify_lifecycle(Variant::ProLocked, None);
+        assert_eq!(locked, ZygiskLifecycle::Faulted);
+        assert!(detail.unwrap().contains("读不到令牌"));
+
+        let (unknown, detail) = classify_lifecycle(Variant::Absent, None);
         assert_eq!(unknown, ZygiskLifecycle::Faulted);
         assert!(detail.unwrap().contains("无法区分"));
     }
 
     #[test]
-    fn lifecycle_distinguishes_missing_module_from_disabled_zygisk() {
-        let mut facts = classify_root_output(PROP_SAMPLE);
-        facts.module_installed = false;
+    fn absent_channel_distinguishes_missing_disabled_and_loaded() {
+        let mut facts = classify_root_output(ROOT_SAMPLE);
+        facts.pro.installed = false;
+        facts.demo.installed = false;
         assert_eq!(
-            classify_lifecycle(Some(&facts), false).0,
+            classify_lifecycle(Variant::Absent, Some(&facts)).0,
             ZygiskLifecycle::NotInstalled
         );
-        facts.module_installed = true;
-        facts.zygisk_impl = None;
+
+        facts.demo.installed = true;
+        facts.demo.disabled_marker = true;
         assert_eq!(
-            classify_lifecycle(Some(&facts), false).0,
+            classify_lifecycle(Variant::Absent, Some(&facts)).0,
             ZygiskLifecycle::ZygiskDisabled
         );
-        facts.zygisk_impl = Some("zygisksu".into());
+
+        facts.demo.disabled_marker = false;
+        facts.pro.pending_update = false;
         assert_eq!(
-            classify_lifecycle(Some(&facts), false).0,
+            classify_lifecycle(Variant::Absent, Some(&facts)).0,
             ZygiskLifecycle::Loaded
+        );
+
+        facts.zygisk_impl = None;
+        assert_eq!(
+            classify_lifecycle(Variant::Absent, Some(&facts)).0,
+            ZygiskLifecycle::ZygiskDisabled
         );
     }
 
+    #[test]
+    fn channel_selection_falls_back_explicitly_not_silently() {
+        let hello = ProHello {
+            version: "v2.0".into(),
+            version_code: 2,
+            locale: "zh-Hans-CN".into(),
+            capabilities: vec!["list".into()],
+        };
+        // v2 握手成功：无论 v1 是否活着都用 v2
+        for demo in [true, false] {
+            let picked = select_variant(ProState::Ready(hello.clone()), demo);
+            assert_eq!(picked.variant, Variant::Pro);
+            assert_eq!(picked.pro_locale.as_deref(), Some("zh-Hans-CN"));
+            assert!(picked.note.is_none());
+        }
+        // 读不到令牌 + v1 可用：退回 v1 但必须留原因
+        let fallback = select_variant(ProState::NeedsToken, true);
+        assert_eq!(fallback.variant, Variant::Demo);
+        assert!(fallback.note.unwrap().contains("root"));
+        // 读不到令牌 + v1 也没有：ProLocked，不猜「未安装」
+        assert_eq!(
+            select_variant(ProState::NeedsToken, false).variant,
+            Variant::ProLocked
+        );
+        // 握手失败同样显式退回
+        let broken = select_variant(ProState::HandshakeFailed("bad proto".into()), true);
+        assert_eq!(broken.variant, Variant::Demo);
+        assert!(broken.note.unwrap().contains("bad proto"));
+        assert_eq!(
+            select_variant(ProState::HandshakeFailed("bad proto".into()), false).variant,
+            Variant::ProLocked
+        );
+        // v2 完全不在：有 v1 走 v1，否则 Absent
+        assert_eq!(select_variant(ProState::Dead, true).variant, Variant::Demo);
+        assert_eq!(
+            select_variant(ProState::Dead, false).variant,
+            Variant::Absent
+        );
+    }
+
+    #[test]
+    fn variant_decides_sub_protocol_and_module_id() {
+        assert_eq!(Variant::Pro.sub_protocol(), PRO_SUB_PROTOCOL_VERSION);
+        assert_eq!(Variant::Pro.module_id(), PRO_MODULE_ID);
+        assert_eq!(Variant::Demo.sub_protocol(), DEMO_SUB_PROTOCOL_VERSION);
+        assert_eq!(Variant::Demo.module_id(), DEMO_MODULE_ID);
+        assert_eq!(Variant::Absent.sub_protocol(), 0);
+    }
+
+    #[test]
+    fn pro_hello_requires_protocol_two_and_reads_caps() {
+        let hello = parse_pro_hello("OK 2 v2.0 2 zh-Hans-CN list manifest export").unwrap();
+        assert_eq!(hello.version, "v2.0");
+        assert_eq!(hello.version_code, 2);
+        assert_eq!(hello.locale, "zh-Hans-CN");
+        assert_eq!(hello.capabilities, vec!["list", "manifest", "export"]);
+        assert_eq!(
+            parse_pro_hello("ERR auth_failed").unwrap_err().code,
+            ErrorCode::IncompatibleVersion
+        );
+        assert_eq!(
+            parse_pro_hello("OK 1 v1 1 zh-CN list").unwrap_err().code,
+            ErrorCode::IncompatibleVersion
+        );
+    }
+
+    #[test]
+    fn pro_error_splits_on_whitespace_and_maps_codes() {
+        // 模块在「无消息」时会留一个尾随空格，整串比较会误判
+        let (code, message) = parse_pro_error("ERR auth_failed ").unwrap();
+        assert_eq!(code, "auth_failed");
+        assert_eq!(message, "");
+        assert_eq!(
+            pro_error_to_agent(&code, &message).code,
+            ErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            pro_error_to_agent("no_files", "com.x").code,
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            pro_error_to_agent("bad_locale", "$(id)").code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            pro_error_to_agent("unsupported_protocol", "").code,
+            ErrorCode::IncompatibleVersion
+        );
+        assert_eq!(
+            pro_error_to_agent("helper_failed", "boom").code,
+            ErrorCode::Internal
+        );
+        assert!(parse_pro_error("F 1 com.x base.apk").is_none());
+    }
+
+    #[test]
+    fn map_pro_items_keeps_module_evidence_and_counts_unproven() {
+        let frames: Vec<serde_json::Value> = [
+            // \u5929\u6c14 = 天气（真机 v2 实际报文形态）
+            br#"{"pkg":"com.google.android.apps.weather","label":"\u5929\u6c14","labelSource":"framework","requestedLocale":"zh-Hans-CN","resolvedLocale":"zh-Hans-CN","fallbackReason":null,"versionName":"1.0","versionCode":34,"uid":10120,"isSystem":true,"enabled":true}"#.as_slice(),
+            br#"{"pkg":"com.google.android.youtube","label":"YouTube","labelSource":"framework","requestedLocale":"fr-FR","resolvedLocale":null,"fallbackReason":"locale_not_resolved_fallback_default","versionName":"21.33","versionCode":1561,"uid":10233,"isSystem":false,"enabled":true}"#.as_slice(),
+            br#"{"pkg":"com.google.android.overlay","label":"com.google.android.overlay","labelSource":"package_name","requestedLocale":"fr-FR","resolvedLocale":null,"fallbackReason":"label_equals_package_name","versionName":"1.0","versionCode":1,"uid":10073,"isSystem":true,"enabled":false}"#.as_slice(),
+            br#"{"final":true,"count":3,"fallback":1,"localeUnproven":2,"deviceLocale":"zh-Hans-CN"}"#.as_slice(),
+        ]
+        .iter()
+        .map(|raw| serde_json::from_slice(raw).unwrap())
+        .collect();
+
+        let (items, unproven) = map_pro_items(&frames, "fr-FR").unwrap();
+        assert_eq!(items.len(), 3, "final 帧不应计入条目");
+        assert_eq!(items[0].label_source, LabelSource::Framework);
+        assert_eq!(items[0].label, "天气");
+        assert_eq!(items[0].resolved_locale.as_deref(), Some("zh-Hans-CN"));
+        assert_eq!(items[0].uid, Some(10120));
+        assert!(items[0].is_system && items[0].enabled);
+        assert_eq!(items[1].version_name.as_deref(), Some("21.33"));
+        assert_eq!(items[1].version_code, Some(1561));
+        assert!(!items[1].is_system, "YouTube 应判为用户应用");
+        assert_eq!(
+            items[1].fallback_reason.as_deref(),
+            Some("locale_not_resolved_fallback_default")
+        );
+        assert_eq!(items[2].label_source, LabelSource::PackageName);
+        assert!(!items[2].enabled);
+        assert_eq!(unproven, 2, "locale 无证据 + 包名回退各一条");
+        assert_eq!(items[2].requested_locale, "fr-FR");
+    }
     #[test]
     fn locale_compatibility_ignores_script_subtag() {
         assert!(locales_compatible("zh-CN", "zh-Hans-CN"));
@@ -1243,7 +2063,8 @@ mod tests {
     #[test]
     fn module_json_shapes_are_typed_or_incompatible() {
         let apps = parse_apps(
-            br#"[{"pkg":"com.x","label":"\u6d4b\u8bd5","versionName":"1.2","versionCode":12}]"#,
+            br#"[{"pkg":"com.x","label":"\u6d4b\u8bd5","versionName":"1.2","versionCode":12}]"#
+                .as_slice(),
         )
         .unwrap();
         assert_eq!(apps[0].pkg, "com.x");
@@ -1292,9 +2113,11 @@ mod tests {
                 .is_some()
         );
         assert_eq!(provider.info().health, ProviderHealth::Unavailable);
+        // 未探测 = 无通道：版本串显式为「未知模块 - 子协议 0」，不给假的 v1 认定
+        assert_eq!(provider.info().version, "-sub-0".to_owned());
         assert_eq!(
-            provider.info().version,
-            format!("sub-{SUB_PROTOCOL_VERSION}")
+            provider.info().last_error.as_deref(),
+            Some("zygisk bridge 尚未探测")
         );
     }
 }
