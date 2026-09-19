@@ -381,7 +381,10 @@ pub async fn device_shell(
     if args.command.trim().is_empty() {
         return Err(CoreError::Internal("命令不能为空".to_string()));
     }
-    state.device.start_shell(&args.serial, &args.command).await
+    state
+        .device
+        .raw_shell_task(&args.serial, &args.command)
+        .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -488,6 +491,6 @@ pub async fn device_logcat(
 ) -> CoreResult<String> {
     state
         .device
-        .start_logcat(&args.serial, args.filter.as_deref())
+        .raw_logcat_task(&args.serial, args.filter.as_deref())
         .await
 }

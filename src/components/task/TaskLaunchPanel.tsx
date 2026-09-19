@@ -12,11 +12,18 @@ export function TaskLaunchPanel({
   placeholder,
   disabled,
   onRun,
+  note,
 }: {
   label: string;
   placeholder: string;
   onRun: (input: string) => Promise<string | null>;
   disabled?: boolean;
+  /**
+   * 通道说明（AR9.3）：Shell / Logcat 这类面板走的是 **Desktop ADB 原始会话**，
+   * 不是 Agent typed API。用户必须能在发起前就看到这一点，否则会以为看到的输出
+   * 经过了 Agent 的鉴权与结构化错误处理。
+   */
+  note?: string;
 }) {
   const [input, setInput] = useState("");
   const [taskId, setTaskId] = useState<string | null>(null);
@@ -46,6 +53,11 @@ export function TaskLaunchPanel({
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-2">
+      {note && (
+        <p className="shrink-0 rounded-md border border-dashed px-2 py-1 text-xs text-muted-foreground">
+          {note}
+        </p>
+      )}
       <div className="flex shrink-0 items-center gap-2">
         <span className="text-xs font-medium">{label}</span>
         <input

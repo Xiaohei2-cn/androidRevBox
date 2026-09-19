@@ -117,6 +117,7 @@ export function DevicesPage() {
             <TaskLaunchPanel
               label="命令"
               placeholder="如：input text hello（回车执行，Ctrl+C 无法用，请点停止取消）"
+              note="ADB 原始会话：命令原样交给 adb shell，不经 Agent，也没有 typed 错误码。设备侧能力请改用各功能页。"
               disabled={!activeSerial}
               onRun={async (input) => {
                 if (!activeSerial || !input.trim()) return null;
@@ -142,6 +143,7 @@ export function DevicesPage() {
             <TaskLaunchPanel
               label="过滤（正则，留空全量）"
               placeholder="如 crash，回车开流；停止按钮取消任务"
+              note="ADB 原始会话：adb logcat 流由 Desktop 直读（传输/调试工具），保留取消与日志回放。"
               disabled={!activeSerial}
               onRun={async (filter) => {
                 if (!activeSerial) return null;

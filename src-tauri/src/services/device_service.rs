@@ -1860,7 +1860,12 @@ impl DeviceService {
         self.tasks.start_with_kind(kind, spec)
     }
 
-    pub async fn start_shell(&self, serial: &str, command: &str) -> CoreResult<String> {
+    /// Raw Tool（§2.3）：用户在 Shell 页主动敲的原始命令，唯一入口是
+    /// `commands::device::device_shell`；Rust 的 `pub(in ...)` 不能跨分支限制，
+    /// 所以这条边界由 `tests/raw_tool_boundary.rs` 用源码扫描钉住（AR9.3：
+    /// 「业务 Service 不调用 raw shell API」）。命令仍走参数数组 + TaskService，
+    /// 保留取消与日志回放；名称带 `_task` 也是提醒：它产任务，不产业务结果。
+    pub async fn raw_shell_task(&self, serial: &str, command: &str) -> CoreResult<String> {
         self.adb_task("adb.shell", Some(serial), &adb::cmd_shell(command))
             .await
     }
@@ -1895,7 +1900,10 @@ impl DeviceService {
             .await
     }
 
-    pub async fn start_logcat(&self, serial: &str, filter: Option<&str>) -> CoreResult<String> {
+    /// Raw Tool（§2.3）：`adb logcat` 本身就是传输/调试工具，保留 Desktop 路径；
+    /// 与 raw_shell_task 同样受 `tests/raw_tool_boundary.rs` 的源码扫描保护。
+    /// 过滤参数交给 `cmd_logcat` 组数组，不做字符串拼接。
+    pub async fn raw_logcat_task(&self, serial: &str, filter: Option<&str>) -> CoreResult<String> {
         self.adb_task("adb.logcat", Some(serial), &adb::cmd_logcat(filter))
             .await
     }
