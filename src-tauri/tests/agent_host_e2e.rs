@@ -130,8 +130,8 @@ async fn host_agent_full_lifecycle() {
             .await
             .expect("hello must succeed");
         assert_eq!(hello.protocol_version, 1);
-        assert_eq!(hello.providers.len(), 4);
-        assert_eq!(hello.capabilities.len(), 10);
+        assert_eq!(hello.providers.len(), 5);
+        assert_eq!(hello.capabilities.len(), 12);
         assert!(
             hello.capabilities.iter().any(|capability| capability.method
                 == agent_protocol::method::ACTIVITY_FOREGROUND
@@ -144,6 +144,21 @@ async fn host_agent_full_lifecycle() {
                 .iter()
                 .any(|capability| capability.method == agent_protocol::method::DEVICE_INFO)
         );
+        // AR6.2：端口/进程互查不依赖 root，provider 必须直接宣告可用
+        for method in [
+            agent_protocol::method::PROCESS_PORTS,
+            agent_protocol::method::PROCESS_BY_PORT,
+        ] {
+            let capability = hello
+                .capabilities
+                .iter()
+                .find(|capability| capability.method == method)
+                .unwrap_or_else(|| panic!("{method} must be discoverable"));
+            assert!(
+                capability.available && capability.provider == "process",
+                "{method} 应由 process provider 宣告可用"
+            );
+        }
         // Zygisk 模块在宿主机上必然不存在：只能降级 provider.zygisk 的具体方法，
         // 既不能假成功，也不能让 shell/系统能力一起消失（AR5.3 第 6 条）。
         assert!(

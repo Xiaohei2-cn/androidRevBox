@@ -10,6 +10,8 @@ pub mod method {
     pub const PACKAGE_LIST: &str = "package.list";
     pub const PACKAGE_LIST_LOCALIZED: &str = "package.list_localized";
     pub const ACTIVITY_FOREGROUND: &str = "activity.foreground";
+    pub const PROCESS_PORTS: &str = "process.ports";
+    pub const PROCESS_BY_PORT: &str = "process.by_port";
     pub const PACKAGE_EXPORT_APK: &str = "package.export_apk";
     pub const PACKAGE_EXPORT_CLEAN: &str = "package.export_clean";
     pub const ZYGISK_STATUS: &str = "zygisk.status";
@@ -143,6 +145,78 @@ pub struct ActivityForegroundResult {
     /// 无前台时的原因提示，便于 UI 直接展示
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+}
+
+/// AR6.2：端口/进程互查。`/proc/net/*` 解析与 fd→inode 匹配全部在设备端完成，
+/// Desktop 不再 cat 全文 + 宿主解析，也不再分批 `ls /proc/*/fd`。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProcessPortsParams {
+    pub pid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListeningPort {
+    pub port: u16,
+    /// `/proc/net` 里十六进制地址还原后的可读形式（IPv4 点分 / IPv6 冒分）
+    pub address: String,
+    pub family: SocketFamily,
+    /// `listen`/`time_wait`/... 已按内核 st 值翻译；未收录值保留 `st=<hex>`
+    pub state: String,
+    pub inode: u64,
+    pub uid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessPortsResult {
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
+    pub ports: Vec<ListeningPort>,
+    /// 读不到就列出来（权限不足或进程已退出），不静默当成"没有监听端口"
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SocketFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProcessByPortParams {
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortHoldingProcess {
+    pub pid: u32,
+    pub uid: u32,
+    pub family: SocketFamily,
+    pub address: String,
+    pub state: String,
+    pub inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comm: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessByPortResult {
+    pub port: u16,
+    pub sockets: Vec<PortHoldingProcess>,
+    /// 无法确定属主的 socket（未找到持有该 inode 的进程）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unowned: Vec<PortHoldingProcess>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// 候选进程数超过扫描上限时列出被跳过的原因，方便判断"查不到"是权限还是上限
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -362,6 +436,62 @@ mod tests {
         assert_eq!(value["module_id"], "applist");
         assert_eq!(value["sub_protocol_version"], 1);
         assert_eq!(value.get("detail"), None);
+    }
+
+    #[test]
+    fn process_ports_result_distinguishes_empty_from_unreadable() {
+        let result = ProcessPortsResult {
+            pid: 4321,
+            comm: Some("com.target.app".into()),
+            cmdline: None,
+            ports: vec![ListeningPort {
+                port: 11501,
+                address: "127.0.0.1".into(),
+                family: SocketFamily::Ipv4,
+                state: "listen".into(),
+                inode: 4242,
+                uid: 0,
+            }],
+            unreadable: vec!["/proc/net/tcp6".into()],
+            truncated: false,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["ports"][0]["family"], "ipv4");
+        assert_eq!(value["ports"][0]["port"], 11501);
+        assert_eq!(value.get("cmdline"), None);
+        assert_eq!(value.get("truncated"), None);
+        assert_eq!(value["unreadable"][0], "/proc/net/tcp6");
+        let parsed: ProcessPortsResult = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.ports[0].family, SocketFamily::Ipv4);
+    }
+
+    #[test]
+    fn process_by_port_result_splits_owned_and_unowned_sockets() {
+        let socket = PortHoldingProcess {
+            pid: 0,
+            uid: 0,
+            family: SocketFamily::Ipv6,
+            address: "::".into(),
+            state: "listen".into(),
+            inode: 99,
+            comm: None,
+        };
+        let result = ProcessByPortResult {
+            port: 8081,
+            sockets: vec![socket.clone()],
+            unowned: vec![socket],
+            truncated: true,
+            skipped: vec!["scanned_pid_limit=4000".into()],
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["sockets"][0]["family"], "ipv6");
+        assert_eq!(value["sockets"][0].get("comm"), None);
+        assert_eq!(value["truncated"], json!(true));
+        assert_eq!(value["skipped"][0], "scanned_pid_limit=4000");
+        // pid=0 表示"socket 存在但属主未知"，不能与"没有该端口"混淆
+        let empty: ProcessByPortResult =
+            serde_json::from_value(json!({"port": 1, "sockets": []})).unwrap();
+        assert!(empty.sockets.is_empty() && empty.unowned.is_empty());
     }
 
     #[test]

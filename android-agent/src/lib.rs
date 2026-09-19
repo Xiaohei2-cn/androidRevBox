@@ -7,6 +7,7 @@ use std::sync::Arc;
 use agent_protocol::PermissionInfo;
 use provider::activity::ActivityProvider;
 use provider::device::DeviceProvider;
+use provider::process::ProcessesProvider;
 use provider::system::SystemProvider;
 use provider::zygisk::ZygiskProvider;
 use router::Router;
@@ -35,5 +36,8 @@ pub fn system_router_with(
     router
         .register(Arc::new(ActivityProvider))
         .expect("activity provider methods must be unique");
+    router
+        .register(Arc::new(ProcessesProvider))
+        .expect("process provider methods must be unique");
     router
 }

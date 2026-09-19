@@ -11,9 +11,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_protocol::method::{DEVICE_INFO, PACKAGE_LIST};
+use agent_protocol::method::{DEVICE_INFO, PACKAGE_LIST, PROCESS_BY_PORT, PROCESS_PORTS};
 use agent_protocol::{
-    DeviceInfoParams, DeviceInfoResult, PackageListParams, PackageListResult, PackageScope,
+    DeviceInfoParams, DeviceInfoResult, ListeningPort, PackageListParams, PackageListResult,
+    PackageScope, PortHoldingProcess, ProcessByPortParams, ProcessByPortResult, ProcessPortsParams,
+    ProcessPortsResult, SocketFamily,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -105,6 +107,9 @@ impl AdbEnvironment {
 const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(3);
 const SHORT_CMD_TIMEOUT: Duration = Duration::from_secs(10);
 const LIST_TIMEOUT: Duration = Duration::from_secs(8);
+/// AR6.2 端口互查：Agent 要扫 `/proc/*/fd` 建 inode→pid 索引，进程数多时比
+/// 单条 shell 慢，超时给到 15 s（Legacy 侧同量级：真机非 root 全量 ls 约 2~4 s）。
+const PORT_SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 /// adb push 大 so 文件用长超时（USB 下数十 MB 也留足余量）
 const PUSH_TIMEOUT: Duration = Duration::from_secs(120);
 /// su -c cat 覆写（设备内拷贝，磁盘写为主）
@@ -860,8 +865,87 @@ impl DeviceService {
         Ok(adb::parse_listening_ports(&out.stdout))
     }
 
-    /// 查任意进程监听端口（PID→端口方向；pid 不限于托管行，复用同链路）。
+    /// 查任意进程监听端口（PID→端口方向）。AR6.2 起默认走 Agent `process.ports`：
+    /// fd→inode 与 `/proc/net/tcp(6)` 的匹配在设备端一次快照完成，Desktop 不再
+    /// cat 全文 + 宿主解析（只读幂等，可回退，删除条件见 Legacy 能力表）。
+    ///
+    /// ⚠️ `root=true` 仍走 Legacy `su -c`：Agent 由 adb shell 以 shell 身份启动，
+    /// 读不到别人 uid 的 `/proc/<pid>/fd`，若把它路由过去，「只有 root 看得见」的
+    /// 端口会凭空消失——那正是「空列表当成没端口」的假象。等价性优先于入口统一（D026），
+    /// 等 Agent 有自己的 root 通道后再收敛这条分支。
     pub async fn process_ports(
+        &self,
+        serial: &str,
+        pid: u32,
+        root: bool,
+    ) -> CoreResult<Vec<adb::ListenPort>> {
+        if root {
+            return self.process_ports_legacy(serial, pid, true).await;
+        }
+        let route = self
+            .android
+            .select(serial, PROCESS_PORTS, OperationKind::ReadOnlyIdempotent)
+            .map_err(CapabilityRouter::core_error)?;
+        if route.backend == AndroidBackendSource::LegacyAdb {
+            return self.process_ports_legacy(serial, pid, false).await;
+        }
+
+        let params = ProcessPortsParams { pid };
+        let agent_request = self.android.agent().request::<_, ProcessPortsResult>(
+            serial,
+            PROCESS_PORTS,
+            &params,
+            PORT_SCAN_TIMEOUT,
+        );
+        let (agent_result, legacy_result) = if process_ports_shadow_enabled() {
+            let legacy = self.process_ports_legacy(serial, pid, false);
+            let (agent, legacy) = tokio::join!(agent_request, legacy);
+            (agent, Some(legacy))
+        } else {
+            (agent_request.await, None)
+        };
+
+        match agent_result {
+            Ok(result) => {
+                if !result.unreadable.is_empty() {
+                    tracing::debug!(
+                        serial,
+                        pid,
+                        method = PROCESS_PORTS,
+                        unreadable = ?result.unreadable,
+                        truncated = result.truncated,
+                        "process.ports 有不可读项：空列表不等于无监听端口"
+                    );
+                }
+                let ports = map_agent_listening_ports(&result.ports);
+                if let Some(Ok(legacy)) = legacy_result {
+                    log_process_ports_shadow_diff(serial, pid, &ports, &legacy);
+                }
+                Ok(ports)
+            }
+            Err(error) => {
+                let fallback = self
+                    .android
+                    .fallback_after_agent_error(
+                        serial,
+                        PROCESS_PORTS,
+                        OperationKind::ReadOnlyIdempotent,
+                        &error,
+                    )
+                    .map_err(CapabilityRouter::core_error)?;
+                debug_assert_eq!(fallback.backend, AndroidBackendSource::LegacyAdb);
+                tracing::warn!(serial, pid, "process.ports 回退 Legacy ADB");
+                match legacy_result {
+                    Some(result) => result,
+                    None => self.process_ports_legacy(serial, pid, false).await,
+                }
+            }
+        }
+    }
+
+    /// Legacy 路径（仅作回退）：单条 shell 里 `ls -l` fd + grep `/proc/net`，
+    /// 十六进制还原在宿主侧 `adb::parse_listening_ports` 完成。
+    async fn process_ports_legacy(
         &self,
         serial: &str,
         pid: u32,
@@ -870,15 +954,80 @@ impl DeviceService {
         self.hosted_ports(serial, pid, root).await
     }
 
-    /// 端口→PID 反查（全 -s 绑定，三步）：
+    /// 端口→PID 反查。AR6.2 起默认走 Agent `process.by_port`：读 `/proc/net/*`
+    /// 与 `/proc/<pid>/fd` 符号链接、inode→pid 归属匹配全在设备端一次完成，
+    /// Desktop 不再拉 `/proc/net` 全文到宿主，也不再 `ls -l /proc/[0-9]*/fd`。
+    ///
+    /// ⚠️ 不开 root 时 shell 用户读不到别人的 `/proc/<pid>/fd`，无论 Agent 还是
+    /// Legacy 都只能命中 shell 自属进程，前端默认引导勾选 Root 的语义保持不变；
+    /// `root=true` 与 PID→端口方向同理继续走 Legacy `su -c`（见 D026）。
+    pub async fn pids_by_port(
+        &self,
+        serial: &str,
+        port: u16,
+        root: bool,
+    ) -> CoreResult<Vec<adb::PortHolder>> {
+        if root {
+            return self.pids_by_port_legacy(serial, port, true).await;
+        }
+        let route = self
+            .android
+            .select(serial, PROCESS_BY_PORT, OperationKind::ReadOnlyIdempotent)
+            .map_err(CapabilityRouter::core_error)?;
+        if route.backend == AndroidBackendSource::LegacyAdb {
+            return self.pids_by_port_legacy(serial, port, false).await;
+        }
+
+        let params = ProcessByPortParams { port };
+        let agent_request = self.android.agent().request::<_, ProcessByPortResult>(
+            serial,
+            PROCESS_BY_PORT,
+            &params,
+            PORT_SCAN_TIMEOUT,
+        );
+        let (agent_result, legacy_result) = if process_ports_shadow_enabled() {
+            let legacy = self.pids_by_port_legacy(serial, port, false);
+            let (agent, legacy) = tokio::join!(agent_request, legacy);
+            (agent, Some(legacy))
+        } else {
+            (agent_request.await, None)
+        };
+
+        match agent_result {
+            Ok(result) => {
+                let holders = map_agent_port_holders(&result);
+                if let Some(Ok(legacy)) = legacy_result {
+                    log_pids_by_port_shadow_diff(serial, port, &holders, &result.unowned, &legacy);
+                }
+                Ok(holders)
+            }
+            Err(error) => {
+                let fallback = self
+                    .android
+                    .fallback_after_agent_error(
+                        serial,
+                        PROCESS_BY_PORT,
+                        OperationKind::ReadOnlyIdempotent,
+                        &error,
+                    )
+                    .map_err(CapabilityRouter::core_error)?;
+                debug_assert_eq!(fallback.backend, AndroidBackendSource::LegacyAdb);
+                tracing::warn!(serial, port, "process.by_port 回退 Legacy ADB");
+                match legacy_result {
+                    Some(result) => result,
+                    None => self.pids_by_port_legacy(serial, port, false).await,
+                }
+            }
+        }
+    }
+
+    /// Legacy 路径（仅作回退，三步）：
     /// ① grep 端口十六进制 → 解析取 LISTEN 且端口精确匹配的 inode；
     /// ② inode_scan_cmd 单次 `ls -l /proc/[0-9]*/fd` → 宿主侧 parse_fd_scan
     ///    找持有这些 inode 的 pid（绝不在设备端逐进程循环——真机数百次
     ///    ls/grep 孵化实测超过 8s 命令超时）；
     /// ③ comm_batch_cmd 仅对命中的少量 pid 批量取进程名。
-    /// ⚠️ 不开 root 时 shell 用户读不到别人的 /proc/<pid>/fd，
-    /// 只能命中 shell 自属进程——前端默认引导勾选 Root。
-    pub async fn pids_by_port(
+    async fn pids_by_port_legacy(
         &self,
         serial: &str,
         port: u16,
@@ -1278,6 +1427,131 @@ fn log_package_list_shadow_diff(serial: &str, agent: &[String], legacy: &[String
     }
 }
 
+/// AR6.2 端口互查的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。
+fn process_ports_shadow_enabled() -> bool {
+    !std::env::var("APP_REVERSE_TOOLS_PROCESS_PORTS_SHADOW")
+        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
+}
+
+fn socket_family_label(family: SocketFamily) -> &'static str {
+    match family {
+        SocketFamily::Ipv4 => "tcp",
+        SocketFamily::Ipv6 => "tcp6",
+    }
+}
+
+/// Agent `process.ports` → 前端既有 `ListenPort[]` 契约：只留 LISTEN、
+/// (端口,地址,族) 去重、端口→族→地址升序，与 `adb::parse_listening_ports` 逐项一致。
+/// `pub(crate)` 是为了让真机对照测试（agent_manager）能拿同一个映射函数比对 Legacy，
+/// 而不是在测试里再抄一份规则。
+pub(crate) fn map_agent_listening_ports(ports: &[ListeningPort]) -> Vec<adb::ListenPort> {
+    let mut seen = HashSet::new();
+    let mut out: Vec<adb::ListenPort> = ports
+        .iter()
+        .filter(|entry| entry.state == "listen")
+        .map(|entry| adb::ListenPort {
+            address: entry.address.clone(),
+            port: entry.port,
+            listen: true,
+            family: socket_family_label(entry.family),
+        })
+        .filter(|entry| seen.insert((entry.port, entry.address.clone(), entry.family)))
+        .collect();
+    out.sort_by(|a, b| {
+        a.port
+            .cmp(&b.port)
+            .then(a.family.cmp(b.family))
+            .then(a.address.cmp(&b.address))
+    });
+    out
+}
+
+/// Agent `process.by_port` → 前端既有 `PortHolder[]` 契约。
+/// `pid=0` 是「socket 在、属主查不到」（权限或竞态），Legacy 从不返回 pid=0，
+/// 为了不改前端语义这里不编成假进程，只在 shadow 日志里留证据。
+fn map_agent_port_holders(result: &ProcessByPortResult) -> Vec<adb::PortHolder> {
+    let mut seen = HashSet::new();
+    let mut out: Vec<adb::PortHolder> = result
+        .sockets
+        .iter()
+        .filter(|socket| socket.pid != 0)
+        .map(|socket| adb::PortHolder {
+            pid: socket.pid,
+            name: socket
+                .comm
+                .clone()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "?".to_string()),
+        })
+        .filter(|holder| seen.insert(holder.pid))
+        .collect();
+    out.sort_by_key(|holder| holder.pid);
+    out
+}
+
+fn log_process_ports_shadow_diff(
+    serial: &str,
+    pid: u32,
+    agent: &[adb::ListenPort],
+    legacy: &[adb::ListenPort],
+) {
+    let key = |entry: &adb::ListenPort| (entry.port, entry.address.clone(), entry.family);
+    let agent_set: HashSet<_> = agent.iter().map(key).collect();
+    let legacy_set: HashSet<_> = legacy.iter().map(key).collect();
+    let only_agent: Vec<_> = agent_set.difference(&legacy_set).collect();
+    let only_legacy: Vec<_> = legacy_set.difference(&agent_set).collect();
+    if only_agent.is_empty() && only_legacy.is_empty() {
+        tracing::debug!(
+            serial,
+            pid,
+            method = PROCESS_PORTS,
+            "Agent/Legacy process.ports matched"
+        );
+    } else {
+        tracing::warn!(
+            serial,
+            pid,
+            method = PROCESS_PORTS,
+            agent_only = ?only_agent,
+            legacy_only = ?only_legacy,
+            "Agent/Legacy process.ports shadow compare differed"
+        );
+    }
+}
+
+fn log_pids_by_port_shadow_diff(
+    serial: &str,
+    port: u16,
+    agent: &[adb::PortHolder],
+    agent_unowned: &[PortHoldingProcess],
+    legacy: &[adb::PortHolder],
+) {
+    let agent_set: HashSet<u32> = agent.iter().map(|holder| holder.pid).collect();
+    let legacy_set: HashSet<u32> = legacy.iter().map(|holder| holder.pid).collect();
+    if agent_set == legacy_set {
+        tracing::debug!(
+            serial,
+            port,
+            method = PROCESS_BY_PORT,
+            unowned = agent_unowned.len(),
+            "Agent/Legacy process.by_port matched"
+        );
+        return;
+    }
+    tracing::warn!(
+        serial,
+        port,
+        method = PROCESS_BY_PORT,
+        agent_only = ?agent_set.difference(&legacy_set).collect::<Vec<_>>(),
+        legacy_only = ?legacy_set.difference(&agent_set).collect::<Vec<_>>(),
+        unowned = ?agent_unowned
+            .iter()
+            .map(|socket| socket.inode)
+            .collect::<Vec<_>>(),
+        "Agent/Legacy process.by_port shadow compare differed"
+    );
+}
+
 fn device_info_shadow_enabled() -> bool {
     !std::env::var("APP_REVERSE_TOOLS_DEVICE_INFO_SHADOW")
         .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
@@ -1342,6 +1616,88 @@ mod tests {
             .with_script(&["shell", "ls"], MockAdbRunner::ok_output(
                 "total 2\n-rw-r--r-- 1 root root 5 2024-01-01 08:00 a.txt\n",
             ))
+    }
+
+    fn listening(port: u16, address: &str, family: SocketFamily, state: &str) -> ListeningPort {
+        ListeningPort {
+            port,
+            address: address.into(),
+            family,
+            state: state.into(),
+            inode: 1,
+            uid: 0,
+        }
+    }
+
+    /// AR6.2 等价性：Agent 已还原的结构化端口经 Desktop 映射后，必须与 Legacy
+    /// 解析器对同一份 `/proc/net` 原文的输出逐项一致（含只留 LISTEN、去重、排序）。
+    #[test]
+    fn agent_listening_ports_match_legacy_parser_output() {
+        const RAW: &str = concat!(
+            "/proc/net/tcp:   0: 0100007F:2CEC 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 62728 1 0000000000000000 100 0 0 10 0\n",
+            "/proc/net/tcp:   1: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1046        0 51406 1 0000000000000000 100 0 0 10 0\n",
+            "/proc/net/tcp:   2: B165B40A:1F90 0100007F:1F94 01 00000000:00000000 00:00000000 00000000 10107        0 98765 1 0000000000000000 100 0 0 10 0\n",
+            "/proc/net/tcp6:  3: 00000000000000000000000000000000:1F91 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 4242 1 0000000000000000 100 0 0 10 0\n",
+        );
+        let legacy = adb::parse_listening_ports(RAW);
+        let agent = map_agent_listening_ports(&[
+            listening(11500, "127.0.0.1", SocketFamily::Ipv4, "listen"),
+            listening(11500, "127.0.0.1", SocketFamily::Ipv4, "listen"), // 重复行必须合并
+            listening(8080, "0.0.0.0", SocketFamily::Ipv4, "listen"),
+            listening(8080, "10.180.101.177", SocketFamily::Ipv4, "established"),
+            listening(8081, "::", SocketFamily::Ipv6, "listen"),
+        ]);
+        assert_eq!(
+            agent, legacy,
+            "Agent 映射结果必须与 Legacy 解析器完全同形同序"
+        );
+        // 排序是「端口→族→地址」，与 Legacy 一致：8080/8081(tcp6)/11500
+        assert_eq!(agent.len(), 3);
+        assert_eq!((agent[0].port, agent[0].family), (8080, "tcp"));
+        assert_eq!((agent[1].port, agent[1].family), (8081, "tcp6"));
+        assert_eq!(
+            (agent[2].port, agent[2].address.as_str()),
+            (11500, "127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn agent_port_holders_drop_unknown_owner_and_sort_by_pid() {
+        let holder = |pid: u32, comm: Option<&str>| PortHoldingProcess {
+            pid,
+            uid: 0,
+            family: SocketFamily::Ipv4,
+            address: "127.0.0.1".into(),
+            state: "listen".into(),
+            inode: 7,
+            comm: comm.map(str::to_string),
+        };
+        let result = ProcessByPortResult {
+            port: 24567,
+            sockets: vec![
+                holder(300, Some("toybox")),
+                holder(12, None),
+                holder(300, Some("x")),
+            ],
+            unowned: vec![holder(0, None)],
+            truncated: false,
+            skipped: vec![],
+        };
+        let holders = map_agent_port_holders(&result);
+        assert_eq!(
+            holders,
+            vec![
+                adb::PortHolder {
+                    pid: 12,
+                    name: "?".into()
+                },
+                adb::PortHolder {
+                    pid: 300,
+                    name: "toybox".into()
+                },
+            ],
+            "pid=0（属主未知）不得编成假进程，重复 pid 要去重，comm 缺失回退 ?"
+        );
     }
 
     #[tokio::test]

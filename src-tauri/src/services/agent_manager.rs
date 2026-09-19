@@ -1175,6 +1175,206 @@ mod tests {
         );
     }
 
+    /// AR6.2 真机腿：Agent 端口互查与 Legacy shell 路径必须给出同一结论。
+    ///
+    /// 用 `toybox nc` 起一个 shell 自己属主的监听端口，这样两条路径都以 shell 身份
+    /// 观察（Agent 也是 shell 启动的），比较的是解析能力而不是权限差异；
+    /// 另取一个 root 属主监听端口验证「读不到属主」被如实报成 `unowned`+`skipped`。
+    #[tokio::test]
+    #[ignore = "需要真机；AR6_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_process_ports_match_legacy -- --ignored --nocapture"]
+    async fn real_agent_process_ports_match_legacy() {
+        use agent_protocol::method::{PROCESS_BY_PORT, PROCESS_PORTS};
+        use agent_protocol::{
+            ProcessByPortParams, ProcessByPortResult, ProcessPortsParams, ProcessPortsResult,
+            SocketFamily,
+        };
+
+        const PROBE_PORT: u16 = 24567;
+
+        async fn adb_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        let serial = std::env::var("AR6_TEST_SERIAL").expect("AR6_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        let status = manager.connect_resolved(&serial).await.unwrap();
+        for method in [PROCESS_PORTS, PROCESS_BY_PORT] {
+            assert!(
+                status
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.method == method && capability.available),
+                "Agent 未发布 {method} capability"
+            );
+        }
+        let client = manager.client(&serial).unwrap();
+
+        // ① shell 自属监听端口：Agent 与 Legacy 都应查到同一个 pid
+        let started = adb_shell(
+            &serial,
+            &format!("nohup toybox nc -4 -L -s 127.0.0.1 -p {PROBE_PORT} </dev/null >/dev/null 2>&1 & echo ok"),
+        )
+        .await;
+        assert!(started.contains("ok"), "未能拉起监听进程: {started}");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let params = ProcessByPortParams { port: PROBE_PORT };
+        let agent_by_port = client
+            .request::<_, ProcessByPortResult>(PROCESS_BY_PORT, &params, Duration::from_secs(20))
+            .await
+            .unwrap();
+        let environment = runner.environment().await;
+        let adb_path = environment.path.unwrap();
+        let legacy_holders = {
+            let grep = runner
+                .run(
+                    &adb_path,
+                    &adb::build_args(
+                        Some(&serial),
+                        &adb::cmd_shell(&adb::port_grep_cmd(PROBE_PORT)),
+                    ),
+                    Duration::from_secs(20),
+                )
+                .await
+                .unwrap();
+            let inodes: std::collections::HashSet<u64> = adb::parse_proc_net_entries(&grep.stdout)
+                .into_iter()
+                .filter(|entry| {
+                    entry.listen && entry.listen_port.port == PROBE_PORT && entry.inode != 0
+                })
+                .map(|entry| entry.inode)
+                .collect();
+            assert!(!inodes.is_empty(), "Legacy 应先看到探测端口，否则对照无效");
+            let scan = runner
+                .run(
+                    &adb_path,
+                    &adb::build_args(Some(&serial), &adb::cmd_shell(&adb::inode_scan_cmd())),
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap();
+            let pids = adb::parse_fd_scan(&scan.stdout, &inodes);
+            assert!(!pids.is_empty(), "Legacy 应能定位探测进程，否则对照无效");
+            let names = runner
+                .run(
+                    &adb_path,
+                    &adb::build_args(Some(&serial), &adb::cmd_shell(&adb::comm_batch_cmd(&pids))),
+                    Duration::from_secs(20),
+                )
+                .await
+                .unwrap();
+            adb::parse_port_holders(&names.stdout)
+        };
+        let agent_pids: std::collections::HashSet<u32> = agent_by_port
+            .sockets
+            .iter()
+            .map(|socket| socket.pid)
+            .collect();
+        let legacy_pids: std::collections::HashSet<u32> =
+            legacy_holders.iter().map(|holder| holder.pid).collect();
+        eprintln!(
+            "[process.by_port] agent={agent_pids:?} legacy={legacy_pids:?} unowned={} skipped={:?}",
+            agent_by_port.unowned.len(),
+            agent_by_port.skipped
+        );
+        assert_eq!(
+            agent_pids, legacy_pids,
+            "Agent 与 Legacy 的属主集合必须一致（探测进程都是 shell 自属，不涉及权限差异）"
+        );
+
+        // ② 反方向：同一个 pid 的监听端口集合也要逐项一致（含地址/族/去重/排序）
+        let pid = *agent_pids.iter().next().expect("已有属主 pid");
+        let params = ProcessPortsParams { pid };
+        let agent_ports = client
+            .request::<_, ProcessPortsResult>(PROCESS_PORTS, &params, Duration::from_secs(20))
+            .await
+            .unwrap();
+        let mapped = crate::services::device_service::map_agent_listening_ports(&agent_ports.ports);
+        let raw = adb_shell(&serial, &adb::hosted_ports_cmd(pid)).await;
+        let legacy_ports = adb::parse_listening_ports(&raw);
+        eprintln!(
+            "[process.ports] pid={pid} comm={:?} agent={} legacy={} cmdline={:?}",
+            agent_ports.comm,
+            mapped.len(),
+            legacy_ports.len(),
+            agent_ports.cmdline
+        );
+        assert_eq!(
+            mapped, legacy_ports,
+            "Agent process.ports 映射后必须与 Legacy 解析逐项相同"
+        );
+        assert!(
+            mapped.iter().any(|entry| entry.port == PROBE_PORT
+                && entry.address == "127.0.0.1"
+                && entry.family == "tcp"),
+            "探测端口应出现在 PID→端口结果里"
+        );
+        assert!(
+            agent_ports
+                .ports
+                .iter()
+                .any(|entry| entry.family == SocketFamily::Ipv4 && entry.state == "listen"),
+            "Agent 侧应保留 address family 与状态原值"
+        );
+
+        // ③ root 属主端口（Zygisk 模块桥 11500/11501）：shell 读不到别人的 fd，
+        //    必须报 unowned + skipped，而不是「没有进程监听」
+        let root_probe = adb_shell(&serial, "grep -E ' 0A ' /proc/net/tcp | head -20").await;
+        let root_port = adb::parse_proc_net_entries(
+            &root_probe
+                .lines()
+                .map(|line| format!("tcp:{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .into_iter()
+        .find(|entry| entry.listen && entry.uid == 0 && entry.inode != 0)
+        .map(|entry| entry.listen_port.port);
+        if let Some(port) = root_port {
+            let params = ProcessByPortParams { port };
+            let result = client
+                .request::<_, ProcessByPortResult>(
+                    PROCESS_BY_PORT,
+                    &params,
+                    Duration::from_secs(20),
+                )
+                .await
+                .unwrap();
+            eprintln!(
+                "[process.by_port root] port={} sockets={} unowned={} skipped={:?}",
+                port,
+                result.sockets.len(),
+                result.unowned.len(),
+                result.skipped
+            );
+            assert!(
+                !result.sockets.is_empty() || !result.unowned.is_empty(),
+                "root 属主端口 {port} 至少应报出 socket，不得当成「无监听」"
+            );
+            assert!(
+                result.unowned.iter().all(|socket| socket.pid == 0),
+                "属主未知的 socket 必须以 pid=0 + unowned 表达"
+            );
+        }
+
+        adb_shell(
+            &serial,
+            &format!("pkill -f 'nc -4 -L -s 127.0.0.1 -p {PROBE_PORT}'"),
+        )
+        .await;
+        manager.disconnect(&serial).await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "需要真机；AR4_TEST_SERIAL=<serial> cargo test real_device_info_matches_legacy_and_reports_latency -- --ignored --nocapture"]
     async fn real_device_info_matches_legacy_and_reports_latency() {
