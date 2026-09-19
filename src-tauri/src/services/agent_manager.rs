@@ -1363,6 +1363,236 @@ mod tests {
         manager.disconnect(&serial).await.unwrap();
     }
 
+    /// AR7.3 真机腿：按句柄停止必须先核身份（PID 易主时拒止且不动手），
+    /// 停止结果要能区分「已确认消失」与「发了信号但没确认到」，
+    /// 端口方向则复用 AR6.2 的 `process.ports`（不再有 `ls -l` fd + grep 那条链）。
+    #[tokio::test]
+    #[ignore = "需要真机；AR7_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_hosted_stop -- --ignored --nocapture"]
+    async fn real_agent_hosted_stop_verifies_identity_and_reuses_process_ports() {
+        use agent_protocol::method::{HOSTED_LIST, HOSTED_START, HOSTED_STOP, PROCESS_PORTS};
+        use agent_protocol::{
+            HostedListResult, HostedRunState, HostedStartParams, HostedStartResult,
+            HostedStopParams, HostedStopResult, KillOutcome, KillSignal, ProcessPortsParams,
+            ProcessPortsResult,
+        };
+
+        const PROBE: &str = "toybox";
+        const PROBE_PORT: u16 = 24574;
+
+        async fn adb_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        let serial = std::env::var("AR7_TEST_SERIAL").expect("AR7_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        let status = manager.connect_resolved(&serial).await.unwrap();
+        assert!(
+            status
+                .capabilities
+                .iter()
+                .any(|capability| capability.method == HOSTED_STOP && capability.available),
+            "Agent 未发布 hosted.stop"
+        );
+        let client = manager.client(&serial).unwrap();
+
+        assert!(
+            !adb_shell(&serial, "ls /data/local/tmp/toybox")
+                .await
+                .contains(PROBE),
+            "设备上已有 /data/local/tmp/{PROBE}，测试不覆盖用户文件"
+        );
+        let copied = adb_shell(
+            &serial,
+            &format!("cp /system/bin/{PROBE} /data/local/tmp/{PROBE} && chmod 755 /data/local/tmp/{PROBE} && echo copied"),
+        )
+        .await;
+        assert!(copied.contains("copied"), "探针准备失败: {copied}");
+
+        let started: HostedStartResult = client
+            .request(
+                HOSTED_START,
+                &HostedStartParams {
+                    name: PROBE.into(),
+                    args: vec![
+                        "nc".into(),
+                        "-4".into(),
+                        "-L".into(),
+                        "-s".into(),
+                        "127.0.0.1".into(),
+                        "-p".into(),
+                        PROBE_PORT.to_string(),
+                    ],
+                    root: false,
+                },
+                Duration::from_secs(15),
+            )
+            .await
+            .unwrap();
+        let handle = started.record.handle.clone();
+        let pid = started.record.pid;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            adb_shell(&serial, "netstat -tln 2>/dev/null")
+                .await
+                .contains(&format!(":{PROBE_PORT}")),
+            "托管进程应在监听"
+        );
+
+        // ① 端口方向复用 AR6.2：按 pid 能查到它自己的监听端口
+        let ports: ProcessPortsResult = client
+            .request(
+                PROCESS_PORTS,
+                &ProcessPortsParams { pid },
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+        eprintln!(
+            "[hosted.ports] pid={} comm={:?} ports={:?}",
+            pid,
+            ports.comm,
+            ports.ports.iter().map(|p| p.port).collect::<Vec<_>>()
+        );
+        assert_eq!(ports.comm.as_deref(), Some(PROBE));
+        assert!(
+            ports
+                .ports
+                .iter()
+                .any(|port| port.port == PROBE_PORT && port.state == "listen"),
+            "托管进程端口应能从 process.ports 查到"
+        );
+
+        // ② 过期视图：expected_pid 与记录不符 → 拒止，且进程必须还活着
+        let stale = client
+            .request::<_, HostedStopResult>(
+                HOSTED_STOP,
+                &HostedStopParams {
+                    handle: handle.clone(),
+                    expected_pid: Some(pid + 1),
+                    signal: KillSignal::Kill,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect_err("PID 与调用方看到的不符时必须拒止");
+        let code = match &stale {
+            crate::services::agent_client::AgentClientError::Remote(error) => error
+                .details
+                .as_ref()
+                .and_then(|v| v["reason"].as_str().map(str::to_string)),
+            _ => None,
+        };
+        assert_eq!(code.as_deref(), Some("pid_mismatch"));
+        assert!(
+            adb_shell(&serial, &format!("kill -0 {pid} 2>/dev/null && echo alive"))
+                .await
+                .contains("alive"),
+            "拒止后进程必须还活着"
+        );
+
+        // ③ 正常停止：核过身份 + 确认消失 + 记录出表
+        let stopped: HostedStopResult = client
+            .request(
+                HOSTED_STOP,
+                &HostedStopParams {
+                    handle: handle.clone(),
+                    expected_pid: Some(pid),
+                    signal: KillSignal::Kill,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        eprintln!(
+            "[hosted.stop] outcome={:?} verified={} dropped={} state={:?} exit_code={:?} detail={:?}",
+            stopped.outcome,
+            stopped.identity_verified,
+            stopped.record_dropped,
+            stopped.record.state,
+            stopped.record.exit_code,
+            stopped.record.detail
+        );
+        assert_eq!(stopped.outcome, KillOutcome::Signaled);
+        assert!(stopped.identity_verified, "start time 一致时必须报核过身份");
+        assert!(
+            stopped.record_dropped,
+            "确认后应删除持久化记录，别在重启里复活"
+        );
+        assert_eq!(stopped.record.state, HostedRunState::Exited);
+        assert_eq!(
+            stopped.record.detail.as_deref(),
+            Some("exited_signal_9"),
+            "被 SIGKILL 的进程只能报信号，不得编退出码"
+        );
+        assert!(stopped.record.exit_code.is_none());
+        assert!(
+            !adb_shell(&serial, &format!("kill -0 {pid} 2>/dev/null && echo alive"))
+                .await
+                .contains("alive"),
+            "设备上进程确实已退出"
+        );
+        let listing = adb_shell(
+            &serial,
+            &format!("ls /data/local/tmp/app-reverse-tools-hosted/{handle}.json 2>&1"),
+        )
+        .await;
+        assert!(
+            listing.contains("No such file"),
+            "持久化记录应已删除: {listing}"
+        );
+        assert!(
+            !adb_shell(&serial, "netstat -tln 2>/dev/null")
+                .await
+                .contains(&format!(":{PROBE_PORT}")),
+            "端口应随进程释放"
+        );
+
+        // ④ 幂等：再停一次不报错（记录已在内存里标 exited，进程不在 → already_gone）
+        let again: HostedStopResult = client
+            .request(
+                HOSTED_STOP,
+                &HostedStopParams {
+                    handle: handle.clone(),
+                    expected_pid: None,
+                    signal: KillSignal::Term,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("重复停止应是幂等成功");
+        assert_eq!(again.outcome, KillOutcome::AlreadyGone);
+
+        // ⑤ list 的运行表里该记录不该再是 running
+        let listed: HostedListResult = client
+            .request(HOSTED_LIST, &serde_json::json!({}), Duration::from_secs(20))
+            .await
+            .unwrap();
+        assert!(
+            !listed
+                .runs
+                .iter()
+                .any(|run| run.handle == handle && run.state == HostedRunState::Running),
+            "已停止的句柄不该仍标 running"
+        );
+
+        adb_shell(
+            &serial,
+            &format!("rm -f /data/local/tmp/{PROBE} /data/local/tmp/.{PROBE}.run.log"),
+        )
+        .await;
+        manager.disconnect(&serial).await.unwrap();
+    }
+
     /// AR7.2 真机腿：托管生命周期交给 Agent 之后，Legacy 的 `ls -l` + `file` + `$!`
     /// 反查必须全部能被替代，而且要能拿到 Legacy 拿不到的东西（稳定句柄、
     /// pid+start time 身份、被自己回收的子进程的真实死因）。

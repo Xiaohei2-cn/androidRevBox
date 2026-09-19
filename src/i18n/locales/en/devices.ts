@@ -96,6 +96,7 @@ export default {
   "adb.binary.starting": "Starting…",
   "adb.binary.kill": "Kill",
   "adb.binary.killed": "Killed pid {pid}",
+  "adb.binary.stopUnverified": "Signal sent to {name}, but the device could not verify the process identity: {detail}",
   "adb.binary.noteLabel": "Note for {name}",
   "adb.binary.notePlaceholder": "Note (purpose / launch args, auto-saved)",
   "adb.binary.noteQuick": "Quick note",

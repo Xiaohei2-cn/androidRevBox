@@ -92,6 +92,17 @@ export interface HostedRunRecord {
   detail?: string | null;
 }
 
+/** 按句柄停止托管进程的结果（AR7.3） */
+export interface HostedStopResult {
+  record: HostedRunRecord;
+  /** signaled=已发信号；already_gone=目标本来就不在（幂等成功） */
+  outcome: "signaled" | "already_gone";
+  /** 已用落盘的 start time 核对过：确认杀的就是当初启动的那个进程 */
+  identityVerified: boolean;
+  /** 持久化记录是否已删除（停止成功后不再进重启对账表） */
+  recordDropped: boolean;
+}
+
 export type PreviewEncoding = "utf8" | "hex";
 
 export interface FilePreviewResult {
@@ -236,6 +247,21 @@ export const deviceApi = {
   /** 托管运行表（AR7.2，Agent only）：真实运行状态与稳定句柄 */
   hostedRuns(serial: string): Promise<HostedRunRecord[]> {
     return invokeCommand<HostedRunRecord[]>("device_hosted_runs", { serial });
+  },
+  /**
+   * 按句柄停止托管进程（AR7.3 写操作）。Agent 发信号前会用落盘的 start time 复核身份，
+   * `expectedPid` 与记录不符说明列表已过期，会被 precondition_failed 拒止而不是照数字杀。
+   */
+  hostedStop(
+    serial: string,
+    handle: string,
+    expectedPid?: number,
+  ): Promise<HostedStopResult> {
+    return invokeCommand<HostedStopResult>("device_hosted_stop", {
+      serial,
+      handle,
+      expectedPid: expectedPid ?? null,
+    });
   },
   /**
    * 终止进程（AR6.3 写操作）。默认走 Agent process.kill：设备端发信号前会重读

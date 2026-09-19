@@ -2,7 +2,9 @@
 //! 短查询直接返回结果；长操作（shell/install/logcat/push/pull）一律返回
 //! task_id，输出走 task://* 事件流（PHASES §1.3 不阻塞 IPC）。
 
-use agent_protocol::{FilesystemPreviewResult, FilesystemStatResult, HostedRunRecord};
+use agent_protocol::{
+    FilesystemPreviewResult, FilesystemStatResult, HostedRunRecord, HostedStopResult,
+};
 use serde::Deserialize;
 
 use crate::AppState;
@@ -220,6 +222,22 @@ pub async fn device_hosted_runs(
     serial: String,
 ) -> CoreResult<Vec<HostedRunRecord>> {
     state.device.hosted_runs(&serial).await
+}
+
+/// 按句柄停止托管进程（AR7.3 写操作，Agent only）。
+/// Agent 发信号前会用落盘的 start time 复核身份；`expectedPid` 与记录不符
+/// 说明列表已过期，会被 precondition_failed 拒止而不是照数字杀。
+#[tauri::command]
+pub async fn device_hosted_stop(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    handle: String,
+    expected_pid: Option<u32>,
+) -> CoreResult<HostedStopResult> {
+    state
+        .device
+        .hosted_stop(&serial, &handle, expected_pid)
+        .await
 }
 
 /// 单路径元数据（AR7.1，Agent only）：type/mode/uid/gid/size/mtime/link target 结构化返回。

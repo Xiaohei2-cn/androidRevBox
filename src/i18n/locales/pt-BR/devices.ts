@@ -96,6 +96,7 @@ export default {
   "adb.binary.starting": "Iniciando…",
   "adb.binary.kill": "Encerrar",
   "adb.binary.killed": "pid {pid} encerrado",
+  "adb.binary.stopUnverified": "Sinal enviado para {name}, mas a identidade do processo não pôde ser verificada: {detail}",
   "adb.binary.noteLabel": "Nota para {name}",
   "adb.binary.notePlaceholder": "Nota (uso/parâmetros de execução, salvamento automático)",
   "adb.binary.noteQuick": "Nota rápida",

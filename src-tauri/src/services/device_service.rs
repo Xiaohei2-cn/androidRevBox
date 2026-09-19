@@ -13,16 +13,18 @@ use std::time::Duration;
 
 use agent_protocol::method::{
     DEVICE_INFO, FILESYSTEM_LIST, FILESYSTEM_PREVIEW, FILESYSTEM_STAT, HOSTED_CHMOD, HOSTED_LIST,
-    HOSTED_START, HOSTED_STATUS, PACKAGE_LIST, PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
+    HOSTED_START, HOSTED_STATUS, HOSTED_STOP, PACKAGE_LIST, PROCESS_BY_PORT, PROCESS_KILL,
+    PROCESS_PORTS,
 };
 use agent_protocol::{
     DeviceInfoParams, DeviceInfoResult, FileKind, FilesystemListParams, FilesystemListResult,
     FilesystemPreviewParams, FilesystemPreviewResult, FilesystemStatParams, FilesystemStatResult,
     HostedBinaryInfo, HostedChmodParams, HostedChmodResult, HostedListParams, HostedListResult,
     HostedRunRecord, HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams,
-    HostedStatusResult, KillSignal, ListeningPort, PackageListParams, PackageListResult,
-    PackageScope, PortHoldingProcess, PreviewEncoding, ProcessByPortParams, ProcessByPortResult,
-    ProcessKillParams, ProcessKillResult, ProcessPortsParams, ProcessPortsResult, SocketFamily,
+    HostedStatusResult, HostedStopParams, HostedStopResult, KillSignal, ListeningPort,
+    PackageListParams, PackageListResult, PackageScope, PortHoldingProcess, PreviewEncoding,
+    ProcessByPortParams, ProcessByPortResult, ProcessKillParams, ProcessKillResult,
+    ProcessPortsParams, ProcessPortsResult, SocketFamily,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -1012,7 +1014,13 @@ impl DeviceService {
                     .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error))),
                 Err(error) => Err(error),
             };
-            audit_hosted_write(serial, HOSTED_CHMOD, name, "agent", &result);
+            audit_hosted_write(
+                serial,
+                HOSTED_CHMOD,
+                name,
+                "agent",
+                &to_audit_summary(&result, |value| format!("mode={:o}", value.mode)),
+            );
             return result.map(|_| ());
         }
         let cmd = Self::hosted_shell(name, "chmod +x")?;
@@ -1055,7 +1063,18 @@ impl DeviceService {
                 .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error))),
             Err(error) => Err(error),
         };
-        audit_hosted_write(serial, HOSTED_START, name, "agent", &started);
+        audit_hosted_write(
+            serial,
+            HOSTED_START,
+            name,
+            "agent",
+            &to_audit_summary(&started, |value| {
+                format!(
+                    "handle={} pid={} log={}",
+                    value.record.handle, value.record.pid, value.record.log_path
+                )
+            }),
+        );
         let record = started.map(|value| value.record)?;
         // 原实现的 300 ms 复查窗口保留：秒退的真因基本都落在启动日志里
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1087,6 +1106,46 @@ impl DeviceService {
             )));
         }
         Ok(status.record.pid)
+    }
+
+    /// 按句柄停止托管进程（AR7.3，写操作）。
+    ///
+    /// 只走 Agent：句柄、start time 与「是不是我启动的子进程」都只有 Agent 知道，
+    /// Legacy 的 `kill -9 <pid>` 给不出这些保证，所以既不回退也不假装等价（同 D028）。
+    /// `root=true` 启动的托管进程没有句柄可寻（Agent 无 root 通道），那条路径继续用
+    /// `device_binary_kill(root=true)`。
+    ///
+    /// `expected_pid` 是界面当前显示的 PID：与记录不符说明列表已过期（PID 可能易主），
+    /// Agent 以 `precondition_failed` 拒止而不是按数字杀；目标已消失时是幂等成功。
+    pub async fn hosted_stop(
+        &self,
+        serial: &str,
+        handle: &str,
+        expected_pid: Option<u32>,
+    ) -> CoreResult<HostedStopResult> {
+        let params = HostedStopParams {
+            handle: handle.to_owned(),
+            expected_pid,
+            signal: KillSignal::Kill,
+        };
+        let result: CoreResult<HostedStopResult> =
+            match self.require_agent_write_route(serial, HOSTED_STOP) {
+                Ok(()) => self
+                    .android
+                    .agent()
+                    .request::<_, HostedStopResult>(serial, HOSTED_STOP, &params, SHORT_CMD_TIMEOUT)
+                    .await
+                    .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error))),
+                Err(error) => Err(error),
+            };
+        let summary = to_audit_summary(&result, |value| {
+            format!(
+                "pid={} outcome={:?} verified={} dropped={}",
+                value.record.pid, value.outcome, value.identity_verified, value.record_dropped
+            )
+        });
+        audit_hosted_write(serial, HOSTED_STOP, handle, "agent", &summary);
+        result
     }
 
     /// 单条托管运行状态（Agent only）。
@@ -1319,11 +1378,25 @@ impl DeviceService {
         self.process_kill(serial, pid, None, root).await
     }
 
-    /// 查托管进程监听端口：
-    /// `for i in $(ls -l /proc/<pid>/fd | sed -n ...socket...); do grep "$i" /proc/net/tcp /proc/net/tcp6; done`
-    /// （用户指定命令；root 启动的进程同身份查询）。输出经 parse_listening_ports
-    /// 还原十六进制端口/IP，只返回 LISTEN 态、去重升序。
+    /// 查托管进程监听端口。AR7.3：直接复用 AR6.2 的 Agent `process.ports`
+    /// （fd→inode 与 `/proc/net` 匹配都在设备端），Legacy 的那串 `ls -l` + grep
+    /// 只在 `root=true` 时保留（Agent 是 shell 身份，读不到 root 进程的 fd 目录）。
     pub async fn hosted_ports(
+        &self,
+        serial: &str,
+        pid: u32,
+        root: bool,
+    ) -> CoreResult<Vec<adb::ListenPort>> {
+        if !root {
+            return self.process_ports(serial, pid, false).await;
+        }
+        self.hosted_ports_legacy(serial, pid, true).await
+    }
+
+    /// Legacy 的 fd+grep 原始链路（只服务 `root=true` 与 AR6.2 的回退腿）。
+    /// 必须与 `process_ports` 分开：两者互相调用会形成 async 递归（需装箱），
+    /// 而且读起来像「有两条等价实现」，实际只有一条。
+    async fn hosted_ports_legacy(
         &self,
         serial: &str,
         pid: u32,
@@ -1423,7 +1496,7 @@ impl DeviceService {
         pid: u32,
         root: bool,
     ) -> CoreResult<Vec<adb::ListenPort>> {
-        self.hosted_ports(serial, pid, root).await
+        self.hosted_ports_legacy(serial, pid, root).await
     }
 
     /// 端口→PID 反查。AR6.2 起默认走 Agent `process.by_port`：读 `/proc/net/*`
@@ -1899,29 +1972,43 @@ fn log_package_list_shadow_diff(serial: &str, agent: &[String], legacy: &[String
     }
 }
 
+/// 写操作结果转审计字符串：成功时带上调用方最关心的证据，失败时保留结构化错误文本。
+fn to_audit_summary<T, F>(
+    result: &CoreResult<T>,
+    describe: F,
+) -> std::result::Result<String, String>
+where
+    F: FnOnce(&T) -> String,
+{
+    result
+        .as_ref()
+        .map(describe)
+        .map_err(|error| error.to_string())
+}
+
 /// §3.7 托管写操作（chmod/start）审计：字段化、成功失败都记，不含命令正文与令牌。
-fn audit_hosted_write<T>(
+fn audit_hosted_write(
     serial: &str,
     method: &str,
-    name: &str,
+    subject: &str,
     backend: &str,
-    outcome: &CoreResult<T>,
+    outcome: &std::result::Result<String, String>,
 ) {
-    match outcome {
-        Ok(_) => tracing::info!(
+    match outcome.as_ref() {
+        Ok(summary) => tracing::info!(
             target: "audit",
             serial,
             method,
-            name,
+            subject,
             backend,
-            outcome = "ok",
+            outcome = %summary,
             "托管写操作已执行"
         ),
         Err(reason) => tracing::warn!(
             target: "audit",
             serial,
             method,
-            name,
+            subject,
             backend,
             error = %reason,
             "托管写操作失败"

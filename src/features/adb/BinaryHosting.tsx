@@ -14,18 +14,24 @@ import { cn } from "@/lib/utils";
 
 /**
  * 二进制托管（ADB 页子标签）：管理 /data/local/tmp 下的 ELF 文件。
- * - 上区：file 判 ELF 后列出——绿色 = 有执行权限（双击加入下区托管），
- *   红色 = 无执行权限（「赋予权限」按钮走 chmod +x）；
- * - 下区：托管清单——「执行」后台启动（cd 目录 + nohup ./name）并回显 pid，
- *   同时拉取该 pid 的 LISTEN 端口（/proc/<pid>/fd → /proc/net/tcp(6)），
- *   pid 与端口 chip 单击复制；有 pid 时「终止」按钮走 kill -9；可移除托管行。
- * - Root 开关：勾选时先 `su -c id` 探测，可用才开——chmod/启动/存活复查/
- *   kill/日志读取整链路走 su -c（root 进程 shell 用户连 kill -0 都会 EPERM）。
+ * - 上区：Agent `hosted.list` 列出托管目录里的 ELF（文件头 magic 判定，不依赖设备端
+ *   `file` 命令）——绿色 = 有执行权限（双击加入下区托管），红色 = 无执行权限
+ *   （「赋予权限」走 Agent `hosted.chmod`，只补执行位且幂等）；
+ * - 下区：托管清单——「执行」走 Agent `hosted.start`（参数数组 exec，不进 shell），
+ *   回显 pid 并给出稳定句柄；行状态由设备端运行表（`hosted.list` 的 runs，5s 轮询）
+ *   校正，Desktop 重启或刷新后不丢；端口 chip 复用 Agent `process.ports`；
+ * - 「终止」优先走 Agent `hosted.stop`（发信号前用落盘的 start time 复核身份，
+ *   PID 易主时拒止而不是照数字杀，并回收自己启动的子进程拿到真实死因）；
+ *   没有句柄时退回按 PID + 进程名的 `process.kill`。
+ * - Root 开关：勾选时先 `su -c id` 探测，可用才开——chmod/启动/终止/日志读取整链路
+ *   仍走 Legacy `su -c`（Agent 以 shell 身份运行，root 属主进程它碰不到）。
  * 所有 adb 调用后端 -s 绑定设备。
  */
 
 interface HostedRow {
   name: string;
+  /** Agent 运行表里的稳定句柄；有它才能按 handle + start time 停止（AR7.3） */
+  handle: string | null;
   pid: number | null;
   running: boolean;
   error: string | null;
@@ -119,7 +125,13 @@ export function BinaryHosting() {
           .sort((a, b) => b.startedAtUnix - a.startedAtUnix);
         const live = mine.find((r) => r.state === "running");
         if (live) {
-          return { ...row, pid: live.pid, running: true, root: live.root };
+          return {
+            ...row,
+            handle: live.handle,
+            pid: live.pid,
+            running: true,
+            root: live.root,
+          };
         }
         const last = mine[0];
         if (last && last.state === "exited" && row.running) {
@@ -132,6 +144,7 @@ export function BinaryHosting() {
         if (run.state !== "running" || known.has(run.name)) continue;
         next.push({
           name: run.name,
+          handle: run.handle,
           pid: run.pid,
           running: true,
           error: null,
@@ -158,6 +171,7 @@ export function BinaryHosting() {
             ...hs,
             {
               name: b.name,
+              handle: null,
               pid: null,
               running: false,
               error: null,
@@ -236,12 +250,39 @@ export function BinaryHosting() {
     }
   };
 
+  /**
+   * 终止托管进程。有句柄（AR7.3）时优先 `hosted.stop`：Agent 会用落盘的 start time
+   * 复核身份，PID 易主时拒止而不是照数字杀，也会顺手回收自己启动的子进程拿到死因。
+   * 没有句柄（Legacy/root 启动的进程、Agent 未连接）时退回按 PID + 进程名终止。
+   */
   const kill = async (row: HostedRow) => {
     if (!deviceSerial || row.pid === null) return;
     patchRow(row.name, { running: true, error: null });
     try {
-      await deviceApi.binaryKill(deviceSerial, row.pid, row.root, row.name);
+      if (row.handle && !row.root) {
+        const stopped = await deviceApi.hostedStop(
+          deviceSerial,
+          row.handle,
+          row.pid ?? undefined,
+        );
+        // 核过身份才算「确认杀的就是它」；未核过时把详情显示出来，不静默当成成功
+        if (!stopped.identityVerified && stopped.outcome === "signaled") {
+          patchRow(row.name, {
+            pid: null,
+            running: false,
+            ports: [],
+            error: t("adb.binary.stopUnverified", {
+            name: row.name,
+            detail: stopped.record.detail ?? "-",
+          }),
+          });
+          return;
+        }
+      } else {
+        await deviceApi.binaryKill(deviceSerial, row.pid, row.root, row.name);
+      }
       patchRow(row.name, {
+        handle: null,
         pid: null,
         running: false,
         ports: [],

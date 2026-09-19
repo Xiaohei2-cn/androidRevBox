@@ -96,6 +96,7 @@ export default {
   "adb.binary.starting": "Запуск…",
   "adb.binary.kill": "Остановить",
   "adb.binary.killed": "pid {pid} остановлен",
+  "adb.binary.stopUnverified": "Сигнал отправлен {name}, но подтвердить идентичность процесса не удалось: {detail}",
   "adb.binary.noteLabel": "Заметка для {name}",
   "adb.binary.notePlaceholder": "Заметка (назначение/параметры, автосохранение)",
   "adb.binary.noteQuick": "Быстрая заметка",

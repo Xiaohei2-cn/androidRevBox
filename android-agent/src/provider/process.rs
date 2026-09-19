@@ -389,14 +389,14 @@ fn guard_identity(
     })))
 }
 
-enum SignalResult {
+pub(crate) enum SignalResult {
     Sent,
     Gone,
     Denied,
     Failed(i32),
 }
 
-fn send_signal(pid: u32, signal: KillSignal) -> SignalResult {
+pub(crate) fn send_signal(pid: u32, signal: KillSignal) -> SignalResult {
     let raw = pid.try_into().map_err(|_| ()).unwrap_or(0_i32);
     if raw <= 0 {
         return SignalResult::Failed(libc::EINVAL);
@@ -414,7 +414,7 @@ fn send_signal(pid: u32, signal: KillSignal) -> SignalResult {
 }
 
 /// 有界确认：`/proc/<pid>` 消失或只剩僵尸态（父进程未收割）算确认死亡。
-async fn confirm_dead(pid: u32) -> bool {
+pub(crate) async fn confirm_dead(pid: u32) -> bool {
     let started = std::time::Instant::now();
     loop {
         if !std::path::Path::new(&format!("{PROC}/{pid}")).exists() {

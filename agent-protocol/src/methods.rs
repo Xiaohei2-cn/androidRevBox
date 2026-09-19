@@ -20,6 +20,7 @@ pub mod method {
     pub const HOSTED_CHMOD: &str = "hosted.chmod";
     pub const HOSTED_START: &str = "hosted.start";
     pub const HOSTED_STATUS: &str = "hosted.status";
+    pub const HOSTED_STOP: &str = "hosted.stop";
     pub const PACKAGE_EXPORT_APK: &str = "package.export_apk";
     pub const PACKAGE_EXPORT_CLEAN: &str = "package.export_clean";
     pub const ZYGISK_STATUS: &str = "zygisk.status";
@@ -569,6 +570,28 @@ pub struct HostedStartResult {
     pub record: HostedRunRecord,
 }
 
+/// AR7.3：停止托管进程。用 `handle` 而不是裸 PID 寻址，并在发信号前用落盘的
+/// start time 再核一次身份——PID 复用窗口里，按数字杀进程可能杀到别人。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HostedStopParams {
+    pub handle: String,
+    /// 调用方看到的 PID：与记录不一致说明中间发生过复用，直接拒止
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_pid: Option<u32>,
+    #[serde(default)]
+    pub signal: KillSignal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedStopResult {
+    pub record: HostedRunRecord,
+    pub outcome: KillOutcome,
+    /// 已核对过 `/proc` 的 start time（true 表示「确认杀的就是当初启动的那个进程」）
+    pub identity_verified: bool,
+    /// 记录文件是否已从磁盘删除（停止成功后不再占用重启对账表）
+    pub record_dropped: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct HostedStatusParams {
     pub handle: String,
@@ -866,6 +889,38 @@ mod tests {
         assert_eq!(value["runs"][0]["exit_code"], json!(137));
         assert_eq!(value.get("truncated"), None);
         assert_eq!(value.get("unreadable"), None);
+    }
+
+    /// 写操作守卫字段名必须钉死：`expected_pid` 拼错不会报错，而是守卫静默失效，
+    /// 所以协议测试直接把 wire 形状锁住（Agent 侧也有一条对称断言）。
+    #[test]
+    fn hosted_stop_params_wire_shape_is_snake_case() {
+        let params: HostedStopParams = serde_json::from_value(json!({
+            "handle": "aabbccddeeff0011", "expected_pid": 4242, "signal": "kill"
+        }))
+        .unwrap();
+        assert_eq!(params.expected_pid, Some(4242));
+        assert_eq!(params.signal, KillSignal::Kill);
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["expected_pid"], json!(4242));
+        assert_eq!(value["signal"], "kill");
+        let minimal: HostedStopParams = serde_json::from_value(json!({ "handle": "aa" })).unwrap();
+        assert_eq!(minimal.expected_pid, None);
+        assert_eq!(minimal.signal, KillSignal::Term);
+        let camel: HostedStopParams =
+            serde_json::from_value(json!({ "handle": "aa", "expectedPid": 1 })).unwrap();
+        assert_eq!(camel.expected_pid, None, "驼峰写法不被识别：守卫会静默失效");
+
+        let result = HostedStopResult {
+            record: running_record(),
+            outcome: KillOutcome::Signaled,
+            identity_verified: true,
+            record_dropped: true,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["outcome"], "signaled");
+        assert_eq!(value["identity_verified"], json!(true));
+        assert_eq!(value["record_dropped"], json!(true));
     }
 
     fn running_record() -> HostedRunRecord {

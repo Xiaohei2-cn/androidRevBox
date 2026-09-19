@@ -96,6 +96,7 @@ export default {
   "adb.binary.starting": "起動中…",
   "adb.binary.kill": "終了",
   "adb.binary.killed": "pid {pid} を終了しました",
+  "adb.binary.stopUnverified": "{name} にシグナルを送りましたが、プロセス身元の検証に失敗しました：{detail}",
   "adb.binary.noteLabel": "{name} の備考",
   "adb.binary.notePlaceholder": "備考（用途・起動パラメータ等、自動保存）",
   "adb.binary.noteQuick": "クイック備考",

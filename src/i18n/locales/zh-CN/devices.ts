@@ -96,6 +96,7 @@ export default {
   "adb.binary.starting": "启动中…",
   "adb.binary.kill": "终止",
   "adb.binary.killed": "已终止 pid {pid}",
+  "adb.binary.stopUnverified": "{name} 已发信号，但设备端未能核对进程身份：{detail}",
   "adb.binary.noteLabel": "{name} 的备注",
   "adb.binary.notePlaceholder": "备注（用途/启动参数等，自动保存）",
   "adb.binary.noteQuick": "快捷备注",

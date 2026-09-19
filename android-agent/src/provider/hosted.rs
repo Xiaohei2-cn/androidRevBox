@@ -19,19 +19,26 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use agent_protocol::method::{HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS};
+use agent_protocol::method::{HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP};
 use agent_protocol::{
     AgentError, ErrorCode, FileKind, HostedBinaryInfo, HostedChmodParams, HostedChmodResult,
     HostedListParams, HostedListResult, HostedRunRecord, HostedRunState, HostedStartParams,
-    HostedStartResult, HostedStatusParams, HostedStatusResult, PERMISSION_BITS, ProviderHealth,
-    ProviderInfo, render_mode_text,
+    HostedStartResult, HostedStatusParams, HostedStatusResult, HostedStopParams, HostedStopResult,
+    KillOutcome, KillSignal, PERMISSION_BITS, ProviderHealth, ProviderInfo, render_mode_text,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::process::{SignalResult, send_signal};
 use super::{Provider, ProviderFuture, RequestContext};
 
-const HOSTED_METHODS: &[&str] = &[HOSTED_LIST, HOSTED_CHMOD, HOSTED_START, HOSTED_STATUS];
+const HOSTED_METHODS: &[&str] = &[
+    HOSTED_LIST,
+    HOSTED_CHMOD,
+    HOSTED_START,
+    HOSTED_STATUS,
+    HOSTED_STOP,
+];
 /// 托管目录固定路径（与 Desktop 的 `adb::HOSTED_DIR` 一致，用户指定的默认目录）。
 const HOSTED_DIR: &str = "/data/local/tmp";
 /// 运行记录落盘目录：Agent 重启后靠它对账，不靠内存表。
@@ -39,6 +46,8 @@ const STATE_DIR: &str = "/data/local/tmp/app-reverse-tools-hosted";
 const MAX_BINARIES: usize = 2_000;
 /// 记录文件保留上限（按 mtime 留最近这些），防止长期堆积。
 const MAX_RUN_RECORDS: usize = 200;
+/// 发信号后确认进程消失的有界等待：超时只说「未确认」，不谎报已停止。
+const STOP_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_500);
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
 pub struct HostedProvider {
@@ -128,6 +137,7 @@ impl Provider for HostedProvider {
                 HOSTED_CHMOD => self.chmod(params),
                 HOSTED_START => self.start(params),
                 HOSTED_STATUS => self.status(params),
+                HOSTED_STOP => self.stop(params),
                 _ => Err(AgentError::new(
                     ErrorCode::UnsupportedMethod,
                     format!("unsupported hosted method: {method}"),
@@ -317,6 +327,166 @@ impl HostedProvider {
             reconciled: source == RunSource::Reconciled,
             record,
         })
+    }
+
+    /// 停止托管进程（AR7.3，写操作）。
+    ///
+    /// 与 `process.kill` 的区别在寻址方式：这里按 `handle` 找记录，发信号前用落盘的
+    /// start time 复核身份。PID 复用窗口里（老进程已退、数字被别人拿走）判
+    /// `already_gone` + `pid_reused_*`，**绝不向新租户补一刀**；既不是自己持有的
+    /// 子进程、又核不出身份时直接拒止，而不是「先杀了看看」。自己启动且未回收的
+    /// 子进程可以放行：它还是僵尸时 PID 被内核保留，不存在复用问题。
+    /// 确认退出后删除持久化记录——状态目录只服务「重启后可能还活着」的对账，
+    /// 已确认死亡的不该在下次重启里复活成 running。
+    fn stop(&self, params: Value) -> Result<Value, AgentError> {
+        let params: HostedStopParams = parse_params(params)?;
+        self.ensure_loaded()?;
+        let signal = params.signal;
+        let mut table = self.lock();
+        let Some(run) = table.runs.get_mut(&params.handle) else {
+            return Err(AgentError::new(
+                ErrorCode::NotFound,
+                format!("没有句柄 {} 的运行记录", params.handle),
+            )
+            .with_details(serde_json::json!({ "reason": "unknown_handle" })));
+        };
+        let pid = run.record.pid;
+        if let Some(expected) = params.expected_pid {
+            if expected != pid {
+                return Err(AgentError::new(
+                    ErrorCode::PreconditionFailed,
+                    format!(
+                        "句柄 {} 的 PID 与调用方看到的不一致，已拒绝终止",
+                        params.handle
+                    ),
+                )
+                .with_details(serde_json::json!({
+                    "reason": "pid_mismatch",
+                    "expected_pid": expected,
+                    "actual_pid": pid,
+                })));
+            }
+        }
+        let owned = run.child.is_some();
+        let observed = read_start_time_ticks(pid);
+        let mut identity_verified = false;
+        match observed {
+            Some(ticks) if ticks == run.record.start_time_ticks => identity_verified = true,
+            Some(ticks) => {
+                run.record.state = HostedRunState::Exited;
+                run.record.detail = Some(format!("pid_reused_new_start_ticks={ticks}"));
+                run.child = None;
+                drop_persisted(&run.record.handle);
+                audit_stop(
+                    &params.handle,
+                    pid,
+                    "already_gone_pid_reused",
+                    signal,
+                    false,
+                );
+                return serialize(HostedStopResult {
+                    record: run.record.clone(),
+                    outcome: KillOutcome::AlreadyGone,
+                    identity_verified: false,
+                    record_dropped: true,
+                });
+            }
+            None if !owned && !std::path::Path::new(&format!("/proc/{pid}")).exists() => {
+                run.record.state = HostedRunState::Exited;
+                run.record.detail = Some("process_gone".to_string());
+                drop_persisted(&run.record.handle);
+                audit_stop(&params.handle, pid, "already_gone", signal, false);
+                return serialize(HostedStopResult {
+                    record: run.record.clone(),
+                    outcome: KillOutcome::AlreadyGone,
+                    identity_verified: false,
+                    record_dropped: true,
+                });
+            }
+            None if !owned => {
+                return Err(AgentError::new(
+                    ErrorCode::PreconditionFailed,
+                    format!("无法核对 pid={pid} 的身份，已拒绝终止"),
+                )
+                .with_details(serde_json::json!({
+                    "reason": "identity_unverifiable",
+                    "hint": "该进程可能属于其它 uid；root 支路请走 Legacy su -c kill",
+                })));
+            }
+            None => {}
+        }
+        match send_signal(pid, signal) {
+            SignalResult::Gone => {
+                run.record.state = HostedRunState::Exited;
+                run.record.detail = Some("process_gone".to_string());
+                run.child = None;
+                drop_persisted(&run.record.handle);
+                audit_stop(
+                    &params.handle,
+                    pid,
+                    "already_gone",
+                    signal,
+                    identity_verified,
+                );
+                serialize(HostedStopResult {
+                    record: run.record.clone(),
+                    outcome: KillOutcome::AlreadyGone,
+                    identity_verified,
+                    record_dropped: true,
+                })
+            }
+            SignalResult::Denied => {
+                audit_stop(
+                    &params.handle,
+                    pid,
+                    "permission_denied",
+                    signal,
+                    identity_verified,
+                );
+                Err(
+                    AgentError::new(ErrorCode::PermissionDenied, format!("无权限终止 pid={pid}"))
+                        .with_details(serde_json::json!({
+                            "reason": "not_owner",
+                            "handle": params.handle,
+                            "agent_uid": effective_uid(),
+                        })),
+                )
+            }
+            SignalResult::Failed(errno) => {
+                audit_stop(
+                    &params.handle,
+                    pid,
+                    &format!("errno={errno}"),
+                    signal,
+                    identity_verified,
+                );
+                Err(AgentError::new(
+                    ErrorCode::Internal,
+                    format!("kill 失败 pid={pid} errno={errno}"),
+                ))
+            }
+            SignalResult::Sent => {
+                audit_stop(&params.handle, pid, "signaled", signal, identity_verified);
+                let gone = poll_dead(pid);
+                if gone {
+                    reap(run);
+                    run.record.state = HostedRunState::Exited;
+                    if run.record.detail.is_none() {
+                        run.record.detail = Some("stopped".to_string());
+                    }
+                    drop_persisted(&run.record.handle);
+                } else {
+                    // SIGTERM 命中忙进程可能几秒后才退：没确认到只说「未确认」
+                    run.record.detail = Some("signal_sent_not_confirmed".to_string());
+                }
+                serialize(HostedStopResult {
+                    record: run.record.clone(),
+                    outcome: KillOutcome::Signaled,
+                    identity_verified,
+                    record_dropped: gone,
+                })
+            }
+        }
     }
 
     /// 首次调用时从磁盘对账（构造期不做 IO）。
@@ -582,6 +752,59 @@ fn scan_binaries() -> BinaryScan {
     scan
 }
 
+/// 确认死亡时顺手回收自己持有的子进程，把真实退出码/信号留在记录里。
+fn reap(run: &mut ManagedRun) {
+    let Some(child) = run.child.as_mut() else {
+        return;
+    };
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            run.record.exit_code = status.code();
+            run.record.detail = Some(match status.signal() {
+                Some(signal) => format!("exited_signal_{signal}"),
+                None => "exited".to_string(),
+            });
+        }
+        Ok(None) => run.record.detail = Some("still_running".to_string()),
+        Err(error) => run.record.detail = Some(format!("wait_failed: {error}")),
+    }
+    run.child = None;
+}
+
+/// 停止成功后删除持久化记录：状态目录只保留「可能还在跑」的进程。
+fn drop_persisted(handle: &str) {
+    let path = PathBuf::from(STATE_DIR).join(format!("{handle}.json"));
+    let _ = std::fs::remove_file(path);
+}
+
+/// 有界轮询确认进程消失。僵尸态算已消失（它只是没被回收，不再运行）。
+fn poll_dead(pid: u32) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return true;
+        };
+        let state = status
+            .rsplit_once(')')
+            .and_then(|(_, tail)| tail.trim_start().chars().next());
+        if state == Some('Z') {
+            return true;
+        }
+        if started.elapsed() >= STOP_CONFIRM_TIMEOUT {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+fn audit_stop(handle: &str, pid: u32, outcome: &str, signal: KillSignal, verified: bool) {
+    eprintln!(
+        "audit method={HOSTED_STOP} handle={handle} pid={} signal={} outcome={outcome} identity_verified={verified}",
+        pid,
+        signal.number()
+    );
+}
+
 fn random_handle() -> Result<String, AgentError> {
     let mut bytes = [0_u8; 8];
     let mut file = std::fs::File::open("/dev/urandom")
@@ -789,12 +1012,30 @@ mod tests {
         assert!(serde_json::from_str::<StoredRun>("{}").is_err());
     }
 
+    /// 写操作的守卫字段名必须钉住：`expected_pid` 拼错时不是「报错」，
+    /// 而是守卫静默失效（Agent 照原 PID 发信号），所以这里锁死协议里的字段名。
     #[test]
-    fn host_provider_declares_exactly_the_four_hosted_methods() {
+    fn stop_guard_field_name_is_snake_case_and_optional() {
+        let params: HostedStopParams =
+            serde_json::from_value(serde_json::json!({ "handle": "aa", "expected_pid": 7 }))
+                .unwrap();
+        assert_eq!(params.expected_pid, Some(7));
+        assert_eq!(params.signal, KillSignal::Term, "缺省必须是温和的 SIGTERM");
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["expected_pid"], serde_json::json!(7));
+        // 驼峰写法不被识别：字段留空，说明拼错会静默放宽守卫，调用方必须用 DTO
+        let loose: HostedStopParams =
+            serde_json::from_value(serde_json::json!({ "handle": "aa", "expectedPid": 7 }))
+                .unwrap();
+        assert_eq!(loose.expected_pid, None);
+    }
+
+    #[test]
+    fn hosted_provider_info_is_stable_and_methods_unique() {
         let provider = HostedProvider::new();
         assert_eq!(provider.info().name, "hosted");
         assert_eq!(provider.methods(), HOSTED_METHODS);
-        assert_eq!(HOSTED_METHODS.len(), 4);
+        assert_eq!(HOSTED_METHODS.len(), 5);
     }
 
     #[test]
@@ -816,6 +1057,107 @@ mod tests {
             .start(serde_json::json!({ "name": "definitely-absent-bin" }))
             .expect_err("缺文件必须报错");
         assert_eq!(error.code, ErrorCode::NotFound);
+    }
+
+    fn table_with(record: HostedRunRecord, source: RunSource) -> HostedProvider {
+        let provider = HostedProvider::new();
+        {
+            let mut table = provider.lock();
+            table.loaded = true;
+            table.runs.insert(
+                record.handle.clone(),
+                ManagedRun {
+                    record,
+                    child: None,
+                    source,
+                },
+            );
+        }
+        provider
+    }
+
+    #[test]
+    fn stop_refuses_stale_pid_before_touching_the_process() {
+        // 调用方拿着旧界面里的 PID 来停：必须先拒止，绝不能按数字发信号
+        let provider = table_with(record("aabbccddeeff0011", 4242, 11), RunSource::Spawned);
+        let error = provider
+            .stop(serde_json::json!({ "handle": "aabbccddeeff0011", "expected_pid": 999 }))
+            .expect_err("PID 与调用方看到的不一致时必须拒止");
+        assert_eq!(error.code, ErrorCode::PreconditionFailed);
+        let details = error.details.unwrap();
+        assert_eq!(details["reason"], "pid_mismatch");
+        assert_eq!(details["expected_pid"], serde_json::json!(999));
+        assert_eq!(details["actual_pid"], serde_json::json!(4242));
+    }
+
+    #[test]
+    fn stop_of_unknown_handle_is_not_found() {
+        let provider = HostedProvider::new();
+        let error = provider
+            .stop(serde_json::json!({ "handle": "1122334455667788" }))
+            .expect_err("未知句柄必须 not_found");
+        assert_eq!(error.code, ErrorCode::NotFound);
+        assert_eq!(error.details.unwrap()["reason"], "unknown_handle");
+    }
+
+    /// 目标早就不在了：幂等成功 + 记录出表，不报错（重复点「停止」不该红字）。
+    #[test]
+    fn stop_of_gone_process_is_idempotent_and_drops_the_record() {
+        let provider = table_with(
+            record("1122334455667788", u32::MAX, 7),
+            RunSource::Reconciled,
+        );
+        let value = provider
+            .stop(serde_json::json!({ "handle": "1122334455667788" }))
+            .expect("目标已消失应作为幂等成功返回");
+        let result: HostedStopResult = serde_json::from_value(value).unwrap();
+        assert_eq!(result.outcome, KillOutcome::AlreadyGone);
+        assert_eq!(result.record.state, HostedRunState::Exited);
+        assert!(result.record_dropped, "已确认死亡的记录不该留在对账表里");
+        assert!(!result.identity_verified, "没核出身份就不能声称核过");
+        assert_eq!(
+            result.record.detail.as_deref(),
+            Some("process_gone"),
+            "要能区分『核出 PID 易主』与『进程本来就不在』"
+        );
+    }
+
+    /// Linux 上才有 /proc：PID 易主时必须判 already_gone 而不是补一刀，
+    /// 且调用方给的 expected_pid 不符时一律先拒止。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_never_signals_a_reused_pid() {
+        let self_pid = std::process::id();
+        let actual = read_start_time_ticks(self_pid).expect("本进程 start time 应可读");
+        let provider = table_with(
+            record("cafe000000000001", self_pid, actual + 1),
+            RunSource::Reconciled,
+        );
+        let value = provider
+            .stop(serde_json::json!({ "handle": "cafe000000000001" }))
+            .expect("复用场景应作为幂等成功返回而不是报错");
+        let result: HostedStopResult = serde_json::from_value(value).unwrap();
+        assert_eq!(result.outcome, KillOutcome::AlreadyGone);
+        assert!(
+            result.record.detail.unwrap().starts_with("pid_reused"),
+            "必须说明为什么不动手"
+        );
+        assert!(
+            read_start_time_ticks(self_pid).is_some(),
+            "本进程必须还活着：绝不能向新租户发信号"
+        );
+    }
+
+    #[test]
+    fn poll_dead_returns_immediately_for_absent_process() {
+        assert!(poll_dead(u32::MAX), "不存在的 pid 必须立刻判已消失");
+    }
+
+    #[test]
+    fn hosted_provider_declares_all_five_hosted_methods() {
+        let provider = HostedProvider::new();
+        assert_eq!(provider.methods().len(), 5);
+        assert!(provider.methods().contains(&HOSTED_STOP));
     }
 
     #[test]
