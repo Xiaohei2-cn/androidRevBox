@@ -47,7 +47,7 @@ C: S\n                                   # 状态/能力再确认
 M: STATUS 2 <version> <versionCode> <deviceLocale> list manifest export\n
 
 C: L <locale|-> <all|user|system> <0|1>\n
-M: <4B len><item json> ... <4B len>{"final":true,"count":N,"fallback":M,"deviceLocale":"...","enumeratedFlags":F}
+M: <4B len><item json> ... <4B len>{"final":true,"count":N,"fallback":M,"localeUnproven":K,"deviceLocale":"...","enumeratedFlags":F}
    ERR helper_failed | bad_request | bad_locale | bad_scope | too_many_items\n
 
    item: {"pkg","label","labelSource":"framework|package_name|manifest",
@@ -60,10 +60,16 @@ M: <4B len>{"pkg":"...","files":[{"name","path","size"}...]} ... <4B len>{"final
 C: E <pkg>\n                             # 流式导出；包名拒绝 shell 元字符与路径分隔
 M: F <size> <pkg> <name>\n <size 字节裸流> ...
    T <size> <pkg> <name> too_large\n      # 超过单文件 512 MiB 上限时跳过并标注
-   DONE\n                                 # 结束；异常时 ERR <code>\n 后断开
+   DONE\n                                 # 结束（一个文件都没命中时改回 `ERR no_files <pkg>`，不回空 DONE）
+   ERR <code>[ <消息>]\n                    # 异常时先 ERR 再断开；无消息时会留一个尾随空格，
+                                            # 客户端必须按空白切分而不是整串等值比较
 
 C: X\n                                   # 主动结束会话
 ```
+
+错误码：`auth_required` `auth_failed` `bad_handshake` `unsupported_protocol` `bad_request`
+`bad_locale` `bad_scope` `bad_package` `unknown_command` `helper_failed` `no_files`
+`too_many_items` `export_truncated` `too_large`。
 
 限制：单次 helper 输出上限 8 MiB（超过即 `ERR helper_failed`，不返回半截清单）、
 条目上限 200000 行、导出总量上限 512 MiB。
@@ -90,9 +96,11 @@ adb reboot
 
 ## 尚未验证（必须真机确认，不能凭编译通过当成功）
 
-1. `Resources.updateConfiguration` + `new Resources(assets, metrics, config)` 在 Android 14
-   （API 34）上是否真能返回按指定 locale 解析的 label，以及 `Configuration` 是否会被
-   AssetManager 回填为**实际命中**的 locale（`resolvedLocale` 的可信度取决于此）。
+1. ~~局部 Resources 按指定 locale 解析~~ **已真机验证**：同机 `zh-CN/en-US/fr-FR/ja-JP` 对
+   `com.google.android.apps.weather` 分别返回 天气/Weather/Météo/天気情報。同时验证出
+   `updateConfiguration` 回填的是**请求值而非实际命中值**（无 fr 资源的包退回中文却自称
+   `fr-FR`），因此 `resolvedLocale` 改成只在「与设备默认解析不同」时上报，否则为 `null`
+   并标 `locale_not_resolved_fallback_default`。
 2. `MATCH_DISABLED_COMPONENTS | MATCH_UNINSTALLED_PACKAGES` 是否真能枚举出停用应用并拿到 label
    （demo 的 `Q` 枚举不到，这是 AR5.4 遗留缺口）。
 3. companion 生成/读取 `0600` 令牌文件的 SELinux 上下文，以及 `app_process` 冷启动在

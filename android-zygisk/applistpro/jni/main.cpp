@@ -106,7 +106,16 @@ static bool ct_equal(const char *a, const char *b) {
 
 static bool wait_readable(int fd, int ms) {
     pollfd p{fd, POLLIN, 0};
-    return poll(&p, 1, ms) == 1 && (p.revents & (POLLIN | POLLHUP)) != 0;
+    int r = poll(&p, 1, ms);
+    if (r != 1) {
+        if (r < 0 && errno != EINTR) LOGW("poll failed: %s", strerror(errno));
+        return false;
+    }
+    if ((p.revents & POLLIN) == 0) {
+        LOGW("poll revents=0x%x (无可读数据)", p.revents);
+        return false;
+    }
+    return true;
 }
 
 // 4 字节大端长度前缀 + 载荷
@@ -239,6 +248,12 @@ static void add_env(char *entry) {
     g_envp[g_envc++] = entry;
 }
 
+extern char **environ;
+
+// ART 缺 BOOTCLASSPATH / DEX2OATBOOTCLASSPATH / ANDROID_*_ROOT 任一变量时，
+// app_process 会不打日志直接以退出码 0 结束（demo 踩过的坑）。
+// Zygisk Next 的 companion 常在独立 pid namespace 里，看不到 zygote64，
+// 但它自身 environ 已带全套 ART 变量 —— 因此两边都要收，先 zygote64 后 environ。
 static void build_java_env() {
     g_env_buf = (char *) malloc(1 << 16);
     if (!g_env_buf) return;
@@ -276,21 +291,25 @@ static void build_java_env() {
             if (l) add_env(p);
             p += l + 1;
         }
-        if (g_envc > 0) {
-            g_envp[g_envc] = nullptr;
-            LOGI("java env: %d entries from zygote64", g_envc);
-        }
+        if (g_envc > 0) LOGI("java env: %d entries from zygote64", g_envc);
         closedir(proc);
-        return;
+        break;
     }
-    closedir(proc);
+
+    for (char **e = environ; *e != nullptr; e++) add_env(*e);
+    g_envp[g_envc] = nullptr;
+    if (g_envc > 0) {
+        LOGI("java env: %d effective entries (zygote64 + companion environ)", g_envc);
+    } else {
+        LOGW("java env: empty; app_process 会静默退出");
+    }
 }
 
 // 跑一次 Java helper，返回 malloc 的 stdout（NUL 终止）；NULL=失败
 static char *run_helper(char *const argv[]) {
     if (g_envc == 0) build_java_env();
     if (g_envc == 0) {
-        LOGW("no java env captured from zygote64");
+        LOGW("no usable java environment");
         return nullptr;
     }
 
@@ -316,12 +335,12 @@ static char *run_helper(char *const argv[]) {
 
         char cp[PATH_MAX + 32];
         snprintf(cp, sizeof(cp), "-Djava.class.path=%s", g_dex_path);
+        // 参数形态沿用 demo 在本机验证过的组合：class.path + /system/bin 占位 + 主类 + 业务参数
         char *args[32];
         int argc = 0;
         args[argc++] = (char *) "app_process";
         args[argc++] = cp;
-        args[argc++] = (char *) "-n";  // new-app-process，避免继承 zygote 的类加载状态
-        args[argc++] = (char *) "--nice-name=applistpro-helper";
+        args[argc++] = (char *) "/system/bin";
         args[argc++] = (char *) "pro.applist.HelperPro";
         for (int i = 0; argv[i] != nullptr && argc < 28; i++) args[argc++] = argv[i];
         args[argc] = nullptr;
@@ -361,8 +380,12 @@ static char *run_helper(char *const argv[]) {
         return nullptr;
     }
     buf[total] = '\0';
-    if (total == 0) {
-        LOGW("helper produced nothing (exit status %d)", status);
+    bool clean_exit = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    LOGI("helper status=%d clean=%d out=%zu", status, clean_exit, total);
+    // 「正常退出且输出为空」是合法结果（例如 --files 查不存在的包），
+    // 不能和「崩了/没起来」混成一类，否则调用方拿不到 no_files 这种可诊断错误。
+    if (total == 0 && !clean_exit) {
+        LOGW("helper produced nothing");
         free(buf);
         return nullptr;
     }
@@ -421,6 +444,7 @@ static bool stream_file(int cfd, const char *path, off_t size) {
 }
 
 static bool cmd_export(int cfd, char *const argv[]) {
+    // 命中数在此统计：一个文件都没匹配上时显式 ERR，而不是回空 DONE
     char *payload = run_helper(argv);
     if (!payload) return send_err(cfd, "helper_failed", nullptr);
 
@@ -465,6 +489,9 @@ static bool cmd_export(int cfd, char *const argv[]) {
         line = nl + 1;
     }
     free(payload);
+    if (total == 0) {
+        return send_err(cfd, "no_files", argv[1]);
+    }
     return write_text(cfd, "DONE\n");
 }
 
@@ -472,8 +499,17 @@ static bool cmd_export(int cfd, char *const argv[]) {
 static void serve_session(int cfd) {
     char line[512];
     for (;;) {
-        if (!wait_readable(cfd, IDLE_TIMEOUT_MS)) return;
-        if (read_line(cfd, line, sizeof(line)) == 0) return;
+        if (!wait_readable(cfd, IDLE_TIMEOUT_MS)) {
+            LOGI("session idle timeout");
+            return;
+        }
+        int got = read_line(cfd, line, sizeof(line));
+        if (got == 0) {
+            LOGI("session eof");
+            return;
+        }
+        if (strncmp(line, "H ", 2) == 0) line[4] = '\0';  // 不在日志里留令牌
+        LOGI("cmd %s", line);
 
         if (strcmp(line, "X") == 0) return;
 
@@ -492,9 +528,18 @@ static void serve_session(int cfd) {
                 send_err(cfd, "bad_request", "L <locale|-> <all|user|system> <0|1>");
                 continue;
             }
-            if (strcmp(locale, "-") != 0 && strpbrk(locale, "\"\\ \t") != nullptr) {
-                send_err(cfd, "bad_locale", locale);
-                continue;
+            if (strcmp(locale, "-") != 0) {
+                size_t llen = strlen(locale);
+                bool ok = llen > 0 && llen <= 35;
+                for (size_t i = 0; i < llen && ok; i++) {
+                    char c = locale[i];
+                    ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                         c == '-' || c == '_' || c == '.';
+                }
+                if (!ok) {
+                    send_err(cfd, "bad_locale", locale);
+                    continue;
+                }
             }
             if (strcmp(scope, "all") && strcmp(scope, "user") && strcmp(scope, "system")) {
                 send_err(cfd, "bad_scope", scope);
@@ -597,9 +642,14 @@ static void serve_forever() {
     LOGI("serving on 127.0.0.1:%d proto=%d", APPLISTPRO_PORT, PROTOCOL_V2);
 
     for (;;) {
-        int cfd = accept(lfd, nullptr, nullptr);
-        if (cfd < 0) continue;
-        if (authenticate(cfd)) serve_session(cfd);
+        int cfd = accept4(lfd, nullptr, nullptr, SOCK_CLOEXEC);
+        if (cfd < 0) {
+            LOGW("accept failed: %s", strerror(errno));
+            continue;
+        }
+        bool authed = authenticate(cfd);
+        if (authed) serve_session(cfd);
+        LOGI("session closed authed=%d", authed);
         close(cfd);
     }
 }

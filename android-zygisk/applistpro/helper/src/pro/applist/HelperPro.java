@@ -96,6 +96,7 @@ public class HelperPro {
                 String deviceLocale = currentLocale(ctx);
                 int count = 0;
                 int fallback = 0;
+                int localeUnproven = 0;
 
                 for (PackageInfo pi : pm.getInstalledPackages(flags)) {
                     ApplicationInfo ai = pi.applicationInfo;
@@ -107,8 +108,11 @@ public class HelperPro {
                     boolean enabled = ai.enabled;
                     if (!includeDisabled && !enabled) continue;
 
-                    String[] label = resolveLabel(pm, ai, locale);
+                    String[] label = resolveLabel(pm, ai, locale, deviceLocale);
                     if (!"framework".equals(label[1])) fallback++;
+                    if ("locale_not_resolved_fallback_default".equals(label[3])
+                            || "locale_resources_unavailable".equals(label[3])
+                            || "locale_label_missing".equals(label[3])) localeUnproven++;
 
                     StringBuilder sb = new StringBuilder(224);
                     sb.append("{\"pkg\":").append(jsonStr(pi.packageName))
@@ -130,6 +134,7 @@ public class HelperPro {
 
                 out.write("{\"final\":true,\"count\":" + count
                         + ",\"fallback\":" + fallback
+                        + ",\"localeUnproven\":" + localeUnproven
                         + ",\"deviceLocale\":" + jsonStr(deviceLocale)
                         + ",\"enumeratedFlags\":" + flags + "}\n");
             }
@@ -150,18 +155,29 @@ public class HelperPro {
         System.exit(0);
     }
 
-    /** 返回 {label, labelSource, resolvedLocale, fallbackReason}。 */
+    /**
+     * 返回 {label, labelSource, resolvedLocale, fallbackReason}。
+     *
+     * Android 不把 AssetManager 的实际匹配结果导出成公开 API：直接读回填后的
+     * Configuration 只会拿到我们塞进去的请求值（真机验证：无 fr 资源的包 label 退回
+     * 中文，却仍报 resolved=fr-FR）。所以 resolvedLocale 只有在
+     * 「按请求 locale 解析出的 label != 设备默认解析出的 label」时才有证据可报，
+     * 否则置 null 并给 locale_not_resolved_fallback_default，不冒充按请求解析成功。
+     */
     @SuppressWarnings("deprecation")
-    private static String[] resolveLabel(PackageManager pm, ApplicationInfo ai, String locale) {
+    private static String[] resolveLabel(PackageManager pm, ApplicationInfo ai, String locale,
+                                         String deviceLocale) {
         String base;
         try {
             base = pm.getApplicationLabel(ai).toString();
         } catch (Throwable t) {
             return new String[]{ai.packageName, "package_name", null, "framework_label_failed"};
         }
+        // 「不指定 locale」就是设备默认解析路径，结论本身可证：resolvedLocale = 设备 locale
         if (locale == null || locale.isEmpty() || "-".equals(locale)) {
-            return classify(base, ai, "framework", null, null);
+            return classify(base, ai, "framework", deviceLocale, null);
         }
+        boolean sameLanguage = languageOf(locale).equals(languageOf(deviceLocale));
 
         try {
             Resources app = pm.getResourcesForApplication(ai);
@@ -186,10 +202,19 @@ public class HelperPro {
                 text = ai.nonLocalizedLabel;
             }
             if (text == null) {
-                return classify(base, ai, "framework", null, "locale_label_missing");
+                return classify(base, ai, "framework",
+                        sameLanguage ? deviceLocale : null, "locale_label_missing");
             }
-            String resolved = want.getLocales().get(0).toLanguageTag();
-            return classify(text.toString(), ai, "framework", resolved, null);
+            String wanted = text.toString();
+            boolean differsFromDefault = !wanted.equals(base);
+            if (differsFromDefault) {
+                return classify(wanted, ai, "framework", want.getLocales().get(0).toLanguageTag(), null);
+            }
+            // 同名且同语言：走的仍是设备默认解析，据实标为设备 locale，不冒充跨语言命中
+            if (sameLanguage) {
+                return classify(wanted, ai, "framework", deviceLocale, null);
+            }
+            return classify(wanted, ai, "framework", null, "locale_not_resolved_fallback_default");
         } catch (Throwable t) {
             // 不能假装按请求 locale 解析成功：如实回退并给出原因
             return classify(base, ai, "framework", null, "locale_resources_unavailable");
@@ -203,6 +228,13 @@ public class HelperPro {
                     reason == null ? "label_equals_package_name" : reason};
         }
         return new String[]{label, source, resolved, reason};
+    }
+
+    private static String languageOf(String tag) {
+        if (tag == null) return "";
+        String t = tag.toLowerCase();
+        int cut = t.indexOf('-');
+        return cut > 0 ? t.substring(0, cut) : t;
     }
 
     private static String currentLocale(Context ctx) {
