@@ -653,6 +653,14 @@ mod tests {
         );
         if status.sub_protocol_version == 2 {
             assert_eq!(status.module_id.as_deref(), Some("applistpro"));
+        } else {
+            // v1 回退腿：必须显式说明这是 demo 通道、指定 locale 无证据可给
+            assert_eq!(status.module_id.as_deref(), Some("applist"));
+            let detail = status.detail.clone().unwrap_or_default();
+            assert!(
+                detail.contains("v1") || detail.contains("demo"),
+                "退回 v1 时 detail 必须说明通道: {detail}"
+            );
         }
 
         let user = service
