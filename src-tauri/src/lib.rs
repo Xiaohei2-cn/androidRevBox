@@ -196,6 +196,7 @@ pub fn run() {
             commands::device::device_ls,
             commands::device::device_file_stat,
             commands::device::device_file_preview,
+            commands::device::device_hosted_runs,
             commands::device::device_packages,
             commands::device::device_shell,
             commands::device::device_install,

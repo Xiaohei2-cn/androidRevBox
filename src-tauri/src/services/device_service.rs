@@ -12,14 +12,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_protocol::method::{
-    DEVICE_INFO, FILESYSTEM_LIST, FILESYSTEM_PREVIEW, FILESYSTEM_STAT, PACKAGE_LIST,
-    PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
+    DEVICE_INFO, FILESYSTEM_LIST, FILESYSTEM_PREVIEW, FILESYSTEM_STAT, HOSTED_CHMOD, HOSTED_LIST,
+    HOSTED_START, HOSTED_STATUS, PACKAGE_LIST, PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
 };
 use agent_protocol::{
     DeviceInfoParams, DeviceInfoResult, FileKind, FilesystemListParams, FilesystemListResult,
     FilesystemPreviewParams, FilesystemPreviewResult, FilesystemStatParams, FilesystemStatResult,
-    KillSignal, ListeningPort, PackageListParams, PackageListResult, PackageScope,
-    PortHoldingProcess, PreviewEncoding, ProcessByPortParams, ProcessByPortResult,
+    HostedBinaryInfo, HostedChmodParams, HostedChmodResult, HostedListParams, HostedListResult,
+    HostedRunRecord, HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams,
+    HostedStatusResult, KillSignal, ListeningPort, PackageListParams, PackageListResult,
+    PackageScope, PortHoldingProcess, PreviewEncoding, ProcessByPortParams, ProcessByPortResult,
     ProcessKillParams, ProcessKillResult, ProcessPortsParams, ProcessPortsResult, SocketFamily,
 };
 use async_trait::async_trait;
@@ -845,9 +847,92 @@ impl DeviceService {
 
     // ===== 二进制托管（P9：/data/local/tmp 下 ELF 的浏览 / chmod / 后台运行 / kill）=====
 
-    /// 列出托管目录下的 ELF 可执行文件：`ls -l` 拿权限 + `file <dir>/*` 判 ELF。
-    /// file 命令本身不可用时报错（不猜测——避免把文本文件当二进制展示）。
+    /// 列出托管目录下的 ELF 可执行文件。AR7.2 起默认走 Agent `hosted.list`：
+    /// ELF 由文件头 magic 判定（不再依赖设备端有没有 `file` 命令），权限/大小/uid/mtime
+    /// 一次取回；Legacy 的 `ls -l` + `file` 两串 shell 保留为回退腿（删除条件见能力表）。
     pub async fn hosted_binaries(&self, serial: &str) -> CoreResult<Vec<adb::HostedBinary>> {
+        let route = self
+            .android
+            .select(serial, HOSTED_LIST, OperationKind::ReadOnlyIdempotent)
+            .map_err(CapabilityRouter::core_error)?;
+        if route.backend == AndroidBackendSource::LegacyAdb {
+            return self.hosted_binaries_legacy(serial).await;
+        }
+        let params = HostedListParams {};
+        let agent_request = self.android.agent().request::<_, HostedListResult>(
+            serial,
+            HOSTED_LIST,
+            &params,
+            LIST_TIMEOUT,
+        );
+        let (agent_result, legacy_result) = if hosted_shadow_enabled() {
+            let legacy = self.hosted_binaries_legacy(serial);
+            let (agent, legacy) = tokio::join!(agent_request, legacy);
+            (agent, Some(legacy))
+        } else {
+            (agent_request.await, None)
+        };
+        match agent_result {
+            Ok(result) => {
+                if result.truncated || !result.unreadable.is_empty() {
+                    tracing::debug!(
+                        serial,
+                        method = HOSTED_LIST,
+                        truncated = result.truncated,
+                        unreadable = ?result.unreadable,
+                        "hosted.list 有截断或读不到的条目：列表不完整不等于目录内容如此"
+                    );
+                }
+                let binaries = map_agent_hosted_binaries(&result.binaries);
+                if let Some(Ok(legacy)) = legacy_result {
+                    log_hosted_list_shadow_diff(serial, &binaries, &legacy);
+                }
+                Ok(binaries)
+            }
+            Err(error) => {
+                let fallback = self
+                    .android
+                    .fallback_after_agent_error(
+                        serial,
+                        HOSTED_LIST,
+                        OperationKind::ReadOnlyIdempotent,
+                        &error,
+                    )
+                    .map_err(CapabilityRouter::core_error)?;
+                debug_assert_eq!(fallback.backend, AndroidBackendSource::LegacyAdb);
+                tracing::warn!(serial, "hosted.list 回退 Legacy ADB");
+                match legacy_result {
+                    Some(result) => result,
+                    None => self.hosted_binaries_legacy(serial).await,
+                }
+            }
+        }
+    }
+
+    /// 托管运行表（Agent only）：稳定句柄 + pid + start time + 状态 + 退出码。
+    /// 页面刷新或 Desktop 重启后仍能显示「谁真的在跑」，不再依赖前端本地状态。
+    pub async fn hosted_runs(&self, serial: &str) -> CoreResult<Vec<HostedRunRecord>> {
+        let route = self
+            .android
+            .select(serial, HOSTED_LIST, OperationKind::ReadOnlyIdempotent)
+            .map_err(CapabilityRouter::core_error)?;
+        if route.backend != AndroidBackendSource::Agent {
+            return Err(CoreError::AgentUnavailable(
+                "托管运行表只能由 Agent 提供，请先在设备页连接 Agent".into(),
+            ));
+        }
+        let params = HostedListParams {};
+        self.android
+            .agent()
+            .request::<_, HostedListResult>(serial, HOSTED_LIST, &params, LIST_TIMEOUT)
+            .await
+            .map(|result| result.runs)
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))
+    }
+
+    /// Legacy 托管列表（仅作回退）：`ls -l` 拿权限 + `file <dir>/*` 判 ELF。
+    /// file 命令不可用时报错（不猜测，避免把文本文件当二进制展示）。
+    async fn hosted_binaries_legacy(&self, serial: &str) -> CoreResult<Vec<adb::HostedBinary>> {
         let dir = adb::HOSTED_DIR;
         let ls_args = adb::build_args(Some(serial), &adb::cmd_ls(dir));
         let ls_out = self.run_adb(&ls_args).await?;
@@ -870,6 +955,31 @@ impl DeviceService {
         Ok(adb::hosted_binaries(&ls_out.stdout, &file_out.stdout))
     }
 
+    /// 托管写操作前置（AR7.2）：Agent 必须在线，且只能走 Agent 通道。
+    /// 与 AR6.3 `process_kill` 同一条规则（§3.6 写操作不自动回退），
+    /// 这里只是把「检查 + 路由 + 防御」收成一个函数给 chmod/start 共用。
+    fn require_agent_write_route(&self, serial: &str, method: &str) -> CoreResult<()> {
+        if !matches!(
+            self.android.agent_status(serial).state,
+            crate::models::agent::AgentSessionState::Ready
+                | crate::models::agent::AgentSessionState::Degraded
+        ) {
+            return Err(CoreError::AgentUnavailable(format!(
+                "{method} 需要 Agent 在线（设备页 → 安装/连接 Agent）；写操作不自动回退 adb shell"
+            )));
+        }
+        let route = self
+            .android
+            .select(serial, method, OperationKind::Mutating)
+            .map_err(CapabilityRouter::core_error)?;
+        if route.backend != AndroidBackendSource::Agent {
+            return Err(CoreError::Internal(format!(
+                "{method} 只允许 Agent 通道，拒绝在非 Agent 后端执行写操作"
+            )));
+        }
+        Ok(())
+    }
+
     /// 探测设备 su 是否可用（`su -c id` 输出含 uid=0）。
     /// 设备信息卡 Root 横幅与二进制托管 Root 开关共用此链路。
     pub async fn su_available(&self, serial: &str) -> CoreResult<bool> {
@@ -879,11 +989,34 @@ impl DeviceService {
         Ok(out.exit_code == Some(0) && adb::is_root_probe_ok(&out.stdout))
     }
 
-    /// 赋予执行权限：`chmod +x <dir>/<name>`（name 过安全白名单校验，防注入）。
-    /// root=true 时整体走 su -c（root 属主的文件 shell 用户 chmod 会被拒）。
+    /// 赋予执行权限。AR7.2：`root=false` 走 Agent `hosted.chmod`（写操作，不回退 + 审计）；
+    /// `root=true` 仍走 Legacy `su -c chmod +x`——root 属主的文件 shell 用户改不动（D026 身份边界）。
     pub async fn hosted_chmod(&self, serial: &str, name: &str, root: bool) -> CoreResult<()> {
+        if !root {
+            let params = HostedChmodParams {
+                name: name.to_owned(),
+            };
+            let result: CoreResult<HostedChmodResult> = match self
+                .require_agent_write_route(serial, HOSTED_CHMOD)
+            {
+                Ok(()) => self
+                    .android
+                    .agent()
+                    .request::<_, HostedChmodResult>(
+                        serial,
+                        HOSTED_CHMOD,
+                        &params,
+                        SHORT_CMD_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error))),
+                Err(error) => Err(error),
+            };
+            audit_hosted_write(serial, HOSTED_CHMOD, name, "agent", &result);
+            return result.map(|_| ());
+        }
         let cmd = Self::hosted_shell(name, "chmod +x")?;
-        let cmd = if root { adb::su_wrap(&cmd) } else { cmd };
+        let cmd = adb::su_wrap(&cmd);
         let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
         let out = self.run_adb(&args).await?;
         if out.exit_code != Some(0) {
@@ -895,16 +1028,89 @@ impl DeviceService {
         Ok(())
     }
 
-    /// 后台启动并返回 pid。⚠️ 用 `;` 而非 `&&`：`&&` 的优先级低于 `&`，
-    /// 会把整个 `cd && nohup` 复合式后台化，`$!` 拿到的是子 shell pid 而非
-    /// 二进制 pid（kill/复查就全错了）；`;` 确保只有 nohup 一段进后台，
-    /// nohup exec 后 pid 即二进制 pid。
-    /// root=true 时整段经 su -c '…' 单引号包裹：外层 shell 不动 `&`/`$!`/重定向，
-    /// 由 root 内层 shell 解释（否则 su 只收到 `cd`）。
-    /// stdout/stderr 落盘 `.<name>.run.log`（隐藏文件不污染 file 列表）：
-    /// 秒退真因（CANNOT LINK / exec format / Permission denied）多在 stderr，
-    /// 复查失败时读日志尾部给出真实死因。
+    /// 后台启动托管二进制并返回 pid。AR7.2：`root=false` 走 Agent `hosted.start`
+    /// （参数数组 exec + 落盘运行记录 + 稳定句柄），`root=true` 走 Legacy `su -c`（D026）。
+    /// 两条路径都在启动后复查存活并在失败时读日志尾部给真实死因——秒退的原因
+    /// （CANNOT LINK / exec format / Permission denied）几乎只存在于 stderr。
     pub async fn hosted_run(&self, serial: &str, name: &str, root: bool) -> CoreResult<u32> {
+        if root {
+            return self.hosted_run_legacy(serial, name, true).await;
+        }
+        // AR7.2：非 root 启动走 Agent。Agent 侧用参数数组 exec，PID 与
+        // `/proc/<pid>/stat` 的 start time 一起构成身份，记录落盘可跨重启对账；
+        // 秒退复查改成按句柄取状态，不再靠 `sleep 0.3; kill -0` 加文件名反查。
+        let params = HostedStartParams {
+            name: name.to_owned(),
+            args: Vec::new(),
+            root: false,
+        };
+        let started: CoreResult<HostedStartResult> = match self
+            .require_agent_write_route(serial, HOSTED_START)
+        {
+            Ok(()) => self
+                .android
+                .agent()
+                .request::<_, HostedStartResult>(serial, HOSTED_START, &params, SHORT_CMD_TIMEOUT)
+                .await
+                .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error))),
+            Err(error) => Err(error),
+        };
+        audit_hosted_write(serial, HOSTED_START, name, "agent", &started);
+        let record = started.map(|value| value.record)?;
+        // 原实现的 300 ms 复查窗口保留：秒退的真因基本都落在启动日志里
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let params = HostedStatusParams {
+            handle: record.handle.clone(),
+        };
+        let status = self
+            .android
+            .agent()
+            .request::<_, HostedStatusResult>(serial, HOSTED_STATUS, &params, SHORT_CMD_TIMEOUT)
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))?;
+        if status.record.state != HostedRunState::Running {
+            let cause = self
+                .read_hosted_log(serial, &status.record.log_path, false)
+                .await
+                .map(|text| text.trim().to_string())
+                .unwrap_or_default();
+            let detail = adb::run_log_diagnostics(&cause).unwrap_or_else(|| {
+                format!("（无输出可参考；完整日志见 {}）", status.record.log_path)
+            });
+            let exit = status
+                .record
+                .exit_code
+                .map(|code| format!("（退出码 {code}）"))
+                .unwrap_or_default();
+            return Err(CoreError::Internal(format!(
+                "{name} 启动后立即退出：{detail}{exit}"
+            )));
+        }
+        Ok(status.record.pid)
+    }
+
+    /// 单条托管运行状态（Agent only）。
+    pub async fn hosted_status(
+        &self,
+        serial: &str,
+        handle: &str,
+    ) -> CoreResult<HostedStatusResult> {
+        let params = HostedStatusParams {
+            handle: handle.to_owned(),
+        };
+        self.android
+            .agent()
+            .request::<_, HostedStatusResult>(serial, HOSTED_STATUS, &params, LIST_TIMEOUT)
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))
+    }
+
+    /// Legacy 启动路径（仅 root 支路使用）。⚠️ 用 `;` 而非 `&&`：`&&` 的优先级低于 `&`，
+    /// 会把整个 `cd && nohup` 复合式后台化，`$!` 拿到的是子 shell pid 而非二进制 pid
+    /// （kill/复查就全错了）；`;` 确保只有 nohup 一段进后台，nohup exec 后 pid 即二进制 pid。
+    /// root=true 时整段经 su -c 单引号包裹：外层 shell 不动 `&`/`$!`/重定向，
+    /// 由 root 内层 shell 解释（否则 su 只收到 `cd`）。
+    async fn hosted_run_legacy(&self, serial: &str, name: &str, root: bool) -> CoreResult<u32> {
         if !adb::is_safe_hosted_name(name) {
             return Err(CoreError::Internal(format!(
                 "文件名非法（仅允许字母数字与 _.-，且不以 . 开头）: {name}"
@@ -1693,6 +1899,36 @@ fn log_package_list_shadow_diff(serial: &str, agent: &[String], legacy: &[String
     }
 }
 
+/// §3.7 托管写操作（chmod/start）审计：字段化、成功失败都记，不含命令正文与令牌。
+fn audit_hosted_write<T>(
+    serial: &str,
+    method: &str,
+    name: &str,
+    backend: &str,
+    outcome: &CoreResult<T>,
+) {
+    match outcome {
+        Ok(_) => tracing::info!(
+            target: "audit",
+            serial,
+            method,
+            name,
+            backend,
+            outcome = "ok",
+            "托管写操作已执行"
+        ),
+        Err(reason) => tracing::warn!(
+            target: "audit",
+            serial,
+            method,
+            name,
+            backend,
+            error = %reason,
+            "托管写操作失败"
+        ),
+    }
+}
+
 /// §3.7 写操作审计：一条结构化 `target="audit"` 事件，成功与失败都记。
 /// 只含 serial/pid/预期身份/通道/结论，不含命令正文、路径与任何令牌。
 fn audit_process_kill(
@@ -1726,6 +1962,70 @@ fn audit_process_kill(
             "process.kill 失败"
         ),
     }
+}
+
+/// AR7.2 托管列表的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。
+fn hosted_shadow_enabled() -> bool {
+    !std::env::var("APP_REVERSE_TOOLS_HOSTED_SHADOW")
+        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
+}
+
+/// Agent `hosted.list` → 前端既有 `HostedBinary[]` 契约（name/path/size/perms/hasExec）。
+fn map_agent_hosted_binaries(binaries: &[HostedBinaryInfo]) -> Vec<adb::HostedBinary> {
+    let mut out: Vec<adb::HostedBinary> = binaries
+        .iter()
+        .map(|item| adb::HostedBinary {
+            name: item.name.clone(),
+            path: item.path.clone(),
+            size: i64::try_from(item.size).unwrap_or(i64::MAX),
+            perms: item.mode_text.clone(),
+            has_exec: item.has_exec,
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// 托管列表的 Agent/Legacy 差异只写日志（迁移期观测用），判据同 D024：名字集合 + 逐项字段。
+fn log_hosted_list_shadow_diff(
+    serial: &str,
+    agent: &[adb::HostedBinary],
+    legacy: &[adb::HostedBinary],
+) {
+    let agent_names: HashSet<&str> = agent.iter().map(|item| item.name.as_str()).collect();
+    let legacy_names: HashSet<&str> = legacy.iter().map(|item| item.name.as_str()).collect();
+    let only_agent: Vec<&str> = agent_names.difference(&legacy_names).copied().collect();
+    let only_legacy: Vec<&str> = legacy_names.difference(&agent_names).copied().collect();
+    let mut field_diffs: Vec<String> = Vec::new();
+    for legacy_item in legacy {
+        let Some(agent_item) = agent.iter().find(|item| item.name == legacy_item.name) else {
+            continue;
+        };
+        if agent_item.has_exec != legacy_item.has_exec {
+            field_diffs.push(format!("{}:has_exec", legacy_item.name));
+        }
+        if agent_item.size != legacy_item.size {
+            field_diffs.push(format!("{}:size", legacy_item.name));
+        }
+        if !legacy_item.perms.is_empty() && agent_item.perms != legacy_item.perms {
+            field_diffs.push(format!(
+                "{}:perms({}!={})",
+                legacy_item.name, agent_item.perms, legacy_item.perms
+            ));
+        }
+    }
+    if only_agent.is_empty() && only_legacy.is_empty() && field_diffs.is_empty() {
+        tracing::debug!(serial, method = HOSTED_LIST, "hosted.list matched");
+        return;
+    }
+    tracing::warn!(
+        serial,
+        method = HOSTED_LIST,
+        agent_only = ?only_agent,
+        legacy_only = ?only_legacy,
+        field_diffs = ?field_diffs,
+        "Agent/Legacy hosted.list shadow compare differed"
+    );
 }
 
 /// AR7.1 文件列表的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。
@@ -2024,6 +2324,59 @@ mod tests {
             inode: 1,
             uid: 0,
         }
+    }
+
+    /// AR7.2 等价性：Agent 的托管条目映射后必须与 Legacy `ls -l` + `file` 的组合结果同形。
+    #[test]
+    fn agent_hosted_binaries_match_legacy_listing() {
+        let info = |name: &str, mode: u32, size: u64| HostedBinaryInfo {
+            name: name.into(),
+            path: format!("{}/{}", adb::HOSTED_DIR, name),
+            size,
+            mode,
+            mode_text: agent_protocol::render_mode_text(FileKind::File, mode),
+            has_exec: mode & 0o100 != 0,
+            uid: 2000,
+            mtime_unix: 1_760_000_000,
+        };
+        let agent = map_agent_hosted_binaries(&[
+            info("zz-tool", 0o755, 4096),
+            info("no-exec", 0o644, 128),
+            info("a with space", 0o4755, 2048),
+        ]);
+        let legacy = adb::hosted_binaries(
+            concat!(
+                "-rwsr-xr-x 1 shell shell 2048 2024-01-01 08:00 a with space\n",
+                "-rw-r--r-- 1 shell shell 128 2024-01-01 08:00 no-exec\n",
+                "-rwxr-xr-x 1 shell shell 4096 2024-01-01 08:00 zz-tool\n",
+            ),
+            concat!(
+                "/data/local/tmp/a with space: ELF 64-bit LSB pie executable\n",
+                "/data/local/tmp/no-exec: ELF 64-bit LSB pie executable\n",
+                "/data/local/tmp/zz-tool: ELF 64-bit LSB pie executable\n",
+            ),
+        );
+        assert_eq!(
+            agent, legacy,
+            "映射必须与 Legacy 组合结果逐项相等（含按名排序）"
+        );
+        assert_eq!(agent[0].name, "a with space", "带空格的文件名不能被切错列");
+        assert_eq!(agent[0].perms, "-rwsr-xr-x", "setuid 位必须与 ls 一致");
+        assert!(!agent[1].has_exec, "no-exec 必须标为不可执行");
+    }
+
+    #[test]
+    fn hosted_binary_mapping_flags_truncated_dirs_without_hiding_them() {
+        let result = HostedListResult {
+            dir: adb::HOSTED_DIR.into(),
+            binaries: vec![],
+            runs: vec![],
+            truncated: true,
+            unreadable: vec!["libfoo.so: Permission denied".into()],
+        };
+        assert!(map_agent_hosted_binaries(&result.binaries).is_empty());
+        // 截断/不可读只存在于 HostedListResult 上，映射后靠 list_files 那条 debug 日志留证
+        assert!(result.truncated && result.unreadable.len() == 1);
     }
 
     fn file_stat(

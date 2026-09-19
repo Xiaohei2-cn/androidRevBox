@@ -1363,6 +1363,312 @@ mod tests {
         manager.disconnect(&serial).await.unwrap();
     }
 
+    /// AR7.2 真机腿：托管生命周期交给 Agent 之后，Legacy 的 `ls -l` + `file` + `$!`
+    /// 反查必须全部能被替代，而且要能拿到 Legacy 拿不到的东西（稳定句柄、
+    /// pid+start time 身份、被自己回收的子进程的真实死因）。
+    #[tokio::test]
+    #[ignore = "需要真机；AR7_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_hosted -- --ignored --nocapture"]
+    async fn real_agent_hosted_lifecycle_handles_identity_and_reaping() {
+        use agent_protocol::method::{HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS};
+        use agent_protocol::{
+            AgentError, ErrorCode, HostedChmodParams, HostedChmodResult, HostedListParams,
+            HostedListResult, HostedRunState, HostedStartParams, HostedStartResult,
+            HostedStatusParams, HostedStatusResult,
+        };
+
+        // toybox 靠 argv[0] 的 basename 派发 applet，所以探针文件名必须是 toybox
+        const PROBE: &str = "toybox";
+        const PROBE_PORT: u16 = 24573;
+
+        async fn adb_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        fn agent_error(error: crate::services::agent_client::AgentClientError) -> AgentError {
+            match error {
+                crate::services::agent_client::AgentClientError::Remote(error) => error,
+                other => panic!("期望 Agent 结构化错误，实际 {other:?}"),
+            }
+        }
+
+        let serial = std::env::var("AR7_TEST_SERIAL").expect("AR7_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        let status = manager.connect_resolved(&serial).await.unwrap();
+        for method in [HOSTED_LIST, HOSTED_CHMOD, HOSTED_START, HOSTED_STATUS] {
+            assert!(
+                status
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.method == method && capability.available),
+                "Agent 未发布 {method} capability"
+            );
+        }
+        let client = manager.client(&serial).unwrap();
+
+        assert!(
+            !adb_shell(&serial, &format!("ls /data/local/tmp/{PROBE}"))
+                .await
+                .contains(PROBE),
+            "设备上已有 /data/local/tmp/{PROBE}，测试不覆盖用户文件，请先手工处理"
+        );
+        let copied = adb_shell(
+            &serial,
+            &format!(
+                "cp /system/bin/{PROBE} /data/local/tmp/{PROBE} && chmod 644 /data/local/tmp/{PROBE} && echo copied"
+            ),
+        )
+        .await;
+        assert!(copied.contains("copied"), "探针文件准备失败: {copied}");
+
+        // ① list：ELF 判定与 Legacy `file` 同结论；无执行位的文件也要列出来
+        let listed: HostedListResult = client
+            .request(HOSTED_LIST, &HostedListParams {}, Duration::from_secs(20))
+            .await
+            .unwrap();
+        let environment = runner.environment().await;
+        let adb_path = environment.path.unwrap();
+        let legacy_ls = runner
+            .run(
+                &adb_path,
+                &adb::build_args(Some(&serial), &adb::cmd_ls(adb::HOSTED_DIR)),
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+        let legacy_file = adb_shell(&serial, &format!("file {}/*", adb::HOSTED_DIR)).await;
+        let legacy = adb::hosted_binaries(&legacy_ls.stdout, &legacy_file);
+        let agent_names: std::collections::HashSet<&str> = listed
+            .binaries
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        let legacy_names: std::collections::HashSet<&str> =
+            legacy.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(
+            agent_names, legacy_names,
+            "Agent 用文件头 magic 判 ELF 必须与设备端 `file` 命令同结论"
+        );
+        let probe = listed
+            .binaries
+            .iter()
+            .find(|item| item.name == PROBE)
+            .expect("探针文件应出现在托管列表");
+        assert!(!probe.has_exec, "chmod 644 之后不该有执行位");
+        assert_eq!(probe.mode & 0o100, 0);
+        assert_eq!(probe.mode_text, "-rw-r--r--");
+        assert!(
+            !listed.runs.iter().any(|run| run.name == PROBE),
+            "还没启动不该有运行记录"
+        );
+        eprintln!(
+            "[hosted.list] agent_binaries={} legacy_binaries={} truncated={} unreadable={}",
+            listed.binaries.len(),
+            legacy.len(),
+            listed.truncated,
+            listed.unreadable.len()
+        );
+
+        // ② chmod：只补执行位，且重复调用幂等
+        let params = HostedChmodParams { name: PROBE.into() };
+        let chmodded: HostedChmodResult = client
+            .request(HOSTED_CHMOD, &params, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(chmodded.has_exec);
+        assert_eq!(chmodded.mode & 0o100, 0o100, "只补执行位，不改读位");
+        assert_eq!(chmodded.mode_text, "-rwxr-xr-x");
+        let again: HostedChmodResult = client
+            .request(HOSTED_CHMOD, &params, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(again.mode, chmodded.mode, "重复 chmod 必须幂等");
+
+        // ③ start：稳定句柄 + pid + start time，进程真的在监听
+        let params = HostedStartParams {
+            name: PROBE.into(),
+            args: vec![
+                "nc".into(),
+                "-4".into(),
+                "-L".into(),
+                "-s".into(),
+                "127.0.0.1".into(),
+                "-p".into(),
+                PROBE_PORT.to_string(),
+            ],
+            root: false,
+        };
+        let started: HostedStartResult = client
+            .request(HOSTED_START, &params, Duration::from_secs(15))
+            .await
+            .unwrap();
+        let record = started.record;
+        eprintln!(
+            "[hosted.start] handle={} pid={} ticks={} log={}",
+            record.handle, record.pid, record.start_time_ticks, record.log_path
+        );
+        assert_eq!(record.handle.len(), 16, "句柄是 16 位十六进制");
+        assert!(
+            record.handle.chars().all(|c| c.is_ascii_hexdigit()),
+            "句柄必须是 hex: {}",
+            record.handle
+        );
+        assert!(record.pid > 0);
+        assert!(
+            record.start_time_ticks > 0,
+            "start time 是身份的一部分，拿不到就是缺陷"
+        );
+        assert!(!record.root);
+        assert_eq!(record.log_path, format!("/data/local/tmp/.{PROBE}.run.log"));
+        assert_eq!(record.state, HostedRunState::Running);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            adb_shell(&serial, "netstat -tln 2>/dev/null")
+                .await
+                .contains(&format!(":{PROBE_PORT}")),
+            "托管进程应真的在监听"
+        );
+        // 记录确实落盘且权限收住（Agent 重启后对账全靠它）
+        let state_listing = adb_shell(
+            &serial,
+            &format!(
+                "ls -ld /data/local/tmp/app-reverse-tools-hosted; ls -l /data/local/tmp/app-reverse-tools-hosted/{}.json",
+                record.handle
+            ),
+        )
+        .await;
+        eprintln!(
+            "[hosted.state] {}",
+            state_listing.trim().replace('\n', " | ")
+        );
+        assert!(
+            state_listing.contains("drwx------"),
+            "状态目录必须 0700，实际: {state_listing}"
+        );
+        assert!(
+            state_listing.contains("-rw-------"),
+            "运行记录必须 0600，实际: {state_listing}"
+        );
+
+        // ④ status：running → 被 SIGKILL 后由 Agent 回收，给出真实死因而非编造退出码
+        let params = HostedStatusParams {
+            handle: record.handle.clone(),
+        };
+        let live: HostedStatusResult = client
+            .request(HOSTED_STATUS, &params, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(live.record.state, HostedRunState::Running);
+        assert!(!live.reconciled, "本 Agent 启动的记录不该标成对账恢复");
+        assert!(live.record.exit_code.is_none(), "还在跑就没有退出码");
+
+        adb_shell(&serial, &format!("kill -9 {}", record.pid)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let dead: HostedStatusResult = client
+            .request(HOSTED_STATUS, &params, Duration::from_secs(10))
+            .await
+            .unwrap();
+        eprintln!(
+            "[hosted.status] state={:?} exit_code={:?} detail={:?}",
+            dead.record.state, dead.record.exit_code, dead.record.detail
+        );
+        assert_eq!(dead.record.state, HostedRunState::Exited);
+        assert_eq!(
+            dead.record.exit_code, None,
+            "被 SIGKILL 杀掉的进程没有退出码只有信号，不能把 137 当 exit_code"
+        );
+        assert_eq!(dead.record.detail.as_deref(), Some("exited_signal_9"));
+        let listed_after: HostedListResult = client
+            .request(HOSTED_LIST, &HostedListParams {}, Duration::from_secs(20))
+            .await
+            .unwrap();
+        let in_list = listed_after
+            .runs
+            .iter()
+            .find(|run| run.handle == record.handle)
+            .expect("list 的 runs 里应能看到同一条记录");
+        assert_eq!(in_list.state, HostedRunState::Exited);
+        assert_eq!(
+            adb_shell(
+                &serial,
+                &format!("kill -0 {} 2>/dev/null && echo alive", record.pid)
+            )
+            .await
+            .trim(),
+            "",
+            "设备上该进程确实已退出"
+        );
+
+        // ⑤ 写操作前置拒止：非法名、root 要求、未知句柄
+        let bad_name = agent_error(
+            client
+                .request::<_, HostedStartResult>(
+                    HOSTED_START,
+                    &HostedStartParams {
+                        name: "../escape".into(),
+                        args: vec![],
+                        root: false,
+                    },
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect_err("非法文件名必须拒"),
+        );
+        assert_eq!(bad_name.code, ErrorCode::InvalidRequest);
+        assert_eq!(bad_name.details.unwrap()["reason"], "invalid_name");
+
+        let root_required = agent_error(
+            client
+                .request::<_, HostedStartResult>(
+                    HOSTED_START,
+                    &HostedStartParams {
+                        name: PROBE.into(),
+                        args: vec![],
+                        root: true,
+                    },
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect_err("Agent 是 shell 身份，不能假装以 root 启动"),
+        );
+        assert_eq!(root_required.code, ErrorCode::PermissionDenied);
+        assert_eq!(root_required.details.unwrap()["reason"], "root_required");
+
+        let unknown = agent_error(
+            client
+                .request::<_, HostedStatusResult>(
+                    HOSTED_STATUS,
+                    &HostedStatusParams {
+                        handle: "0000000000000000".into(),
+                    },
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect_err("未知句柄必须 not_found"),
+        );
+        assert_eq!(unknown.code, ErrorCode::NotFound);
+        assert_eq!(unknown.details.unwrap()["reason"], "unknown_handle");
+
+        adb_shell(
+            &serial,
+            &format!(
+                "rm -f /data/local/tmp/{PROBE} /data/local/tmp/.{PROBE}.run.log /data/local/tmp/app-reverse-tools-hosted/{}.json",
+                record.handle
+            ),
+        )
+        .await;
+        manager.disconnect(&serial).await.unwrap();
+    }
+
     /// AR7.1 真机腿：设备端文件 API 与 Legacy `ls -lA` 文本解析必须同结论，
     /// 且路径策略（允许根、`..` 拒止、符号链接逃逸）在真机上真的挡得住。
     #[tokio::test]

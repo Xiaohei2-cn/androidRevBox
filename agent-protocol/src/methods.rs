@@ -16,6 +16,10 @@ pub mod method {
     pub const FILESYSTEM_LIST: &str = "filesystem.list";
     pub const FILESYSTEM_STAT: &str = "filesystem.stat";
     pub const FILESYSTEM_PREVIEW: &str = "filesystem.preview";
+    pub const HOSTED_LIST: &str = "hosted.list";
+    pub const HOSTED_CHMOD: &str = "hosted.chmod";
+    pub const HOSTED_START: &str = "hosted.start";
+    pub const HOSTED_STATUS: &str = "hosted.status";
     pub const PACKAGE_EXPORT_APK: &str = "package.export_apk";
     pub const PACKAGE_EXPORT_CLEAN: &str = "package.export_clean";
     pub const ZYGISK_STATUS: &str = "zygisk.status";
@@ -474,6 +478,109 @@ pub struct FilesystemPreviewResult {
     pub detail: Option<String>,
 }
 
+/// AR7.2：托管二进制。Desktop 不再 `ls -l` + `file` + `nohup … & echo $!`，
+/// 生命周期与身份判定全在设备端完成。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedBinaryInfo {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    /// 权限位（含 setuid/sticky），不含文件类型位
+    pub mode: u32,
+    pub mode_text: String,
+    /// owner 有执行位（UI 的绿色/红色标记）
+    pub has_exec: bool,
+    pub uid: u32,
+    pub mtime_unix: u64,
+}
+
+/// 一次托管运行的状态。`unknown` 只用于「Agent 重启后连 `/proc` 都读不到」，
+/// 绝不拿它冒充 `running`，也不冒充 `exited`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedRunState {
+    Running,
+    Exited,
+    Unknown,
+}
+
+/// 托管运行记录。身份是 `pid + start_time_ticks`（`/proc/<pid>/stat` 第 22 字段），
+/// 单靠 PID 在 PID 复用后会认错进程；`handle` 是给上层用的稳定句柄。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedRunRecord {
+    pub handle: String,
+    pub name: String,
+    pub pid: u32,
+    pub start_time_ticks: u64,
+    pub started_at_unix: u64,
+    pub log_path: String,
+    /// 由谁启动：Agent 只能以 shell 身份启动（root=true 的记录来自 Legacy 支路对账）
+    pub root: bool,
+    pub state: HostedRunState,
+    /// 仅 Agent 亲自启动、且已回收僵尸时才有的退出码
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HostedListParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedListResult {
+    pub dir: String,
+    /// 只含 ELF 头的普通文件（按文件头 magic 判定，不再依赖设备端 `file` 命令）
+    pub binaries: Vec<HostedBinaryInfo>,
+    pub runs: Vec<HostedRunRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HostedChmodParams {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedChmodResult {
+    pub name: String,
+    pub path: String,
+    pub mode: u32,
+    pub mode_text: String,
+    pub has_exec: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HostedStartParams {
+    pub name: String,
+    /// 参数数组直接交给 `exec`，不经过 shell；文件名与参数都不进任何解析上下文
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// 调用方要求以 root 启动：Agent 以 shell 身份运行时应显式拒绝（同 D026）
+    #[serde(default)]
+    pub root: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedStartResult {
+    pub record: HostedRunRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HostedStatusParams {
+    pub handle: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedStatusResult {
+    pub record: HostedRunRecord,
+    /// 记录是否来自磁盘对账（Agent 重启后不再是自己的子进程，无法回收退出码）
+    pub reconciled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfoResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -692,6 +799,88 @@ mod tests {
         assert_eq!(value["module_id"], "applist");
         assert_eq!(value["sub_protocol_version"], 1);
         assert_eq!(value.get("detail"), None);
+    }
+
+    #[test]
+    fn hosted_run_record_keeps_state_and_exit_code_honest() {
+        let running = HostedRunRecord {
+            handle: "aabbccdd00112233".into(),
+            name: "toybox".into(),
+            pid: 4321,
+            start_time_ticks: 987654,
+            started_at_unix: 1_760_000_000,
+            log_path: "/data/local/tmp/.toybox.run.log".into(),
+            root: false,
+            state: HostedRunState::Running,
+            exit_code: None,
+            detail: None,
+        };
+        let value = serde_json::to_value(&running).unwrap();
+        assert_eq!(value["state"], "running");
+        assert_eq!(value["start_time_ticks"], json!(987654));
+        // 没有回收到的退出码不得出现字段，前端不能拿 null 当 0
+        assert_eq!(value.get("exit_code"), None);
+        assert_eq!(value.get("detail"), None);
+        let parsed: HostedRunRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.state, HostedRunState::Running);
+        assert_eq!(parsed.exit_code, None);
+        assert_eq!(
+            serde_json::to_value(HostedRunState::Unknown).unwrap(),
+            json!("unknown")
+        );
+    }
+
+    #[test]
+    fn hosted_params_default_to_shell_start_with_no_args() {
+        let params: HostedStartParams =
+            serde_json::from_value(json!({ "name": "toybox" })).unwrap();
+        assert!(params.args.is_empty());
+        assert!(!params.root);
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value.get("args"), None, "空参数数组不占报文");
+        assert_eq!(value["root"], json!(false));
+
+        let listed = HostedListResult {
+            dir: "/data/local/tmp".into(),
+            binaries: vec![HostedBinaryInfo {
+                name: "toybox".into(),
+                path: "/data/local/tmp/toybox".into(),
+                size: 4096,
+                mode: 0o755,
+                mode_text: render_mode_text(FileKind::File, 0o755),
+                has_exec: true,
+                uid: 2000,
+                mtime_unix: 1_760_000_000,
+            }],
+            runs: vec![HostedRunRecord {
+                state: HostedRunState::Exited,
+                exit_code: Some(137),
+                ..running_record()
+            }],
+            truncated: false,
+            unreadable: vec![],
+        };
+        let value = serde_json::to_value(&listed).unwrap();
+        assert_eq!(value["binaries"][0]["mode"], json!(493));
+        assert_eq!(value["binaries"][0]["mode_text"], "-rwxr-xr-x");
+        assert_eq!(value["runs"][0]["exit_code"], json!(137));
+        assert_eq!(value.get("truncated"), None);
+        assert_eq!(value.get("unreadable"), None);
+    }
+
+    fn running_record() -> HostedRunRecord {
+        HostedRunRecord {
+            handle: "aabbccdd00112233".into(),
+            name: "toybox".into(),
+            pid: 4321,
+            start_time_ticks: 987654,
+            started_at_unix: 1_760_000_000,
+            log_path: "/data/local/tmp/.toybox.run.log".into(),
+            root: false,
+            state: HostedRunState::Running,
+            exit_code: None,
+            detail: None,
+        }
     }
 
     #[test]

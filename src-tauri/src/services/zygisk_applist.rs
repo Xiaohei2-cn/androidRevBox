@@ -906,6 +906,16 @@ mod tests {
             .expect("Agent 安装/连接失败（非 root 也应可用）");
 
         let status = service.status(&serial).await.unwrap();
+        if status.bridge_ready || status.module_id.is_some() {
+            // 这条腿的前提是「这台设备没装模块」。拿装了模块的机器跑它，
+            // 失败信息会长得像代码回归，所以先自证前提再断言，不满足就明确跳过。
+            eprintln!(
+                "[跳过] 设备 {serial} 上已能观察到 Zygisk 模块（module={:?}, lifecycle={}），\
+                 real_agent_zygisk_absent 需要一台未安装模块的设备（本项目用无模块的 vivo）",
+                status.module_id, status.lifecycle
+            );
+            return;
+        }
         eprintln!(
             "[zygisk.absent] lifecycle={} bridge={} root={} sub_protocol={} module={:?} detail={:?}",
             status.lifecycle,

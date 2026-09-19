@@ -74,6 +74,24 @@ export interface FileStatResult {
   stat: FileStat;
 }
 
+/** 托管运行记录（AR7.2 `hosted.list` 的 runs）：身份是 pid + start time */
+export type HostedRunState = "running" | "exited" | "unknown";
+
+export interface HostedRunRecord {
+  handle: string;
+  name: string;
+  pid: number;
+  /** `/proc/<pid>/stat` 第 22 字段；PID 被复用时它必然不同 */
+  startTimeTicks: number;
+  startedAtUnix: number;
+  logPath: string;
+  root: boolean;
+  state: HostedRunState;
+  /** 只有 Agent 亲自启动并已回收的进程才有退出码 */
+  exitCode?: number | null;
+  detail?: string | null;
+}
+
 export type PreviewEncoding = "utf8" | "hex";
 
 export interface FilePreviewResult {
@@ -214,6 +232,10 @@ export const deviceApi = {
   /** 后台启动二进制，返回 pid（root=true 走 su -c） */
   binaryRun(serial: string, name: string, root = false): Promise<number> {
     return invokeCommand<number>("device_binary_run", { serial, name, root });
+  },
+  /** 托管运行表（AR7.2，Agent only）：真实运行状态与稳定句柄 */
+  hostedRuns(serial: string): Promise<HostedRunRecord[]> {
+    return invokeCommand<HostedRunRecord[]>("device_hosted_runs", { serial });
   },
   /**
    * 终止进程（AR6.3 写操作）。默认走 Agent process.kill：设备端发信号前会重读

@@ -8,6 +8,7 @@ use agent_protocol::PermissionInfo;
 use provider::activity::ActivityProvider;
 use provider::device::DeviceProvider;
 use provider::filesystem::FilesystemProvider;
+use provider::hosted::HostedProvider;
 use provider::process::ProcessesProvider;
 use provider::system::SystemProvider;
 use provider::zygisk::ZygiskProvider;
@@ -43,5 +44,8 @@ pub fn system_router_with(
     router
         .register(Arc::new(FilesystemProvider))
         .expect("filesystem provider methods must be unique");
+    router
+        .register(Arc::new(HostedProvider::new()))
+        .expect("hosted provider methods must be unique");
     router
 }

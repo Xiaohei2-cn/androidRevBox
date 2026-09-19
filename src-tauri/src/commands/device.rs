@@ -2,7 +2,7 @@
 //! 短查询直接返回结果；长操作（shell/install/logcat/push/pull）一律返回
 //! task_id，输出走 task://* 事件流（PHASES §1.3 不阻塞 IPC）。
 
-use agent_protocol::{FilesystemPreviewResult, FilesystemStatResult};
+use agent_protocol::{FilesystemPreviewResult, FilesystemStatResult, HostedRunRecord};
 use serde::Deserialize;
 
 use crate::AppState;
@@ -210,6 +210,16 @@ pub async fn device_binary_kill(
         .device
         .process_kill(&serial, pid, expected_name, root.unwrap_or(false))
         .await
+}
+
+/// 托管运行表（AR7.2，Agent only）：句柄 + pid + start time + 状态 + 退出码。
+/// 页面刷新或 Desktop 重启后仍能显示「谁真的在跑」，不再依赖前端本地状态。
+#[tauri::command]
+pub async fn device_hosted_runs(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+) -> CoreResult<Vec<HostedRunRecord>> {
+    state.device.hosted_runs(&serial).await
 }
 
 /// 单路径元数据（AR7.1，Agent only）：type/mode/uid/gid/size/mtime/link target 结构化返回。

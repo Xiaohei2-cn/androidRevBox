@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod device;
 pub mod filesystem;
+pub mod hosted;
 pub mod process;
 pub mod system;
 pub mod zygisk;

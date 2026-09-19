@@ -2,7 +2,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Play, RefreshCw, ShieldCheck, Square, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { deviceApi, type DeviceEntry, type HostedBinary, type ListenPort } from "@/api/device";
+import {
+  deviceApi,
+  type DeviceEntry,
+  type HostedBinary,
+  type HostedRunRecord,
+  type ListenPort,
+} from "@/api/device";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 
@@ -84,12 +90,61 @@ export function BinaryHosting() {
     retry: false,
   });
 
+  /**
+   * Agent 侧托管运行表（AR7.2）：pid 与状态来自设备端 `pid + start time` 对账，
+   * 不是前端本地记忆，所以 Desktop 重启、页面刷新后也能恢复「谁真的在跑」。
+   */
+  const { data: runs = [] } = useQuery({
+    queryKey: ["adb", "hosted-runs", deviceSerial],
+    queryFn: () => deviceApi.hostedRuns(deviceSerial!),
+    enabled: !!deviceSerial,
+    refetchInterval: 5_000,
+    retry: false,
+  });
+
   // 设备切换：托管区清空（pid 属于旧设备）；Root 探测状态失效
   useEffect(() => {
     setHosted([]);
     setNotice(null);
     setRoot(false);
   }, [deviceSerial]);
+
+  // 用运行表校正/补齐托管行：设备端说在跑就是在跑，说退了就把状态收回去
+  useEffect(() => {
+    if (runs.length === 0) return;
+    setHosted((rows) => {
+      const next = rows.map((row) => {
+        const mine = runs
+          .filter((r: HostedRunRecord) => r.name === row.name)
+          .sort((a, b) => b.startedAtUnix - a.startedAtUnix);
+        const live = mine.find((r) => r.state === "running");
+        if (live) {
+          return { ...row, pid: live.pid, running: true, root: live.root };
+        }
+        const last = mine[0];
+        if (last && last.state === "exited" && row.running) {
+          return { ...row, running: false, pid: last.pid };
+        }
+        return row;
+      });
+      const known = new Set(next.map((row) => row.name));
+      for (const run of runs) {
+        if (run.state !== "running" || known.has(run.name)) continue;
+        next.push({
+          name: run.name,
+          pid: run.pid,
+          running: true,
+          error: null,
+          root: run.root,
+          ports: [],
+          portsLoading: false,
+          note: loadNote(deviceSerial, run.name),
+        });
+        known.add(run.name);
+      }
+      return next;
+    });
+  }, [runs, deviceSerial]);
 
   const patchRow = (name: string, p: Partial<HostedRow>) =>
     setHosted((hs) => hs.map((h) => (h.name === name ? { ...h, ...p } : h)));
