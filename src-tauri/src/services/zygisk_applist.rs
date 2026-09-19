@@ -1,35 +1,104 @@
-//! 独立 Zygisk Applist 模块的线协议适配器。
-//! 模块本身是可独立安装的 C++/Java 工程，桌面端只依赖稳定 wire protocol。
+//! Zygisk 应用清单 Service（AR5.3/AR5.4）。
+//!
+//! 边界：模块的 `Q/E/D` 私有线协议由 **Android Agent 的 ZygiskProvider** 负责，
+//! Desktop 只调用 Agent typed API，不再直连模块端口；APK 字节回传复用
+//! 「Desktop Transport」允许项（ADB pull），因此本文件不出现任何 Zygisk 私有协议。
+//! 该能力不允许静默降级成 `pm`/Shell 结果（AR5.5 规则）：缺 Agent 或缺模块时
+//! 直接返回可诊断的 `provider_unavailable`。
 
-use std::collections::BTreeMap;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_protocol::method::{
+    PACKAGE_EXPORT_APK, PACKAGE_EXPORT_CLEAN, PACKAGE_LIST_LOCALIZED, ZYGISK_STATUS,
+};
+use agent_protocol::{
+    PackageExportApkParams, PackageExportApkResult, PackageExportCleanParams,
+    PackageListLocalizedParams, PackageListLocalizedResult, PackageScope, ZygiskStatusResult,
+};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::timeout;
 
 use crate::adapters::adb;
 use crate::core::error::{CoreError, CoreResult};
-use crate::services::device_service::{AdbRunOutput, AdbRunner};
+use crate::models::agent::{AgentSessionState, AndroidBackendSource};
+use crate::services::android_backend::{AgentBackendError, CapabilityRouter, OperationKind};
+use crate::services::device_service::AdbRunner;
 
-const MODULE_PORT: u16 = 11_500;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
-const FORWARD_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
-const MAX_APK_BYTES: u64 = 512 * 1024 * 1024;
+const STATUS_TIMEOUT: Duration = Duration::from_secs(20);
+const LIST_TIMEOUT: Duration = Duration::from_secs(60);
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(900);
+const PULL_TIMEOUT: Duration = Duration::from_secs(900);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalizedScope {
+    All,
+    User,
+    System,
+}
+
+impl LocalizedScope {
+    fn as_protocol(self) -> PackageScope {
+        match self {
+            Self::All => PackageScope::All,
+            Self::User => PackageScope::User,
+            Self::System => PackageScope::System,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ZygiskAppItem {
-    /// 模块线协议字段名是 `pkg`；对前端保持 `packageName`（camelCase）不变。
-    #[serde(alias = "pkg")]
     pub package_name: String,
     pub label: String,
     pub version_name: String,
-    pub version_code: u64,
+    pub version_code: Option<u64>,
+    pub label_source: String,
+    pub requested_locale: String,
+    pub resolved_locale: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub uid: Option<u32>,
+    pub is_system: bool,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZygiskAppWarning {
+    pub package_name: Option<String>,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZygiskAppList {
+    pub items: Vec<ZygiskAppItem>,
+    pub success_count: u32,
+    pub fallback_count: u32,
+    pub warnings: Vec<ZygiskAppWarning>,
+    pub device_locale: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZygiskStatus {
+    /// `not_installed` / `zygisk_disabled` / `installed_reboot_required` /
+    /// `loaded` / `bridge_ready` / `incompatible` / `faulted`
+    pub lifecycle: String,
+    pub bridge_ready: bool,
+    pub root_available: bool,
+    pub agent_connected: bool,
+    pub module_id: Option<String>,
+    pub module_version: Option<String>,
+    pub module_version_code: Option<u32>,
+    pub zygisk_impl: Option<String>,
+    pub device_locale: Option<String>,
+    pub sub_protocol_version: u32,
+    pub probe_latency_ms: Option<u64>,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -37,15 +106,6 @@ pub struct ZygiskAppItem {
 pub struct ZygiskApkFile {
     pub package_name: String,
     pub name: String,
-    pub size: u64,
-}
-
-/// E 清单中的单个 APK 文件（设备侧路径仅用于展示与校验，不参与本地落盘路径拼接）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ZygiskApkManifestEntry {
-    pub name: String,
-    pub path: String,
     pub size: u64,
 }
 
@@ -59,45 +119,74 @@ pub struct ZygiskExportReport {
 }
 
 pub struct ZygiskApplistService {
+    android: Arc<CapabilityRouter>,
     runner: Arc<dyn AdbRunner>,
 }
 
 impl ZygiskApplistService {
-    pub fn new(runner: Arc<dyn AdbRunner>) -> Self {
-        Self { runner }
+    pub fn new(android: Arc<CapabilityRouter>, runner: Arc<dyn AdbRunner>) -> Self {
+        Self { android, runner }
     }
 
-    /// Q：由 Framework PackageManager 解析设备当前 locale 的应用显示名。
-    pub async fn list(&self, serial: &str) -> CoreResult<Vec<ZygiskAppItem>> {
-        self.with_module(serial, |mut stream| async move {
-            stream.write_all(b"Q").await.map_err(io_error)?;
-            let line = read_line(&mut stream, MAX_JSON_BYTES).await?;
-            let value: serde_json::Value = serde_json::from_slice(&line).map_err(|error| {
-                CoreError::Internal(format!("Zygisk 应用清单 JSON 无法解析: {error}"))
-            })?;
-            if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-                return Err(CoreError::Internal(format!("Zygisk 应用清单失败: {error}")));
-            }
-            serde_json::from_value(value)
-                .map_err(|error| CoreError::Internal(format!("Zygisk 应用清单字段不兼容: {error}")))
+    /// 诊断模块生命周期状态；UI 用它区分「未安装 / 未启用 / 需重启 / bridge 未就绪」。
+    pub async fn status(&self, serial: &str) -> CoreResult<ZygiskStatus> {
+        let state = self.android.agent_status(serial).state;
+        let agent_connected = matches!(
+            state,
+            AgentSessionState::Ready | AgentSessionState::Degraded
+        );
+        self.require_agent(serial, ZYGISK_STATUS)?;
+        let result: ZygiskStatusResult = self
+            .android
+            .agent()
+            .request(
+                serial,
+                ZYGISK_STATUS,
+                &serde_json::json!({}),
+                STATUS_TIMEOUT,
+            )
+            .await
+            .map_err(agent_core_error)?;
+        Ok(ZygiskStatus {
+            lifecycle: lifecycle_name(result.lifecycle).to_owned(),
+            bridge_ready: result.bridge_ready,
+            root_available: result.root_available,
+            agent_connected,
+            module_id: result.module_id,
+            module_version: result.module_version,
+            module_version_code: result.module_version_code,
+            zygisk_impl: result.zygisk_impl,
+            device_locale: result.device_locale,
+            sub_protocol_version: result.sub_protocol_version,
+            probe_latency_ms: result.probe_latency_ms,
+            detail: result.detail,
         })
-        .await
     }
 
-    /// E：每包 base + split APK 的文件清单（名称、设备路径、字节数），不含文件体。
-    pub async fn apk_manifest(
+    /// `package.list_localized`：一次批量 RPC 取得 Framework 解析后的显示名。
+    pub async fn list(
         &self,
         serial: &str,
-    ) -> CoreResult<BTreeMap<String, Vec<ZygiskApkManifestEntry>>> {
-        self.with_module(serial, |mut stream| async move {
-            stream.write_all(b"E").await.map_err(io_error)?;
-            let line = read_line(&mut stream, MAX_JSON_BYTES).await?;
-            parse_apk_manifest(&line)
-        })
-        .await
+        locale: Option<String>,
+        scope: LocalizedScope,
+        include_disabled: bool,
+    ) -> CoreResult<ZygiskAppList> {
+        self.require_agent(serial, PACKAGE_LIST_LOCALIZED)?;
+        let params = PackageListLocalizedParams {
+            locale,
+            scope: scope.as_protocol(),
+            include_disabled,
+        };
+        let result: PackageListLocalizedResult = self
+            .android
+            .agent()
+            .request(serial, PACKAGE_LIST_LOCALIZED, &params, LIST_TIMEOUT)
+            .await
+            .map_err(agent_core_error)?;
+        Ok(map_localized_result(result))
     }
 
-    /// D：流式导出一个包的 base.apk 与全部 split APK。
+    /// 导出 base + split APK：Agent 在设备侧暂存，Desktop 经 ADB pull 取回并校验大小。
     pub async fn export_package(
         &self,
         serial: &str,
@@ -105,192 +194,248 @@ impl ZygiskApplistService {
         destination: &Path,
     ) -> CoreResult<ZygiskExportReport> {
         validate_package_name(package_name)?;
-        let destination = destination.to_path_buf();
-        let package_name = package_name.to_string();
-        self.with_module(serial, move |mut stream| async move {
-            stream.write_all(b"D").await.map_err(io_error)?;
-            stream
-                .write_all(package_name.as_bytes())
-                .await
-                .map_err(io_error)?;
-            stream.write_all(b"\n\n").await.map_err(io_error)?;
+        self.require_agent(serial, PACKAGE_EXPORT_APK)?;
 
-            let package_dir = destination.join(&package_name);
-            tokio::fs::create_dir_all(&package_dir)
-                .await
-                .map_err(io_error)?;
-            let mut files = Vec::new();
-            let mut total_bytes = 0_u64;
-            loop {
-                let line = read_line(&mut stream, 32 * 1024).await?;
-                if line == b"DONE" {
-                    break;
-                }
-                if line.starts_with(b"ERR") {
-                    return Err(CoreError::Internal(format!(
-                        "Zygisk APK 导出失败: {}",
-                        String::from_utf8_lossy(&line)
-                    )));
-                }
-                let header = parse_file_header(&line)?;
-                if header.package_name != package_name {
-                    return Err(CoreError::Internal(format!(
-                        "Zygisk 返回了意外包名 {}",
-                        header.package_name
-                    )));
-                }
-                if header.size > MAX_APK_BYTES {
-                    return Err(CoreError::Internal("APK 文件超过 512 MiB 限制".into()));
-                }
-                let safe_name = safe_filename(&header.name)?;
-                let target = package_dir.join(&safe_name);
-                let temporary = package_dir.join(format!(".{}.part", safe_name));
-                let mut file = tokio::fs::File::create(&temporary)
-                    .await
-                    .map_err(io_error)?;
-                copy_exact(&mut stream, &mut file, header.size).await?;
-                file.flush().await.map_err(io_error)?;
-                drop(file);
-                tokio::fs::rename(&temporary, &target)
-                    .await
-                    .map_err(io_error)?;
-                total_bytes = total_bytes.saturating_add(header.size);
-                files.push(ZygiskApkFile {
-                    package_name: header.package_name,
-                    name: safe_name,
-                    size: header.size,
-                });
-            }
-            Ok(ZygiskExportReport {
-                package_name,
-                files,
-                destination: package_dir.to_string_lossy().into_owned(),
-                bytes: total_bytes,
-            })
+        let staged: PackageExportApkResult = self
+            .android
+            .agent()
+            .request(
+                serial,
+                PACKAGE_EXPORT_APK,
+                &PackageExportApkParams {
+                    package_name: package_name.to_owned(),
+                },
+                EXPORT_TIMEOUT,
+            )
+            .await
+            .map_err(agent_core_error)?;
+
+        let package_dir = destination.join(package_name);
+        tokio::fs::create_dir_all(&package_dir)
+            .await
+            .map_err(|error| CoreError::Internal(format!("创建导出目录失败: {error}")))?;
+
+        let pull = self.pull_staged_files(serial, &staged, &package_dir).await;
+        // 无论取回成功与否都回收设备侧暂存，避免残留 APK 副本。
+        if let Err(error) = self.clean_staged(serial, &staged.session).await {
+            tracing::warn!(serial, error = %error, "Zygisk 导出暂存清理失败");
+        }
+        let files = pull?;
+
+        let bytes = files.iter().map(|file| file.size).sum::<u64>();
+        Ok(ZygiskExportReport {
+            package_name: staged.package_name,
+            files,
+            destination: package_dir.to_string_lossy().into_owned(),
+            bytes,
         })
-        .await
     }
 
-    async fn with_module<F, Fut, T>(&self, serial: &str, operation: F) -> CoreResult<T>
-    where
-        F: FnOnce(TcpStream) -> Fut,
-        Fut: std::future::Future<Output = CoreResult<T>>,
-    {
-        if serial.trim().is_empty() {
-            return Err(CoreError::Internal("设备 serial 不能为空".into()));
-        }
+    async fn pull_staged_files(
+        &self,
+        serial: &str,
+        staged: &PackageExportApkResult,
+        package_dir: &Path,
+    ) -> CoreResult<Vec<ZygiskApkFile>> {
         let environment = self.runner.environment().await;
         let adb_path = environment
             .path
-            .ok_or_else(|| CoreError::Internal("adb 不可用，无法连接 Zygisk 模块".into()))?;
-        let forward = self
-            .runner
-            .run(
-                &adb_path,
-                &adb::build_args(
-                    Some(serial),
-                    &adb::cmd_forward("tcp:0", &format!("tcp:{}", MODULE_PORT)),
-                ),
-                FORWARD_TIMEOUT,
-            )
-            .await?;
-        ensure_adb_success("建立 Zygisk forward", &forward)?;
-        let port = adb::parse_dynamic_forward_port(&forward.stdout).ok_or_else(|| {
-            CoreError::Internal(format!(
-                "adb forward 未返回动态端口: {}",
-                forward.stdout.trim()
-            ))
-        })?;
-        let local = format!("tcp:{}", port);
-        let result = match timeout(REQUEST_TIMEOUT, TcpStream::connect(("127.0.0.1", port))).await {
-            Ok(Ok(stream)) => timeout(REQUEST_TIMEOUT, operation(stream))
+            .ok_or_else(|| CoreError::Internal("adb 不可用，无法取回导出的 APK".into()))?;
+        let mut files = Vec::with_capacity(staged.files.len());
+        for entry in &staged.files {
+            let name = safe_filename(&entry.name)?;
+            let target = package_dir.join(&name);
+            let output = self
+                .runner
+                .run(
+                    &adb_path,
+                    &adb::build_args(
+                        Some(serial),
+                        &adb::cmd_pull(&entry.remote_path, &target.to_string_lossy()),
+                    ),
+                    PULL_TIMEOUT,
+                )
+                .await?;
+            if output.exit_code != Some(0) {
+                return Err(CoreError::Internal(format!(
+                    "取回 {} 失败: {}",
+                    entry.remote_path,
+                    output.stderr.trim()
+                )));
+            }
+            let metadata = tokio::fs::metadata(&target)
                 .await
-                .map_err(|_| CoreError::Internal("Zygisk 请求超时".into()))
-                .and_then(|result| result),
-            Ok(Err(error)) => Err(CoreError::Internal(format!(
-                "无法连接 Zygisk 模块: {error}"
-            ))),
-            Err(_) => Err(CoreError::Internal("连接 Zygisk 模块超时".into())),
-        };
-        let cleanup = self
-            .runner
-            .run(
-                &adb_path,
-                &adb::build_args(Some(serial), &adb::cmd_forward_remove(Some(&local))),
-                FORWARD_TIMEOUT,
-            )
-            .await;
-        let cleanup = cleanup.and_then(|output| {
-            ensure_adb_success("清理 Zygisk forward", &output)?;
-            Ok(())
-        });
-        if result.is_ok()
-            && let Err(error) = cleanup
-        {
-            return Err(error);
+                .map_err(|error| CoreError::Internal(format!("读取取回文件失败: {error}")))?;
+            if metadata.len() != entry.size {
+                return Err(CoreError::Internal(format!(
+                    "{} 大小不符：设备侧 {}，本地 {}",
+                    name,
+                    entry.size,
+                    metadata.len()
+                )));
+            }
+            files.push(ZygiskApkFile {
+                package_name: staged.package_name.clone(),
+                name,
+                size: entry.size,
+            });
         }
-        result
+        Ok(files)
+    }
+
+    async fn clean_staged(&self, serial: &str, session: &str) -> CoreResult<()> {
+        let _: agent_protocol::PackageExportCleanResult = self
+            .android
+            .agent()
+            .request(
+                serial,
+                PACKAGE_EXPORT_CLEAN,
+                &PackageExportCleanParams {
+                    session: session.to_owned(),
+                },
+                STATUS_TIMEOUT,
+            )
+            .await
+            .map_err(agent_core_error)?;
+        Ok(())
+    }
+
+    /// 三个方法都不登记 Legacy 回退：Agent 未连接或模块缺失时必须显式失败。
+    fn require_agent(&self, serial: &str, method: &str) -> CoreResult<()> {
+        match self
+            .android
+            .select(serial, method, OperationKind::ReadOnlyIdempotent)
+        {
+            Ok(decision) if decision.backend == AndroidBackendSource::Agent => Ok(()),
+            Ok(decision) => Err(CoreError::AgentUnavailable(format!(
+                "Zygisk 能力不能由 Legacy ADB 提供，但路由选择了 {:?}",
+                decision.backend
+            ))),
+            Err(error) => Err(route_error(method, error)),
+        }
     }
 }
 
-#[derive(Debug)]
-struct FileHeader {
-    size: u64,
-    package_name: String,
-    name: String,
+/// Agent 业务错误里的 `provider_unavailable` / `incompatible_version` 是「能力缺失」
+/// 而不是内部故障，必须映射成可路由的 CoreError 变体，UI 才能给安装/启用/重启指引。
+fn agent_core_error(error: AgentBackendError) -> CoreError {
+    match &error {
+        AgentBackendError::Business(business)
+            if business.code == agent_protocol::ErrorCode::ProviderUnavailable =>
+        {
+            CoreError::AgentUnavailable(business.message.clone())
+        }
+        AgentBackendError::Business(business)
+            if business.code == agent_protocol::ErrorCode::IncompatibleVersion =>
+        {
+            CoreError::AgentIncompatible(business.message.clone())
+        }
+        _ => CapabilityRouter::agent_error(error),
+    }
 }
 
-fn parse_apk_manifest(line: &[u8]) -> CoreResult<BTreeMap<String, Vec<ZygiskApkManifestEntry>>> {
-    let value: serde_json::Value = serde_json::from_slice(line)
-        .map_err(|error| CoreError::Internal(format!("Zygisk APK 清单 JSON 无法解析: {error}")))?;
-    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-        return Err(CoreError::Internal(format!("Zygisk APK 清单失败: {error}")));
+fn route_error(method: &str, error: crate::services::android_backend::RouteError) -> CoreError {
+    use crate::services::android_backend::RouteError;
+    let core = CapabilityRouter::core_error(error.clone());
+    let detail = match error {
+        RouteError::AgentUnavailable { reason, .. } => format!(
+            "Android Agent 未连接或能力未就绪（{reason}）：请先在设备页「安装并连接」Agent，\
+             Zygisk 应用清单必须经 Agent 的 ZygiskProvider 获取"
+        ),
+        RouteError::ProviderUnavailable { reason, .. } => reason,
+        RouteError::UnsupportedMethod(_) => format!("Agent 未实现 {method}，请重新安装 Agent"),
+        RouteError::LegacyFallbackNotRegistered(_) => {
+            format!("{method} 只允许由 Zygisk Framework 提供，禁止用 pm/Shell 结果伪装成功")
+        }
+        RouteError::Incompatible(reason) => reason,
+        RouteError::MutatingFallbackForbidden(method) => method,
+        RouteError::AgentFailure(inner) => inner.to_string(),
+    };
+    match core {
+        CoreError::AgentUnavailable(_) | CoreError::AgentIncompatible(_) => {
+            CoreError::AgentUnavailable(detail)
+        }
+        other => other,
     }
-    serde_json::from_value(value)
-        .map_err(|error| CoreError::Internal(format!("Zygisk APK 清单字段不兼容: {error}")))
 }
 
-fn parse_file_header(line: &[u8]) -> CoreResult<FileHeader> {
-    let text = std::str::from_utf8(line)
-        .map_err(|_| CoreError::Internal("Zygisk APK 文件头不是 UTF-8".into()))?;
-    let mut parts = text.splitn(4, ' ');
-    if parts.next() != Some("F") {
-        return Err(CoreError::Internal(format!("Zygisk 未知文件头: {text}")));
+fn map_localized_result(result: PackageListLocalizedResult) -> ZygiskAppList {
+    let device_locale = result
+        .items
+        .first()
+        .and_then(|item| item.resolved_locale.clone());
+    ZygiskAppList {
+        items: result
+            .items
+            .into_iter()
+            .map(|item| ZygiskAppItem {
+                package_name: item.package_name,
+                label: item.label,
+                version_name: item.version_name.unwrap_or_default(),
+                version_code: item.version_code,
+                label_source: label_source_name(item.label_source).to_owned(),
+                requested_locale: item.requested_locale,
+                resolved_locale: item.resolved_locale,
+                fallback_reason: item.fallback_reason,
+                uid: item.uid,
+                is_system: item.is_system,
+                enabled: item.enabled,
+            })
+            .collect(),
+        success_count: result.success_count,
+        fallback_count: result.fallback_count,
+        warnings: result
+            .warnings
+            .into_iter()
+            .map(|warning| ZygiskAppWarning {
+                package_name: warning.package_name,
+                code: warning.code,
+                message: warning.message,
+            })
+            .collect(),
+        device_locale,
     }
-    let size = parts
-        .next()
-        .ok_or_else(|| CoreError::Internal("Zygisk 文件头缺少大小".into()))?
-        .parse::<u64>()
-        .map_err(|_| CoreError::Internal("Zygisk 文件大小非法".into()))?;
-    let package_name = parts
-        .next()
-        .ok_or_else(|| CoreError::Internal("Zygisk 文件头缺少包名".into()))?;
-    let name = parts
-        .next()
-        .ok_or_else(|| CoreError::Internal("Zygisk 文件头缺少文件名".into()))?;
-    validate_package_name(package_name)?;
-    Ok(FileHeader {
-        size,
-        package_name: package_name.to_string(),
-        name: name.to_string(),
-    })
+}
+
+fn lifecycle_name(lifecycle: agent_protocol::ZygiskLifecycle) -> &'static str {
+    use agent_protocol::ZygiskLifecycle as L;
+    match lifecycle {
+        L::NotInstalled => "not_installed",
+        L::ZygiskDisabled => "zygisk_disabled",
+        L::InstalledRebootRequired => "installed_reboot_required",
+        L::Loaded => "loaded",
+        L::BridgeReady => "bridge_ready",
+        L::Incompatible => "incompatible",
+        L::Faulted => "faulted",
+    }
+}
+
+fn label_source_name(source: agent_protocol::LabelSource) -> &'static str {
+    use agent_protocol::LabelSource as S;
+    match source {
+        S::Framework => "framework",
+        S::Manifest => "manifest",
+        S::PackageName => "package_name",
+    }
 }
 
 fn validate_package_name(package_name: &str) -> CoreResult<()> {
-    if package_name.is_empty()
-        || package_name.len() > 255
-        || package_name.contains('/')
-        || package_name.contains('\\')
-        || package_name.contains("..")
-    {
-        return Err(CoreError::Internal("包名非法".into()));
+    let ok = !package_name.is_empty()
+        && package_name.len() <= 256
+        && package_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(CoreError::Internal("包名不合法".into()))
     }
-    Ok(())
 }
 
 fn safe_filename(name: &str) -> CoreResult<String> {
     let path = Path::new(name);
     if name.is_empty()
+        || name.len() > 200
         || path.is_absolute()
         || path.components().any(|component| {
             matches!(
@@ -298,218 +443,337 @@ fn safe_filename(name: &str) -> CoreResult<String> {
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
             )
         })
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     {
-        return Err(CoreError::Internal(
-            "Zygisk 返回了不安全的 APK 文件名".into(),
-        ));
+        return Err(CoreError::Internal(format!(
+            "Agent 返回了不安全的文件名: {name}"
+        )));
     }
-    Ok(name.to_string())
-}
-
-async fn read_line(stream: &mut TcpStream, max: usize) -> CoreResult<Vec<u8>> {
-    let mut line = Vec::new();
-    loop {
-        let mut byte = [0_u8; 1];
-        stream.read_exact(&mut byte).await.map_err(io_error)?;
-        if byte[0] == b'\n' {
-            return Ok(line);
-        }
-        line.push(byte[0]);
-        if line.len() > max {
-            return Err(CoreError::Internal("Zygisk 响应行超过大小限制".into()));
-        }
-    }
-}
-
-async fn copy_exact(
-    stream: &mut TcpStream,
-    file: &mut tokio::fs::File,
-    size: u64,
-) -> CoreResult<()> {
-    let mut remaining = size;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    while remaining > 0 {
-        let want = remaining.min(buffer.len() as u64) as usize;
-        stream
-            .read_exact(&mut buffer[..want])
-            .await
-            .map_err(io_error)?;
-        file.write_all(&buffer[..want]).await.map_err(io_error)?;
-        remaining -= want as u64;
-    }
-    Ok(())
-}
-
-fn io_error(error: impl std::fmt::Display) -> CoreError {
-    CoreError::Internal(format!("Zygisk I/O 失败: {error}"))
-}
-
-fn ensure_adb_success(action: &str, output: &AdbRunOutput) -> CoreResult<()> {
-    if output.exit_code == Some(0) {
-        Ok(())
-    } else {
-        Err(CoreError::Internal(format!(
-            "{action}失败: {}",
-            output.stderr.trim()
-        )))
-    }
+    Ok(name.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
+    use agent_protocol::{LabelSource, LocalizedPackageItem, PackageWarning};
+
     use super::*;
 
     #[test]
-    fn parses_export_header_with_spaces_in_filename() {
-        let header = parse_file_header(b"F 123 com.example base split.apk").unwrap();
-        assert_eq!(header.size, 123);
-        assert_eq!(header.package_name, "com.example");
-        assert_eq!(header.name, "base split.apk");
-    }
-
-    #[test]
-    fn rejects_path_traversal_from_module() {
-        assert!(safe_filename("../evil.apk").is_err());
+    fn local_path_inputs_are_confined_to_destination() {
+        assert!(safe_filename("split_config.zh.apk").is_ok());
+        assert!(safe_filename("../escape.apk").is_err());
         assert!(safe_filename("/tmp/evil.apk").is_err());
-        assert!(validate_package_name("com.example/app").is_err());
-    }
-
-    #[test]
-    fn accepts_normal_apk_names_and_package_names() {
-        assert_eq!(
-            safe_filename("split_config.zh.apk").unwrap(),
-            "split_config.zh.apk"
-        );
+        assert!(safe_filename("sub/dir/base.apk").is_err());
+        assert!(validate_package_name("com.example;rm -rf /").is_err());
         assert!(validate_package_name("com.example.app").is_ok());
     }
 
     #[test]
-    fn maps_module_wire_fields_to_camel_case_dto() {
-        // 真机 applist 模块的真实报文形状：pkg / label / versionName / versionCode
-        let line = br#"[{"pkg":"com.czb.chezhubang","label":"\u56e2\u6cb9","versionName":"7.6.4","versionCode":204}]"#;
-        let value: serde_json::Value = serde_json::from_slice(line).unwrap();
-        let apps: Vec<ZygiskAppItem> = serde_json::from_value(value).unwrap();
-        assert_eq!(apps[0].package_name, "com.czb.chezhubang");
-        assert_eq!(apps[0].label, "团油");
-        assert_eq!(apps[0].version_name, "7.6.4");
-        assert_eq!(apps[0].version_code, 204);
-        let out = serde_json::to_value(&apps).unwrap();
-        assert_eq!(out[0]["packageName"], "com.czb.chezhubang");
-        assert_eq!(out[0]["versionCode"], 204);
+    fn localized_result_maps_to_camel_case_and_counts_fallbacks() {
+        let result = PackageListLocalizedResult {
+            items: vec![
+                LocalizedPackageItem {
+                    package_name: "com.amazon.mShop.android.shopping".into(),
+                    label: "亚马逊购物".into(),
+                    version_name: Some("32.17.0.100".into()),
+                    version_code: Some(1243230206),
+                    requested_locale: "zh-CN".into(),
+                    resolved_locale: Some("zh-Hans-CN".into()),
+                    label_source: LabelSource::Framework,
+                    fallback_reason: None,
+                    uid: Some(10233),
+                    is_system: false,
+                    enabled: true,
+                },
+                LocalizedPackageItem {
+                    package_name: "com.google.android.overlay".into(),
+                    label: "com.google.android.overlay".into(),
+                    version_name: None,
+                    version_code: None,
+                    requested_locale: "zh-CN".into(),
+                    resolved_locale: Some("zh-Hans-CN".into()),
+                    label_source: LabelSource::PackageName,
+                    fallback_reason: Some("framework_label_equals_package_name".into()),
+                    uid: None,
+                    is_system: true,
+                    enabled: true,
+                },
+            ],
+            success_count: 1,
+            fallback_count: 1,
+            warnings: vec![PackageWarning {
+                package_name: None,
+                code: "manifest_missing".into(),
+                message: "1 个包缺少 E 清单".into(),
+            }],
+        };
+
+        let list = map_localized_result(result);
+        assert_eq!(list.device_locale.as_deref(), Some("zh-Hans-CN"));
+        assert_eq!(list.success_count, 1);
+        assert_eq!(list.fallback_count, 1);
+        assert_eq!(list.warnings.len(), 1);
+
+        let value = serde_json::to_value(&list).unwrap();
+        assert_eq!(
+            value["items"][0]["packageName"],
+            "com.amazon.mShop.android.shopping"
+        );
+        assert_eq!(value["items"][0]["versionCode"], 1243230206_u64);
+        assert_eq!(value["items"][0]["labelSource"], "framework");
+        assert_eq!(value["items"][0]["isSystem"], false);
+        assert_eq!(value["items"][1]["labelSource"], "package_name");
+        assert_eq!(value["items"][1]["versionName"], "");
+        assert_eq!(value["items"][1]["uid"], serde_json::Value::Null);
+        assert_eq!(value["warnings"][0]["packageName"], serde_json::Value::Null);
     }
 
     #[test]
-    fn parses_manifest_map_grouped_by_package() {
-        let line = br#"{"com.example":[{"name":"base.apk","path":"/app/base.apk","size":123},{"name":"split_config.zh.apk","path":"/app/split_zh.apk","size":45}]}"#;
-        let manifest = parse_apk_manifest(line).unwrap();
-        let files = manifest.get("com.example").unwrap();
-        assert_eq!(files.len(), 2);
-        assert_eq!(files[0].name, "base.apk");
-        assert_eq!(files[0].size, 123);
-        assert_eq!(files[1].path, "/app/split_zh.apk");
+    fn scope_maps_to_protocol_enum() {
+        assert_eq!(LocalizedScope::User.as_protocol(), PackageScope::User);
+        assert_eq!(LocalizedScope::System.as_protocol(), PackageScope::System);
+        assert_eq!(LocalizedScope::All.as_protocol(), PackageScope::All);
+        let parsed: LocalizedScope = serde_json::from_value(serde_json::json!("user")).unwrap();
+        assert_eq!(parsed, LocalizedScope::User);
     }
 
-    #[test]
-    fn surfaces_module_error_from_manifest() {
-        let error = parse_apk_manifest(br#"{"error":"helper crashed"}"#).unwrap_err();
-        assert!(error.to_string().contains("helper crashed"));
+    fn router(runner: Arc<dyn AdbRunner>) -> Arc<CapabilityRouter> {
+        router_with_agent(runner).0
+    }
+
+    /// 真机测试需要先拿到 AgentManager 才能安装/启动 Agent，因此同时返回两者。
+    fn router_with_agent(
+        runner: Arc<dyn AdbRunner>,
+    ) -> (
+        Arc<CapabilityRouter>,
+        Arc<crate::services::agent_manager::AgentManager>,
+    ) {
+        let config = Arc::new(crate::services::config_service::ConfigService::new(
+            Arc::new(crate::db::Db::in_memory().unwrap()),
+        ));
+        let agent = Arc::new(crate::services::agent_manager::AgentManager::new(
+            runner.clone(),
+            Arc::new(crate::services::agent_artifact::AgentArtifactResolver::new(
+                config, None,
+            )),
+        ));
+        let router = Arc::new(CapabilityRouter::new(
+            agent.clone(),
+            runner,
+            crate::services::android_backend::default_legacy_capabilities(),
+        ));
+        (router, agent)
     }
 
     #[tokio::test]
-    #[ignore = "需要已安装 applist 模块并重启生效的真机；APPLIST_TEST_SERIAL=<serial> cargo test real_zygisk_module -- --ignored --nocapture"]
-    async fn real_zygisk_module_query_manifest_and_export() {
-        use crate::db::Db;
-        use crate::services::config_service::ConfigService;
+    async fn localized_list_refuses_legacy_fallback_when_agent_is_missing() {
+        let runner: Arc<dyn AdbRunner> =
+            Arc::new(crate::services::device_service::MockAdbRunner::new(true));
+        let service = ZygiskApplistService::new(router(runner.clone()), runner.clone());
+        // Legacy ADB 没有登记 package.list_localized，缺 Agent 时不得回退成 pm 结果
+        assert!(runner.environment().await.installed);
+
+        let error = service
+            .list("serial-a", None, LocalizedScope::All, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CoreError::AgentUnavailable(_)),
+            "缺 Agent 时必须显式失败而不是回退 pm: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("Agent"),
+            "错误要能指导用户连接 Agent: {message}"
+        );
+        assert!(
+            service
+                .export_package("serial-a", "com.example.app", Path::new("/tmp"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "需要已安装 applist 模块并重启生效的真机；APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_zygisk -- --ignored --nocapture"]
+    async fn real_agent_zygisk_status_list_and_export() {
         use crate::services::device_service::RealAdbRunner;
-        use std::collections::HashSet;
 
         let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
-        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
-        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config));
-        let service = ZygiskApplistService::new(runner.clone());
-
-        let apps = service.list(&serial).await.expect("Q 查询失败");
-        assert!(apps.len() >= 5, "Zygisk 应用清单过少: {}", apps.len());
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(Arc::new(
+            crate::services::config_service::ConfigService::new(Arc::new(
+                crate::db::Db::in_memory().unwrap(),
+            )),
+        )));
+        let (android, agent) = router_with_agent(runner.clone());
+        let service = ZygiskApplistService::new(android, runner.clone());
+        let status = agent
+            .connect_resolved(&serial)
+            .await
+            .expect("Agent 安装/连接失败（真机测试需要先构建并推送 Agent 产物）");
         assert!(
-            apps.iter()
-                .all(|app| !app.package_name.trim().is_empty() && !app.label.trim().is_empty()),
-            "存在空包名或空显示名"
+            status
+                .capabilities
+                .iter()
+                .any(|capability| capability.method == PACKAGE_LIST_LOCALIZED),
+            "Agent 未发布 package.list_localized capability: {:?}",
+            status.capabilities
+        );
+
+        let status = service.status(&serial).await.unwrap();
+        eprintln!(
+            "[zygisk.status] lifecycle={} bridge={} root={} module={} impl={} locale={} latency={:?}ms",
+            status.lifecycle,
+            status.bridge_ready,
+            status.root_available,
+            status
+                .module_version_code
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            status.zygisk_impl.clone().unwrap_or_default(),
+            status.device_locale.clone().unwrap_or_default(),
+            status.probe_latency_ms,
+        );
+        assert!(status.bridge_ready, "bridge 未就绪: {:?}", status.detail);
+        assert_eq!(status.lifecycle, "bridge_ready");
+        assert_eq!(status.sub_protocol_version, 1);
+
+        let user = service
+            .list(&serial, Some("zh-CN".into()), LocalizedScope::User, false)
+            .await
+            .unwrap();
+        assert!(!user.items.is_empty(), "三方应用清单为空");
+        assert!(
+            user.items.iter().all(|item| !item.is_system),
+            "scope=user 混入了系统应用"
         );
         assert!(
-            apps.iter().any(|app| app.label != app.package_name),
-            "全部 label 都等于包名，疑似未经 Framework 本地化解析"
+            user.items
+                .iter()
+                .any(|item| item.label_source == "framework" && item.label != item.package_name),
+            "没有 Framework 解析出的本地化名称"
+        );
+        assert!(
+            user.items
+                .windows(2)
+                .all(|pair| pair[0].label.cmp(&pair[1].label) != std::cmp::Ordering::Greater),
+            "清单必须按 label 稳定排序，否则 UI 刷新抖动"
         );
 
-        let environment = runner.environment().await;
-        let adb_path = environment.path.expect("adb 不可用");
-        let legacy = runner
+        let all = service
+            .list(&serial, None, LocalizedScope::All, false)
+            .await
+            .unwrap();
+        assert!(all.items.len() >= user.items.len());
+        assert!(
+            all.items.iter().any(|item| item.is_system),
+            "scope=all 应包含系统应用"
+        );
+        let known = all
+            .items
+            .iter()
+            .find(|item| item.label_source == "framework" && !item.version_name.is_empty());
+        assert!(known.is_some(), "versionName 未从模块报文映射出来");
+
+        // 指定一个设备默认 locale 之外的语言：不得假装按请求解析，必须给回退原因
+        let en = service
+            .list(&serial, Some("en-US".into()), LocalizedScope::User, false)
+            .await
+            .unwrap();
+        if let Some(device) = en.device_locale.as_deref() {
+            if !device.starts_with("en") {
+                assert!(
+                    en.warnings.iter().any(|w| w.code == "locale_not_honored"),
+                    "locale 不匹配必须显式警告: {:?}",
+                    en.warnings
+                );
+                assert!(en.items.iter().all(|item| item.requested_locale == "en-US"));
+                assert!(
+                    en.items
+                        .iter()
+                        .all(|item| item.resolved_locale.as_deref() == Some(device)),
+                    "resolved_locale 必须是设备真实 locale，不能伪造"
+                );
+            }
+        }
+
+        let target = all
+            .items
+            .iter()
+            .find(|item| item.package_name.ends_with(".cutout.emulation.noCutout"))
+            .expect("样本设备缺少 cutout overlay 小包，无法做导出体积校验");
+        let out_dir = tempfile::tempdir().unwrap();
+        let report = service
+            .export_package(&serial, &target.package_name, out_dir.path())
+            .await
+            .unwrap();
+        assert_eq!(report.package_name, target.package_name);
+        assert!(!report.files.is_empty());
+        assert_eq!(
+            report.bytes,
+            report.files.iter().map(|file| file.size).sum::<u64>()
+        );
+        for file in &report.files {
+            let bytes = std::fs::read(Path::new(&report.destination).join(&file.name)).unwrap();
+            assert_eq!(bytes.len() as u64, file.size, "{} 大小不符", file.name);
+            assert!(bytes.starts_with(b"PK"), "{} 缺少 zip 魔数", file.name);
+        }
+        // 设备侧暂存必须回收，避免残留 APK 副本
+        let leftovers = runner
             .run(
-                &adb_path,
-                &adb::build_args(Some(&serial), &adb::cmd_list_packages(true)),
-                Duration::from_secs(20),
+                &runner.environment().await.path.unwrap(),
+                &adb::build_args(
+                    Some(&serial),
+                    &adb::cmd_shell("ls /data/local/tmp | grep -c app-reverse-tools-apk || true"),
+                ),
+                Duration::from_secs(10),
             )
             .await
             .unwrap();
-        let legacy_pkgs = adb::parse_packages(&legacy.stdout);
-        let zygisk_pkgs: HashSet<&str> = apps.iter().map(|app| app.package_name.as_str()).collect();
-        let missing: Vec<&str> = legacy_pkgs
-            .iter()
-            .filter(|pkg| !zygisk_pkgs.contains(pkg.as_str()))
-            .map(String::as_str)
-            .collect();
-        assert!(missing.is_empty(), "Zygisk 清单缺少 pm 三方包: {missing:?}");
-
-        let manifest = service.apk_manifest(&serial).await.expect("E 清单失败");
-        assert!(!manifest.is_empty(), "APK 清单为空");
-        let (target, entries) = manifest
-            .iter()
-            .filter(|(pkg, files)| !files.is_empty() && zygisk_pkgs.contains(pkg.as_str()))
-            .min_by_key(|(_, files)| files.iter().map(|file| file.size).sum::<u64>())
-            .expect("没有可导出的包");
-
-        let out_dir = tempfile::tempdir().unwrap();
-        let report = service
-            .export_package(&serial, target, out_dir.path())
-            .await
-            .expect("D 导出失败");
-        assert_eq!(report.package_name, *target);
-        let mut expected: Vec<(String, u64)> = entries
-            .iter()
-            .map(|file| (file.name.clone(), file.size))
-            .collect();
-        let mut actual: Vec<(String, u64)> = report
-            .files
-            .iter()
-            .map(|file| (file.name.clone(), file.size))
-            .collect();
-        expected.sort();
-        actual.sort();
-        assert_eq!(actual, expected, "导出的 APK 集合与 E 清单不一致");
         assert_eq!(
-            report.bytes,
-            expected.iter().map(|(_, size)| *size).sum::<u64>()
+            leftovers.stdout.trim(),
+            "0",
+            "导出暂存目录未清理: {}",
+            leftovers.stdout
         );
-        for (name, size) in &expected {
-            let bytes = std::fs::read(out_dir.path().join(target).join(name)).unwrap();
-            assert_eq!(bytes.len() as u64, *size, "{target}/{name} 大小不符");
-            assert!(
-                bytes.starts_with(b"PK"),
-                "{target}/{name} 缺少 zip 魔数，导出流可能被截断"
-            );
-        }
-
         let forwards = runner
             .run(
-                &adb_path,
+                &runner.environment().await.path.unwrap(),
                 &adb::build_args(Some(&serial), &adb::cmd_forward_list()),
                 Duration::from_secs(10),
             )
             .await
             .unwrap();
         assert!(
-            !forwards.stdout.contains(&format!(":{MODULE_PORT}")),
-            "Zygisk forward 未清理: {}",
+            !forwards.stdout.contains(":11500"),
+            "Desktop 不应再直连模块端口: {}",
             forwards.stdout
         );
+    }
+
+    #[test]
+    fn status_serializes_lifecycle_as_stable_snake_case() {
+        let status = ZygiskStatus {
+            lifecycle: lifecycle_name(agent_protocol::ZygiskLifecycle::InstalledRebootRequired)
+                .into(),
+            bridge_ready: true,
+            root_available: true,
+            agent_connected: true,
+            module_id: Some("applist".into()),
+            module_version: Some("v1.0".into()),
+            module_version_code: Some(1),
+            zygisk_impl: Some("zygisksu".into()),
+            device_locale: Some("zh-Hans-CN".into()),
+            sub_protocol_version: 1,
+            probe_latency_ms: Some(6),
+            detail: Some("模块有新版本待重启加载".into()),
+        };
+        let value = serde_json::to_value(status).unwrap();
+        assert_eq!(value["lifecycle"], "installed_reboot_required");
+        assert_eq!(value["bridgeReady"], true);
+        assert_eq!(value["agentConnected"], true);
+        assert_eq!(value["subProtocolVersion"], 1);
     }
 }

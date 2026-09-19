@@ -94,7 +94,8 @@ pub fn run() {
                 app.handle().clone(),
             ));
             device.clone().start_watch();
-            let zygisk_applist = Arc::new(ZygiskApplistService::new(runner.clone()));
+            let zygisk_applist =
+                Arc::new(ZygiskApplistService::new(android.clone(), runner.clone()));
 
             // 4.5) EnvService：仪表盘环境/工具探测（P7），复用同一 adb runner
             let env = Arc::new(EnvService::new(config.clone(), runner.clone()));
@@ -165,9 +166,9 @@ pub fn run() {
             commands::task::task_cancel,
             commands::task::task_list,
             commands::task::task_logs,
-            commands::zygisk::zygisk_applist,
-            commands::zygisk::zygisk_apk_manifest,
-            commands::zygisk::zygisk_applist_export,
+            commands::zygisk::zygisk_status,
+            commands::zygisk::package_list_localized,
+            commands::zygisk::package_export_apk,
             commands::device::adb_environment,
             commands::device::adb_set_path,
             commands::device::devices_list,

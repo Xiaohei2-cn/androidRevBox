@@ -68,13 +68,17 @@ impl Router {
             .providers
             .iter()
             .flat_map(|provider| {
+                let provider = Arc::clone(provider);
                 let info = provider.info();
-                provider.methods().iter().map(move |method| CapabilityInfo {
-                    method: (*method).into(),
-                    version: 1,
-                    provider: info.name.clone(),
-                    available: true,
-                    unavailable_reason: None,
+                provider.methods().iter().map(move |method| {
+                    let unavailable_reason = provider.unavailable_reason(method);
+                    CapabilityInfo {
+                        method: (*method).into(),
+                        version: 1,
+                        provider: info.name.clone(),
+                        available: unavailable_reason.is_none(),
+                        unavailable_reason,
+                    }
                 })
             })
             .collect();

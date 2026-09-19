@@ -130,13 +130,34 @@ async fn host_agent_full_lifecycle() {
             .await
             .expect("hello must succeed");
         assert_eq!(hello.protocol_version, 1);
-        assert_eq!(hello.providers.len(), 2);
-        assert_eq!(hello.capabilities.len(), 4);
+        assert_eq!(hello.providers.len(), 3);
+        assert_eq!(hello.capabilities.len(), 8);
         assert!(
             hello
                 .capabilities
                 .iter()
                 .any(|capability| capability.method == agent_protocol::method::DEVICE_INFO)
+        );
+        // Zygisk 模块在宿主机上必然不存在：只能降级 provider.zygisk 的具体方法，
+        // 既不能假成功，也不能让 shell/系统能力一起消失（AR5.3 第 6 条）。
+        let zygisk_status = hello
+            .capabilities
+            .iter()
+            .find(|capability| capability.method == agent_protocol::method::ZYGISK_STATUS)
+            .expect("zygisk.status must be discoverable for diagnostics");
+        assert!(
+            zygisk_status.available,
+            "生命周期诊断必须始终可调用，否则 UI 拿不到失败原因"
+        );
+        let localized = hello
+            .capabilities
+            .iter()
+            .find(|capability| capability.method == agent_protocol::method::PACKAGE_LIST_LOCALIZED)
+            .expect("package.list_localized must be discoverable");
+        assert!(!localized.available, "缺模块时不得声明本地化清单可用");
+        assert!(
+            localized.unavailable_reason.is_some(),
+            "不可用必须带原因，不能只报失败"
         );
         let health = client
             .health(Duration::from_secs(2))

@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_protocol::PermissionInfo;
+use android_agent::provider::zygisk::ZygiskProvider;
 use android_agent::server::serve_connection;
-use android_agent::system_router;
+use android_agent::system_router_with;
 use tokio::net::TcpListener;
 
 #[cfg(target_os = "android")]
@@ -32,7 +33,10 @@ struct Config {
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = parse_args(env::args().skip(1))?;
     let auth_token = read_and_remove_auth_token(&config.auth_token_file)?;
-    let router = Arc::new(system_router(auth_token, detect_permissions()));
+    let zygisk = Arc::new(ZygiskProvider::new());
+    // 启动即探测一次：hello 的 capability 可用性必须是真实状态，而不是“未探测”。
+    zygisk.warm_up().await;
+    let router = Arc::new(system_router_with(auth_token, detect_permissions(), zygisk));
     match config.listen {
         ListenTarget::Tcp(address) => serve_tcp(address, router).await?,
         ListenTarget::Abstract(name) => serve_abstract(&name, router).await?,

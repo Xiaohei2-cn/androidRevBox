@@ -6,7 +6,7 @@ import { SubTabs } from "@/components/nav/SubTabs";
 import { TaskLaunchPanel } from "@/components/task/TaskLaunchPanel";
 import { TaskSessionView } from "@/components/task/TaskSessionView";
 import { deviceApi, type DeviceEntry } from "@/api/device";
-import { zygiskApi, type ZygiskAppItem } from "@/api/zygisk";
+import { zygiskApi, type ZygiskAppItem, type ZygiskScope } from "@/api/zygisk";
 import { agentApi, type AgentSessionState } from "@/api/agent";
 import { envApi } from "@/api/env";
 import { useAppNav } from "@/app/nav";
@@ -696,10 +696,17 @@ export function AppsView({ serial }: { serial: string | null }) {
   const [context, setContext] = useState<{ x: number; y: number; app: ZygiskAppItem } | null>(null);
   const [exporting, setExporting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [scope, setScope] = useState<ZygiskScope>("all");
   const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ["zygisk", "applist", serial],
-    queryFn: () => zygiskApi.list(serial!),
+    queryKey: ["zygisk", "applist", serial, scope],
+    queryFn: () => zygiskApi.list(serial!, scope),
     enabled: !!serial,
+  });
+  // 清单失败时再取一次模块生命周期，区分「Agent 未连接 / 未安装 / 未启用 / 需重启」
+  const { data: diagnosis } = useQuery({
+    queryKey: ["zygisk", "status", serial],
+    queryFn: () => zygiskApi.status(serial!),
+    enabled: !!serial && !!error,
   });
   const [action, setAction] = useState<{ kind: string; taskId: string } | null>(null);
 
@@ -710,7 +717,14 @@ export function AppsView({ serial }: { serial: string | null }) {
       <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-xs">
         <p className="font-medium text-destructive">{t("apps.unavailable")}</p>
         <p className="max-w-lg text-muted-foreground">{String((error as Error)?.message ?? error)}</p>
-        <p className="max-w-lg text-muted-foreground">{t("apps.unavailableHint")}</p>
+        <p className="max-w-lg text-muted-foreground">
+          {diagnosis
+            ? t("apps.lifecycle", {
+                lifecycle: diagnosis.lifecycle,
+                detail: diagnosis.detail ?? t("apps.unknown"),
+              })
+            : t("apps.unavailableHint")}
+        </p>
         <Button size="sm" variant="outline" onClick={() => void refetch()}>
           <RefreshCw className="h-3.5 w-3.5" />
           {t("apps.retry")}
@@ -719,9 +733,8 @@ export function AppsView({ serial }: { serial: string | null }) {
     );
   }
 
-  const apps = [...(data ?? [])].sort((a, b) =>
-    a.label.localeCompare(b.label, undefined, { sensitivity: "base" }),
-  );
+  const apps = data?.items ?? [];
+  const warnings = data?.warnings ?? [];
 
   const runAction = async (fn: () => Promise<string>, kind: string) => {
     try {
@@ -778,6 +791,35 @@ export function AppsView({ serial }: { serial: string | null }) {
             {t("apps.refresh")}
           </Button>
         </div>
+        <div className="flex shrink-0 items-center gap-1">
+          {(["all", "user", "system"] as const).map((value) => (
+            <button
+              key={value}
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                setScope(value);
+              }}
+              className={cn(
+                "rounded-full border px-2 py-0.5 text-[11px] hover:bg-accent",
+                scope === value ? "border-primary text-foreground" : "text-muted-foreground",
+              )}
+            >
+              {value === "all" ? t("apps.scopeAll") : value === "user" ? t("apps.scopeUser") : t("apps.scopeSystem")}
+            </button>
+          ))}
+        </div>
+        {data && data.fallbackCount > 0 && (
+          <p className="shrink-0 text-[11px] text-muted-foreground">
+            {t("apps.fallbackCount", { count: data.fallbackCount })}
+            {data.deviceLocale ? ` · ${t("apps.deviceLocale", { locale: data.deviceLocale })}` : ""}
+          </p>
+        )}
+        {warnings.length > 0 && (
+          <p className="shrink-0 truncate text-[11px] text-muted-foreground" title={warnings.map((w) => w.message).join(" / ")}>
+            {warnings[0].message}
+          </p>
+        )}
         <div className="min-h-0 flex-1 overflow-auto rounded-lg border">
           {apps.length === 0 && <Empty text={t("apps.empty")} />}
           <ul className="text-xs">
@@ -803,7 +845,27 @@ export function AppsView({ serial }: { serial: string | null }) {
                   app.packageName === selectedApp?.packageName && "bg-accent font-medium",
                 )}
               >
-                <span className="block truncate">{app.label || app.packageName}</span>
+                <span className="flex items-center gap-1.5">
+                  <span className="min-w-0 flex-1 truncate">{app.label || app.packageName}</span>
+                  <span
+                    className={cn(
+                      "shrink-0 rounded px-1 text-[10px]",
+                      app.isSystem ? "bg-muted text-muted-foreground" : "bg-primary/10 text-primary",
+                    )}
+                  >
+                    {app.isSystem ? t("apps.badgeSystem") : t("apps.badgeUser")}
+                  </span>
+                  {!app.enabled && (
+                    <span className="shrink-0 rounded bg-destructive/10 px-1 text-[10px] text-destructive">
+                      {t("apps.badgeDisabled")}
+                    </span>
+                  )}
+                  {app.labelSource === "package_name" && (
+                    <span className="shrink-0 rounded bg-muted px-1 text-[10px] text-muted-foreground">
+                      {t("apps.badgeNoLabel")}
+                    </span>
+                  )}
+                </span>
                 <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
                   {app.packageName}
                 </span>
@@ -820,9 +882,28 @@ export function AppsView({ serial }: { serial: string | null }) {
             {selectedApp?.packageName ?? t("apps.contextHint")}
           </div>
           {selectedApp && (
-            <div className="mt-1 text-muted-foreground">
-              {t("apps.version", { version: selectedApp.versionName || t("apps.unknown"), code: selectedApp.versionCode })}
-            </div>
+            <>
+              <div className="mt-1 text-muted-foreground">
+                {t("apps.version", {
+                  version: selectedApp.versionName || t("apps.unknown"),
+                  code: selectedApp.versionCode ?? t("apps.unknown"),
+                })}
+              </div>
+              <div className="mt-1 text-muted-foreground">
+                {t("apps.labelSource", {
+                  source: selectedApp.labelSource,
+                  locale: selectedApp.resolvedLocale ?? selectedApp.requestedLocale,
+                })}
+              </div>
+              {selectedApp.fallbackReason && (
+                <div className="mt-1 text-muted-foreground">
+                  {t("apps.fallbackReason", { reason: selectedApp.fallbackReason })}
+                </div>
+              )}
+              {selectedApp.uid !== null && (
+                <div className="mt-1 font-mono text-muted-foreground">uid {selectedApp.uid}</div>
+              )}
+            </>
           )}
         </div>
         <div className="flex flex-wrap items-center gap-2">

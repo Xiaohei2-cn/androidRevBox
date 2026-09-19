@@ -345,6 +345,16 @@ impl CapabilityRouter {
             .cloned()
     }
 
+    /// 当前 Agent 会话状态（只读诊断用，不触发连接）。
+    pub fn agent_status(&self, serial: &str) -> AgentSessionStatus {
+        self.agent.manager.status(serial)
+    }
+
+    /// Agent 调用错误 -> CoreError（供不经过路由决策的 typed API 复用同一映射）。
+    pub fn agent_error(error: AgentBackendError) -> CoreError {
+        agent_backend_core_error(error)
+    }
+
     pub fn core_error(error: RouteError) -> CoreError {
         match error {
             RouteError::AgentUnavailable { reason, .. }

@@ -9,35 +9,46 @@ import { zygiskApi } from "./zygisk";
 describe("zygiskApi", () => {
   beforeEach(() => invokeCommand.mockReset());
 
-  it("uses the stable list command and serial argument", async () => {
-    invokeCommand.mockResolvedValue([]);
+  it("reads module lifecycle through the agent-backed status command", async () => {
+    invokeCommand.mockResolvedValue({ lifecycle: "bridge_ready", bridgeReady: true });
 
-    await expect(zygiskApi.list("serial-1")).resolves.toEqual([]);
-    expect(invokeCommand).toHaveBeenCalledWith("zygisk_applist", { serial: "serial-1" });
-  });
-
-  it("reads the per-package APK manifest through the E command", async () => {
-    invokeCommand.mockResolvedValue({ "com.example.app": [] });
-
-    await expect(zygiskApi.manifest("serial-1")).resolves.toEqual({
-      "com.example.app": [],
+    await expect(zygiskApi.status("serial-1")).resolves.toMatchObject({
+      lifecycle: "bridge_ready",
     });
-    expect(invokeCommand).toHaveBeenCalledWith("zygisk_apk_manifest", { serial: "serial-1" });
+    expect(invokeCommand).toHaveBeenCalledWith("zygisk_status", { serial: "serial-1" });
   });
 
-  it("passes package and destination to the streaming export command", async () => {
+  it("sends scope plus explicit locale opt-ins to package.list_localized", async () => {
+    invokeCommand.mockResolvedValue({ items: [], successCount: 0, fallbackCount: 0, warnings: [] });
+
+    await zygiskApi.list("serial-1", "user");
+    await zygiskApi.list("serial-1", "all", { locale: "zh-CN", includeDisabled: true });
+
+    expect(invokeCommand.mock.calls).toEqual([
+      [
+        "package_list_localized",
+        { serial: "serial-1", scope: "user", locale: null, includeDisabled: false },
+      ],
+      [
+        "package_list_localized",
+        { serial: "serial-1", scope: "all", locale: "zh-CN", includeDisabled: true },
+      ],
+    ]);
+  });
+
+  it("exports base and split APKs through the agent staging command", async () => {
     const report = {
       packageName: "com.example.app",
-      files: [],
+      files: [{ packageName: "com.example.app", name: "base.apk", size: 10 }],
       destination: "/tmp/apks/com.example.app",
-      bytes: 0,
+      bytes: 10,
     };
     invokeCommand.mockResolvedValue(report);
 
     await expect(
       zygiskApi.exportPackage("serial-1", "com.example.app", "/tmp/apks"),
     ).resolves.toEqual(report);
-    expect(invokeCommand).toHaveBeenCalledWith("zygisk_applist_export", {
+    expect(invokeCommand).toHaveBeenCalledWith("package_export_apk", {
       serial: "serial-1",
       packageName: "com.example.app",
       destination: "/tmp/apks",
