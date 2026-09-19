@@ -8,17 +8,23 @@
 
 use std::time::Duration;
 
-use agent_protocol::method::ACTIVITY_FOREGROUND;
+use agent_protocol::method::{ACTIVITY_FORCE_STOP, ACTIVITY_FOREGROUND, ACTIVITY_LAUNCH};
 use agent_protocol::{
-    ActivityForegroundParams, ActivityForegroundResult, AgentError, ErrorCode, PackageKind,
-    ProcEntrySummary, ProviderHealth, ProviderInfo,
+    ActivityForceStopParams, ActivityForegroundParams, ActivityForegroundResult,
+    ActivityLaunchParams, AgentError, ErrorCode, PackageKind, PackageWriteAction,
+    PackageWriteResult, ProcEntrySummary, ProviderHealth, ProviderInfo, WriteOutcome,
 };
 use serde_json::Value;
 use tokio::process::Command;
 
-use super::{Provider, ProviderFuture, RequestContext};
+use super::{Provider, ProviderFuture, RequestContext, operations};
 
-const ACTIVITY_METHODS: &[&str] = &[ACTIVITY_FOREGROUND];
+const ACTIVITY_METHODS: &[&str] = &[ACTIVITY_FOREGROUND, ACTIVITY_LAUNCH, ACTIVITY_FORCE_STOP];
+const MONKEY: &str = "/system/bin/monkey";
+const AM: &str = "/system/bin/am";
+/// 启动/强停后的复核窗口：有界，超时只报「未确认」，不猜结论。
+const WRITE_VERIFY: Duration = Duration::from_millis(2_000);
+const WRITE_VERIFY_POLL: Duration = Duration::from_millis(100);
 const DUMPSYS: &str = "/system/bin/dumpsys";
 const PIDOF: &str = "/system/bin/pidof";
 const PM: &str = "/system/bin/pm";
@@ -114,6 +120,8 @@ impl Provider for ActivityProvider {
         Box::pin(async move {
             match method {
                 ACTIVITY_FOREGROUND => self.foreground(params).await,
+                ACTIVITY_LAUNCH => self.launch(params).await,
+                ACTIVITY_FORCE_STOP => self.force_stop(params).await,
                 _ => Err(AgentError::new(
                     ErrorCode::UnsupportedMethod,
                     format!("unsupported activity method: {method}"),
@@ -206,7 +214,261 @@ async fn read_head_lines(path: &str, head: usize) -> Option<String> {
     Some(text.lines().take(head).collect::<Vec<_>>().join("\n"))
 }
 
-async fn run(program: &str, args: &[&str]) -> Result<String, AgentError> {
+impl ActivityProvider {
+    /// 启动应用（AR8.1 写操作）。沿用 Legacy 的 `monkey -p <pkg> -c LAUNCHER 1`：
+    /// 不需要知道 launcher activity 名，且没有可启动入口时 monkey 会非零退出——
+    /// 那是明确结论而不是超时。参数数组执行，包名不进 shell。
+    async fn launch(&self, params: Value) -> Result<Value, AgentError> {
+        let params: ActivityLaunchParams = parse_params(params)?;
+        begin_write(
+            ACTIVITY_LAUNCH_METHOD,
+            &params.package,
+            &params.operation_id,
+        )?;
+        if let Some(cached) = operations::lookup(&params.operation_id) {
+            return Ok(operations::mark_replayed(cached));
+        }
+        guard_writable_package(&params.package).await?;
+        let output = run_ok(
+            MONKEY,
+            &["-p", &params.package, "-c", LAUNCHER_CATEGORY, "1"],
+        )
+        .await
+        .map_err(|error| match error.code {
+            // monkey 找不到可启动入口时给可分辨的理由，而不是笼统 internal
+            ErrorCode::ProviderUnavailable => AgentError::new(
+                ErrorCode::NotFound,
+                format!("{} 没有可启动的 LAUNCHER 入口", params.package),
+            )
+            .with_details(serde_json::json!({ "reason": "no_launcher_activity" })),
+            _ => error,
+        })?;
+        if output.contains("No activities found to run") || output.contains("** Error") {
+            return Err(AgentError::new(
+                ErrorCode::NotFound,
+                format!("{} 没有可启动的 LAUNCHER 入口", params.package),
+            )
+            .with_details(serde_json::json!({ "reason": "no_launcher_activity" })));
+        }
+        let found = wait_for_pid(&params.package, true).await;
+        let pid = found.filter(|value| *value != 0);
+        let value = serialize_value(PackageWriteResult {
+            action: PackageWriteAction::Launch,
+            package: params.package.clone(),
+            operation_id: params.operation_id.clone(),
+            outcome: WriteOutcome::Executed,
+            verified: pid.is_some(),
+            pid,
+            detail: pid
+                .map(|_| "pid_seen".to_owned())
+                .or_else(|| Some("pid_not_seen".to_owned())),
+            ran_as_root: false,
+        })?;
+        finish_write(
+            ACTIVITY_LAUNCH_METHOD,
+            &params.operation_id,
+            &params.package,
+            &value,
+        );
+        Ok(value)
+    }
+
+    /// 强停应用（AR8.1 写操作）。本来就没在跑时是 `no_op`（幂等），
+    /// 执行后复核 `pidof` 是否消失；还在就报未确认，不谎报已停。
+    async fn force_stop(&self, params: Value) -> Result<Value, AgentError> {
+        let params: ActivityForceStopParams = parse_params(params)?;
+        begin_write(
+            ACTIVITY_FORCE_STOP_METHOD,
+            &params.package,
+            &params.operation_id,
+        )?;
+        if let Some(cached) = operations::lookup(&params.operation_id) {
+            return Ok(operations::mark_replayed(cached));
+        }
+        guard_writable_package(&params.package).await?;
+        let before = wait_for_pid(&params.package, false).await;
+        if before.is_none() {
+            let value = serialize_value(PackageWriteResult {
+                action: PackageWriteAction::ForceStop,
+                package: params.package.clone(),
+                operation_id: params.operation_id.clone(),
+                outcome: WriteOutcome::NoOp,
+                verified: true,
+                pid: None,
+                detail: Some("not_running".to_owned()),
+                ran_as_root: false,
+            })?;
+            finish_write(
+                ACTIVITY_FORCE_STOP_METHOD,
+                &params.operation_id,
+                &params.package,
+                &value,
+            );
+            return Ok(value);
+        }
+        run_ok(AM, &["force-stop", &params.package]).await?;
+        let gone = wait_for_pid(&params.package, false).await.is_none();
+        let value = serialize_value(PackageWriteResult {
+            action: PackageWriteAction::ForceStop,
+            package: params.package.clone(),
+            operation_id: params.operation_id.clone(),
+            outcome: WriteOutcome::Executed,
+            verified: gone,
+            pid: before,
+            detail: Some(if gone {
+                "pid_gone".to_owned()
+            } else {
+                "pid_still_present".to_owned()
+            }),
+            ran_as_root: false,
+        })?;
+        finish_write(
+            ACTIVITY_FORCE_STOP_METHOD,
+            &params.operation_id,
+            &params.package,
+            &value,
+        );
+        Ok(value)
+    }
+}
+
+/// 写操作方法名（审计与台账日志里区分动作用）。
+pub(crate) const ACTIVITY_LAUNCH_METHOD: &str = "activity.launch";
+pub(crate) const ACTIVITY_FORCE_STOP_METHOD: &str = "activity.force_stop";
+const LAUNCHER_CATEGORY: &str = "android.intent.category.LAUNCHER";
+
+/// 写操作入参统一校验：包名字符集 + operation_id 形状（缺 id 直接拒，不允许匿名写）。
+pub(crate) fn begin_write(
+    method: &str,
+    package: &str,
+    operation_id: &str,
+) -> Result<(), AgentError> {
+    if !is_safe_package_name(package) {
+        return Err(
+            AgentError::new(ErrorCode::InvalidRequest, format!("包名非法: {package}"))
+                .with_details(serde_json::json!({ "reason": "invalid_package_name" })),
+        );
+    }
+    if !operations::is_valid_operation_id(operation_id) {
+        return Err(AgentError::new(
+            ErrorCode::InvalidRequest,
+            format!("{method} 需要合法且唯一的 operation_id，收到 {operation_id:?}"),
+        )
+        .with_details(serde_json::json!({ "reason": "invalid_operation_id" })));
+    }
+    Ok(())
+}
+
+/// 记入幂等台账 + 落一条设备侧审计行（§3.7）：只含包名/操作 id/结论，不含命令正文。
+pub(crate) fn finish_write(method: &str, operation_id: &str, package: &str, value: &Value) {
+    operations::remember(operation_id, value);
+    let outcome = value
+        .get("outcome")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let verified = value
+        .get("verified")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    eprintln!(
+        "audit method={method} package={package} operation_id={operation_id} outcome={outcome} verified={verified} agent_uid={}",
+        // SAFETY: geteuid 无前置条件，也不改进程状态。
+        unsafe { libc::geteuid() }
+    );
+}
+
+/// 写操作的目标范围守卫（§3.7「授权范围」在这层的落点）。顺序是刻意的：
+///
+/// 1. **没装的包**先答 `not_found`。它同时也不在第三方名单里，若先查名单就会被说成
+///    「系统包不许动」——把「这个包没装」误导成「这个包不许动」，用户会去找错方向；
+/// 2. **系统包一律拒止**（`android`、system_server、`com.android.settings`…）：
+///    对它们 force-stop 可能把设备推到重启，uninstall 更不该发生，
+///    所以守卫先于执行，不做「先试一下看 am/pm 怎么说」。
+pub(crate) async fn guard_writable_package(package: &str) -> Result<(), AgentError> {
+    if !pm_path_present(package).await {
+        return Err(
+            AgentError::new(ErrorCode::NotFound, format!("{package} 未安装"))
+                .with_details(serde_json::json!({ "reason": "package_not_installed" })),
+        );
+    }
+    let listing = run(PM, &["list", "packages", "-3", package]).await?;
+    if classify_package_kind(&listing, package) != PackageKind::ThirdParty {
+        return Err(AgentError::new(
+            ErrorCode::PreconditionFailed,
+            format!("{package} 不是第三方应用，Agent 拒绝对系统包执行写操作"),
+        )
+        .with_details(serde_json::json!({ "reason": "system_package_protected" })));
+    }
+    Ok(())
+}
+
+/// `pm path <pkg>` 是否给出安装包路径。判据必须是 `package:` 前缀本身，
+/// **不能图省事找 `=`**：`/data/app/~~hash==/pkg-==/base.apk` 里恰好有等号，
+/// 而系统包的 `/system_ext/priv-app/Settings/Settings.apk` 没有——
+/// 真机腿就是因为这个把 com.android.settings 误判成「未安装」的。
+pub(crate) async fn pm_path_present(package: &str) -> bool {
+    run(PM, &["path", package])
+        .await
+        .map(|paths| {
+            paths.lines().any(|line| {
+                line.trim_end_matches('\r')
+                    .trim_start()
+                    .starts_with("package:")
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 执行后的客观复核：`want_some=true` 等 pidof 出现；`false` 等它消失。
+/// 超时返回最后一次观测值，调用方据此给「未确认」而不是猜。
+pub(crate) async fn wait_for_pid(package: &str, want_some: bool) -> Option<u32> {
+    let started = std::time::Instant::now();
+    loop {
+        let observed = current_pid(package).await;
+        if want_some && observed.is_some() {
+            return observed;
+        }
+        if !want_some && observed.is_none() {
+            return None;
+        }
+        if started.elapsed() >= WRITE_VERIFY {
+            return observed;
+        }
+        tokio::time::sleep(WRITE_VERIFY_POLL).await;
+    }
+}
+
+pub(crate) async fn current_pid(package: &str) -> Option<u32> {
+    run(PIDOF, &[package])
+        .await
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse::<u32>()
+        .ok()
+}
+
+/// 成功时返回 stdout + stderr 合并文本（monkey 的关键判词写在 stderr）。
+async fn run_ok(program: &str, args: &[&str]) -> Result<String, AgentError> {
+    let output = tokio::time::timeout(COMMAND_TIMEOUT, Command::new(program).args(args).output())
+        .await
+        .map_err(|_| AgentError::new(ErrorCode::DeadlineExceeded, "命令超时"))?
+        .map_err(|error| command_unavailable(program, error.to_string()))?;
+    if output.status.success() {
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        return Ok(text);
+    }
+    Err(AgentError::new(
+        ErrorCode::ProviderUnavailable,
+        format!(
+            "{program} 退出码 {}",
+            output.status.code().unwrap_or_default()
+        ),
+    ))
+}
+
+pub(crate) async fn run(program: &str, args: &[&str]) -> Result<String, AgentError> {
     let output = tokio::time::timeout(COMMAND_TIMEOUT, Command::new(program).args(args).output())
         .await
         .map_err(|_| AgentError::new(ErrorCode::DeadlineExceeded, "activity command timeout"))?
@@ -326,6 +588,71 @@ fn serialize_value<T: serde::Serialize>(value: T) -> Result<Value, AgentError> {
             format!("failed to serialize activity result: {error}"),
         )
     })
+}
+
+/// 写操作入参守卫必须在**任何命令执行之前**完成：这里不给包名/操作 id 合法的
+/// 机会，用不带 dumpsys/pm 的坏输入证明校验先于副作用。
+#[tokio::test]
+async fn write_entry_points_validate_before_any_side_effect() {
+    let provider = ActivityProvider;
+    let cases = [
+        (
+            ACTIVITY_LAUNCH,
+            serde_json::json!({ "package": "com.x; rm", "operation_id": "op-1" }),
+        ),
+        (
+            ACTIVITY_FORCE_STOP,
+            serde_json::json!({ "package": "com.x", "operation_id": "" }),
+        ),
+        (
+            ACTIVITY_LAUNCH,
+            serde_json::json!({ "package": "com.x", "operation_id": "带空格" }),
+        ),
+        (
+            ACTIVITY_FORCE_STOP,
+            serde_json::json!({ "package": "com.x" }),
+        ),
+    ];
+    for (method, params) in cases {
+        let error = provider
+            .handle(
+                RequestContext {
+                    providers: vec![],
+                    capabilities: vec![],
+                },
+                method,
+                params,
+            )
+            .await
+            .expect_err("非法包名或缺 operation_id 必须拒");
+        assert_eq!(error.code, ErrorCode::InvalidRequest, "{method}: {error:?}");
+    }
+}
+
+/// 同一个 operation_id 第二次提交必须拿到上次的结果并标成 replayed，
+/// 且不能再次触达设备（这里靠「宿主上没有 monkey 也照样返回缓存」来证明）。
+#[tokio::test]
+async fn same_operation_id_replays_instead_of_executing_twice() {
+    let provider = ActivityProvider;
+    let operation_id = "replay-test-op";
+    let cached = serde_json::json!({
+        "action": "force_stop",
+        "package": "com.example.replay",
+        "operation_id": operation_id,
+        "outcome": "executed",
+        "verified": true,
+        "ran_as_root": false
+    });
+    operations::remember(operation_id, &cached);
+    let value = provider
+        .force_stop(serde_json::json!({
+            "package": "com.example.replay",
+            "operation_id": operation_id,
+        }))
+        .await
+        .expect("重发应返回已知结果");
+    assert_eq!(value["outcome"], "replayed");
+    assert_eq!(value["verified"], cached["verified"]);
 }
 
 #[cfg(test)]

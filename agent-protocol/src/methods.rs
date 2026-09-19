@@ -25,6 +25,9 @@ pub mod method {
     pub const PACKAGE_EXPORT_CLEAN: &str = "package.export_clean";
     pub const ZYGISK_STATUS: &str = "zygisk.status";
     pub const PACKAGE_NATIVE_LIB_DIR: &str = "package.native_lib_dir";
+    pub const ACTIVITY_LAUNCH: &str = "activity.launch";
+    pub const ACTIVITY_FORCE_STOP: &str = "activity.force_stop";
+    pub const PACKAGE_UNINSTALL: &str = "package.uninstall";
 }
 
 /// Zygisk 模块生命周期。`installed_reboot_required` / `loaded` / `bridge_ready` 必须区分，
@@ -648,6 +651,66 @@ pub struct PackageNativeLibDirResult {
     pub detail: Option<String>,
 }
 
+/// AR8.1：包写操作。三个方法共用一套语义——写操作不自动回退、必须带 `operation_id`，
+/// 同一个 id 重复提交只返回已知结果，绝不二次执行（网络重试、用户连点都不该再动一次）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageWriteAction {
+    Launch,
+    ForceStop,
+    Uninstall,
+}
+
+/// `replayed` 与 `executed` 必须能区分：前者是幂等命中，后者是真的动过设备状态。
+/// `no_op` 表示目标已经在期望状态（例如强停一个本来没在跑的包）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteOutcome {
+    Executed,
+    Replayed,
+    NoOp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ActivityLaunchParams {
+    pub package: String,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ActivityForceStopParams {
+    pub package: String,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PackageUninstallParams {
+    pub package: String,
+    pub operation_id: String,
+    /// `pm uninstall -k`：保留数据与缓存
+    #[serde(default)]
+    pub keep_data: bool,
+    /// 指定用户卸载；缺省为全部用户
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageWriteResult {
+    pub action: PackageWriteAction,
+    pub package: String,
+    pub operation_id: String,
+    pub outcome: WriteOutcome,
+    /// 执行后客观复核过（launch 看到 pid / force_stop 看到 pid 消失 / uninstall 看到 pm path 为空）
+    pub verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// am/pm 都是 shell 身份发起；root 支路（`su -c`）在 AR8 之前不承诺
+    pub ran_as_root: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfoResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -937,6 +1000,45 @@ mod tests {
 
     /// 写操作守卫字段名必须钉死：`expected_pid` 拼错不会报错，而是守卫静默失效，
     /// 所以协议测试直接把 wire 形状锁住（Agent 侧也有一条对称断言）。
+    #[test]
+    fn package_write_results_separate_executed_from_replayed_and_noop() {
+        let result = PackageWriteResult {
+            action: PackageWriteAction::ForceStop,
+            package: "com.x".into(),
+            operation_id: "op-1".into(),
+            outcome: WriteOutcome::Executed,
+            verified: true,
+            pid: None,
+            detail: Some("pid_gone".into()),
+            ran_as_root: false,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["action"], "force_stop");
+        assert_eq!(value["outcome"], "executed");
+        assert_eq!(value.get("pid"), None);
+        assert_eq!(value["ran_as_root"], json!(false));
+        for (outcome, wire) in [
+            (WriteOutcome::Replayed, "replayed"),
+            (WriteOutcome::NoOp, "no_op"),
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), json!(wire));
+        }
+    }
+
+    #[test]
+    fn write_params_require_operation_id_and_default_flags() {
+        let params: PackageUninstallParams =
+            serde_json::from_value(json!({ "package": "com.x", "operation_id": "op-2" })).unwrap();
+        assert!(!params.keep_data);
+        assert_eq!(params.user, None);
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value.get("user"), None);
+        // 缺 operation_id 必须解不出来：写操作不允许匿名提交
+        assert!(
+            serde_json::from_value::<ActivityLaunchParams>(json!({ "package": "com.x" })).is_err()
+        );
+    }
+
     #[test]
     fn hosted_stop_params_wire_shape_is_snake_case() {
         let params: HostedStopParams = serde_json::from_value(json!({

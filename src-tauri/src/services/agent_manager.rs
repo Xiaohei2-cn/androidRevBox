@@ -1363,6 +1363,182 @@ mod tests {
         manager.disconnect(&serial).await.unwrap();
     }
 
+    /// AR8.1 真机腿：包写操作的语义只能在真机上验全——幂等台账、目标范围守卫、
+    /// 执行后客观复核（pidof / pm path）。本腿**不做任何真实卸载**：卸载只验证
+    /// 「系统包必须被拒」和「没装的包必须报没装」两条守卫，等用户指定可牺牲的靶子包
+    /// 之后再补成功路径。启动/强停用 `com.termux`（终端类应用，强停等于上滑划掉，无数据损失）。
+    #[tokio::test]
+    #[ignore = "需要真机；AR8_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_package_writes -- --ignored --nocapture"]
+    async fn real_agent_package_writes_are_idempotent_and_scoped() {
+        use agent_protocol::method::{ACTIVITY_FORCE_STOP, ACTIVITY_LAUNCH, PACKAGE_UNINSTALL};
+        use agent_protocol::{
+            ActivityForceStopParams, ActivityLaunchParams, ErrorCode, PackageUninstallParams,
+            PackageWriteResult, WriteOutcome,
+        };
+
+        const TARGET: &str = "com.termux";
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let serial = std::env::var("AR8_TEST_SERIAL").expect("AR8_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        let status = manager.connect_resolved(&serial).await.unwrap();
+        for method in [ACTIVITY_LAUNCH, ACTIVITY_FORCE_STOP, PACKAGE_UNINSTALL] {
+            assert!(
+                status
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.method == method && capability.available),
+                "Agent 未发布 {method}"
+            );
+        }
+        let client = manager.client(&serial).unwrap();
+
+        // ① 启动：必须看到 pid，否则 verified=false
+        let launch_op = format!("ar81-launch-{stamp}");
+        let launched: PackageWriteResult = client
+            .request(
+                ACTIVITY_LAUNCH,
+                &ActivityLaunchParams {
+                    package: TARGET.into(),
+                    operation_id: launch_op.clone(),
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+        eprintln!(
+            "[activity.launch] outcome={:?} verified={} pid={:?} detail={:?}",
+            launched.outcome, launched.verified, launched.pid, launched.detail
+        );
+        assert_eq!(launched.outcome, WriteOutcome::Executed);
+        assert!(launched.verified, "启动后必须复核到 pid");
+        assert!(launched.pid.unwrap_or(0) > 0);
+        assert!(!launched.ran_as_root);
+
+        // ② 幂等：同一 operation_id 重发只回已知结果，不二次执行
+        let replay: PackageWriteResult = client
+            .request(
+                ACTIVITY_LAUNCH,
+                &ActivityLaunchParams {
+                    package: TARGET.into(),
+                    operation_id: launch_op.clone(),
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.outcome, WriteOutcome::Replayed, "重发不得再次执行");
+        assert_eq!(replay.pid, launched.pid, "复用结果必须与上次一致");
+
+        // ③ 强停：先看到 pidof 消失，再复核一次；两次都要能分辨 executed / no_op
+        let stop_op = format!("ar81-stop-{stamp}");
+        let stopped: PackageWriteResult = client
+            .request(
+                ACTIVITY_FORCE_STOP,
+                &ActivityForceStopParams {
+                    package: TARGET.into(),
+                    operation_id: stop_op.clone(),
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+        eprintln!(
+            "[activity.force_stop] outcome={:?} verified={} pid_before={:?} detail={:?}",
+            stopped.outcome, stopped.verified, stopped.pid, stopped.detail
+        );
+        assert_eq!(stopped.outcome, WriteOutcome::Executed);
+        assert!(stopped.verified, "强停后必须复核到进程消失");
+        assert_eq!(stopped.detail.as_deref(), Some("pid_gone"));
+        assert!(
+            !adb_shell_is_alive(&serial, TARGET).await,
+            "设备上 {} 应已不在运行",
+            TARGET
+        );
+
+        // ④ 已经停了再停一次：no_op（幂等），不是错误
+        let again: PackageWriteResult = client
+            .request(
+                ACTIVITY_FORCE_STOP,
+                &ActivityForceStopParams {
+                    package: TARGET.into(),
+                    operation_id: format!("ar81-stop-again-{stamp}"),
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.outcome, WriteOutcome::NoOp);
+        assert!(again.verified);
+        assert_eq!(again.detail.as_deref(), Some("not_running"));
+
+        // ⑤ 目标范围守卫：系统包一律拒止（settings 连强停都不许，卸载更不行）。
+        // 三个方法共用一段断言，避免「只测了一个入口的守卫」。
+        for method in [ACTIVITY_FORCE_STOP, ACTIVITY_LAUNCH, PACKAGE_UNINSTALL] {
+            let params = serde_json::json!({
+                "package": "com.android.settings",
+                "operation_id": format!("ar81-guard-{method}-{stamp}"),
+            });
+            let error = client
+                .request::<_, PackageWriteResult>(method, &params, Duration::from_secs(15))
+                .await
+                .expect_err("系统包不允许写操作");
+            let error = match error {
+                crate::services::agent_client::AgentClientError::Remote(error) => error,
+                other => panic!("期望结构化错误，实际 {other:?}"),
+            };
+            assert_eq!(
+                error.code,
+                ErrorCode::PreconditionFailed,
+                "{method}: {error:?}"
+            );
+            assert_eq!(error.details.unwrap()["reason"], "system_package_protected");
+        }
+
+        // ⑥ 没装的包：not_found，而不是「没权限动系统包」这种误导
+        let missing = client
+            .request::<_, PackageWriteResult>(
+                PACKAGE_UNINSTALL,
+                &PackageUninstallParams {
+                    package: "com.definitely.not.installed.pkg".into(),
+                    operation_id: format!("ar81-missing-{stamp}"),
+                    keep_data: false,
+                    user: None,
+                },
+                Duration::from_secs(15),
+            )
+            .await
+            .expect_err("未安装的包必须报 not_found");
+        let missing = match missing {
+            crate::services::agent_client::AgentClientError::Remote(error) => error,
+            other => panic!("期望结构化错误，实际 {other:?}"),
+        };
+        assert_eq!(missing.code, ErrorCode::NotFound);
+        assert_eq!(missing.details.unwrap()["reason"], "package_not_installed");
+
+        // 收尾：把目标应用留在「已安装、未运行」的自然状态
+        manager.disconnect(&serial).await.unwrap();
+    }
+
+    /// `pidof <pkg>` 是否有输出（走 Agent 的 shell 无关判定用 adb 直查）。
+    async fn adb_shell_is_alive(serial: &str, package: &str) -> bool {
+        let output = tokio::process::Command::new("adb")
+            .args(["-s", serial, "shell", "pidof"])
+            .arg(package)
+            .output()
+            .await
+            .expect("adb 可用");
+        !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+    }
+
     /// AR8.3 真机腿：`package.native_lib_dir` 必须与 Legacy 的 dumpsys 解析同结论，
     /// 而且要把 Legacy 只能报错的两种情况（framework 形态目录、多实例块）分开说清。
     #[tokio::test]

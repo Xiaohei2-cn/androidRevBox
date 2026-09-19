@@ -131,7 +131,7 @@ async fn host_agent_full_lifecycle() {
             .expect("hello must succeed");
         assert_eq!(hello.protocol_version, 1);
         assert_eq!(hello.providers.len(), 8);
-        assert_eq!(hello.capabilities.len(), 22);
+        assert_eq!(hello.capabilities.len(), 25);
         assert!(
             hello.capabilities.iter().any(|capability| capability.method
                 == agent_protocol::method::ACTIVITY_FOREGROUND
@@ -159,6 +159,9 @@ async fn host_agent_full_lifecycle() {
             (agent_protocol::method::HOSTED_STATUS, "hosted"),
             (agent_protocol::method::HOSTED_STOP, "hosted"),
             (agent_protocol::method::PACKAGE_NATIVE_LIB_DIR, "package"),
+            (agent_protocol::method::PACKAGE_UNINSTALL, "package"),
+            (agent_protocol::method::ACTIVITY_LAUNCH, "activity"),
+            (agent_protocol::method::ACTIVITY_FORCE_STOP, "activity"),
         ] {
             let capability = hello
                 .capabilities

@@ -2,6 +2,7 @@ pub mod activity;
 pub mod device;
 pub mod filesystem;
 pub mod hosted;
+pub(crate) mod operations;
 pub mod package;
 pub mod process;
 pub mod system;

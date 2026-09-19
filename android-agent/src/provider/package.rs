@@ -9,17 +9,20 @@
 
 use std::process::Stdio;
 
-use agent_protocol::method::PACKAGE_NATIVE_LIB_DIR;
+use agent_protocol::method::{PACKAGE_NATIVE_LIB_DIR, PACKAGE_UNINSTALL};
 use agent_protocol::{
     AgentError, ErrorCode, NativeLibDirSource, PackageNativeLibDirParams,
-    PackageNativeLibDirResult, ProviderHealth, ProviderInfo,
+    PackageNativeLibDirResult, PackageUninstallParams, PackageWriteAction, PackageWriteResult,
+    ProviderHealth, ProviderInfo, WriteOutcome,
 };
 use serde_json::Value;
 use tokio::process::Command;
 
 use super::{Provider, ProviderFuture, RequestContext};
 
-const PACKAGE_METHODS: &[&str] = &[PACKAGE_NATIVE_LIB_DIR];
+const PACKAGE_METHODS: &[&str] = &[PACKAGE_NATIVE_LIB_DIR, PACKAGE_UNINSTALL];
+const PM: &str = "/system/bin/pm";
+const PACKAGE_UNINSTALL_NAME: &str = "package.uninstall";
 const DUMPSYS: &str = "/system/bin/dumpsys";
 /// dumpsys 在大包上会慢，给足但仍有界（Desktop 侧超时更短，Agent 不能无限挂着）。
 const DUMPSYS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
@@ -60,6 +63,7 @@ impl Provider for PackageProvider {
         Box::pin(async move {
             match method {
                 PACKAGE_NATIVE_LIB_DIR => native_lib_dir(params).await,
+                PACKAGE_UNINSTALL => uninstall(params).await,
                 _ => Err(AgentError::new(
                     ErrorCode::UnsupportedMethod,
                     format!("unsupported package method: {method}"),
@@ -144,6 +148,80 @@ async fn native_lib_dir(params: Value) -> Result<Value, AgentError> {
         source,
         detail,
     })
+}
+
+/// 卸载第三方应用（AR8.1 写操作）。
+///
+/// 三道闸：① `operation_id` 必填且合法（幂等台账的键，缺它等于允许匿名重复写）；
+/// ② 只允许第三方应用——`android`、system_server 这类被卸载不是「失败一次」而已，
+/// 可能让设备起不来，所以守卫先于任何执行，不做「先试一下看 pm 怎么说」；
+/// ③ 卸载后必须用 `pm path` 复核路径消失：`pm` 自己说 Success 而路径还在时算未确认，
+/// 不跟随它的措辞。目标本来不存在是 `no_op`（幂等成功），不是错误。
+async fn uninstall(params: Value) -> Result<Value, AgentError> {
+    let params: PackageUninstallParams = parse_params(params)?;
+    super::activity::begin_write(
+        PACKAGE_UNINSTALL_NAME,
+        &params.package,
+        &params.operation_id,
+    )?;
+    if let Some(cached) = super::operations::lookup(&params.operation_id) {
+        return Ok(super::operations::mark_replayed(cached));
+    }
+    super::activity::guard_writable_package(&params.package).await?;
+    if !super::activity::pm_path_present(&params.package).await {
+        let value = serialize(PackageWriteResult {
+            action: PackageWriteAction::Uninstall,
+            package: params.package.clone(),
+            operation_id: params.operation_id.clone(),
+            outcome: WriteOutcome::NoOp,
+            verified: true,
+            pid: None,
+            detail: Some("package_not_installed".to_owned()),
+            ran_as_root: false,
+        })?;
+        super::activity::finish_write(
+            PACKAGE_UNINSTALL_NAME,
+            &params.operation_id,
+            &params.package,
+            &value,
+        );
+        return Ok(value);
+    }
+    let mut args: Vec<String> = vec!["uninstall".to_string()];
+    if params.keep_data {
+        args.push("-k".to_string());
+    }
+    if let Some(user) = params.user {
+        args.extend(["--user".to_string(), user.to_string()]);
+    }
+    args.push(params.package.clone());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = super::activity::run(PM, &refs).await.unwrap_or_default();
+    let rejected = output.contains("Failure") || output.contains("DELETE_FAILED");
+    let gone = !super::activity::pm_path_present(&params.package).await;
+    let value = serialize(PackageWriteResult {
+        action: PackageWriteAction::Uninstall,
+        package: params.package.clone(),
+        operation_id: params.operation_id.clone(),
+        outcome: WriteOutcome::Executed,
+        verified: gone,
+        pid: None,
+        detail: Some(if rejected {
+            format!("pm_rejected: {}", output.trim())
+        } else if gone {
+            "path_gone".to_owned()
+        } else {
+            "path_still_present".to_owned()
+        }),
+        ran_as_root: false,
+    })?;
+    super::activity::finish_write(
+        PACKAGE_UNINSTALL_NAME,
+        &params.operation_id,
+        &params.package,
+        &value,
+    );
+    Ok(value)
 }
 
 /// `dumpsys package <pkg> [--user N]`：参数数组执行，包名不进 shell。
