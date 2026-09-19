@@ -7,6 +7,7 @@ pub mod method {
     pub const SYSTEM_HEALTH: &str = "system.health";
     pub const CAPABILITY_LIST: &str = "capability.list";
     pub const DEVICE_INFO: &str = "device.info";
+    pub const DEVICE_ROOT_CHECK: &str = "device.root_check";
     pub const PACKAGE_LIST: &str = "package.list";
     pub const PACKAGE_LIST_LOCALIZED: &str = "package.list_localized";
     pub const ACTIVITY_FOREGROUND: &str = "activity.foreground";
@@ -711,6 +712,26 @@ pub struct PackageWriteResult {
     pub ran_as_root: bool,
 }
 
+/// AR9.1 前置：设备 root 能力探测改由 Agent 执行（Desktop 之前自己跑 `su -c id`）。
+/// 这是 §2.1「Desktop 不把在线等同于 root」那条要求落地的地方。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DeviceRootCheckParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRootCheckResult {
+    /// 只在**确实拿到 uid=0** 时为 true；超时、su 不存在、被拒都算 false
+    pub root: bool,
+    /// Agent 自身 uid（未提权时就是它真实身份，便于解释为什么读不到别的进程）
+    pub agent_uid: u32,
+    /// 探测耗时，便于 UI 区分「问过了」和「没问出来」
+    pub probe_ms: u64,
+    /// 区分 false 的原因：`su_unavailable`（二进制不可达）、`denied`（有 su 但没给 root）、
+    /// `timeout`（授权弹窗未答或卡住）、`granted`。false 不等于「设备没 root」，
+    /// 也可能是用户还没点允许——UI 要能说出来
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfoResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1000,6 +1021,26 @@ mod tests {
 
     /// 写操作守卫字段名必须钉死：`expected_pid` 拼错不会报错，而是守卫静默失效，
     /// 所以协议测试直接把 wire 形状锁住（Agent 侧也有一条对称断言）。
+    #[test]
+    fn root_check_result_keeps_the_reason_for_absence() {
+        let result = DeviceRootCheckResult {
+            root: false,
+            agent_uid: 2000,
+            probe_ms: 12,
+            detail: Some("su_unavailable".into()),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["root"], json!(false));
+        assert_eq!(value["detail"], "su_unavailable");
+        // 旧报文没有 detail 时必须解成 None，不能默认成 granted/denied
+        let legacy: DeviceRootCheckResult = serde_json::from_value(json!({
+            "root": true, "agent_uid": 0, "probe_ms": 30
+        }))
+        .unwrap();
+        assert!(legacy.root);
+        assert_eq!(legacy.detail, None);
+    }
+
     #[test]
     fn package_write_results_separate_executed_from_replayed_and_noop() {
         let result = PackageWriteResult {

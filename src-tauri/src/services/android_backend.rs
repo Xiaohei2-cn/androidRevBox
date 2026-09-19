@@ -77,6 +77,10 @@ impl LegacyCapability {
 pub fn default_legacy_capabilities() -> Vec<LegacyCapability> {
     [
         (
+            "device.root_check",
+            "AR12.1 after AR9.1 and two stable phase regressions",
+        ),
+        (
             "device.info",
             "AR12.1 after AR5.2 and two stable phase regressions",
         ),

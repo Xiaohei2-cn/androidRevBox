@@ -12,19 +12,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_protocol::method::{
-    DEVICE_INFO, FILESYSTEM_LIST, FILESYSTEM_PREVIEW, FILESYSTEM_STAT, HOSTED_CHMOD, HOSTED_LIST,
-    HOSTED_START, HOSTED_STATUS, HOSTED_STOP, PACKAGE_LIST, PACKAGE_NATIVE_LIB_DIR,
-    PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
+    DEVICE_INFO, DEVICE_ROOT_CHECK, FILESYSTEM_LIST, FILESYSTEM_PREVIEW, FILESYSTEM_STAT,
+    HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP, PACKAGE_LIST,
+    PACKAGE_NATIVE_LIB_DIR, PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
 };
 use agent_protocol::{
-    DeviceInfoParams, DeviceInfoResult, FileKind, FilesystemListParams, FilesystemListResult,
-    FilesystemPreviewParams, FilesystemPreviewResult, FilesystemStatParams, FilesystemStatResult,
-    HostedBinaryInfo, HostedChmodParams, HostedChmodResult, HostedListParams, HostedListResult,
-    HostedRunRecord, HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams,
-    HostedStatusResult, HostedStopParams, HostedStopResult, KillSignal, ListeningPort,
-    PackageListParams, PackageListResult, PackageNativeLibDirParams, PackageNativeLibDirResult,
-    PackageScope, PortHoldingProcess, PreviewEncoding, ProcessByPortParams, ProcessByPortResult,
-    ProcessKillParams, ProcessKillResult, ProcessPortsParams, ProcessPortsResult, SocketFamily,
+    DeviceInfoParams, DeviceInfoResult, DeviceRootCheckParams, DeviceRootCheckResult, FileKind,
+    FilesystemListParams, FilesystemListResult, FilesystemPreviewParams, FilesystemPreviewResult,
+    FilesystemStatParams, FilesystemStatResult, HostedBinaryInfo, HostedChmodParams,
+    HostedChmodResult, HostedListParams, HostedListResult, HostedRunRecord, HostedRunState,
+    HostedStartParams, HostedStartResult, HostedStatusParams, HostedStatusResult, HostedStopParams,
+    HostedStopResult, KillSignal, ListeningPort, PackageListParams, PackageListResult,
+    PackageNativeLibDirParams, PackageNativeLibDirResult, PackageScope, PortHoldingProcess,
+    PreviewEncoding, ProcessByPortParams, ProcessByPortResult, ProcessKillParams,
+    ProcessKillResult, ProcessPortsParams, ProcessPortsResult, SocketFamily,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -982,9 +983,78 @@ impl DeviceService {
         Ok(())
     }
 
-    /// 探测设备 su 是否可用（`su -c id` 输出含 uid=0）。
-    /// 设备信息卡 Root 横幅与二进制托管 Root 开关共用此链路。
+    /// 探测设备 su 是否可用。AR9.1 前置：默认走 Agent `device.root_check`，
+    /// Desktop 不再自己拼 `su -c id`。两条链路都必须「只回答 su 可用性」，
+    /// 且 Agent 侧额外带回自身 uid——**su 可用 ≠ Agent 有 root**（D026 的根因），
+    /// UI 之后要按这个区分「root 支路能不能走 Agent」。只读幂等，可回退。
     pub async fn su_available(&self, serial: &str) -> CoreResult<bool> {
+        let route = self
+            .android
+            .select(serial, DEVICE_ROOT_CHECK, OperationKind::ReadOnlyIdempotent)
+            .map_err(CapabilityRouter::core_error)?;
+        if route.backend == AndroidBackendSource::LegacyAdb {
+            return self.su_available_legacy(serial).await;
+        }
+        let params = DeviceRootCheckParams {};
+        let agent_request = self.android.agent().request::<_, DeviceRootCheckResult>(
+            serial,
+            DEVICE_ROOT_CHECK,
+            &params,
+            SHORT_CMD_TIMEOUT,
+        );
+        let (agent_result, legacy_result) = if root_shadow_enabled() {
+            let legacy = self.su_available_legacy(serial);
+            let (agent, legacy) = tokio::join!(agent_request, legacy);
+            (agent, Some(legacy))
+        } else {
+            (agent_request.await, None)
+        };
+        match agent_result {
+            Ok(result) => {
+                if let Some(Ok(legacy)) = legacy_result {
+                    if legacy != result.root {
+                        tracing::warn!(
+                            serial,
+                            method = DEVICE_ROOT_CHECK,
+                            agent = result.root,
+                            legacy,
+                            detail = ?result.detail,
+                            "Agent/Legacy root 探测不一致（一侧超时或 su 包装脚本行为差异）"
+                        );
+                    }
+                }
+                tracing::debug!(
+                    serial,
+                    method = DEVICE_ROOT_CHECK,
+                    root = result.root,
+                    agent_uid = result.agent_uid,
+                    probe_ms = result.probe_ms,
+                    detail = ?result.detail,
+                    "root 探测完成（su 可用性与 Agent 自身身份是两件事）"
+                );
+                Ok(result.root)
+            }
+            Err(error) => {
+                let fallback = self
+                    .android
+                    .fallback_after_agent_error(
+                        serial,
+                        DEVICE_ROOT_CHECK,
+                        OperationKind::ReadOnlyIdempotent,
+                        &error,
+                    )
+                    .map_err(CapabilityRouter::core_error)?;
+                debug_assert_eq!(fallback.backend, AndroidBackendSource::LegacyAdb);
+                match legacy_result {
+                    Some(result) => result,
+                    None => self.su_available_legacy(serial).await,
+                }
+            }
+        }
+    }
+
+    /// Legacy root 探测（仅作回退）：`su -c id` + `uid=0` 判定。
+    async fn su_available_legacy(&self, serial: &str) -> CoreResult<bool> {
         let cmd = adb::su_wrap("id");
         let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
         let out = self.run_adb(&args).await?;
@@ -2162,6 +2232,12 @@ fn audit_process_kill(
             "process.kill 失败"
         ),
     }
+}
+
+/// root 探测的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。
+fn root_shadow_enabled() -> bool {
+    !std::env::var("APP_REVERSE_TOOLS_ROOT_SHADOW")
+        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
 }
 
 /// AR8.3 native lib 目录的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。

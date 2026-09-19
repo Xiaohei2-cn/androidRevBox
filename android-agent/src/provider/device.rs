@@ -1,17 +1,20 @@
 use std::collections::HashMap;
 use std::process::Output;
 
-use agent_protocol::method::{DEVICE_INFO, PACKAGE_LIST};
+use agent_protocol::method::{DEVICE_INFO, DEVICE_ROOT_CHECK, PACKAGE_LIST};
 use agent_protocol::{
-    AgentError, DeviceInfoParams, DeviceInfoResult, ErrorCode, PackageListParams,
-    PackageListResult, PackageScope, PackageSummary, ProviderHealth, ProviderInfo,
+    AgentError, DeviceInfoParams, DeviceInfoResult, DeviceRootCheckParams, DeviceRootCheckResult,
+    ErrorCode, PackageListParams, PackageListResult, PackageScope, PackageSummary, ProviderHealth,
+    ProviderInfo,
 };
 use serde_json::{Value, to_value};
 use tokio::process::Command;
 
 use super::{Provider, ProviderFuture, RequestContext};
 
-const DEVICE_METHODS: &[&str] = &[DEVICE_INFO, PACKAGE_LIST];
+const DEVICE_METHODS: &[&str] = &[DEVICE_INFO, PACKAGE_LIST, DEVICE_ROOT_CHECK];
+/// root 探测必须有界：授权弹窗没点、su 卡住都不能把整条会话拖死。
+const ROOT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2_500);
 const GETPROP: &str = "/system/bin/getprop";
 const PM: &str = "/system/bin/pm";
 const IP: &str = "/system/bin/ip";
@@ -138,6 +141,77 @@ pub(crate) fn parse_pm_uid_lines(text: &str) -> Vec<(String, Option<u32>)> {
     rows
 }
 
+impl DeviceProvider {
+    /// Root 能力探测（AR9.1 前置）：Desktop 之前自己 `adb shell su -c id` 判 root，
+    /// 于是「设备在线」和「有 root」在 UI 上长期混成一件事。这里由 Agent 探一次，
+    /// 同时把 **Agent 自己的 uid** 一起带回去：`root=true` 说的是 `su` 可用，
+    /// 不代表 Agent 进程有 root——Agent 仍以 shell(2000) 身份运行，
+    /// 这正是 D026 里 `root=true` 支路必须留在 Legacy 的原因。
+    async fn root_check(&self, params: Value) -> Result<Value, AgentError> {
+        let _: DeviceRootCheckParams = serde_json::from_value(params).map_err(|error| {
+            AgentError::new(
+                ErrorCode::InvalidRequest,
+                "invalid device.root_check parameters",
+            )
+            .with_details(serde_json::json!({ "reason": error.to_string() }))
+        })?;
+        let started = std::time::Instant::now();
+        let agent_uid = unsafe { libc::geteuid() };
+        let (root, detail) = match tokio::time::timeout(
+            ROOT_PROBE_TIMEOUT,
+            tokio::process::Command::new("su")
+                .args(["-c", "id"])
+                .output(),
+        )
+        .await
+        {
+            Err(_) => (false, Some("timeout")),
+            Ok(Err(error)) => (
+                false,
+                Some(match error.kind() {
+                    // su 不在 PATH（未装 root、或已被撤销授权后从 shell 不可达）
+                    std::io::ErrorKind::NotFound => "su_unavailable",
+                    _ => "su_exec_failed",
+                }),
+            ),
+            Ok(Ok(output)) => classify_root_probe(
+                output.status.success(),
+                &format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ),
+        };
+        to_value(DeviceRootCheckResult {
+            root,
+            agent_uid,
+            probe_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            detail: detail.map(str::to_owned),
+        })
+        .map_err(|error| {
+            AgentError::new(ErrorCode::Internal, format!("encode root result: {error}"))
+        })
+    }
+}
+
+/// root 探测结果分类（拆成纯函数，宿主上也能测全部分支）。
+/// `uid=0` 只认成功输出；失败但有输出 ≠ 有 root。
+fn classify_root_probe(success: bool, text: &str) -> (bool, Option<&'static str>) {
+    if text.contains("uid=0") && success {
+        return (true, Some("granted"));
+    }
+    if text.contains("uid=0") && !success {
+        // 罕见：su 打印了 uid=0 却以非零退出（包装脚本行为）。不据此宣称有 root，
+        // 但要把矛盾留成证据，供排障时看出是 su 的包装脚本而不是权限本身。
+        return (false, Some("granted_but_failed"));
+    }
+    if !success {
+        return (false, Some("denied"));
+    }
+    (false, Some("not_root"))
+}
+
 impl Provider for DeviceProvider {
     fn info(&self) -> ProviderInfo {
         ProviderInfo {
@@ -163,6 +237,7 @@ impl Provider for DeviceProvider {
             match method {
                 DEVICE_INFO => self.device_info(params).await,
                 PACKAGE_LIST => self.package_list(params).await,
+                DEVICE_ROOT_CHECK => self.root_check(params).await,
                 _ => Err(AgentError::new(
                     ErrorCode::UnsupportedMethod,
                     format!("unsupported device method: {method}"),
@@ -249,6 +324,28 @@ fn serialize_result<T: serde::Serialize>(result: T) -> Result<Value, AgentError>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn root_probe_classification_needs_success_and_uid0() {
+        let granted = "uid=0(root) gid=0(root) groups=0(root) context=u:r:su:s0\n";
+        assert_eq!(classify_root_probe(true, granted), (true, Some("granted")));
+        // 只有 uid=0 但退出码非零：不能宣称有 root
+        assert_eq!(
+            classify_root_probe(false, granted),
+            (false, Some("granted_but_failed"))
+        );
+        // KernelSU 拒绝时常见：非零退出 + 无 uid=0
+        assert_eq!(
+            classify_root_probe(false, "Permission denied\n"),
+            (false, Some("denied"))
+        );
+        // 成功执行但不是 root（例如 su 被替换成普通 shell）
+        assert_eq!(
+            classify_root_probe(true, "uid=2000(shell) gid=2000(shell)\n"),
+            (false, Some("not_root"))
+        );
+        assert_eq!(classify_root_probe(true, ""), (false, Some("not_root")));
+    }
+
     use super::*;
 
     #[test]

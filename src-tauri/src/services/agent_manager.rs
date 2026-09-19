@@ -1732,6 +1732,91 @@ mod tests {
         manager.disconnect(&serial).await.unwrap();
     }
 
+    /// AR9.1 前置真机腿：root 探测改由 Agent 执行后，结论必须与 Legacy `su -c id`
+    /// 一致，而且要把「su 可用」与「Agent 自身有 root」分开带回——UI 之前把这两件事
+    /// 混成一个绿色徽章，正是 D026 那批 `root=true` 支路必须留在 Legacy 的原因。
+    #[tokio::test]
+    #[ignore = "需要真机；AR9_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_root_check -- --ignored --nocapture"]
+    async fn real_agent_root_check_separates_su_from_agent_identity() {
+        use agent_protocol::method::DEVICE_ROOT_CHECK;
+        use agent_protocol::{DeviceRootCheckParams, DeviceRootCheckResult};
+
+        let serial = std::env::var("AR9_TEST_SERIAL").expect("AR9_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        let status = manager.connect_resolved(&serial).await.unwrap();
+        assert!(
+            status
+                .capabilities
+                .iter()
+                .any(|capability| capability.method == DEVICE_ROOT_CHECK && capability.available),
+            "Agent 未发布 device.root_check"
+        );
+        let client = manager.client(&serial).unwrap();
+
+        let result: DeviceRootCheckResult = client
+            .request(
+                DEVICE_ROOT_CHECK,
+                &DeviceRootCheckParams {},
+                Duration::from_secs(15),
+            )
+            .await
+            .unwrap();
+        let environment = runner.environment().await;
+        let adb_path = environment.path.unwrap();
+        let legacy = runner
+            .run(
+                &adb_path,
+                &adb::build_args(Some(&serial), &adb::cmd_shell(&adb::su_wrap("id"))),
+                Duration::from_secs(15),
+            )
+            .await
+            .unwrap();
+        let legacy_root = legacy.exit_code == Some(0) && adb::is_root_probe_ok(&legacy.stdout);
+        eprintln!(
+            "[device.root_check] root={} agent_uid={} probe_ms={} detail={:?} legacy_root={}",
+            result.root, result.agent_uid, result.probe_ms, result.detail, legacy_root
+        );
+        assert_eq!(
+            result.root, legacy_root,
+            "Agent 与 Legacy 的 su 可用性结论必须一致（一侧超时也不行）"
+        );
+        assert!(
+            result.detail.is_some(),
+            "false 也必须给出可区分的理由（超时/无 su/被拒不是一回事）"
+        );
+        let known = [
+            "granted",
+            "granted_but_failed",
+            "denied",
+            "not_root",
+            "timeout",
+            "su_unavailable",
+            "su_exec_failed",
+        ];
+        assert!(
+            known.contains(&result.detail.as_deref().unwrap_or("")),
+            "detail 必须是已分类的理由，实际 {:?}",
+            result.detail
+        );
+        // 关键区分：su 可用（root=true）时 Agent 自己仍是 shell(2000)
+        assert_eq!(
+            result.agent_uid, 2000,
+            "Agent 由 adb shell 启动，uid 必须是 2000；若某天变了说明启动方式变了，D026 需要重评"
+        );
+        if result.root {
+            assert_ne!(
+                result.agent_uid, 0,
+                "su 可用不等于 Agent 已提权，这条断言就是 D026 的机读版本"
+            );
+        }
+        manager.disconnect(&serial).await.unwrap();
+    }
+
     /// AR7.3 真机腿：按句柄停止必须先核身份（PID 易主时拒止且不动手），
     /// 停止结果要能区分「已确认消失」与「发了信号但没确认到」，
     /// 端口方向则复用 AR6.2 的 `process.ports`（不再有 `ls -l` fd + grep 那条链）。
