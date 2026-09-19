@@ -1,0 +1,36 @@
+#!/bin/sh
+#################
+# update-binary (自包含实现, 兼容 Magisk 与 KernelSU 安装环境)
+# 安装器约定: $1=API 版本, $2=输出 fd, $3=模块 zip 路径
+#################
+
+OUTFD=$2
+ZIPFILE=$3
+
+ui_print() { printf '%s\n' "$*" >&$OUTFD 2>/dev/null || printf '%s\n' "$*"; }
+
+abort() { ui_print "! $*"; exit 1; }
+
+# 读取 module.prop 中的 id
+MODID=$(unzip -p "$ZIPFILE" module.prop | grep '^id=' | cut -d= -f2 | tr -d ' \r')
+[ -n "$MODID" ] || abort "module.prop 缺少 id"
+
+MODPATH="/data/adb/modules/$MODID"
+ui_print "- 安装模块: $MODID"
+
+rm -rf "$MODPATH"
+mkdir -p "$MODPATH"
+
+unzip -o "$ZIPFILE" -d "$MODPATH" >&2 \
+  || abort "解压失败"
+
+rm -rf "$MODPATH/META-INF"
+
+chmod 755 "$MODPATH" "$MODPATH/zygisk" 2>/dev/null
+chmod 644 "$MODPATH"/*.prop "$MODPATH"/*.dex "$MODPATH"/zygisk/*.so 2>/dev/null
+chcon -R u:object_r:system_file:s0 "$MODPATH" 2>/dev/null
+
+# 删除同名残留标记
+rm -f "$MODPATH/remove"
+
+ui_print "- 安装完成, 重启生效"
