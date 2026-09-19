@@ -302,6 +302,34 @@ impl ZygiskApplistService {
         Ok(())
     }
 
+    /// 仅真机测试用：透传到公共 `package.list`，验证它与 Zygisk 无关也能工作。
+    #[cfg(test)]
+    pub async fn plain_packages_for_test(&self, serial: &str) -> CoreResult<Vec<String>> {
+        use crate::services::android_backend::{AgentBackendError, CapabilityRouter};
+        let result = self
+            .android
+            .agent()
+            .request::<_, agent_protocol::PackageListResult>(
+                serial,
+                agent_protocol::method::PACKAGE_LIST,
+                &agent_protocol::PackageListParams {
+                    scope: agent_protocol::PackageScope::All,
+                    include_disabled: false,
+                },
+                LIST_TIMEOUT,
+            )
+            .await
+            .map_err(|error| match error {
+                AgentBackendError::Business(business) => CoreError::Internal(business.message),
+                other => CapabilityRouter::agent_error(other),
+            })?;
+        Ok(result
+            .items
+            .into_iter()
+            .map(|item| item.package_name)
+            .collect())
+    }
+
     /// 三个方法都不登记 Legacy 回退：Agent 未连接或模块缺失时必须显式失败。
     fn require_agent(&self, serial: &str, method: &str) -> CoreResult<()> {
         match self
@@ -855,6 +883,63 @@ mod tests {
             "Desktop 不应再直连模块端口: {}",
             forwards.stdout
         );
+    }
+
+    /// AR5.5 的「Zygisk 缺失」真机腿：在没有 root、也没有任何模块的设备上，
+    /// 诊断必须报「无通道」，清单必须显式失败并给可执行指引，绝不返回空列表冒充成功。
+    #[tokio::test]
+    #[ignore = "需要一台未安装 Zygisk 模块的真机；APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_zygisk_absent -- --ignored --nocapture"]
+    async fn real_agent_zygisk_absent_reports_honest_failure() {
+        use crate::services::device_service::RealAdbRunner;
+
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(Arc::new(
+            crate::services::config_service::ConfigService::new(Arc::new(
+                crate::db::Db::in_memory().unwrap(),
+            )),
+        )));
+        let (android, agent) = router_with_agent(runner.clone());
+        let service = ZygiskApplistService::new(android, runner.clone());
+        agent
+            .connect_resolved(&serial)
+            .await
+            .expect("Agent 安装/连接失败（非 root 也应可用）");
+
+        let status = service.status(&serial).await.unwrap();
+        eprintln!(
+            "[zygisk.absent] lifecycle={} bridge={} root={} sub_protocol={} module={:?} detail={:?}",
+            status.lifecycle,
+            status.bridge_ready,
+            status.root_available,
+            status.sub_protocol_version,
+            status.module_id,
+            status.detail
+        );
+        assert!(!status.bridge_ready, "没有模块时不得声称 bridge 就绪");
+        assert_eq!(status.sub_protocol_version, 0, "不得宣告任何子协议版本");
+        assert_eq!(status.lifecycle, "faulted", "无法判定时必须如实报 faulted");
+        let detail = status.detail.unwrap_or_default();
+        assert!(
+            detail.contains("无法区分") || detail.contains("未安装") || detail.contains("root"),
+            "detail 要能告诉用户下一步查什么: {detail}"
+        );
+
+        let error = service
+            .list(&serial, None, LocalizedScope::All, false)
+            .await
+            .expect_err("缺 Zygisk 时清单必须失败，不能返回空列表冒充成功");
+        let message = error.to_string();
+        assert!(
+            message.contains("Zygisk") || message.contains("模块"),
+            "错误必须指向模块安装/启用: {message}"
+        );
+
+        // 同一个 Agent 的普通包列表不依赖 root/Zygisk，必须照常可用
+        let packages = service
+            .plain_packages_for_test(&serial)
+            .await
+            .expect("package.list 不应依赖 Zygisk");
+        assert!(!packages.is_empty(), "非 root 设备上普通包列表仍应可用");
     }
 
     #[test]
