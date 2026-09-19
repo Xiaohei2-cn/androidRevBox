@@ -131,7 +131,7 @@ async fn host_agent_full_lifecycle() {
             .expect("hello must succeed");
         assert_eq!(hello.protocol_version, 1);
         assert_eq!(hello.providers.len(), 3);
-        assert_eq!(hello.capabilities.len(), 8);
+        assert_eq!(hello.capabilities.len(), 9);
         assert!(
             hello
                 .capabilities
@@ -140,6 +140,13 @@ async fn host_agent_full_lifecycle() {
         );
         // Zygisk 模块在宿主机上必然不存在：只能降级 provider.zygisk 的具体方法，
         // 既不能假成功，也不能让 shell/系统能力一起消失（AR5.3 第 6 条）。
+        assert!(
+            hello.capabilities.iter().any(|capability| capability.method
+                == agent_protocol::method::PACKAGE_LIST
+                && capability.provider == "shell"
+                && capability.available),
+            "package.list 应由 ShellProvider 宣告且始终可用"
+        );
         let zygisk_status = hello
             .capabilities
             .iter()

@@ -26,6 +26,7 @@ export default {
   "apps.scopeUser": "サードパーティアプリ",
   "apps.scopeSystem": "システム",
   "apps.includeDisabled": "無効アプリを含む",
+  "apps.channelFallback": "現在のチャネル {channel}：v2 モジュールではないため、locale 指定と呼び出し根拠は使えません",
   "apps.badgeSystem": "システム",
   "apps.badgeUser": "3rd",
   "apps.badgeDisabled": "無効",

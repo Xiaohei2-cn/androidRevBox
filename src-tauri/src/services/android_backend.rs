@@ -692,6 +692,53 @@ mod tests {
         ));
     }
 
+    /// AR5.5 矩阵腿：旧版 Agent 没有 package.list capability 时，只读列表允许回退 Legacy；
+    /// 而 package.list_localized（Zygisk 专属）不在 Legacy 能力表里，必须拒绝回退。
+    #[test]
+    fn package_list_may_fall_back_but_localized_list_must_not() {
+        let runner: Arc<dyn AdbRunner> = Arc::new(MockAdbRunner::new(true));
+        let router = CapabilityRouter::new(
+            manager(runner.clone()),
+            runner,
+            default_legacy_capabilities(),
+        );
+
+        let decision = router
+            .fallback_after_agent_error(
+                "serial-a",
+                agent_protocol::method::PACKAGE_LIST,
+                OperationKind::ReadOnlyIdempotent,
+                &AgentBackendError::UnsupportedMethod(agent_protocol::method::PACKAGE_LIST.into()),
+            )
+            .unwrap();
+        assert_eq!(decision.backend, AndroidBackendSource::LegacyAdb);
+        assert_eq!(
+            decision.fallback_reason,
+            Some(FallbackReason::UnsupportedMethod)
+        );
+
+        for method in [
+            agent_protocol::method::PACKAGE_LIST_LOCALIZED,
+            agent_protocol::method::ZYGISK_STATUS,
+            agent_protocol::method::PACKAGE_EXPORT_APK,
+        ] {
+            assert!(
+                matches!(
+                    router.fallback_after_agent_error(
+                        "serial-a",
+                        method,
+                        OperationKind::ReadOnlyIdempotent,
+                        &AgentBackendError::UnsupportedMethod(method.into()),
+                    ),
+                    // 这三个方法没有登记 Legacy 能力，路由层必须显式拒绝，
+                    // 而不是悄悄换成 pm/Shell 的等价实现。
+                    Err(RouteError::LegacyFallbackNotRegistered(_))
+                ),
+                "{method} 不得回退成 pm/Shell 结果"
+            );
+        }
+    }
+
     #[test]
     fn unsupported_method_error_can_fallback_only_when_legacy_is_registered() {
         let runner: Arc<dyn AdbRunner> = Arc::new(MockAdbRunner::new(true));

@@ -26,6 +26,7 @@ export default {
   "apps.scopeUser": "3rd-party",
   "apps.scopeSystem": "System",
   "apps.includeDisabled": "Include disabled",
+  "apps.channelFallback": "Active channel {channel}: not the v2 module, so an explicit locale and label evidence are unavailable",
   "apps.badgeSystem": "system",
   "apps.badgeUser": "3rd",
   "apps.badgeDisabled": "disabled",

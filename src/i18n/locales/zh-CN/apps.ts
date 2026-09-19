@@ -26,6 +26,7 @@ export default {
   "apps.scopeUser": "三方",
   "apps.scopeSystem": "系统",
   "apps.includeDisabled": "含停用应用",
+  "apps.channelFallback": "当前通道 {channel}：非 v2 模块，指定 locale 与来源证据不可用",
   "apps.badgeSystem": "系统",
   "apps.badgeUser": "三方",
   "apps.badgeDisabled": "停用",

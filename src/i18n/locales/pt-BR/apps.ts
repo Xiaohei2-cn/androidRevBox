@@ -26,6 +26,7 @@ export default {
   "apps.scopeUser": "Terceiros",
   "apps.scopeSystem": "Sistema",
   "apps.includeDisabled": "Incluir desativados",
+  "apps.channelFallback": "Canal ativo {channel}: não é o módulo v2, então locale explícito e evidência de origem não estão disponíveis",
   "apps.badgeSystem": "sistema",
   "apps.badgeUser": "3º",
   "apps.badgeDisabled": "desativado",

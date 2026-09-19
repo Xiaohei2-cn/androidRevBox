@@ -23,12 +23,16 @@ export interface ZygiskAppWarning {
   message: string;
 }
 
+export type ZygiskChannel = "zygisk_v2" | "zygisk_v1" | "zygisk_none" | string;
+
 export interface ZygiskAppList {
   items: ZygiskAppItem[];
   successCount: number;
   fallbackCount: number;
   warnings: ZygiskAppWarning[];
   deviceLocale: string | null;
+  /** 实际服务本次清单的通道；v1 无法按请求 locale 解析，UI 必须显式提示 */
+  channel: ZygiskChannel;
 }
 
 export interface ZygiskStatus {

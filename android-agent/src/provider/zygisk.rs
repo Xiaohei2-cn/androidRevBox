@@ -546,6 +546,7 @@ impl ZygiskProvider {
             success_count,
             fallback_count,
             warnings,
+            channel: Some("zygisk_v1".to_owned()),
         })
     }
 
@@ -583,7 +584,7 @@ impl ZygiskProvider {
             .clone()
             .unwrap_or_else(|| device_locale.clone());
 
-        let (mut items, unproven_locale) = map_pro_items(&frames, &requested_locale)?;
+        let (mut items, unproven_locale, mut warnings) = map_pro_items(&frames, &requested_locale)?;
         items.sort_by(|left, right| {
             (&left.label, &left.package_name).cmp(&(&right.label, &right.package_name))
         });
@@ -595,7 +596,6 @@ impl ZygiskProvider {
                 .count(),
         )
         .unwrap_or(u32::MAX);
-        let mut warnings = Vec::new();
         if let Some(final_frame) = final_frame {
             let reported = final_frame.get("count").and_then(serde_json::Value::as_u64);
             if reported.is_some_and(|count| usize::try_from(count) != Ok(items.len())) {
@@ -631,6 +631,7 @@ impl ZygiskProvider {
             fallback_count,
             items,
             warnings,
+            channel: Some("zygisk_v2".to_owned()),
         })
     }
 
@@ -1174,19 +1175,33 @@ async fn pro_command_frames_with_token(
 fn map_pro_items(
     frames: &[serde_json::Value],
     requested_locale: &str,
-) -> Result<(Vec<LocalizedPackageItem>, u32), AgentError> {
+) -> Result<(Vec<LocalizedPackageItem>, u32, Vec<PackageWarning>), AgentError> {
     let mut items = Vec::with_capacity(frames.len());
     let mut unproven_locale = 0_u32;
+    let mut warnings = Vec::new();
     for value in frames
         .iter()
         .filter(|value| value.get("final").and_then(serde_json::Value::as_bool) != Some(true))
     {
-        let item: ProItem = serde_json::from_value(value.clone()).map_err(|error| {
-            incompatible(
-                format!("v2 清单条目字段不兼容: {error}"),
-                Some("pro_item_schema"),
-            )
-        })?;
+        // 单条字段异常只影响该条：记 item warning 后继续，保住整批清单（AR5.4 契约）
+        let item: ProItem = match serde_json::from_value(value.clone()) {
+            Ok(item) => item,
+            Err(error) => {
+                let pkg = value
+                    .get("pkg")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                warnings.push(PackageWarning {
+                    package_name: pkg.clone(),
+                    code: "item_parse_failed".into(),
+                    message: format!(
+                        "{} 条目字段异常，已从清单跳过: {error}",
+                        pkg.unwrap_or_else(|| "<未知包名>".to_owned())
+                    ),
+                });
+                continue;
+            }
+        };
         let label_source = match item.label_source.as_str() {
             "framework" => LabelSource::Framework,
             "manifest" => LabelSource::Manifest,
@@ -1216,7 +1231,7 @@ fn map_pro_items(
             enabled: item.enabled,
         });
     }
-    Ok((items, unproven_locale))
+    Ok((items, unproven_locale, warnings))
 }
 
 fn parse_apps(bytes: &[u8]) -> Result<Vec<ModuleApp>, AgentError> {
@@ -1604,24 +1619,14 @@ async fn pm_flags() -> PmFlags {
 }
 
 fn collect_pm_lines(text: &str, flags: &mut PmFlags, disabled: bool) {
-    for line in text.lines().map(str::trim) {
-        let Some(rest) = line.strip_prefix("package:") else {
-            continue;
-        };
-        let mut parts = rest.split_whitespace();
-        let Some(package) = parts.next() else {
-            continue;
-        };
-        let package = package.to_owned();
+    // 解析规则与 ShellProvider 的 package.list 共用一份，避免两处各自理解 `pm` 输出。
+    for (package, uid) in super::device::parse_pm_uid_lines(text) {
         if disabled {
             flags.disabled.insert(package.clone());
         } else {
             flags.enabled.insert(package.clone());
         }
-        if let Some(uid) = parts
-            .find_map(|token| token.strip_prefix("uid:"))
-            .and_then(|value| value.parse::<u32>().ok())
-        {
+        if let Some(uid) = uid {
             flags.uids.entry(package).or_insert(uid);
         }
     }
@@ -2004,8 +2009,9 @@ mod tests {
         .map(|raw| serde_json::from_slice(raw).unwrap())
         .collect();
 
-        let (items, unproven) = map_pro_items(&frames, "fr-FR").unwrap();
+        let (items, unproven, warnings) = map_pro_items(&frames, "fr-FR").unwrap();
         assert_eq!(items.len(), 3, "final 帧不应计入条目");
+        assert!(warnings.is_empty());
         assert_eq!(items[0].label_source, LabelSource::Framework);
         assert_eq!(items[0].label, "天气");
         assert_eq!(items[0].resolved_locale.as_deref(), Some("zh-Hans-CN"));
@@ -2078,6 +2084,35 @@ mod tests {
             ErrorCode::IncompatibleVersion
         );
         assert!(parse_manifest(br#"{"error":"x"}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_bad_item_does_not_lose_the_whole_list() {
+        let raw_frames: Vec<&[u8]> = vec![
+            br#"{"pkg":"com.good","label":"\u597d\u7684","labelSource":"framework","resolvedLocale":"zh-Hans-CN","versionName":"1.0","versionCode":1,"uid":10001,"isSystem":false,"enabled":true}"#.as_slice(),
+            // versionCode 类型不对（真机 helper 异常时可能是字符串或缺失）
+            br#"{"pkg":"com.broken","label":"\u574f\u7684","versionCode":"NaN","isSystem":false}"#.as_slice(),
+            br#"{"label":"\u6ca1\u6709\u5305\u540d","versionCode":2}"#.as_slice(),
+            br#"{"final":true,"count":3,"fallback":1,"deviceLocale":"zh-Hans-CN"}"#.as_slice(),
+        ];
+        let frames: Vec<serde_json::Value> = raw_frames
+            .iter()
+            .map(|raw| serde_json::from_slice(raw).unwrap())
+            .collect();
+
+        let (items, unproven, warnings) = map_pro_items(&frames, "zh-Hans-CN").unwrap();
+        assert_eq!(items.len(), 1, "坏条目跳过但整批必须继续");
+        assert_eq!(items[0].package_name, "com.good");
+        assert_eq!(items[0].label, "好的");
+        assert_eq!(
+            warnings.len(),
+            2,
+            "两条坏数据各出一条 item warning: {warnings:?}"
+        );
+        assert_eq!(warnings[0].package_name.as_deref(), Some("com.broken"));
+        assert_eq!(warnings[0].code, "item_parse_failed");
+        assert_eq!(warnings[1].package_name, None, "缺包名时不得编造");
+        assert_eq!(unproven, 0);
     }
 
     #[test]

@@ -198,6 +198,11 @@ pub struct PackageListLocalizedResult {
     pub fallback_count: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<PackageWarning>,
+    /// 实际服务本次清单的通道，UI 必须可见：`zygisk_v2`（可指定 locale）、
+    /// `zygisk_v1`（demo 模块，只有设备默认 locale）或 `zygisk_none`。
+    /// 缺字段表示旧版 Agent，前端按 `zygisk_none` 处理，不猜成 v2。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 #[cfg(test)]
@@ -240,6 +245,7 @@ mod tests {
             success_count: 1,
             fallback_count: 1,
             warnings: vec![],
+            channel: None,
         };
         let value = serde_json::to_value(result).unwrap();
         assert_eq!(value["items"][0]["label_source"], "manifest");
@@ -278,6 +284,28 @@ mod tests {
         assert_eq!(params.locale, None);
         let value = serde_json::to_value(&params).unwrap();
         assert_eq!(value.get("locale"), None);
+    }
+
+    #[test]
+    fn localized_channel_is_optional_and_snake_case_compatible() {
+        let mut result = PackageListLocalizedResult {
+            items: Vec::new(),
+            success_count: 0,
+            fallback_count: 0,
+            warnings: Vec::new(),
+            channel: Some("zygisk_v2".into()),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["channel"], "zygisk_v2");
+        assert_eq!(value.get("warnings"), None);
+        result.channel = None;
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value.get("channel"), None);
+        // 旧版 Agent 报文没有该字段，也必须能解出来（不得当成 v2）
+        let legacy: PackageListLocalizedResult =
+            serde_json::from_value(json!({"items": [], "success_count": 0, "fallback_count": 0}))
+                .unwrap();
+        assert_eq!(legacy.channel, None);
     }
 
     #[test]

@@ -26,6 +26,7 @@ export default {
   "apps.scopeUser": "Сторонние",
   "apps.scopeSystem": "Системные",
   "apps.includeDisabled": "Включая отключённые",
+  "apps.channelFallback": "Активный канал {channel}: это не v2-модуль, поэтому явный locale и подтверждение источника недоступны",
   "apps.badgeSystem": "система",
   "apps.badgeUser": "3-я",
   "apps.badgeDisabled": "отключено",

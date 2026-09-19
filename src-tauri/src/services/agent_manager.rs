@@ -1070,6 +1070,111 @@ mod tests {
         manager.disconnect(&serial).await.unwrap();
     }
 
+    /// AR5.5 路由矩阵的只读腿：Agent `package.list` 必须在设备端解析完成，
+    /// 并与 Legacy `pm list packages -3` 的集合一致（迁移期 shadow 对照的真机版本）。
+    #[tokio::test]
+    #[ignore = "需要真机；AR4_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_package_list_matches_legacy -- --ignored --nocapture"]
+    async fn real_agent_package_list_matches_legacy() {
+        use agent_protocol::{PackageListParams, PackageListResult, PackageScope};
+
+        let serial = std::env::var("AR4_TEST_SERIAL").expect("AR4_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let artifacts = Arc::new(AgentArtifactResolver::new(config, None));
+        let manager = AgentManager::new(runner.clone(), artifacts);
+        let status = manager.connect_resolved(&serial).await.unwrap();
+        assert!(
+            status
+                .capabilities
+                .iter()
+                .any(|capability| capability.method == agent_protocol::method::PACKAGE_LIST),
+            "Agent 未发布 package.list capability"
+        );
+
+        let client = manager.client(&serial).unwrap();
+        let user = client
+            .request::<_, PackageListResult>(
+                agent_protocol::method::PACKAGE_LIST,
+                &PackageListParams {
+                    scope: PackageScope::User,
+                    include_disabled: false,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(!user.items.is_empty(), "Agent 三方包列表为空");
+        assert!(
+            user.items.iter().all(|item| !item.is_system),
+            "scope=user 混入系统包"
+        );
+        assert!(
+            user.items
+                .windows(2)
+                .all(|pair| pair[0].package_name <= pair[1].package_name),
+            "package.list 必须稳定排序，否则 UI 抖动"
+        );
+        let with_uid = user.items.iter().filter(|item| item.uid.is_some()).count();
+        assert!(
+            with_uid as f64 / user.items.len() as f64 > 0.9,
+            "绝大多数三方包应带 uid，实际 {with_uid}/{}",
+            user.items.len()
+        );
+
+        let environment = runner.environment().await;
+        let adb_path = environment.path.unwrap();
+        let legacy = runner
+            .run(
+                &adb_path,
+                &adb::build_args(Some(&serial), &adb::cmd_list_packages(true)),
+                Duration::from_secs(15),
+            )
+            .await
+            .unwrap();
+        let legacy_names: std::collections::HashSet<String> =
+            crate::adapters::adb::parse_packages(&legacy.stdout)
+                .into_iter()
+                .collect();
+        let agent_names: std::collections::HashSet<String> = user
+            .items
+            .iter()
+            .map(|item| item.package_name.clone())
+            .collect();
+        assert_eq!(
+            agent_names, legacy_names,
+            "Agent 与 Legacy 三方包集合必须一致（差异即迁移缺陷）"
+        );
+
+        let all = client
+            .request::<_, PackageListResult>(
+                agent_protocol::method::PACKAGE_LIST,
+                &PackageListParams {
+                    scope: PackageScope::All,
+                    include_disabled: true,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(
+            all.items.len() >= user.items.len(),
+            "include_disabled 不得减少条目"
+        );
+        assert!(
+            all.items.iter().any(|item| !item.enabled),
+            "真机存在停用系统包，必须能报 enabled=false"
+        );
+        assert!(
+            all.items.iter().any(|item| item.is_system),
+            "scope=all 应包含系统包"
+        );
+        eprintln!(
+            "[package.list] user={} all_with_disabled={}",
+            user.items.len(),
+            all.items.len()
+        );
+    }
+
     #[tokio::test]
     #[ignore = "需要真机；AR4_TEST_SERIAL=<serial> cargo test real_device_info_matches_legacy_and_reports_latency -- --ignored --nocapture"]
     async fn real_device_info_matches_legacy_and_reports_latency() {

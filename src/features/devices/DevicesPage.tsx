@@ -778,6 +778,9 @@ export function AppsView({ serial }: { serial: string | null }) {
         <div className="flex shrink-0 items-center gap-2">
           <span className="text-xs font-medium">{t("apps.zygiskList")}</span>
           <span className="text-[11px] text-muted-foreground">{t("apps.count", { count: apps.length })}</span>
+          {data && data.channel === "zygisk_v2" && (
+            <span className="shrink-0 rounded bg-primary/10 px-1 text-[10px] text-primary">v2</span>
+          )}
           <Button
             size="sm"
             variant="ghost"
@@ -827,6 +830,11 @@ export function AppsView({ serial }: { serial: string | null }) {
           <p className="shrink-0 text-[11px] text-muted-foreground">
             {t("apps.fallbackCount", { count: data.fallbackCount })}
             {data.deviceLocale ? ` · ${t("apps.deviceLocale", { locale: data.deviceLocale })}` : ""}
+          </p>
+        )}
+        {data && data.channel !== "zygisk_v2" && (
+          <p className="shrink-0 text-[11px] text-destructive">
+            {t("apps.channelFallback", { channel: data.channel })}
           </p>
         )}
         {warnings.length > 0 && (

@@ -1,17 +1,19 @@
 use std::collections::HashMap;
 use std::process::Output;
 
-use agent_protocol::method::DEVICE_INFO;
+use agent_protocol::method::{DEVICE_INFO, PACKAGE_LIST};
 use agent_protocol::{
-    AgentError, DeviceInfoParams, DeviceInfoResult, ErrorCode, ProviderHealth, ProviderInfo,
+    AgentError, DeviceInfoParams, DeviceInfoResult, ErrorCode, PackageListParams,
+    PackageListResult, PackageScope, PackageSummary, ProviderHealth, ProviderInfo,
 };
 use serde_json::{Value, to_value};
 use tokio::process::Command;
 
 use super::{Provider, ProviderFuture, RequestContext};
 
-const DEVICE_METHODS: &[&str] = &[DEVICE_INFO];
+const DEVICE_METHODS: &[&str] = &[DEVICE_INFO, PACKAGE_LIST];
 const GETPROP: &str = "/system/bin/getprop";
+const PM: &str = "/system/bin/pm";
 const IP: &str = "/system/bin/ip";
 
 pub struct DeviceProvider;
@@ -42,6 +44,100 @@ impl DeviceProvider {
     }
 }
 
+impl DeviceProvider {
+    /// `package.list`：在设备端解析 `pm list packages`，Desktop 不再拿文本自己切。
+    /// 本地化显示名不归这里（必须走 Zygisk Provider），这里只给包名/uid/系统位/启用位。
+    async fn package_list(&self, params: Value) -> Result<Value, AgentError> {
+        let params: PackageListParams = serde_json::from_value(params).map_err(|error| {
+            AgentError::new(ErrorCode::InvalidRequest, "invalid package.list parameters")
+                .with_details(serde_json::json!({ "reason": error.to_string() }))
+        })?;
+
+        let mut items: Vec<PackageSummary> = Vec::new();
+        for (flag, is_system) in [("-s", true), ("-3", false)] {
+            if matches!(params.scope, PackageScope::User) && is_system {
+                continue;
+            }
+            if matches!(params.scope, PackageScope::System) && !is_system {
+                continue;
+            }
+            collect_packages(&mut items, &[flag, "-U", "-e"], is_system, true).await?;
+            if params.include_disabled {
+                collect_packages(&mut items, &[flag, "-U", "-d"], is_system, false).await?;
+            }
+            // 说明：`pm` 的第一个实参必须是子命令，直接传 `-3 -U -e` 会被当成命令名，
+            // 设备侧回 255（真机首次运行即暴露，见 AR5.5 记录）。
+        }
+        items.sort_by(|left, right| left.package_name.cmp(&right.package_name));
+        items.dedup_by(|left, right| left.package_name == right.package_name);
+        serialize_result(PackageListResult { items })
+    }
+}
+
+/// `args` 只是 `pm list packages` 之后的过滤参数（如 `-s -U -e`），子命令在此拼接。
+async fn collect_packages(
+    sink: &mut Vec<PackageSummary>,
+    args: &[&str],
+    is_system: bool,
+    enabled: bool,
+) -> Result<(), AgentError> {
+    let mut argv: Vec<&str> = vec!["list", "packages"];
+    argv.extend_from_slice(args);
+    let output = Command::new(PM)
+        .args(&argv)
+        .output()
+        .await
+        .map_err(|error| command_unavailable("pm", error.to_string()))?;
+    if !output.status.success() {
+        return Err(
+            AgentError::new(ErrorCode::ProviderUnavailable, "pm list packages failed")
+                .with_details(serde_json::json!({
+                    "args": argv,
+                    "exit_code": output.status.code(),
+                    "stderr": String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                })),
+        );
+    }
+    for (package_name, uid) in parse_pm_uid_lines(&String::from_utf8_lossy(&output.stdout)) {
+        sink.push(PackageSummary {
+            package_name,
+            uid,
+            is_system,
+            enabled,
+        });
+    }
+    Ok(())
+}
+
+/// 解析 `pm list packages -U` 的行：`package:<pkg>[ uid:<n>]`。
+/// uid 缺失时返回 `None`（旧 ROM/OEM 变异），不用 0 伪装成功。
+pub(crate) fn parse_pm_uid_lines(text: &str) -> Vec<(String, Option<u32>)> {
+    let mut rows = Vec::new();
+    for line in text.lines().map(str::trim) {
+        let Some(rest) = line.strip_prefix("package:") else {
+            continue;
+        };
+        let (package, tail) = match rest.split_once(char::is_whitespace) {
+            Some((package, tail)) => (package, Some(tail)),
+            None => (rest, None),
+        };
+        // `package: uid:123` 这类畸形行：包名为空（切出来的首段其实是 uid:）必须跳过
+        if package.is_empty() || package.starts_with("uid:") {
+            continue;
+        }
+        let uid = tail
+            .unwrap_or_default()
+            .split_whitespace()
+            .find_map(|token| {
+                token
+                    .strip_prefix("uid:")
+                    .and_then(|value| value.parse::<u32>().ok())
+            });
+        rows.push((package.to_owned(), uid));
+    }
+    rows
+}
+
 impl Provider for DeviceProvider {
     fn info(&self) -> ProviderInfo {
         ProviderInfo {
@@ -66,6 +162,7 @@ impl Provider for DeviceProvider {
         Box::pin(async move {
             match method {
                 DEVICE_INFO => self.device_info(params).await,
+                PACKAGE_LIST => self.package_list(params).await,
                 _ => Err(AgentError::new(
                     ErrorCode::UnsupportedMethod,
                     format!("unsupported device method: {method}"),
@@ -165,6 +262,21 @@ mod tests {
         assert_eq!(result.manufacturer, None);
         assert_eq!(result.api_level, Some(36));
         assert_eq!(result.wlan_ipv4.as_deref(), Some("192.0.2.4"));
+    }
+
+    #[test]
+    fn parses_pm_uid_lines_with_and_without_uid() {
+        let rows = parse_pm_uid_lines(
+            "package:com.a uid:10152\r\npackage:com.b\r\n\r\nnot-a-line\r\npackage: uid:5\r\n",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                ("com.a".to_owned(), Some(10152)),
+                ("com.b".to_owned(), None),
+            ],
+            "空包名与非 package 行必须忽略，缺 uid 不得编 0"
+        );
     }
 
     #[test]

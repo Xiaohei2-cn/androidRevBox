@@ -11,8 +11,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_protocol::method::DEVICE_INFO;
-use agent_protocol::{DeviceInfoParams, DeviceInfoResult};
+use agent_protocol::method::{DEVICE_INFO, PACKAGE_LIST};
+use agent_protocol::{
+    DeviceInfoParams, DeviceInfoResult, PackageListParams, PackageListResult, PackageScope,
+};
 use async_trait::async_trait;
 use serde::Serialize;
 use tauri::Emitter;
@@ -547,7 +549,63 @@ impl DeviceService {
     }
 
     /// 第三方应用列表
+    /// 三方包列表（保持既有 command 语义）。AR5.5 起默认走 Agent `package.list`，
+    /// 解析在设备端完成；Agent 不可用或旧版 Agent 时才回退 Legacy ADB（只读幂等，
+    /// 删除条件见 Legacy 能力表）。
     pub async fn list_packages(&self, serial: &str) -> CoreResult<Vec<String>> {
+        let route = self
+            .android
+            .select(serial, PACKAGE_LIST, OperationKind::ReadOnlyIdempotent)
+            .map_err(CapabilityRouter::core_error)?;
+        if route.backend == AndroidBackendSource::LegacyAdb {
+            return self.list_packages_legacy(serial).await;
+        }
+
+        let agent_request = self.android.agent().request::<_, PackageListResult>(
+            serial,
+            PACKAGE_LIST,
+            &PackageListParams {
+                scope: PackageScope::User,
+                include_disabled: false,
+            },
+            LIST_TIMEOUT,
+        );
+        let (agent_result, legacy_result) = if package_list_shadow_enabled() {
+            let legacy = self.list_packages_legacy(serial);
+            let (agent, legacy) = tokio::join!(agent_request, legacy);
+            (agent, Some(legacy))
+        } else {
+            (agent_request.await, None)
+        };
+
+        match agent_result {
+            Ok(result) => {
+                let names = package_names(&result);
+                if let Some(Ok(legacy)) = legacy_result {
+                    log_package_list_shadow_diff(serial, &names, &legacy);
+                }
+                Ok(names)
+            }
+            Err(error) => {
+                let fallback = self
+                    .android
+                    .fallback_after_agent_error(
+                        serial,
+                        PACKAGE_LIST,
+                        OperationKind::ReadOnlyIdempotent,
+                        &error,
+                    )
+                    .map_err(CapabilityRouter::core_error)?;
+                debug_assert_eq!(fallback.backend, AndroidBackendSource::LegacyAdb);
+                match legacy_result {
+                    Some(result) => result,
+                    None => self.list_packages_legacy(serial).await,
+                }
+            }
+        }
+    }
+
+    async fn list_packages_legacy(&self, serial: &str) -> CoreResult<Vec<String>> {
         let args = adb::build_args(Some(serial), &adb::cmd_list_packages(true));
         let out = self.run_adb(&args).await?;
         if out.exit_code != Some(0) {
@@ -1181,6 +1239,42 @@ fn map_agent_device_info(serial: &str, result: DeviceInfoResult) -> DeviceInfo {
             .unwrap_or_default(),
         serial: serial.to_owned(),
         ip: result.wlan_ipv4,
+    }
+}
+
+fn package_list_shadow_enabled() -> bool {
+    !std::env::var("APP_REVERSE_TOOLS_PACKAGE_LIST_SHADOW")
+        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
+}
+
+fn package_names(result: &PackageListResult) -> Vec<String> {
+    result
+        .items
+        .iter()
+        .map(|item| item.package_name.clone())
+        .collect()
+}
+
+/// Agent 与 Legacy 的三方包集合差异只写日志，不影响返回值（迁移期观测用）。
+fn log_package_list_shadow_diff(serial: &str, agent: &[String], legacy: &[String]) {
+    let agent_set: std::collections::HashSet<&str> = agent.iter().map(String::as_str).collect();
+    let legacy_set: std::collections::HashSet<&str> = legacy.iter().map(String::as_str).collect();
+    let only_agent: Vec<&str> = agent_set.difference(&legacy_set).copied().collect();
+    let only_legacy: Vec<&str> = legacy_set.difference(&agent_set).copied().collect();
+    if only_agent.is_empty() && only_legacy.is_empty() {
+        tracing::debug!(
+            serial,
+            method = PACKAGE_LIST,
+            "Agent/Legacy package list matched"
+        );
+    } else {
+        tracing::warn!(
+            serial,
+            method = PACKAGE_LIST,
+            agent_only = ?only_agent,
+            legacy_only = ?only_legacy,
+            "Agent/Legacy package list shadow compare differed"
+        );
     }
 }
 

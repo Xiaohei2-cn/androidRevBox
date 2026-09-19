@@ -80,6 +80,8 @@ pub struct ZygiskAppList {
     pub fallback_count: u32,
     pub warnings: Vec<ZygiskAppWarning>,
     pub device_locale: Option<String>,
+    /// `zygisk_v2` / `zygisk_v1` / `zygisk_none`：UI 必须能看出当前是否走了降级通道
+    pub channel: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -364,6 +366,12 @@ fn map_localized_result(result: PackageListLocalizedResult) -> ZygiskAppList {
         .items
         .first()
         .and_then(|item| item.resolved_locale.clone());
+    // 旧版 Agent 不带 channel：宁可报「未知通道」，也不默认成能力更强的 v2
+    let channel = result
+        .channel
+        .clone()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "zygisk_none".to_owned());
     ZygiskAppList {
         items: result
             .items
@@ -394,6 +402,7 @@ fn map_localized_result(result: PackageListLocalizedResult) -> ZygiskAppList {
             })
             .collect(),
         device_locale,
+        channel,
     }
 }
 
@@ -510,8 +519,15 @@ mod tests {
                 code: "manifest_missing".into(),
                 message: "1 个包缺少 E 清单".into(),
             }],
+            channel: Some("zygisk_v2".into()),
         };
 
+        let legacy = result.clone();
+        let legacy_shape = {
+            let mut copy = result.clone();
+            copy.channel = None;
+            copy
+        };
         let list = map_localized_result(result);
         assert_eq!(list.device_locale.as_deref(), Some("zh-Hans-CN"));
         assert_eq!(list.success_count, 1);
@@ -530,6 +546,12 @@ mod tests {
         assert_eq!(value["items"][1]["versionName"], "");
         assert_eq!(value["items"][1]["uid"], serde_json::Value::Null);
         assert_eq!(value["warnings"][0]["packageName"], serde_json::Value::Null);
+        assert_eq!(value["channel"], "zygisk_v2");
+        assert_eq!(map_localized_result(legacy_shape).channel, "zygisk_none");
+        // 旧版 Agent 缺字段 -> 明确成 zygisk_none，绝不猜成 v2
+        let mut legacy = legacy;
+        legacy.channel = None;
+        assert_eq!(map_localized_result(legacy).channel, "zygisk_none");
     }
 
     #[test]
