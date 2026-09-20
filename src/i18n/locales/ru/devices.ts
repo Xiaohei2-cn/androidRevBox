@@ -115,7 +115,7 @@ export default {
   "adb.binary.removeRow": "Убрать из списка",
 
   // Страница бинарных · замена .so
-  "binary.so.description": "Запись исправленного .so прямо в каталог приложения (push → su -c cat → очистка), без переупаковки. Сначала остановите приложение, иначе перезапись не удастся.",
+  "binary.so.description": "Запись исправленного .so с хоста прямо в каталог приложения, без переупаковки. Agent на устройстве делает резервную копию, атомарно заменяет файл и сверяет sha256, при сбое — автоматически откатывает. Сначала остановите приложение, иначе перезапись не удастся.",
   "binary.so.localFile": "Локальный файл",
   "binary.so.pick": "Обзор…",
   "binary.so.dragHint": "Перетащите из Finder — путь подставится",
@@ -128,9 +128,12 @@ export default {
   "binary.so.abi32": "32-бит (arm)",
   "binary.so.target": "Целевой путь",
   "binary.so.targetIdle": "Введите пакет для предпросмотра",
-  "binary.so.rootNote": "Нужен root (cat пишет в /data/app); su проверяется при запуске.",
+  "binary.so.rootNote": "Нужен root: Agent работает от shell и для записи в /data/app запускает su-потомок с фиксированным скриптом; su проверяется автоматически.",
   "binary.so.run": "Заменить",
   "binary.so.running": "Замена…",
-  "binary.so.success": "Записано: {target}",
-  "binary.so.noForeground": "Не удалось получить пакет активного приложения",
+  "binary.so.success": "Заменено и проверено: {target}",
+    "binary.so.notVerified": "Записанный файл не прошёл проверку: {target}",
+  "binary.so.rolledBack": "Выполнен автоматический откат к прежнему состоянию",
+  "binary.so.backupKept": "Резервная копия оригинала на устройстве: {path}",
+"binary.so.noForeground": "Не удалось получить пакет активного приложения",
 } as const;

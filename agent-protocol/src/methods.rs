@@ -29,7 +29,14 @@ pub mod method {
     pub const ACTIVITY_LAUNCH: &str = "activity.launch";
     pub const ACTIVITY_FORCE_STOP: &str = "activity.force_stop";
     pub const PACKAGE_UNINSTALL: &str = "package.uninstall";
+    pub const PACKAGE_REPLACE_NATIVE_LIBRARY: &str = "package.replace_native_library";
 }
+
+/// AR8.4：Desktop 用 `adb push` 暂存「主机侧修补好的 so」的**唯一**允许目录。
+///
+/// 两侧共用这个常量：Desktop 只往这里推，Agent 只认这里的文件，
+/// 避免「推到 A、校验 B」这种靠文档维持的约定。每次操作再用唯一子目录隔开。
+pub const SO_STAGED_ROOT: &str = "/data/local/tmp/app-reverse-tools-so";
 
 /// Zygisk 模块生命周期。`installed_reboot_required` / `loaded` / `bridge_ready` 必须区分，
 /// 「文件已装」不等于「接口可用」（AR5.3 契约）。
@@ -696,6 +703,68 @@ pub struct PackageUninstallParams {
     pub user: Option<u32>,
 }
 
+/// 破坏性操作的单步结果（AR8.1/AR8.4）：失败时用户要能看出**卡在哪一步**，
+/// 而不是只拿到一句「卸载失败」。`ok=false` 的步骤必须带 `detail`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationStep {
+    pub name: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// 卸载结果。比通用 `PackageWriteResult` 多带步骤链，因为卸载是**不可逆**动作，
+/// 「pm 说 Success」和「路径真的没了」「数据是否按 keep_data 保留」是三件不同的事。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageUninstallResult {
+    pub package: String,
+    pub operation_id: String,
+    pub outcome: WriteOutcome,
+    /// 复核结论：`pm path` 已为空
+    pub verified: bool,
+    pub keep_data: bool,
+    pub steps: Vec<OperationStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// AR8.4：把主机侧已修补的 `.so` 原子装到包的 native lib 目录。
+/// `staged_path` 一定是 Desktop 用 ADB push 上去、由本方法校验过的暂存文件；
+/// Agent 不接收任意命令，只执行代码里写死的固定脚本（D038）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ReplaceNativeLibraryParams {
+    pub package: String,
+    /// `arm64` | `arm`
+    pub abi: String,
+    /// 形如 `libfoo.so`：只允许 `[A-Za-z0-9._-]`，必须 `.so` 结尾
+    pub so_name: String,
+    /// 设备侧暂存文件（/data/local/tmp 下）
+    pub staged_path: String,
+    pub operation_id: String,
+}
+
+/// 单步结果里的证据按需给：`sha256_before`/`sha256_after` 只有真正算出来才有值。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaceNativeLibraryResult {
+    pub package: String,
+    pub target_path: String,
+    pub staged_path: String,
+    pub operation_id: String,
+    pub outcome: WriteOutcome,
+    /// 复核结论：目标的 sha256 与暂存件一致、大小一致、ELF magic 正确
+    pub verified: bool,
+    /// 目标是「替换已有」还是「新增文件」——回滚动作完全不同
+    pub replaced_existing: bool,
+    pub steps: Vec<OperationStep>,
+    /// 失败且已自动恢复备份时为 true
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolled_back: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageWriteResult {
     pub action: PackageWriteAction,
@@ -1021,6 +1090,43 @@ mod tests {
 
     /// 写操作守卫字段名必须钉死：`expected_pid` 拼错不会报错，而是守卫静默失效，
     /// 所以协议测试直接把 wire 形状锁住（Agent 侧也有一条对称断言）。
+    /// AR8.4 契约：新增与替换必须分得开（回滚动作不同），且 `rolled_back`
+    /// 只在真的发生恢复时才有值 —— 不能拿 false 冒充「不需要回滚」。
+    #[test]
+    fn replace_native_library_result_distinguishes_add_from_replace() {
+        let result = ReplaceNativeLibraryResult {
+            package: "com.x".into(),
+            target_path: "/data/app/~~a/com.x-b/lib/arm64/libfoo.so".into(),
+            staged_path: "/data/local/tmp/app-reverse-tools-so/com.x-1c/libfoo.so".into(),
+            operation_id: "op-11".into(),
+            outcome: WriteOutcome::Executed,
+            verified: true,
+            replaced_existing: true,
+            steps: vec![OperationStep {
+                name: "verify_staged".into(),
+                ok: true,
+                detail: Some("size=10096".into()),
+            }],
+            rolled_back: None,
+            backup_path: Some("/data/local/tmp/app-reverse-tools-so/com.x-1c/libfoo.so.bak".into()),
+            detail: Some("sha256_matched".into()),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["replaced_existing"], json!(true));
+        assert_eq!(value.get("rolled_back"), None);
+        assert_eq!(value["steps"][0]["name"], "verify_staged");
+        let parsed: ReplaceNativeLibraryResult = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, result);
+        let rolled: ReplaceNativeLibraryResult = ReplaceNativeLibraryResult {
+            rolled_back: Some(true),
+            ..parsed
+        };
+        assert_eq!(
+            serde_json::to_value(rolled).unwrap()["rolled_back"],
+            json!(true)
+        );
+    }
+
     #[test]
     fn root_check_result_keeps_the_reason_for_absence() {
         let result = DeviceRootCheckResult {
@@ -1039,6 +1145,43 @@ mod tests {
         .unwrap();
         assert!(legacy.root);
         assert_eq!(legacy.detail, None);
+    }
+
+    /// 卸载结果必须带步骤链，且「数据是否保留」不能靠猜 —— `keep_data` 要原样回显。
+    #[test]
+    fn uninstall_result_carries_step_chain_and_keep_data_echo() {
+        let result = PackageUninstallResult {
+            package: "com.x".into(),
+            operation_id: "op-9".into(),
+            outcome: WriteOutcome::Executed,
+            verified: true,
+            keep_data: true,
+            steps: vec![
+                OperationStep {
+                    name: "guard_target".into(),
+                    ok: true,
+                    detail: None,
+                },
+                OperationStep {
+                    name: "pm_uninstall".into(),
+                    ok: true,
+                    detail: Some("Success".into()),
+                },
+                OperationStep {
+                    name: "verify_removed".into(),
+                    ok: true,
+                    detail: None,
+                },
+            ],
+            detail: Some("path_gone".into()),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["steps"].as_array().map(Vec::len), Some(3));
+        assert_eq!(value["steps"][1]["ok"], json!(true));
+        assert_eq!(value["steps"][0].get("detail"), None);
+        assert_eq!(value["keep_data"], json!(true));
+        let parsed: PackageUninstallResult = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, result);
     }
 
     #[test]

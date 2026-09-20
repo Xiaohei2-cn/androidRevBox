@@ -1732,6 +1732,710 @@ mod tests {
         manager.disconnect(&serial).await.unwrap();
     }
 
+    /// AR8.1 卸载成功路径真机腿（**破坏性**：会卸掉指定应用）。
+    ///
+    /// 双重门控：必须同时给 `AR8_UNINSTALL_TARGET=<包名>` 与 `AR8_UNINSTALL_CONFIRM=yes`
+    /// 才会执行，否则打印跳过原因并返回。这样它既不会被 CI 误跑，也不会被忘了参数的
+    /// 本地 `--ignored` 全量跑误伤——卸载是不可逆动作，门控必须是显式的。
+    /// 用 `keep_data=true` 卸：数据目录保留，用户从应用商店重装即恢复原状。
+    #[tokio::test]
+    #[ignore = "破坏性真机腿；AR8_TEST_SERIAL=<serial> AR8_UNINSTALL_TARGET=<pkg> AR8_UNINSTALL_CONFIRM=yes cargo test -p app-reverse-tools real_agent_package_uninstall -- --ignored --nocapture"]
+    async fn real_agent_package_uninstall_success_path_and_guard() {
+        use agent_protocol::method::{PACKAGE_NATIVE_LIB_DIR, PACKAGE_UNINSTALL};
+        use agent_protocol::{
+            ErrorCode, PackageNativeLibDirParams, PackageNativeLibDirResult,
+            PackageUninstallParams, PackageUninstallResult, WriteOutcome,
+        };
+
+        let target = std::env::var("AR8_UNINSTALL_TARGET").unwrap_or_default();
+        let confirm = std::env::var("AR8_UNINSTALL_CONFIRM").unwrap_or_default();
+        if target.is_empty() || confirm != "yes" {
+            eprintln!(
+                "[跳过] 卸载真机腿需要 AR8_UNINSTALL_TARGET=<包名> 且 AR8_UNINSTALL_CONFIRM=yes（当前 target={target:?} confirm={confirm:?}）"
+            );
+            return;
+        }
+
+        let serial = std::env::var("AR8_TEST_SERIAL").expect("AR8_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+
+        let adb = |command: String| {
+            let serial = serial.clone();
+            async move {
+                let output = tokio::process::Command::new("adb")
+                    .args(["-s", &serial, "shell", &command])
+                    .output()
+                    .await
+                    .expect("adb shell 可用");
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            }
+        };
+
+        // 前置：这台机上它必须是「已安装的第三方应用」，否则实验没有意义
+        let listed: PackageNativeLibDirResult = client
+            .request(
+                PACKAGE_NATIVE_LIB_DIR,
+                &PackageNativeLibDirParams {
+                    package: target.clone(),
+                    abi: None,
+                    user: None,
+                },
+                Duration::from_secs(15),
+            )
+            .await
+            .expect("卸载前目标必须是已安装的第三方应用");
+        assert!(listed.code_path.is_some(), "目标包应能取到 codePath");
+
+        // ① 真卸载：executed + verified + pm path 消失
+        let operation_id = format!("uninstall-{}", std::process::id());
+        let params = PackageUninstallParams {
+            package: target.clone(),
+            operation_id: operation_id.clone(),
+            keep_data: true,
+            user: None,
+        };
+        let result: PackageUninstallResult = client
+            .request(PACKAGE_UNINSTALL, &params, Duration::from_secs(60))
+            .await
+            .expect("卸载应成功返回");
+        eprintln!(
+            "[package.uninstall] outcome={:?} verified={} steps={:?} detail={:?}",
+            result.outcome, result.verified, result.steps, result.detail
+        );
+        assert_eq!(result.outcome, WriteOutcome::Executed);
+        assert!(result.verified, "必须复核到 pm path 消失");
+        assert_eq!(
+            result.steps.iter().filter(|step| step.ok).count(),
+            result.steps.len(),
+            "成功路径每一步都该 ok，实际 {:?}",
+            result.steps
+        );
+        assert!(
+            !adb(format!("pm path {target}")).await.contains('='),
+            "设备上 pm path 应已为空"
+        );
+        assert!(
+            !adb(format!("pm list packages {target}"))
+                .await
+                .contains(&target)
+        );
+
+        // ② keep_data=true 的效果必须看得见：数据目录还在（重装即恢复原状）
+        let data_kept = adb(format!(
+            "su -c 'if [ -d /data/data/{target} ]; then echo kept; fi'"
+        ))
+        .await
+        .contains("kept");
+        eprintln!("[package.uninstall] keep_data 生效={data_kept}");
+        assert!(
+            data_kept,
+            "keep_data=true 却把数据删了，等于骗用户可无损重装"
+        );
+
+        // ③ 同一 operation_id 重发：replayed，不得二次执行
+        let replay: PackageUninstallResult = client
+            .request(PACKAGE_UNINSTALL, &params, Duration::from_secs(30))
+            .await
+            .expect("重发应返回已知结果");
+        assert_eq!(replay.outcome, WriteOutcome::Replayed);
+        assert_eq!(replay.steps, result.steps, "复用结果必须与首次一致");
+
+        // ④ 换个 id 再卸：not_found（已经没了，不是「不许动」）
+        let gone = client
+            .request::<_, PackageUninstallResult>(
+                PACKAGE_UNINSTALL,
+                &PackageUninstallParams {
+                    package: target.clone(),
+                    operation_id: format!("{operation_id}-again"),
+                    keep_data: true,
+                    user: None,
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("已卸载的包必须报 not_found");
+        let gone = match gone {
+            crate::services::agent_client::AgentClientError::Remote(error) => error,
+            other => panic!("期望结构化错误，实际 {other:?}"),
+        };
+        assert_eq!(gone.code, ErrorCode::NotFound);
+        assert_eq!(gone.details.unwrap()["reason"], "package_not_installed");
+        eprintln!("[提示] {target} 已卸载（数据保留）。要恢复原状：在 Play 商店点重装即可。");
+        manager.disconnect(&serial).await.unwrap();
+    }
+
+    /// AR8.4 SO 替换真机腿（**破坏性**：往目标包的安装目录写文件）。
+    ///
+    /// 验证姿势按用户指定实现，一步不改：
+    /// ① 从目标 APK 里**解出**一个真实 `.so`；② 打一个**可控**补丁——只改
+    ///    `.note.gnu.build-id` 里的一个字节，长度不变、指令不变，所以 App 行为不变；
+    /// ③ 走产品链路装进 `<native_lib_dir>/<so>`；④ 判「换没换成」不看命令返回值，
+    ///    看安卓自己的机制：冷启动后 `/proc/<pid>/maps` 里这个路径的映射来源——
+    ///    `extractNativeLibs=false` 的应用原本只会映射到 `split_config.*.apk`，
+    ///    装成功后必须出现来自**我们那个文件**的映射（偏移从 0 开始）；
+    /// ⑤ 删掉文件再启动，maps 必须回到原来的命中数——证明信号由本次替换造成。
+    /// 另外钉两条：目标 sha256 必须等于补丁件（内容真的换了）、非 ELF 暂存件必须被拒
+    /// 且不留下任何文件（失败不影响 App）。
+    #[tokio::test]
+    #[ignore = "破坏性真机腿；AR8_TEST_SERIAL=<serial> AR84_TARGET_PKG=<pkg> AR84_SO=<libfoo.so> AR84_CONFIRM=yes cargo test -p app-reverse-tools real_agent_replace_native_library -- --ignored --nocapture"]
+    async fn real_agent_replace_native_library_is_verified_by_proc_maps() {
+        use agent_protocol::method::{PACKAGE_NATIVE_LIB_DIR, PACKAGE_REPLACE_NATIVE_LIBRARY};
+        use agent_protocol::{
+            ErrorCode, PackageNativeLibDirParams, PackageNativeLibDirResult,
+            ReplaceNativeLibraryParams, ReplaceNativeLibraryResult, WriteOutcome,
+        };
+        use sha2::{Digest, Sha256};
+
+        let missing = |name: &str| -> String {
+            format!(
+                "{name} is required（这条腿会往目标包安装目录写文件，四个参数必须显式给：\
+                 AR8_TEST_SERIAL / AR84_TARGET_PKG / AR84_SO / AR84_CONFIRM=yes）"
+            )
+        };
+        let serial = std::env::var("AR8_TEST_SERIAL")
+            .unwrap_or_else(|_| panic!("{}", missing("AR8_TEST_SERIAL")));
+        let pkg = std::env::var("AR84_TARGET_PKG")
+            .unwrap_or_else(|_| panic!("{}", missing("AR84_TARGET_PKG")));
+        let so = std::env::var("AR84_SO").unwrap_or_else(|_| panic!("{}", missing("AR84_SO")));
+        if std::env::var("AR84_CONFIRM").unwrap_or_default() != "yes" {
+            eprintln!("[跳过] 需要 AR84_CONFIRM=yes 才执行这条破坏性腿（会写 {pkg} 的安装目录）");
+            return;
+        }
+        assert!(adb::is_safe_so_name(&so), "AR84_SO 不合法: {so}");
+
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        let adb_path = runner.environment().await.path.expect("本机应有 adb");
+
+        let sh = |command: String| {
+            let runner = runner.clone();
+            let adb_path = adb_path.clone();
+            let serial = serial.clone();
+            async move {
+                let output = runner
+                    .run(
+                        &adb_path,
+                        &adb::build_args(Some(&serial), &adb::cmd_shell(&command)),
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .unwrap();
+                output.stdout
+            }
+        };
+        let root_sh = |command: String| {
+            let sh = &sh;
+            async move { sh(adb::su_wrap(&command)).await }
+        };
+        let transport = |subcommand: Vec<String>| {
+            let runner = runner.clone();
+            let adb_path = adb_path.clone();
+            let serial = serial.clone();
+            async move {
+                runner
+                    .run(
+                        &adb_path,
+                        &adb::build_args(Some(&serial), &subcommand),
+                        Duration::from_secs(120),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // 前置：特权步骤靠 Agent 起 su，这台机必须先给 shell root，否则整条腿没有意义
+        let whoami = root_sh("id".to_string()).await;
+        assert!(
+            adb::is_root_probe_ok(&whoami),
+            "AR8.4 需要 root（Agent 内的特权固定脚本要 su），实际: {whoami}"
+        );
+
+        // ① 目标目录与 APK：都由 Agent 从包信息推导，腿不自己拼路径
+        let native: PackageNativeLibDirResult = client
+            .request(
+                PACKAGE_NATIVE_LIB_DIR,
+                &PackageNativeLibDirParams {
+                    package: pkg.clone(),
+                    abi: Some("arm64".into()),
+                    user: None,
+                },
+                Duration::from_secs(15),
+            )
+            .await
+            .expect("目标包必须已安装");
+        let dir = native.native_lib_dir.clone();
+        // ⚠️ `splits` 是 dumpsys 里的**名字**（`config.arm64_v8a`），不是文件路径；
+        // 解包要的是真实 APK，所以按 AR8.3 的字段设计去 `pm path` 取路径。
+        let paths: Vec<String> = sh(format!("pm path {pkg}"))
+            .await
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("package:"))
+            .map(str::to_owned)
+            .collect();
+        let apk = paths
+            .iter()
+            .find(|path| path.contains("arm64_v8a"))
+            .cloned()
+            .or_else(|| native.code_path.clone())
+            .unwrap_or_else(|| panic!("拿不到可解包的 APK，pm path 返回 {paths:?}"));
+        let target = format!("{dir}/{so}");
+        eprintln!("[ar8.4] pkg={pkg} dir={dir} apk={apk} target={target}");
+
+        // ② 从 APK 里解出原件（设备侧 unzip → 拉回宿主），确认它确实来自 APK
+        let work = format!("/data/local/tmp/ar84-{}", std::process::id());
+        root_sh(format!(
+            "rm -rf {work}; mkdir -p {work}; unzip -o -q -d {work} \"{apk}\" \"lib/arm64-v8a/{so}\""
+        ))
+        .await;
+        let extracted = format!("{work}/lib/arm64-v8a/{so}");
+        let listed = root_sh(format!("ls -l {extracted} 2>&1")).await;
+        assert!(
+            listed.contains(&so),
+            "APK 里解不出 {so}，这条腿的靶子选错了：{listed}"
+        );
+        root_sh(format!("chmod -R a+rX {work}")).await;
+        let host = tempfile::tempdir().unwrap();
+        let original_on_host = host.path().join("original.so");
+        transport(adb::cmd_pull(
+            &extracted,
+            &original_on_host.display().to_string(),
+        ))
+        .await;
+        let original = std::fs::read(&original_on_host).expect("pull 回来的原件应可读");
+        assert_eq!(&original[..4], b"\x7fELF", "解出来的必须是 ELF");
+
+        // ③ 可控补丁：只动 .note.gnu.build-id 的一个字节（原件保持纯净，⑩ 撤销要用它）
+        let original_sha = {
+            let mut digest = Sha256::new();
+            digest.update(&original);
+            format!("{:x}", digest.finalize())
+        };
+        let mut patched = original.clone();
+        let patched_offset = patch_build_id_byte(&mut patched)
+            .expect("靶子 so 必须带 .note.gnu.build-id，否则这条腿测的是空操作");
+        assert_eq!(
+            patched.len(),
+            original.len(),
+            "修补必须等长，否则不是同一个 so"
+        );
+        let diffs: Vec<usize> = (0..original.len())
+            .filter(|index| original[*index] != patched[*index])
+            .collect();
+        assert_eq!(
+            diffs,
+            vec![patched_offset],
+            "只允许改 build-id 的最后 1 个字节"
+        );
+        let expected_sha = {
+            let mut digest = Sha256::new();
+            digest.update(&patched);
+            format!("{:x}", digest.finalize())
+        };
+        let staged_local = host.path().join(&so);
+        std::fs::write(&staged_local, &patched).unwrap();
+
+        // ④ 起点：目标存在吗？maps 现在命中几条？（两种安装形态都要说得清）
+        let existed_before = root_sh(format!("test -e {target} && echo YES || echo NO"))
+            .await
+            .contains("YES");
+        let maps_hits = |probe: String| {
+            let root_sh = &root_sh;
+            async move {
+                let out = root_sh(probe).await;
+                out.trim()
+                    .rsplit('\n')
+                    .next()
+                    .unwrap_or("0")
+                    .trim()
+                    .to_owned()
+            }
+        };
+        let probe_hits = |pid: &str| format!("grep -c -F {dir}/{so} /proc/{pid}/maps");
+        let restart = || {
+            let sh = &sh;
+            let pkg = pkg.clone();
+            async move {
+                sh(format!("am force-stop {pkg}")).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                sh(format!(
+                    "monkey -p {pkg} -c android.intent.category.LAUNCHER 1"
+                ))
+                .await;
+                // 等进程起来（冷启动慢的机器上这不叫放宽，叫不猜）
+                for _ in 0..15 {
+                    let pid = sh(format!("pidof {pkg}")).await;
+                    let pid = pid.split_whitespace().next().unwrap_or("").to_owned();
+                    if !pid.is_empty() {
+                        tokio::time::sleep(Duration::from_secs(6)).await;
+                        return Some(pid);
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                None
+            }
+        };
+        let pid_before = restart().await.expect("目标 App 冷启动必须能起来");
+        let hits_before: usize = maps_hits(probe_hits(&pid_before)).await.parse().unwrap();
+        eprintln!(
+            "[ar8.4] 起点：目标存在={existed_before} maps 命中={hits_before}（extractNativeLibs={}）",
+            if hits_before == 0 && !existed_before {
+                "false"
+            } else {
+                "true/未知"
+            }
+        );
+
+        // ⑤ 装：Desktop 的等价动作 = push 到唯一暂存目录 + 一次 typed 请求
+        let operation_id = format!("ar84-{}", std::process::id());
+        let staged_dir = format!(
+            "{}/{}-{}",
+            agent_protocol::SO_STAGED_ROOT,
+            pkg,
+            &operation_id[operation_id.len() - 8..]
+        );
+        let staged_path = format!("{staged_dir}/{so}");
+        let pushed = transport(adb::cmd_push(
+            &staged_local.display().to_string(),
+            &staged_path,
+        ))
+        .await;
+        assert_eq!(pushed.exit_code, Some(0), "adb push 暂存件失败");
+        let params = ReplaceNativeLibraryParams {
+            package: pkg.clone(),
+            abi: "arm64".into(),
+            so_name: so.clone(),
+            staged_path: staged_path.clone(),
+            operation_id: operation_id.clone(),
+        };
+        let result: ReplaceNativeLibraryResult = client
+            .request(
+                PACKAGE_REPLACE_NATIVE_LIBRARY,
+                &params,
+                Duration::from_secs(100),
+            )
+            .await
+            .expect("替换应成功返回步骤链");
+        eprintln!(
+            "[ar8.4] outcome={:?} verified={} replaced_existing={} steps={:?}",
+            result.outcome, result.verified, result.replaced_existing, result.steps
+        );
+        assert_eq!(result.outcome, WriteOutcome::Executed);
+        assert!(
+            result.verified,
+            "sha256 复核必须过，步骤链 {:?}",
+            result.steps
+        );
+        assert_eq!(result.target_path, target);
+        assert_eq!(
+            result.replaced_existing, existed_before,
+            "「原本有没有文件」必须与起点观测一致"
+        );
+        assert_eq!(result.rolled_back, None, "成功路径不该有回滚记录");
+        assert!(
+            result.steps.iter().all(|step| step.ok),
+            "成功路径每一步都得 ok：{:?}",
+            result.steps
+        );
+        assert_eq!(
+            result.backup_path.is_some(),
+            existed_before,
+            "只有原本存在文件才谈得上备份"
+        );
+
+        // ⑥ 内容证据：设备上目标文件的 sha256 == 补丁件的 sha256（不信 Agent 自称复核过）
+        let on_device_sha = root_sh(format!("sha256sum {target}"))
+            .await
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(
+            on_device_sha, expected_sha,
+            "目标内容不是我们那个补丁件——替换是假的"
+        );
+
+        // ⑦ 机制证据：冷启动后 maps 里必须出现来自该文件的映射
+        let pid_after = restart().await.expect("替换后 App 仍必须能起");
+        let hits_after: usize = maps_hits(probe_hits(&pid_after)).await.parse().unwrap();
+        eprintln!("[ar8.4] 替换后 maps 命中={hits_after}");
+        if !existed_before {
+            assert!(
+                hits_after >= 1,
+                "安卓按「先文件后 APK」找 native lib：装进 {dir} 的 {so} 必须被映射到；\
+                 命中 0 说明这个库当前没被加载（换一个 AR84_SO）或替换没生效"
+            );
+            let detail = root_sh(format!(
+                "grep -F {dir}/{so} /proc/{pid_after}/maps | head -3"
+            ))
+            .await;
+            assert!(
+                detail.contains("00000000"),
+                "来自散装文件的映射首段偏移必须是 0（APK 内加载会是大偏移）：{detail}"
+            );
+        } else {
+            eprintln!("[ar8.4] 目标原本就是已解包的实体文件，机制判据退化为 sha256（⑥ 已过）");
+        }
+
+        // ⑧ 幂等：同 operation_id 重发必须是 replayed，且不得再动设备
+        let replay: ReplaceNativeLibraryResult = client
+            .request(
+                PACKAGE_REPLACE_NATIVE_LIBRARY,
+                &params,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("重发应返回已知结果");
+        assert_eq!(replay.outcome, WriteOutcome::Replayed);
+        assert_eq!(replay.steps, result.steps, "复用结果必须与首次一致");
+
+        // ⑨ 非 ELF 暂存件必须被拒，且安装目录不得多出任何东西
+        let fake_so = "libar84fake.so";
+        let fake_dir = format!("{}/{}-fake", agent_protocol::SO_STAGED_ROOT, pkg);
+        let fake_path = format!("{fake_dir}/{fake_so}");
+        let fake_local = host.path().join(fake_so);
+        std::fs::write(&fake_local, b"#!/system/bin/sh\necho not an elf\n").unwrap();
+        transport(adb::cmd_push(&fake_local.display().to_string(), &fake_path)).await;
+        let rejected = client
+            .request::<_, ReplaceNativeLibraryResult>(
+                PACKAGE_REPLACE_NATIVE_LIBRARY,
+                &ReplaceNativeLibraryParams {
+                    package: pkg.clone(),
+                    abi: "arm64".into(),
+                    so_name: fake_so.into(),
+                    staged_path: fake_path.clone(),
+                    operation_id: format!("{operation_id}-fake"),
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("非 ELF 暂存件必须被拒");
+        let rejected = match rejected {
+            crate::services::agent_client::AgentClientError::Remote(error) => error,
+            other => panic!("期望结构化错误，实际 {other:?}"),
+        };
+        assert_eq!(rejected.code, ErrorCode::InvalidRequest);
+        assert_eq!(rejected.details.unwrap()["reason"], "staged_not_elf");
+        // 被拒时 Agent **不动**暂存件（那是调用方的文件，也是「为什么被拒」的证据），
+        // 清理由调用方负责——Desktop 的产品路径里就是那句无条件 `rm -f`。
+        // 这条腿刻意镜像同样的顺序：先断言安装目录没被污染，再按产品姿势自己扫干净。
+        transport(adb::cmd_shell(&format!("rm -f {fake_path}"))).await;
+        sh(format!("rm -rf {fake_dir}")).await;
+        assert!(
+            !root_sh(format!(
+                "test -e {fake_dir}/{fake_so} && echo YES || echo NO"
+            ))
+            .await
+            .contains("YES"),
+            "调用方按产品姿势清理后，暂存目录不该还有残留"
+        );
+        assert!(
+            !root_sh(format!("test -e {dir}/{fake_so} && echo YES || echo NO"))
+                .await
+                .contains("YES"),
+            "被拒的请求绝不能往安装目录写任何东西——这才是「失败不影响 App」的判据"
+        );
+
+        // ⑩ 撤销必须回到「起点」，而且两种安装形态走法不同：
+        // · 原本没有这个文件（extractNativeLibs=false，靶子是 APK 内加载）→ 删掉我们加的；
+        // · 原本就有（已解包）→ 必须用产品链路把**原件**装回去，顺带证明「覆盖已存在文件」
+        //   这条支路也对（replaced_existing=true 且会留下备份件）。
+        if existed_before {
+            let restore_local = host.path().join("restore.so");
+            std::fs::write(&restore_local, &original).unwrap();
+            let restore_dir = format!("{}/{}-restore", agent_protocol::SO_STAGED_ROOT, pkg);
+            let restore_path = format!("{restore_dir}/{so}");
+            transport(adb::cmd_push(
+                &restore_local.display().to_string(),
+                &restore_path,
+            ))
+            .await;
+            let restored: ReplaceNativeLibraryResult = client
+                .request(
+                    PACKAGE_REPLACE_NATIVE_LIBRARY,
+                    &ReplaceNativeLibraryParams {
+                        package: pkg.clone(),
+                        abi: "arm64".into(),
+                        so_name: so.clone(),
+                        staged_path: restore_path.clone(),
+                        operation_id: format!("{operation_id}-restore"),
+                    },
+                    Duration::from_secs(100),
+                )
+                .await
+                .expect("装回原件应成功（这一步决定用户下次启动看到的是不是原样）");
+            assert!(restored.verified && restored.replaced_existing);
+            assert!(restored.backup_path.is_some(), "覆盖已存在文件必须先备份");
+            let back_sha = root_sh(format!("sha256sum {target}"))
+                .await
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            assert_eq!(back_sha, original_sha, "装回去的必须是原件本体");
+            root_sh(format!("rm -rf {restore_dir}")).await;
+            transport(adb::cmd_shell(&format!("rm -f {restore_path}"))).await;
+        } else {
+            root_sh(format!("rm -f {target}; sync")).await;
+        }
+        let pid_reverted = restart().await.expect("撤销后 App 仍必须能起");
+        let hits_reverted: usize = maps_hits(probe_hits(&pid_reverted)).await.parse().unwrap();
+        eprintln!("[ar8.4] 撤销后 maps 命中={hits_reverted}（起点 {hits_before}）");
+        assert_eq!(
+            hits_reverted, hits_before,
+            "撤销后必须回到起点的加载形态，否则前面的判据不算因果"
+        );
+        if existed_before {
+            let final_sha = root_sh(format!("sha256sum {target}"))
+                .await
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            assert_eq!(final_sha, original_sha, "设备侧终态必须与实验前逐字节一致");
+        } else {
+            assert!(
+                !root_sh(format!("test -e {target} && echo YES || echo NO"))
+                    .await
+                    .contains("YES"),
+                "实验前没有的文件，实验后也不该在"
+            );
+        }
+
+        // 清理：暂存目录（含备份件）与解包工作目录
+        root_sh(format!("rm -rf {staged_dir} {fake_dir} {work}; sync")).await;
+        sh(format!("rm -f {staged_path} {fake_path}")).await;
+        let leftovers = root_sh(format!(
+            "ls -A {}/ 2>/dev/null | grep -c -F {pkg} || true",
+            agent_protocol::SO_STAGED_ROOT
+        ))
+        .await;
+        assert_eq!(
+            leftovers.trim().rsplit('\n').next().unwrap_or("0").trim(),
+            "0",
+            "腿跑完不该在暂存根目录留下任何本次痕迹"
+        );
+        manager.disconnect(&serial).await.unwrap();
+        eprintln!("[ar8.4] 机制双向验证完成：{so} 装/撤各自改变 maps，App 三次冷启动均正常");
+    }
+
+    /// 补丁器本身要能在宿主上测：合成一个「ELF64 头 + 一个 PT_NOTE + build-id note」，
+    /// 断言只改 1 字节、改的位置落在 note 描述里、非 note 文件返回 None。
+    /// 真机腿跑不了几次，但这个解析错了整条腿就是自欺。
+    #[test]
+    fn build_id_patch_touches_exactly_one_byte_inside_the_note() {
+        fn synthetic(with_note: bool) -> Vec<u8> {
+            let mut bytes = vec![0_u8; 4096];
+            bytes[0..4].copy_from_slice(b"\x7fELF");
+            bytes[4] = 2; // ELFCLASS64
+            let phoff = 64_u64; // 程序头紧跟 ELF 头
+            bytes[0x20..0x28].copy_from_slice(&phoff.to_le_bytes());
+            bytes[0x36..0x38].copy_from_slice(&56_u16.to_le_bytes()); // phentsize
+            bytes[0x38..0x3a].copy_from_slice(&1_u16.to_le_bytes()); // phnum
+            let note_off = 256_u64;
+            if with_note {
+                // PT_NOTE 段
+                let header = phoff as usize;
+                bytes[header..header + 4].copy_from_slice(&4_u32.to_le_bytes());
+                bytes[header + 8..header + 16].copy_from_slice(&note_off.to_le_bytes());
+                bytes[header + 32..header + 40].copy_from_slice(&32_u64.to_le_bytes());
+                // note: namesz=4 descsz=8 type=3 "GNU\0" + 8 字节 id
+                let n = note_off as usize;
+                bytes[n..n + 4].copy_from_slice(&4_u32.to_le_bytes());
+                bytes[n + 4..n + 8].copy_from_slice(&8_u32.to_le_bytes());
+                bytes[n + 8..n + 12].copy_from_slice(&3_u32.to_le_bytes());
+                bytes[n + 12..n + 16].copy_from_slice(b"GNU\0");
+                bytes[n + 16..n + 24].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            } else {
+                let header = phoff as usize;
+                bytes[header..header + 4].copy_from_slice(&6_u32.to_le_bytes()); // PT_LOAD
+                bytes[header + 8..header + 16].copy_from_slice(&note_off.to_le_bytes());
+            }
+            bytes
+        }
+
+        let base = synthetic(true);
+        let mut patched = base.clone();
+        let offset = patch_build_id_byte(&mut patched).expect("合成 ELF 应能定位 build-id");
+        assert!(
+            (272..280).contains(&offset),
+            "改动必须落在 build-id 描述区内，实际 {offset}"
+        );
+        assert_eq!(patched.len(), base.len());
+        let diffs: Vec<usize> = (0..base.len())
+            .filter(|i| base[*i] != patched[*i])
+            .collect();
+        assert_eq!(
+            diffs,
+            vec![offset],
+            "只能有一个字节不同，且必须是 build-id 内"
+        );
+        // 没有 note 的 ELF 必须返回 None，而不是随手改一处当成功
+        assert_eq!(patch_build_id_byte(&mut synthetic(false)), None);
+        // 非 ELF / 太短同样拒绝
+        assert_eq!(
+            patch_build_id_byte(&mut b"not an elf at all, really".to_vec()),
+            None
+        );
+    }
+
+    /// 在这份 ELF 里定位 `.note.gnu.build-id` 并**只翻一个比特**（可控修补）。
+    ///
+    /// 为什么选 build-id：它是纯元数据，改它不影响任何指令与符号，App 行为不变；
+    /// 但它同时在「文件字节」和「加载日志」两侧可见，是代价最小的可辨识差异。
+    /// 找不到 note 就返回 None——宁可让腿失败，也不要悄悄测了个空操作。
+    fn patch_build_id_byte(bytes: &mut [u8]) -> Option<usize> {
+        if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" || bytes[4] != 2 {
+            return None;
+        }
+        let phoff = usize::try_from(u64::from_le_bytes(bytes[0x20..0x28].try_into().ok()?)).ok()?;
+        let phentsize = usize::from(u16::from_le_bytes(bytes[0x36..0x38].try_into().ok()?));
+        let phnum = usize::from(u16::from_le_bytes(bytes[0x38..0x3a].try_into().ok()?));
+        for index in 0..phnum {
+            let base = phoff.checked_add(index.checked_mul(phentsize)?)?;
+            let header = bytes.get(base..base + 56)?;
+            if u32::from_le_bytes(header[0..4].try_into().ok()?) != 4 {
+                continue; // PT_NOTE
+            }
+            let offset =
+                usize::try_from(u64::from_le_bytes(header[8..16].try_into().ok()?)).ok()?;
+            let size = usize::try_from(u64::from_le_bytes(header[32..40].try_into().ok()?)).ok()?;
+            let mut cursor = offset;
+            let end = offset.checked_add(size)?;
+            while cursor + 12 <= end {
+                let chunk = bytes.get(cursor..cursor + 12)?;
+                let namesz =
+                    usize::try_from(u32::from_le_bytes(chunk[0..4].try_into().ok()?)).ok()?;
+                let descsz =
+                    usize::try_from(u32::from_le_bytes(chunk[4..8].try_into().ok()?)).ok()?;
+                let ntype = u32::from_le_bytes(chunk[8..12].try_into().ok()?);
+                let name_start = cursor.checked_add(12)?;
+                let name = bytes.get(name_start..name_start.checked_add(namesz)?)?;
+                let desc_start = name_start.checked_add(namesz.div_ceil(4).checked_mul(4)?)?;
+                if ntype == 3 && name.starts_with(b"GNU") {
+                    let last = desc_start.checked_add(descsz)?.checked_sub(1)?;
+                    bytes[last] ^= 0x01;
+                    return Some(last);
+                }
+                cursor = desc_start.checked_add(descsz.div_ceil(4).checked_mul(4)?)?;
+            }
+        }
+        None
+    }
+
     /// AR9.1 前置真机腿：root 探测改由 Agent 执行后，结论必须与 Legacy `su -c id`
     /// 一致，而且要把「su 可用」与「Agent 自身有 root」分开带回——UI 之前把这两件事
     /// 混成一个绿色徽章，正是 D026 那批 `root=true` 支路必须留在 Legacy 的原因。

@@ -157,6 +157,35 @@ export interface DeviceChangedPayload {
   lastSeen: number;
 }
 
+/**
+ * 写操作的执行结果三态（与 `agent-protocol` 的 `WriteOutcome` 对齐）：
+ * `executed` 真的做了，`replayed` 同一个 operationId 重发拿到旧结果，
+ * `simulated` 是没连真机的演练结果——三者都不能显示成同一个绿色徽章。
+ */
+export type WriteOutcome = "executed" | "replayed" | "simulated";
+
+/** 设备侧执行的其中一步（SO 替换的备份/安装/复核/回滚各自一条）。 */
+export interface OperationStep {
+  name: string;
+  ok: boolean;
+  detail?: string;
+}
+
+/** `package.replace_native_library` 的返回（AR8.4）。 */
+export interface ReplaceNativeLibraryResult {
+  package: string;
+  targetPath: string;
+  stagedPath: string;
+  operationId: string;
+  outcome: WriteOutcome;
+  verified: boolean;
+  replacedExisting: boolean;
+  steps: OperationStep[];
+  rolledBack?: boolean;
+  backupPath?: string;
+  detail?: string;
+}
+
 export const deviceApi = {
   environment(): Promise<AdbEnvironment> {
     return invokeCommand<AdbEnvironment>("adb_environment");
@@ -329,9 +358,17 @@ export const deviceApi = {
   pkgLibDir(serial: string, pkg: string, abi: "arm64" | "arm"): Promise<string> {
     return invokeCommand<string>("device_pkg_lib_dir", { args: { serial, pkg, abi } });
   },
-  /** so 替换：push → su -c cat 写回 → 清理；返回写入的目标路径 */
-  soReplace(serial: string, localPath: string, pkg: string, abi: "arm64" | "arm"): Promise<string> {
-    return invokeCommand<string>("device_so_replace", {
+  /**
+   * SO 替换（AR8.4）：Desktop push 到唯一暂存目录，设备侧 Agent 备份 → 原子替换 →
+   * sha256 复核，失败自动回滚。返回步骤链，UI 必须把「哪一步没做」显示出来。
+   */
+  soReplace(
+    serial: string,
+    localPath: string,
+    pkg: string,
+    abi: "arm64" | "arm",
+  ): Promise<ReplaceNativeLibraryResult> {
+    return invokeCommand<ReplaceNativeLibraryResult>("device_so_replace", {
       args: { serial, localPath, pkg, abi },
     });
   },

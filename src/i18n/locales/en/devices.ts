@@ -115,7 +115,7 @@ export default {
   "adb.binary.removeRow": "Remove from hosted list",
 
   // Binary page · .so replace
-  "binary.so.description": "Write a patched .so straight into the app's install dir (push → su -c cat → cleanup), no re-packaging. Stop the target app first, or the overwrite fails.",
+  "binary.so.description": "Write a patched .so from your machine straight into the app's install dir, no re-packaging. The on-device Agent backs up, atomically replaces and re-verifies by sha256, rolling back automatically if any step fails. Stop the target app first, or the overwrite fails.",
   "binary.so.localFile": "Local file",
   "binary.so.pick": "Browse…",
   "binary.so.dragHint": "Drag from Finder to fill the absolute path",
@@ -128,9 +128,12 @@ export default {
   "binary.so.abi32": "32-bit (arm)",
   "binary.so.target": "Target path",
   "binary.so.targetIdle": "Enter a package to preview",
-  "binary.so.rootNote": "Requires rooted device (cat writes to /data/app); su is probed at run time.",
+  "binary.so.rootNote": "Requires a rooted device: the Agent runs as shell and spawns a su child for the fixed write script when touching /data/app; su is probed automatically.",
   "binary.so.run": "Replace",
   "binary.so.running": "Replacing…",
-  "binary.so.success": "Written: {target}",
-  "binary.so.noForeground": "No foreground package found",
+  "binary.so.success": "Replaced and verified: {target}",
+    "binary.so.notVerified": "Written file failed verification: {target}",
+  "binary.so.rolledBack": "Automatically rolled back to the previous state",
+  "binary.so.backupKept": "Original backup kept on device: {path}",
+"binary.so.noForeground": "No foreground package found",
 } as const;

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { FolderInput, Play, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { deviceApi, type DeviceEntry } from "@/api/device";
+import { deviceApi, type DeviceEntry, type ReplaceNativeLibraryResult } from "@/api/device";
 import { envApi } from "@/api/env";
 import { pickFile } from "@/api/dialog";
 import { useDragDropPath } from "@/hooks/useDragDropPath";
@@ -11,11 +11,11 @@ import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 /**
- * so 替换（二进制主标签子页）：修补后的 .so 直接写回安装目录，免重打包。
- * 流程：① push 本地 so 到 /data/local/tmp；② dumpsys package 查安装 lib 目录，
- * 按所选 ABI（arm64=64位 / arm=32位）拼目标路径，su -c 'cat tmp > 目标' 覆写；
- * ③ 删临时文件。目标路径实时预览（只读查询），执行前需停止目标应用
- * （运行中的 so 覆写会 text file busy）。
+ * SO 替换（二进制主标签子页）：把修补后的 .so 写回应用安装目录，免重打包。
+ * 流程（AR8.4 起由设备侧 Agent 执行）：① push 到唯一暂存目录；② Agent 推导目标路径、
+ * 备份原件、同目录临时名落盘（权限/属主/SELinux 上下文跟随原件）→ rename → sha256 复核；
+ * ③ 任一步失败自动回滚。页面展示**步骤链**而不是「一句话成功」，因为写安装目录这件事
+ * 必须能回答「到底哪一步做了、原件还在不在」。执行前请先停止目标应用（运行中覆写会 text file busy）。
  */
 
 type Abi = "arm64" | "arm";
@@ -27,7 +27,7 @@ export function SoReplacePage() {
   const [pkg, setPkg] = useState("");
   const [abi, setAbi] = useState<Abi>("arm64");
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<string | null>(null);
+  const [result, setResult] = useState<ReplaceNativeLibraryResult | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   const { data: env } = useQuery({
@@ -107,8 +107,7 @@ export function SoReplacePage() {
     setResult(null);
     setNotice(null);
     try {
-      const target = await deviceApi.soReplace(deviceSerial, localPath, pkg.trim(), abi);
-      setResult(target);
+      setResult(await deviceApi.soReplace(deviceSerial, localPath, pkg.trim(), abi));
     } catch (e) {
       setNotice(String((e as Error)?.message ?? e));
     } finally {
@@ -255,9 +254,49 @@ export function SoReplacePage() {
       </div>
 
       {result && (
-        <p className="shrink-0 break-all rounded-md border border-emerald-500/50 bg-emerald-500/10 px-2 py-1 font-mono text-xs text-emerald-600 dark:text-emerald-400" data-testid="so-replace-result">
-          {t("binary.so.success", { target: result })}
-        </p>
+        <div
+          className="shrink-0 rounded-md border px-2 py-1.5 text-xs"
+          data-testid="so-replace-result"
+        >
+          <p
+            className={
+              result.verified
+                ? "break-all font-mono text-emerald-600 dark:text-emerald-400"
+                : "break-all font-mono text-destructive"
+            }
+          >
+            {result.verified
+              ? t("binary.so.success", { target: result.targetPath })
+              : t("binary.so.notVerified", { target: result.targetPath })}
+          </p>
+          {result.rolledBack && (
+            <p className="mt-1 text-amber-500" data-testid="so-replace-rolled-back">
+              {t("binary.so.rolledBack")}
+            </p>
+          )}
+          <ul className="mt-1 space-y-0.5">
+            {result.steps.map((step, index) => (
+              <li
+                key={`${step.name}-${index}`}
+                className="flex items-start gap-1.5 font-mono text-[11px] leading-relaxed"
+                data-testid={`so-replace-step-${step.name}`}
+              >
+                <span className={step.ok ? "text-emerald-600" : "text-destructive"}>
+                  {step.ok ? "\u2713" : "\u2715"}
+                </span>
+                <span className="shrink-0">{step.name}</span>
+                {step.detail && (
+                  <span className="min-w-0 break-all text-muted-foreground">{step.detail}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+          {result.backupPath && (
+            <p className="mt-1 break-all text-[11px] text-muted-foreground">
+              {t("binary.so.backupKept", { path: result.backupPath })}
+            </p>
+          )}
+        </div>
       )}
       {notice && (
         <p className="shrink-0 break-all rounded-md border bg-muted/40 px-2 py-1 text-xs text-muted-foreground">

@@ -4,6 +4,7 @@
 
 use agent_protocol::{
     FilesystemPreviewResult, FilesystemStatResult, HostedRunRecord, HostedStopResult,
+    ReplaceNativeLibraryResult,
 };
 use serde::Deserialize;
 
@@ -333,21 +334,24 @@ pub async fn device_pkg_lib_dir(
         .await
 }
 
-/// so 替换：push → su -c cat 写回安装目录 lib/<abi> → 清理临时。返回写入路径。
+/// SO 替换（AR8.4）：Desktop push 到唯一暂存目录 → Agent 备份/原子安装/sha256 复核/
+/// 失败自动回滚。返回**步骤链结果**（不再是一句路径字符串）：UI 要能看见到底哪一步做了、
+/// 哪一步没做、有没有回滚。写操作不自动回退——Agent 不在线就是明确报错。
 #[tauri::command]
 pub async fn device_so_replace(
     state: tauri::State<'_, AppState>,
     args: SoReplaceArgs,
-) -> CoreResult<String> {
-    state
+) -> CoreResult<ReplaceNativeLibraryResult> {
+    let result = state
         .device
-        .so_replace(
+        .replace_native_library(
             &args.serial,
             std::path::Path::new(&args.local_path),
             &args.pkg,
             &args.abi,
         )
-        .await
+        .await?;
+    Ok(result)
 }
 
 /// 端口→PID 反查（LISTEN 行 inode → 扫 /proc/[0-9]*/fd 找持有进程）

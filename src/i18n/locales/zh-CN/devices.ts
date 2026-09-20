@@ -115,7 +115,7 @@ export default {
   "adb.binary.removeRow": "从托管区移除",
 
   // 二进制页 · so 替换
-  "binary.so.description": "把修补后的 .so 直接写回应用安装目录（push → su -c cat → 清理），免重打包。替换前请先停止目标应用，否则覆写会失败。",
+  "binary.so.description": "把主机侧修补好的 .so 写回应用安装目录，免重打包。设备侧 Agent 负责备份、原子替换、sha256 复核，任一步失败自动回滚。替换前请先停止目标应用，否则覆写会失败。",
   "binary.so.localFile": "本地文件",
   "binary.so.pick": "选择…",
   "binary.so.dragHint": "拖入即识别访达文件绝对路径并填入",
@@ -128,9 +128,12 @@ export default {
   "binary.so.abi32": "32 位 (arm)",
   "binary.so.target": "目标路径",
   "binary.so.targetIdle": "填写包名后自动预览",
-  "binary.so.rootNote": "需要设备已 root（cat 写入 /data/app 安装目录）；执行时会自动探测 su。",
+  "binary.so.rootNote": "需要设备已 root：Agent 以 shell 身份运行，写 /data/app 时由它拉起 su 子进程执行固定脚本；执行时自动探测 su。",
   "binary.so.run": "替换",
   "binary.so.running": "替换中…",
-  "binary.so.success": "已写入：{target}",
-  "binary.so.noForeground": "未获取到前台应用包名",
+  "binary.so.success": "已替换并复核通过：{target}",
+    "binary.so.notVerified": "写入未通过复核：{target}",
+  "binary.so.rolledBack": "已自动回滚到替换前的状态",
+  "binary.so.backupKept": "原件备份保留在设备：{path}",
+"binary.so.noForeground": "未获取到前台应用包名",
 } as const;

@@ -115,7 +115,7 @@ export default {
   "adb.binary.removeRow": "Remover da lista hospedada",
 
   // Página binário · substituição de .so
-  "binary.so.description": "Grava o .so corrigido direto no diretório de instalação do app (push → su -c cat → limpeza), sem reempacotar. Pare o app antes, senão a sobrescrita falha.",
+  "binary.so.description": "Grava o .so corrigido no computador direto no diretório de instalação do app, sem reempacotar. O Agent no dispositivo faz backup, substitui de forma atômica e confere o sha256, revertendo automaticamente se algo falhar. Pare o app antes, senão a sobrescrita falha.",
   "binary.so.localFile": "Arquivo local",
   "binary.so.pick": "Procurar…",
   "binary.so.dragHint": "Arraste do Finder para preencher o caminho",
@@ -128,9 +128,12 @@ export default {
   "binary.so.abi32": "32 bits (arm)",
   "binary.so.target": "Caminho de destino",
   "binary.so.targetIdle": "Informe o pacote para pré-visualizar",
-  "binary.so.rootNote": "Requer root (cat grava em /data/app); su é verificado na execução.",
+  "binary.so.rootNote": "Requer root: o Agent roda como shell e, para gravar em /data/app, executa um script fixo via su; o su é verificado automaticamente.",
   "binary.so.run": "Substituir",
   "binary.so.running": "Substituindo…",
-  "binary.so.success": "Gravado: {target}",
-  "binary.so.noForeground": "Nenhum pacote em primeiro plano encontrado",
+  "binary.so.success": "Substituído e verificado: {target}",
+    "binary.so.notVerified": "O arquivo gravado não passou na verificação: {target}",
+  "binary.so.rolledBack": "Revertido automaticamente para o estado anterior",
+  "binary.so.backupKept": "Backup do original mantido no dispositivo: {path}",
+"binary.so.noForeground": "Nenhum pacote em primeiro plano encontrado",
 } as const;

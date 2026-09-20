@@ -4,6 +4,7 @@ pub mod filesystem;
 pub mod hosted;
 pub(crate) mod operations;
 pub mod package;
+pub(crate) mod privileged;
 pub mod process;
 pub mod system;
 pub mod zygisk;

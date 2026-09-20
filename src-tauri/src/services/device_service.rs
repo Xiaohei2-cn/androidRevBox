@@ -14,7 +14,8 @@ use std::time::Duration;
 use agent_protocol::method::{
     DEVICE_INFO, DEVICE_ROOT_CHECK, FILESYSTEM_LIST, FILESYSTEM_PREVIEW, FILESYSTEM_STAT,
     HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP, PACKAGE_LIST,
-    PACKAGE_NATIVE_LIB_DIR, PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
+    PACKAGE_NATIVE_LIB_DIR, PACKAGE_REPLACE_NATIVE_LIBRARY, PROCESS_BY_PORT, PROCESS_KILL,
+    PROCESS_PORTS,
 };
 use agent_protocol::{
     DeviceInfoParams, DeviceInfoResult, DeviceRootCheckParams, DeviceRootCheckResult, FileKind,
@@ -25,7 +26,8 @@ use agent_protocol::{
     HostedStopResult, KillSignal, ListeningPort, PackageListParams, PackageListResult,
     PackageNativeLibDirParams, PackageNativeLibDirResult, PackageScope, PortHoldingProcess,
     PreviewEncoding, ProcessByPortParams, ProcessByPortResult, ProcessKillParams,
-    ProcessKillResult, ProcessPortsParams, ProcessPortsResult, SocketFamily,
+    ProcessKillResult, ProcessPortsParams, ProcessPortsResult, ReplaceNativeLibraryParams,
+    ReplaceNativeLibraryResult, SO_STAGED_ROOT, SocketFamily,
 };
 use async_trait::async_trait;
 use serde::Serialize;
@@ -124,8 +126,10 @@ const HOSTED_LOG_TAIL_BYTES: u32 = 2048;
 const PORT_SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 /// adb push 大 so 文件用长超时（USB 下数十 MB 也留足余量）
 const PUSH_TIMEOUT: Duration = Duration::from_secs(120);
-/// su -c cat 覆写（设备内拷贝，磁盘写为主）
-const CAT_TIMEOUT: Duration = Duration::from_secs(30);
+/// AR8.4 SO 替换：Desktop 等待上限必须**大于** Agent 内部各步之和
+/// （sha256 复核 10 s×2 + su 步骤 20 s×3），否则宿主先放弃而设备还在写——
+/// 那才是最坏局面（用户以为失败、其实写了一半）。宁可让 UI 多等。
+const SO_REPLACE_TIMEOUT: Duration = Duration::from_secs(100);
 
 // ===== 真实实现：直接 tokio 进程 capture =====
 
@@ -1796,102 +1800,87 @@ impl DeviceService {
         })
     }
 
-    /// so 替换（免重打包）：主机侧修补好的 .so 直接写回 APK 安装目录。
-    /// 三步（用户指定底层流程）：
-    /// ① `adb push <local> /data/local/tmp/<name>`；
-    /// ② dumpsys package 查 legacyNativeLibraryDir，按所选 ABI 拼
-    ///    `.../lib/arm64`（64 位）或 `.../lib/arm`（32 位）目录，
-    ///    `su -c 'cat <tmp> > <target>'` 以 root 覆写；
-    /// ③ `rm <tmp>` 清理临时文件（尽力而为，失败不影响结果）。
-    /// 返回实际写入的目标路径。前置：设备必须已 root（cat 步写 /data/app）。
-    pub async fn so_replace(
+    /// AR8.4：SO 替换（免重打包）——主机侧修补好的 `.so` 交给 Agent 原子装进包的 native lib 目录。
+    ///
+    /// 用户指定的底层流程没变（push → 查目录 → root 写入 → 清理），变的是**谁来保证正确性**：
+    /// ① 目标路径由 Agent 从包信息推导，Desktop 不再 `dumpsys` + 拼字符串（解析已在 AR8.3 迁走）；
+    /// ② 备份 → 同目录临时名 → fsync → 权限/属主/SELinux 上下文 → rename → sha256 复核，
+    ///    全在设备侧一次会话内完成，Desktop 拿到的是**步骤链**而不是「命令没报错」；
+    /// ③ 任一步失败 Agent 自动回滚（原有文件装回备份、原本没有就删掉我们写的）；
+    /// ④ 写操作不自动回退（§3.6）：Agent 不在线或设备无 root 都直接报错并给出下一步，
+    ///    绝不偷偷退回旧的 `su -c cat`——那条路既没备份也没复核。
+    pub async fn replace_native_library(
         &self,
         serial: &str,
         local: &std::path::Path,
         pkg: &str,
         abi: &str,
-    ) -> CoreResult<String> {
-        if !adb::is_safe_pkg_name(pkg) {
-            return Err(CoreError::Internal(format!("包名非法: {pkg}")));
-        }
-        if abi != "arm64" && abi != "arm" {
-            return Err(CoreError::Internal(format!(
-                "ABI 仅支持 arm64(64位)/arm(32位): {abi}"
-            )));
-        }
-        let name = local
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| CoreError::Internal("本地文件路径无法解析文件名".into()))?;
-        if !adb::is_safe_hosted_name(name) || !name.ends_with(".so") {
-            return Err(CoreError::Internal(format!(
-                "文件名需为 .so 且不含空格/特殊字符: {name}"
-            )));
-        }
-        if !local.is_file() {
-            return Err(CoreError::Internal(format!(
-                "本地文件不存在: {}",
-                local.display()
-            )));
-        }
-        // 前置检查：cat 步要 root 写 /data/app——先探测 su，省得半途失败
+    ) -> CoreResult<ReplaceNativeLibraryResult> {
+        // ① 形状校验 + 暂存规划（纯函数，可脱离 AppHandle 单测）
+        let (name, staged_dir, staged_path) = plan_so_staging(pkg, local, abi)?;
+
+        // ② 路由：Agent 必须在线，且只允许 Agent 通道
+        self.require_agent_write_route(serial, PACKAGE_REPLACE_NATIVE_LIBRARY)?;
+
+        // ③ root 前置探测：/data/app 属 system，Agent 以 shell 身份写不进去，
+        //    特权步骤由 Agent 起 su 子进程执行（D037）。su 不可用时给准确原因。
         if !self.su_available(serial).await? {
             return Err(CoreError::Internal(
-                "so 替换需要 root（su -c cat 写安装目录），设备 su 不可用".into(),
+                "SO 替换需要 root：设备 su 不可用（Agent 内的特权步骤要起 su 子进程）".into(),
             ));
         }
 
-        // 目标路径：dumpsys package 查 legacyNativeLibraryDir → 换 abi 子目录
-        let ds_args = adb::build_args(
-            Some(serial),
-            &adb::cmd_shell(&format!("dumpsys package {pkg}")),
-        );
-        let ds = self.run_adb(&ds_args).await?;
-        let legacy =
-            crate::services::env_service::parse_legacy_native_lib(&ds.stdout).ok_or_else(|| {
-                CoreError::Internal(format!(
-                    "未找到 {pkg} 的 legacyNativeLibraryDir（应用未安装？包名拼错？）"
-                ))
-            })?;
-        let target = adb::so_target_path(&legacy, abi, name)
-            .ok_or_else(|| CoreError::Internal(format!("无法按 ABI {abi} 拼目标路径: {legacy}")))?;
-        let tmp = format!("{}/{}", adb::HOSTED_DIR, name);
-        if !adb::is_safe_android_path(&tmp) || !adb::is_safe_android_path(&target) {
-            return Err(CoreError::Internal("设备侧路径含非法字符，已中止".into()));
-        }
-
-        // ① push 到临时目录（长超时档）
+        // ④ 传输仍走 Desktop（adb push 是宿主能力，Agent 不需要也不该有网络出口）
         let push_args = adb::build_args(
             Some(serial),
-            &adb::cmd_push(&local.display().to_string(), &tmp),
+            &adb::cmd_push(&local.display().to_string(), &staged_path),
         );
-        let out = self.run_adb_with(&push_args, PUSH_TIMEOUT).await?;
-        if out.exit_code != Some(0) {
+        let pushed = self.run_adb_with(&push_args, PUSH_TIMEOUT).await?;
+        if pushed.exit_code != Some(0) {
             return Err(CoreError::Internal(format!(
-                "adb push 失败: {}",
-                out.stderr.trim()
+                "adb push 到暂存目录失败: {}",
+                pushed.stderr.trim()
             )));
         }
 
-        // ② su -c 'cat tmp > target'（整段单引号包裹，重定向归 root shell）
-        let cat_cmd = adb::su_wrap(&format!("cat {tmp} > {target}"));
-        let args = adb::build_args(Some(serial), &adb::cmd_shell(&cat_cmd));
-        let out = self.run_adb_with(&args, CAT_TIMEOUT).await?;
-        if out.exit_code != Some(0) {
-            return Err(CoreError::Internal(format!(
-                "cat 写入失败: {}",
-                out.stderr.trim()
-            )));
+        // ⑤ 交给 Agent：备份/安装/复核/回滚都在设备侧一次做完
+        let operation_id = format!("so-replace-{}", uuid::Uuid::new_v4().simple());
+        let params = ReplaceNativeLibraryParams {
+            package: pkg.to_owned(),
+            abi: abi.to_owned(),
+            so_name: name.to_owned(),
+            staged_path: staged_path.clone(),
+            operation_id,
+        };
+        let result: CoreResult<ReplaceNativeLibraryResult> = self
+            .android
+            .agent()
+            .request::<_, ReplaceNativeLibraryResult>(
+                serial,
+                PACKAGE_REPLACE_NATIVE_LIBRARY,
+                &params,
+                SO_REPLACE_TIMEOUT,
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)));
+
+        // ⑥ 暂存件用完即删；**备份件留着**——那是唯一的撤销点，删它属于用户决定
+        let cleanup = adb::build_args(
+            Some(serial),
+            &adb::cmd_shell(&format!("rm -f {staged_path}")),
+        );
+        if let Err(error) = self.run_adb(&cleanup).await {
+            tracing::warn!(serial, %error, "暂存件清理失败（可忽略，不影响替换结果）");
         }
 
-        // ③ 清理临时文件（尽力而为）
-        let rm_args = adb::build_args(Some(serial), &adb::cmd_shell(&format!("rm {tmp}")));
-        if let Err(e) = self.run_adb(&rm_args).await {
-            tracing::warn!(error = %e, tmp, "so_replace 临时文件清理失败（可忽略）");
-        }
-
-        tracing::info!(serial, pkg, abi, target = %target, "so 替换完成");
-        Ok(target)
+        audit_so_replace(
+            serial,
+            pkg,
+            abi,
+            &staged_dir,
+            &to_audit_summary(&result, describe_replace),
+        );
+        result
     }
 
     /// 拼 `<verb> <dir>/<name>` 并做名称安全校验（所有托管文件操作共用入口）。
@@ -2167,6 +2156,93 @@ where
         .as_ref()
         .map(describe)
         .map_err(|error| error.to_string())
+}
+
+/// 审计摘要：只留「是否真执行、是否复核、落在哪」，不含文件内容与任何令牌。
+fn describe_replace(result: &ReplaceNativeLibraryResult) -> String {
+    format!(
+        "outcome={:?} verified={} rolled_back={} replaced_existing={} target={}",
+        result.outcome,
+        result.verified,
+        result.rolled_back.unwrap_or(false),
+        result.replaced_existing,
+        result.target_path
+    )
+}
+
+/// §3.7 SO 替换审计：写安装目录必须留下「谁、动了哪个包的哪个文件、结果如何」。
+/// 含目标目录（审计要看的就是这个），不含文件内容。
+fn audit_so_replace(
+    serial: &str,
+    pkg: &str,
+    abi: &str,
+    staged_dir: &str,
+    outcome: &Result<String, String>,
+) {
+    match outcome.as_ref() {
+        Ok(summary) => tracing::info!(
+            target: "audit",
+            serial,
+            method = PACKAGE_REPLACE_NATIVE_LIBRARY,
+            pkg,
+            abi,
+            staged_dir,
+            outcome = %summary,
+            "SO 替换已执行"
+        ),
+        Err(reason) => tracing::warn!(
+            target: "audit",
+            serial,
+            method = PACKAGE_REPLACE_NATIVE_LIBRARY,
+            pkg,
+            abi,
+            staged_dir,
+            error = %reason,
+            "SO 替换失败"
+        ),
+    }
+}
+
+/// SO 替换的入参把关 + 暂存路径规划（AR8.4，纯函数）。
+///
+/// 抽出来的理由：`DeviceService::new` 需要 `tauri::AppHandle`，服务方法里的分支在
+/// 单测里根本构造不出来，写操作的「什么请求会被挡在宿主」就永远只能靠真机腿镜像。
+/// 把关与规划做成纯函数后，规则本身有单测，腿只需要负责设备侧那半段。
+/// 返回 `(so 文件名, 本次暂存目录, 暂存文件路径)`。
+fn plan_so_staging(
+    pkg: &str,
+    local: &std::path::Path,
+    abi: &str,
+) -> CoreResult<(String, String, String)> {
+    if !adb::is_safe_pkg_name(pkg) {
+        return Err(CoreError::Internal(format!("包名非法: {pkg}")));
+    }
+    if abi != "arm64" && abi != "arm" {
+        return Err(CoreError::Internal(format!(
+            "ABI 仅支持 arm64(64位)/arm(32位): {abi}"
+        )));
+    }
+    let name = local
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| CoreError::Internal("本地文件路径无法解析文件名".into()))?;
+    if !adb::is_safe_so_name(name) {
+        return Err(CoreError::Internal(format!(
+            "文件名需为 .so 且只含字母数字与 _.-+（与设备侧同一套规则）: {name}"
+        )));
+    }
+    if !local.is_file() {
+        return Err(CoreError::Internal(format!(
+            "本地文件不存在: {}",
+            local.display()
+        )));
+    }
+    // 每次操作一个唯一子目录：Agent 只认 `<root>/<本次目录>/<name>.so`，
+    // 备份件与暂存件同级，同名 so 连替两次也不会互相踩掉第一个备份。
+    let seed = uuid::Uuid::new_v4().simple().to_string();
+    let dir = format!("{SO_STAGED_ROOT}/{pkg}-{}", &seed[..8]);
+    let path = format!("{dir}/{name}");
+    Ok((name.to_owned(), dir, path))
 }
 
 /// §3.7 托管写操作（chmod/start）审计：字段化、成功失败都记，不含命令正文与令牌。
@@ -3005,6 +3081,59 @@ mod tests {
             // 本机跑 --ignored 时若真无 adb 才走这里；用 eprintln 让 --nocapture 可见
             eprintln!("[real] adb 未检测到：{}", env.hint.unwrap_or_default());
             assert!(!env.installed);
+        }
+    }
+
+    /// AR8.4：Desktop 侧的入参把关必须与设备侧同形，而且不合法就不该算出暂存路径。
+    /// （服务方法要 `AppHandle` 才构造得出来，所以把关做成纯函数后在这里钉住。）
+    #[test]
+    fn so_staging_plan_mirrors_the_agent_side_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("libc++_shared.so");
+        std::fs::write(&good, b"x").unwrap();
+        let (name, staged_dir, staged_path) =
+            plan_so_staging("com.example.app", &good, "arm64").expect("合法输入必须通过");
+        assert_eq!(name, "libc++_shared.so", "C++ 库名不能被宿主这层误拦");
+        assert_eq!(
+            staged_path,
+            format!("{staged_dir}/{name}"),
+            "暂存件必须躺在本次操作目录里"
+        );
+        assert!(
+            staged_dir.starts_with(&format!("{SO_STAGED_ROOT}/com.example.app-")),
+            "实际: {staged_dir}"
+        );
+        assert!(
+            !staged_dir.ends_with('/'),
+            "目录参数不该以 / 结尾（设备侧同样拒绝）"
+        );
+        // 两次调用的目录必须不同：同名 so 连替两次不能互相踩掉备份
+        let again = plan_so_staging("com.example.app", &good, "arm64").unwrap();
+        assert_ne!(staged_dir, again.1);
+
+        let missing = dir.path().join("nope.so");
+        let spaced = dir.path().join("a b.so");
+        let not_so = dir.path().join("a.txt");
+        std::fs::write(&spaced, b"x").unwrap();
+        std::fs::write(&not_so, b"x").unwrap();
+        let cases = [
+            ("bad pkg;rm", &good, "arm64"),
+            ("com.example.app", &good, "x86"),
+            ("com.example.app", &missing, "arm64"),
+            ("com.example.app", &spaced, "arm64"),
+            ("com.example.app", &not_so, "arm64"),
+        ];
+        for (bad_pkg, bad_path, bad_abi) in cases {
+            let error = plan_so_staging(bad_pkg, bad_path, bad_abi)
+                .expect_err("非法输入必须在宿主就被拒，不能推到设备上再失败");
+            let text = error.to_string();
+            assert!(
+                text.contains("包名")
+                    || text.contains("ABI")
+                    || text.contains("文件名")
+                    || text.contains("本地文件"),
+                "错误要说清拦在哪一项，实际: {text}"
+            );
         }
     }
 

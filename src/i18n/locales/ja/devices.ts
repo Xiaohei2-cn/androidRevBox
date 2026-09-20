@@ -115,7 +115,7 @@ export default {
   "adb.binary.removeRow": "ホスト一覧から削除",
 
   // バイナリページ · so 置換
-  "binary.so.description": "修正済み .so をインストールディレクトリへ直接書き戻す（push → su -c cat → 後片付け）。再パッケージ不要。対象アプリを停止してから実行してください。",
+  "binary.so.description": "PC 側で修正した .so をアプリのインストール directory に直接書き戻します（再パッケージ不要）。デバイス側 Agent がバックアップ→原子的置換→sha256 検証を行い、失敗時は自動でロールバックします。対象アプリを停止してから実行してください。",
   "binary.so.localFile": "ローカルファイル",
   "binary.so.pick": "選択…",
   "binary.so.dragHint": "Finder からドラッグで絶対パスを入力",
@@ -128,9 +128,12 @@ export default {
   "binary.so.abi32": "32bit (arm)",
   "binary.so.target": "ターゲットパス",
   "binary.so.targetIdle": "パッケージ名を入力するとプレビュー",
-  "binary.so.rootNote": "root 必須（cat が /data/app に書き込み）。実行時に su を自動確認します。",
+  "binary.so.rootNote": "root 必須：Agent は shell 権限で動作し、/data/app への書き込み時に su 子プロセスへ固定スクリプトを渡します。su は実行時に自動確認します。",
   "binary.so.run": "置換",
   "binary.so.running": "置換中…",
-  "binary.so.success": "書き込み完了：{target}",
-  "binary.so.noForeground": "フォアグラウンドのパッケージ名が取得できません",
+  "binary.so.success": "置換と検証が完了しました：{target}",
+    "binary.so.notVerified": "書き込み内容は検証を通過しませんでした：{target}",
+  "binary.so.rolledBack": "置換前の状態へ自動ロールバックしました",
+  "binary.so.backupKept": "原本のバックアップは端末側に保存：{path}",
+"binary.so.noForeground": "フォアグラウンドのパッケージ名が取得できません",
 } as const;

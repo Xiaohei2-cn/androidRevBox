@@ -281,6 +281,21 @@ pub fn is_safe_hosted_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
+/// SO 文件名白名单：`[A-Za-z0-9._+-]` + 以 `.so` 结尾 + 不以 `.` 开头 + 长度上限。
+///
+/// **必须与 Agent 侧 `package::is_safe_so_name` 同形**（AR8.4）：Desktop 先拦一道只是
+/// 为了给出可读错误，真正的边界在设备侧；两边不一致就会出现「Desktop 放行、Agent 拒绝」
+/// 或者反过来白拦一次。`+` 必须在内——`libc++_shared.so` 是最常见的替换目标之一。
+pub fn is_safe_so_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 96
+        && name.ends_with(".so")
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '+'))
+}
+
 /// ls 权限串（如 "-rwxr-xr-x"）是否 owner 可执行（第 4 字符 x/s）。
 pub fn perms_has_exec(perms: &str) -> bool {
     // -rwxr-xr-x → 索引 3 是 owner 的 execute
@@ -1433,6 +1448,26 @@ tcp: garbage line
         assert!(c.ends_with("/proc/net/tcp /proc/net/tcp6; done"));
         // su -c 单引号包裹安全：内部无单引号
         assert!(!c.contains('\''));
+    }
+
+    /// SO 名白名单：形状要与 Agent 一致，`+` 不能少（libc++_shared.so 是真实目标）
+    #[test]
+    fn so_name_whitelist_matches_the_agent_side() {
+        let too_long = format!("{}.so", "x".repeat(96));
+        for good in ["libfoo.so", "libc++_shared.so", "lib-v1_2.so"] {
+            assert!(is_safe_so_name(good), "{good} 必须放行");
+        }
+        for bad in [
+            "",
+            ".hidden.so",
+            "../lib.so",
+            "libfoo.txt",
+            "lib foo.so",
+            "libfoo.so;rm",
+            &too_long,
+        ] {
+            assert!(!is_safe_so_name(bad), "{bad:?} 必须拒绝");
+        }
     }
 
     #[test]
