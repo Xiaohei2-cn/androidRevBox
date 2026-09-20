@@ -12,23 +12,27 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_protocol::method::{
-    DEVICE_INFO, DEVICE_ROOT_CHECK, FILESYSTEM_LIST, FILESYSTEM_PREVIEW, FILESYSTEM_STAT,
-    HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP, PACKAGE_LIST,
-    PACKAGE_NATIVE_LIB_DIR, PACKAGE_REPLACE_NATIVE_LIBRARY, PROCESS_BY_PORT, PROCESS_KILL,
-    PROCESS_PORTS,
+    ACTIVITY_FORCE_STOP, ACTIVITY_LAUNCH, DEVICE_INFO, DEVICE_ROOT_CHECK, FILESYSTEM_LIST,
+    FILESYSTEM_PREVIEW, FILESYSTEM_STAT, HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS,
+    HOSTED_STOP, PACKAGE_LIST, PACKAGE_NATIVE_LIB_DIR, PACKAGE_REPLACE_NATIVE_LIBRARY,
+    PACKAGE_UNINSTALL, PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
 };
+
 use agent_protocol::{
-    DeviceInfoParams, DeviceInfoResult, DeviceRootCheckParams, DeviceRootCheckResult, FileKind,
-    FilesystemListParams, FilesystemListResult, FilesystemPreviewParams, FilesystemPreviewResult,
-    FilesystemStatParams, FilesystemStatResult, HostedBinaryInfo, HostedChmodParams,
-    HostedChmodResult, HostedListParams, HostedListResult, HostedRunRecord, HostedRunState,
-    HostedStartParams, HostedStartResult, HostedStatusParams, HostedStatusResult, HostedStopParams,
-    HostedStopResult, KillSignal, ListeningPort, PackageListParams, PackageListResult,
-    PackageNativeLibDirParams, PackageNativeLibDirResult, PackageScope, PortHoldingProcess,
-    PreviewEncoding, ProcessByPortParams, ProcessByPortResult, ProcessKillParams,
-    ProcessKillResult, ProcessPortsParams, ProcessPortsResult, ReplaceNativeLibraryParams,
-    ReplaceNativeLibraryResult, SO_STAGED_ROOT, SocketFamily,
+    ActivityForceStopParams, ActivityLaunchParams, DeviceInfoParams, DeviceInfoResult,
+    DeviceRootCheckParams, DeviceRootCheckResult, FileKind, FilesystemListParams,
+    FilesystemListResult, FilesystemPreviewParams, FilesystemPreviewResult, FilesystemStatParams,
+    FilesystemStatResult, HostedBinaryInfo, HostedChmodParams, HostedChmodResult, HostedListParams,
+    HostedListResult, HostedRunRecord, HostedRunState, HostedStartParams, HostedStartResult,
+    HostedStatusParams, HostedStatusResult, HostedStopParams, HostedStopResult, KillSignal,
+    ListeningPort, PackageListParams, PackageListResult, PackageNativeLibDirParams,
+    PackageNativeLibDirResult, PackageScope, PackageUninstallParams, PackageUninstallResult,
+    PackageWriteResult, PortHoldingProcess, PreviewEncoding, ProcessByPortParams,
+    ProcessByPortResult, ProcessKillParams, ProcessKillResult, ProcessPortsParams,
+    ProcessPortsResult, ReplaceNativeLibraryParams, ReplaceNativeLibraryResult, SO_STAGED_ROOT,
+    SocketFamily,
 };
+
 use async_trait::async_trait;
 use serde::Serialize;
 use tauri::Emitter;
@@ -126,6 +130,10 @@ const HOSTED_LOG_TAIL_BYTES: u32 = 2048;
 const PORT_SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 /// adb push 大 so 文件用长超时（USB 下数十 MB 也留足余量）
 const PUSH_TIMEOUT: Duration = Duration::from_secs(120);
+/// 包写操作（launch/force_stop/uninstall）的等待上限：Agent 内部是单条 `am`/`pm`
+/// 加一次复核，真机实测都在秒级；给到 30 s 是留给冷启动与慢 ROM，不再往上放——
+/// 写操作等太久，用户就会连点，那时候幂等比超时更该负责。
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// AR8.4 SO 替换：Desktop 等待上限必须**大于** Agent 内部各步之和
 /// （sha256 复核 10 s×2 + su 步骤 20 s×3），否则宿主先放弃而设备还在写——
 /// 那才是最坏局面（用户以为失败、其实写了一半）。宁可让 UI 多等。
@@ -1934,19 +1942,119 @@ impl DeviceService {
             .await
     }
 
-    pub async fn start_uninstall(&self, serial: &str, pkg: &str) -> CoreResult<String> {
-        self.adb_task("adb.uninstall", Some(serial), &adb::cmd_uninstall(pkg))
+    /// 启动应用（AR8.1 收尾：改走 Agent typed，**不再产任务卡**）。
+    ///
+    /// 与旧 `adb_task("adb.launch")` 的区别不只是少一张卡：旧路径只能告诉你
+    /// 「`am start` 这条命令返回 0」，新路径回的是**复核过的事实**——
+    /// `verified=true` 表示真的看到了新 pid，`outcome=replayed` 表示这是幂等命中
+    /// （用户连点或网络重试不会二次启动），`no_op` 表示目标已在期望状态。
+    pub async fn launch(&self, serial: &str, pkg: &str) -> CoreResult<PackageWriteResult> {
+        let method = ACTIVITY_LAUNCH;
+        let operation_id = plan_package_write(pkg, "launch")?;
+        self.require_agent_write_route(serial, method)?;
+        let result = self
+            .android
+            .agent()
+            .request::<_, PackageWriteResult>(
+                serial,
+                method,
+                &ActivityLaunchParams {
+                    package: pkg.to_owned(),
+                    operation_id,
+                },
+                WRITE_TIMEOUT,
+            )
             .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)));
+        audit_package_write(
+            serial,
+            method,
+            pkg,
+            &to_audit_summary(&result, |value| {
+                format!(
+                    "outcome={:?} verified={} pid={:?} detail={:?}",
+                    value.outcome, value.verified, value.pid, value.detail
+                )
+            }),
+        );
+        result
     }
 
-    pub async fn start_launch(&self, serial: &str, pkg: &str) -> CoreResult<String> {
-        self.adb_task("adb.launch", Some(serial), &adb::cmd_launch(pkg))
+    /// 强制停止（同上：Agent typed + 幂等 + 审计，不产卡）。
+    pub async fn force_stop(&self, serial: &str, pkg: &str) -> CoreResult<PackageWriteResult> {
+        let method = ACTIVITY_FORCE_STOP;
+        let operation_id = plan_package_write(pkg, "force-stop")?;
+        self.require_agent_write_route(serial, method)?;
+        let result = self
+            .android
+            .agent()
+            .request::<_, PackageWriteResult>(
+                serial,
+                method,
+                &ActivityForceStopParams {
+                    package: pkg.to_owned(),
+                    operation_id,
+                },
+                WRITE_TIMEOUT,
+            )
             .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)));
+        audit_package_write(
+            serial,
+            method,
+            pkg,
+            &to_audit_summary(&result, |value| {
+                format!(
+                    "outcome={:?} verified={} pid={:?} detail={:?}",
+                    value.outcome, value.verified, value.pid, value.detail
+                )
+            }),
+        );
+        result
     }
 
-    pub async fn start_force_stop(&self, serial: &str, pkg: &str) -> CoreResult<String> {
-        self.adb_task("adb.force_stop", Some(serial), &adb::cmd_force_stop(pkg))
+    /// 卸载（同上）。`keep_data` 默认 false —— 与迁移前 `pm uninstall <pkg>` 的语义
+    /// 完全一致，不能借迁移悄悄改成 `-k`（那样磁盘不释放，用户以为清掉了）。
+    pub async fn uninstall(
+        &self,
+        serial: &str,
+        pkg: &str,
+        keep_data: bool,
+    ) -> CoreResult<PackageUninstallResult> {
+        let method = PACKAGE_UNINSTALL;
+        let operation_id = plan_package_write(pkg, "uninstall")?;
+        self.require_agent_write_route(serial, method)?;
+        let result = self
+            .android
+            .agent()
+            .request::<_, PackageUninstallResult>(
+                serial,
+                method,
+                &PackageUninstallParams {
+                    package: pkg.to_owned(),
+                    operation_id,
+                    keep_data,
+                    user: None,
+                },
+                WRITE_TIMEOUT,
+            )
             .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)));
+        audit_package_write(
+            serial,
+            method,
+            pkg,
+            &to_audit_summary(&result, |value| {
+                format!(
+                    "outcome={:?} verified={} keep_data={} steps={}",
+                    value.outcome,
+                    value.verified,
+                    value.keep_data,
+                    value.steps.len()
+                )
+            }),
+        );
+        result
     }
 
     pub async fn start_push(&self, serial: &str, local: &str, remote: &str) -> CoreResult<String> {
@@ -2156,6 +2264,50 @@ where
         .as_ref()
         .map(describe)
         .map_err(|error| error.to_string())
+}
+
+/// 包写操作的宿主侧把关（纯函数，AR8.1 收尾）。
+///
+/// 只负责两件事：包名形状、`operation_id` 生成。路由与审计留在方法里，因为那两件
+/// 事需要 `AppHandle` 才能构造出来。**每次用户动作生成一个 id**（不是每次请求）：
+/// 同一请求的网络重试会复用同一个 id 从而命中设备侧幂等台账，而用户连点两次是两次
+/// 合法意图，必须分别执行。
+fn plan_package_write(pkg: &str, id_prefix: &str) -> CoreResult<String> {
+    if !adb::is_safe_pkg_name(pkg) {
+        return Err(CoreError::Internal(format!("包名非法: {pkg}")));
+    }
+    if !adb::is_safe_pkg_name(id_prefix) {
+        return Err(CoreError::Internal(format!(
+            "内部错误：操作前缀非法 {id_prefix}"
+        )));
+    }
+    let seed = uuid::Uuid::new_v4().simple().to_string();
+    Ok(format!("{id_prefix}-{seed}"))
+}
+
+/// §3.7 包写操作审计：卸载/强停/启动都会改设备状态，必须留下「谁、对哪个包、结果」。
+/// 只含结构化字段，不含令牌与命令正文。
+fn audit_package_write(serial: &str, method: &str, pkg: &str, outcome: &Result<String, String>) {
+    match outcome.as_ref() {
+        Ok(summary) => tracing::info!(
+            target: "audit",
+            serial,
+            method,
+            pkg,
+            backend = "agent",
+            outcome = %summary,
+            "包写操作已执行"
+        ),
+        Err(reason) => tracing::warn!(
+            target: "audit",
+            serial,
+            method,
+            pkg,
+            backend = "agent",
+            error = %reason,
+            "包写操作失败"
+        ),
+    }
 }
 
 /// 审计摘要：只留「是否真执行、是否复核、落在哪」，不含文件内容与任何令牌。
@@ -3134,6 +3286,30 @@ mod tests {
                     || text.contains("本地文件"),
                 "错误要说清拦在哪一项，实际: {text}"
             );
+        }
+    }
+
+    /// AR8.1：包写操作的宿主侧把关。`operation_id` 形状必须满足设备侧白名单
+    /// （`[A-Za-z0-9._-:]`，≤64）——写操作不允许匿名提交，id 不合法就等于请求被拒。
+    #[test]
+    fn package_write_plan_validates_name_and_shapes_an_idempotency_key() {
+        let id = plan_package_write("com.example.app", "launch").expect("合法包名必须通过");
+        assert!(id.starts_with("launch-"), "实际: {id}");
+        assert!(id.len() <= 64, "operation_id 超过设备侧上限: {}", id.len());
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')),
+            "operation_id 含设备侧会拒的字符: {id}"
+        );
+        assert_ne!(
+            id,
+            plan_package_write("com.example.app", "launch").unwrap(),
+            "两次用户动作必须是两个 id，否则第二次会被幂等台账吃掉"
+        );
+        for bad in ["", "com; rm -rf /", "com x", "pm path com.x"] {
+            let error =
+                plan_package_write(bad, "uninstall").expect_err(&format!("{bad:?} 必须被拒"));
+            assert!(error.to_string().contains("包名"), "错误要看得懂: {error}");
         }
     }
 

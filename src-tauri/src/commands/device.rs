@@ -4,7 +4,7 @@
 
 use agent_protocol::{
     FilesystemPreviewResult, FilesystemStatResult, HostedRunRecord, HostedStopResult,
-    ReplaceNativeLibraryResult,
+    PackageUninstallResult, PackageWriteResult, ReplaceNativeLibraryResult,
 };
 use serde::Deserialize;
 
@@ -418,36 +418,39 @@ pub async fn device_install(
 pub struct UninstallArgs {
     pub serial: String,
     pub package: String,
+    /// `pm uninstall -k`：保留数据与缓存。默认 false，与迁移前 `adb uninstall` 语义一致
+    #[serde(default)]
+    pub keep_data: bool,
 }
 
+/// 卸载：Agent typed 结果（AR8.1 收尾）。返回步骤链与复核结论，不产任务卡。
 #[tauri::command]
 pub async fn device_uninstall(
     state: tauri::State<'_, AppState>,
     args: UninstallArgs,
-) -> CoreResult<String> {
+) -> CoreResult<PackageUninstallResult> {
     state
         .device
-        .start_uninstall(&args.serial, &args.package)
+        .uninstall(&args.serial, &args.package, args.keep_data)
         .await
 }
 
+/// 启动应用：Agent typed 结果（`verified` 表示真看到新 pid，`replayed` 表示幂等命中）。
 #[tauri::command]
 pub async fn device_launch(
     state: tauri::State<'_, AppState>,
     args: UninstallArgs,
-) -> CoreResult<String> {
-    state.device.start_launch(&args.serial, &args.package).await
+) -> CoreResult<PackageWriteResult> {
+    state.device.launch(&args.serial, &args.package).await
 }
 
+/// 强制停止：Agent typed 结果（`verified` 表示复核到 pid 消失）。
 #[tauri::command]
 pub async fn device_force_stop(
     state: tauri::State<'_, AppState>,
     args: UninstallArgs,
-) -> CoreResult<String> {
-    state
-        .device
-        .start_force_stop(&args.serial, &args.package)
-        .await
+) -> CoreResult<PackageWriteResult> {
+    state.device.force_stop(&args.serial, &args.package).await
 }
 
 #[derive(Debug, Deserialize)]

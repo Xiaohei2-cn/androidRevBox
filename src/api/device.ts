@@ -158,11 +158,38 @@ export interface DeviceChangedPayload {
 }
 
 /**
- * 写操作的执行结果三态（与 `agent-protocol` 的 `WriteOutcome` 对齐）：
- * `executed` 真的做了，`replayed` 同一个 operationId 重发拿到旧结果，
- * `simulated` 是没连真机的演练结果——三者都不能显示成同一个绿色徽章。
+ * 写操作结果三态，逐值对应 `agent-protocol` 的 `WriteOutcome`（snake_case 线格式）：
+ * `executed` 真的动了设备；`replayed` 同一个 operationId 命中幂等台账、本次没再动；
+ * `no_op` 目标本来就在期望状态（例如强停一个没在跑的包）。
+ * 三态不能显示成同一个绿色徽章——连点两次却报「已启动」就是骗人。
+ * 改这个联合类型时请对着 Rust 那个 enum 看，别凭印象加值。
  */
-export type WriteOutcome = "executed" | "replayed" | "simulated";
+export type WriteOutcome = "executed" | "replayed" | "no_op";
+
+/** `activity.launch` / `activity.force_stop` 的返回（AR8.1）。 */
+export interface PackageWriteResult {
+  action: "launch" | "force_stop" | "uninstall";
+  package: string;
+  operationId: string;
+  outcome: WriteOutcome;
+  /** 客观复核过：launch 看到新 pid、force_stop 看到 pid 消失 */
+  verified: boolean;
+  pid?: number;
+  detail?: string;
+  ranAsRoot: boolean;
+}
+
+/** `package.uninstall` 的返回（AR8.1）。 */
+export interface PackageUninstallResult {
+  package: string;
+  operationId: string;
+  outcome: WriteOutcome;
+  /** 复核结论：`pm path` 已为空 */
+  verified: boolean;
+  keepData: boolean;
+  steps: OperationStep[];
+  detail?: string;
+}
 
 /** 设备侧执行的其中一步（SO 替换的备份/安装/复核/回滚各自一条）。 */
 export interface OperationStep {
@@ -330,14 +357,24 @@ export const deviceApi = {
   install(serial: string, apkPath: string): Promise<string> {
     return invokeCommand<string>("device_install", { args: { serial, apkPath } });
   },
-  uninstall(serial: string, pkg: string): Promise<string> {
-    return invokeCommand<string>("device_uninstall", { args: { serial, package: pkg } });
+  /**
+   * 卸载（AR8.1 收尾）：Agent typed 结果 + 步骤链，**不产任务卡**。
+   * `keepData` 默认 false，与迁移前 `adb uninstall` 语义一致（不悄悄改成 `-k`）。
+   */
+  uninstall(serial: string, pkg: string, keepData = false): Promise<PackageUninstallResult> {
+    return invokeCommand<PackageUninstallResult>("device_uninstall", {
+      args: { serial, package: pkg, keepData },
+    });
   },
-  launch(serial: string, pkg: string): Promise<string> {
-    return invokeCommand<string>("device_launch", { args: { serial, package: pkg } });
+  /** 启动：`verified` 表示真的看到了新 pid，`replayed` 表示幂等命中没二次执行。 */
+  launch(serial: string, pkg: string): Promise<PackageWriteResult> {
+    return invokeCommand<PackageWriteResult>("device_launch", { args: { serial, package: pkg } });
   },
-  forceStop(serial: string, pkg: string): Promise<string> {
-    return invokeCommand<string>("device_force_stop", { args: { serial, package: pkg } });
+  /** 强停：`verified` 表示复核到 pid 消失；`noOp` 表示本来就没在跑。 */
+  forceStop(serial: string, pkg: string): Promise<PackageWriteResult> {
+    return invokeCommand<PackageWriteResult>("device_force_stop", {
+      args: { serial, package: pkg },
+    });
   },
   push(serial: string, local: string, remote: string): Promise<string> {
     return invokeCommand<string>("device_push", { args: { serial, local, remote } });

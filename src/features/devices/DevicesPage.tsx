@@ -5,7 +5,14 @@ import { Button } from "@/components/ui/button";
 import { SubTabs } from "@/components/nav/SubTabs";
 import { TaskLaunchPanel } from "@/components/task/TaskLaunchPanel";
 import { TaskSessionView } from "@/components/task/TaskSessionView";
-import { deviceApi, type DeviceEntry } from "@/api/device";
+import {
+  deviceApi,
+  type DeviceEntry,
+  type OperationStep,
+  type PackageUninstallResult,
+  type PackageWriteResult,
+  type WriteOutcome,
+} from "@/api/device";
 import { zygiskApi, type ZygiskAppItem, type ZygiskScope } from "@/api/zygisk";
 import { agentApi, type AgentSessionState } from "@/api/agent";
 import { envApi } from "@/api/env";
@@ -21,6 +28,17 @@ import { pickDirectory } from "@/api/dialog";
  * 长操作（shell/logcat/install/uninstall/push/pull）一律走 TaskService 任务，
  * 内联展示实时输出；设备热插拔由后端 watch 线程事件驱动刷新。
  */
+/** 包写操作的展示模型：三态（executed / replayed / noOp）与复核结论必须分开显示。 */
+interface PackageWriteView {
+  kind: string;
+  outcome: WriteOutcome;
+  verified: boolean;
+  summary: string;
+  steps: OperationStep[];
+  detail?: string;
+  failed?: boolean;
+}
+
 export function DevicesPage() {
   const [selected, setSelected] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
@@ -788,6 +806,12 @@ export function AppsView({ serial }: { serial: string | null }) {
     enabled: !!serial && !!error,
   });
   const [action, setAction] = useState<{ kind: string; taskId: string } | null>(null);
+  /**
+   * 包写操作（启动/强停/卸载）走 Agent typed 结果，**不再有任务卡**（AR8.1 收尾 + D041）。
+   * 这里存的是「一眼能看懂的结论 + 设备侧步骤链」；`replayed`/`noOp`/`verified=false`
+   * 三态必须与 `executed` 区分开，否则幂等命中会被显示成一次新的成功。
+   */
+  const [writeResult, setWriteResult] = useState<PackageWriteView | null>(null);
 
   if (!serial) return <Empty text={t("apps.noDevice")} />;
   if (isLoading) return <Empty text={t("apps.loading")} />;
@@ -815,6 +839,41 @@ export function AppsView({ serial }: { serial: string | null }) {
   const apps = data?.items ?? [];
   const warnings = data?.warnings ?? [];
 
+  const runWrite = async (
+    fn: () => Promise<PackageWriteResult | PackageUninstallResult>,
+    kind: string,
+    done: (result: PackageWriteResult | PackageUninstallResult) => string,
+    onDone?: (result: PackageWriteResult | PackageUninstallResult) => void,
+  ) => {
+    setAction(null);
+    try {
+      const result = await fn();
+      onDone?.(result);
+      setWriteResult({
+        kind,
+        outcome: result.outcome,
+        verified: result.verified,
+        summary: done(result),
+        steps: "steps" in result ? result.steps : [],
+        detail: result.detail,
+      });
+    } catch (e) {
+      setWriteResult({
+        kind,
+        outcome: "executed",
+        verified: false,
+        summary: String((e as Error)?.message ?? e),
+        steps: [],
+        failed: true,
+      });
+    }
+  };
+
+  /**
+   * 卸载成功（或幂等命中）后要自己刷清单：以前这条链靠任务中心的 `adb.uninstall`
+   * 完成事件触发（TasksPage 里那个 kind 判断），现在不产卡了就得由发起方负责。
+   * push/install 那两条仍然产卡，仍走 TasksPage 的既有通知。
+   */
   const runAction = async (fn: () => Promise<string>, kind: string) => {
     try {
       const id = await fn();
@@ -1012,7 +1071,15 @@ export function AppsView({ serial }: { serial: string | null }) {
             variant="outline"
             disabled={!selectedApp}
             onClick={() =>
-              selectedApp && void runAction(() => deviceApi.launch(serial, selectedApp.packageName), "启动")
+              selectedApp &&
+              void runWrite(
+                () => deviceApi.launch(serial, selectedApp.packageName),
+                "启动",
+                (r) =>
+                  "pid" in r && r.pid
+                    ? `${selectedApp.packageName} 已启动 · pid ${r.pid}`
+                    : `${selectedApp.packageName} 启动命令已执行`,
+              )
             }
           >
             <Rocket className="h-3.5 w-3.5" />
@@ -1024,7 +1091,11 @@ export function AppsView({ serial }: { serial: string | null }) {
             disabled={!selectedApp}
             onClick={() =>
               selectedApp &&
-              void runAction(() => deviceApi.forceStop(serial, selectedApp.packageName), "强停")
+              void runWrite(
+                () => deviceApi.forceStop(serial, selectedApp.packageName),
+                "强停",
+                () => `${selectedApp.packageName} 已强制停止（复核到进程消失）`,
+              )
             }
           >
             <CircleStop className="h-3.5 w-3.5" />
@@ -1036,7 +1107,16 @@ export function AppsView({ serial }: { serial: string | null }) {
             disabled={!selectedApp}
             onClick={() =>
               selectedApp &&
-              void runAction(() => deviceApi.uninstall(serial, selectedApp.packageName), "卸载")
+              void runWrite(
+                () => deviceApi.uninstall(serial, selectedApp.packageName),
+                "卸载",
+                (r) =>
+                  `${selectedApp.packageName} 已卸载 · 数据${"keepData" in r && r.keepData ? "保留" : "一并清除"}`,
+                // 卸成功（含幂等命中）就自己刷清单：以前这条链靠任务完成事件，现在没有卡了
+                (r) => {
+                  if (r.outcome !== "executed" || r.verified) void refetch();
+                },
+              )
             }
           >
             <PackageOpen className="h-3.5 w-3.5" />
@@ -1067,9 +1147,61 @@ export function AppsView({ serial }: { serial: string | null }) {
             ) : (
               <p className="text-xs text-destructive">{action.kind}</p>
             )
+          ) : writeResult ? (
+            <div
+              className="rounded-md border px-2 py-1.5 text-xs"
+              data-testid="package-write-result"
+            >
+              <p
+                className={
+                  writeResult.failed || (writeResult.outcome === "executed" && !writeResult.verified)
+                    ? "font-medium text-destructive"
+                    : writeResult.outcome === "executed"
+                      ? "font-medium text-emerald-600 dark:text-emerald-400"
+                      : "font-medium text-amber-500"
+                }
+              >
+                {writeResult.kind} · {writeResult.summary}
+              </p>
+              {/* 幂等命中与「本来就在期望状态」不能显示成一次新的成功 */}
+              {writeResult.outcome === "replayed" && (
+                <p className="mt-1 text-[11px] text-amber-500">
+                  幂等命中：这个操作刚刚已经做过，本次没有再动设备
+                </p>
+              )}
+              {writeResult.outcome === "no_op" && (
+                <p className="mt-1 text-[11px] text-muted-foreground">目标本来就在期望状态</p>
+              )}
+              {writeResult.outcome === "executed" && !writeResult.verified && !writeResult.failed && (
+                <p className="mt-1 text-[11px] text-destructive">
+                  命令执行了，但设备侧没复核到预期变化——别当成成功
+                </p>
+              )}
+              {writeResult.steps.length > 0 && (
+                <ul className="mt-1 space-y-0.5">
+                  {writeResult.steps.map((step, index) => (
+                    <li
+                      key={`${step.name}-${index}`}
+                      className="flex items-start gap-1.5 font-mono text-[11px]"
+                      data-testid={`package-write-step-${step.name}`}
+                    >
+                      <span className={step.ok ? "text-emerald-600" : "text-destructive"}>
+                        {step.ok ? "\u2713" : "\u2715"}
+                      </span>
+                      <span className="shrink-0">{step.name}</span>
+                      {step.detail && (
+                        <span className="min-w-0 break-all text-muted-foreground">
+                          {step.detail}
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
           ) : (
             <div className="flex h-full items-center justify-center rounded-lg border border-dashed text-xs text-muted-foreground">
-              操作后此处显示任务输出
+              操作后此处显示结果（安装仍为任务，启动/强停/卸载为设备侧复核结果）
             </div>
           )}
         </div>
