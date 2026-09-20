@@ -8,6 +8,7 @@ use agent_protocol::PermissionInfo;
 use provider::activity::ActivityProvider;
 use provider::device::DeviceProvider;
 use provider::filesystem::FilesystemProvider;
+use provider::frida::FridaProvider;
 use provider::hosted::HostedProvider;
 use provider::package::PackageProvider;
 use provider::process::ProcessesProvider;
@@ -51,5 +52,8 @@ pub fn system_router_with(
     router
         .register(Arc::new(PackageProvider))
         .expect("package provider methods must be unique");
+    router
+        .register(Arc::new(FridaProvider))
+        .expect("frida provider methods must be unique");
     router
 }

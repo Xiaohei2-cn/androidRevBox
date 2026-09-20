@@ -13,24 +13,25 @@ use std::time::Duration;
 
 use agent_protocol::method::{
     ACTIVITY_FORCE_STOP, ACTIVITY_LAUNCH, DEVICE_INFO, DEVICE_ROOT_CHECK, FILESYSTEM_LIST,
-    FILESYSTEM_PREVIEW, FILESYSTEM_STAT, HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS,
-    HOSTED_STOP, PACKAGE_LIST, PACKAGE_NATIVE_LIB_DIR, PACKAGE_REPLACE_NATIVE_LIBRARY,
-    PACKAGE_UNINSTALL, PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
+    FILESYSTEM_PREVIEW, FILESYSTEM_STAT, FRIDA_SERVER_START, FRIDA_SERVER_STATUS,
+    FRIDA_SERVER_STOP, HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP,
+    PACKAGE_LIST, PACKAGE_NATIVE_LIB_DIR, PACKAGE_REPLACE_NATIVE_LIBRARY, PACKAGE_UNINSTALL,
+    PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
 };
-
 use agent_protocol::{
     ActivityForceStopParams, ActivityLaunchParams, DeviceInfoParams, DeviceInfoResult,
     DeviceRootCheckParams, DeviceRootCheckResult, FileKind, FilesystemListParams,
     FilesystemListResult, FilesystemPreviewParams, FilesystemPreviewResult, FilesystemStatParams,
-    FilesystemStatResult, HostedBinaryInfo, HostedChmodParams, HostedChmodResult, HostedListParams,
-    HostedListResult, HostedRunRecord, HostedRunState, HostedStartParams, HostedStartResult,
-    HostedStatusParams, HostedStatusResult, HostedStopParams, HostedStopResult, KillSignal,
-    ListeningPort, PackageListParams, PackageListResult, PackageNativeLibDirParams,
-    PackageNativeLibDirResult, PackageScope, PackageUninstallParams, PackageUninstallResult,
-    PackageWriteResult, PortHoldingProcess, PreviewEncoding, ProcessByPortParams,
-    ProcessByPortResult, ProcessKillParams, ProcessKillResult, ProcessPortsParams,
-    ProcessPortsResult, ReplaceNativeLibraryParams, ReplaceNativeLibraryResult, SO_STAGED_ROOT,
-    SocketFamily,
+    FilesystemStatResult, FridaServerStartParams, FridaServerStartResult, FridaServerStatusParams,
+    FridaServerStatusResult, FridaServerStopParams, FridaServerStopResult, HostedBinaryInfo,
+    HostedChmodParams, HostedChmodResult, HostedListParams, HostedListResult, HostedRunRecord,
+    HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams, HostedStatusResult,
+    HostedStopParams, HostedStopResult, KillSignal, ListeningPort, PackageListParams,
+    PackageListResult, PackageNativeLibDirParams, PackageNativeLibDirResult, PackageScope,
+    PackageUninstallParams, PackageUninstallResult, PackageWriteResult, PortHoldingProcess,
+    PreviewEncoding, ProcessByPortParams, ProcessByPortResult, ProcessKillParams,
+    ProcessKillResult, ProcessPortsParams, ProcessPortsResult, ReplaceNativeLibraryParams,
+    ReplaceNativeLibraryResult, SO_STAGED_ROOT, SocketFamily,
 };
 
 use async_trait::async_trait;
@@ -970,6 +971,22 @@ impl DeviceService {
         Ok(adb::hosted_binaries(&ls_out.stdout, &file_out.stdout))
     }
 
+    /// 只有 Agent 实现、没有 Legacy 对照的能力（AR9.1 的 frida.server.*）：
+    /// 离线路径必须给出「设备页 → 安装/连接 Agent」这种可执行的下一步，
+    /// 不能退化成一个空结果——空状态会被读成「frida-server 没在跑」。
+    fn require_agent_route(&self, serial: &str, method: &str) -> CoreResult<()> {
+        if !matches!(
+            self.android.agent_status(serial).state,
+            crate::models::agent::AgentSessionState::Ready
+                | crate::models::agent::AgentSessionState::Degraded
+        ) {
+            return Err(CoreError::AgentUnavailable(format!(
+                "{method} 只能由 Agent 提供（设备页 → 安装/连接 Agent）；这条能力没有 ADB 回退腿"
+            )));
+        }
+        Ok(())
+    }
+
     /// 托管写操作前置（AR7.2）：Agent 必须在线，且只能走 Agent 通道。
     /// 与 AR6.3 `process_kill` 同一条规则（§3.6 写操作不自动回退），
     /// 这里只是把「检查 + 路由 + 防御」收成一个函数给 chmod/start 共用。
@@ -1891,6 +1908,109 @@ impl DeviceService {
         result
     }
 
+    /// frida-server 状态（AR9.1，只读）。Agent 以 shell 身份即可探测——实测
+    /// `/proc/<pid>/cmdline` 与 `/proc/<pid>/status` 的 `Uid:` 对 shell 可读，
+    /// 所以这一项**不需要 root**；需要 root 的只有 start/stop。
+    ///
+    /// 没有 Legacy 对照（旧实现根本不看设备侧状态），所以 Agent 不在线就是明确错误。
+    pub async fn frida_server_status(&self, serial: &str) -> CoreResult<FridaServerStatusResult> {
+        self.require_agent_route(serial, FRIDA_SERVER_STATUS)?;
+        let params = FridaServerStatusParams {};
+        self.android
+            .agent()
+            .request::<_, FridaServerStatusResult>(
+                serial,
+                FRIDA_SERVER_STATUS,
+                &params,
+                SHORT_CMD_TIMEOUT,
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))
+    }
+
+    /// 以 root 启动 frida-server（AR9.1）。
+    ///
+    /// 两道把关都必要：Agent 在线（写操作不回退）+ 设备 su 可用。后者单独检查是因为
+    /// 「Agent 在、但没 root」是完全可能的组合（未授权 KernelSU），那时应该直接说
+    /// 「需要 root」，而不是发一次注定失败的请求再去解析 su 的错误。
+    pub async fn frida_server_start(
+        &self,
+        serial: &str,
+        binary_name: Option<String>,
+        port: Option<u16>,
+        bind: Option<String>,
+    ) -> CoreResult<FridaServerStartResult> {
+        self.require_agent_write_route(serial, FRIDA_SERVER_START)?;
+        if !self.su_available(serial).await? {
+            return Err(CoreError::Internal(
+                "启动 frida-server 需要 root：设备 su 不可用（shell 身份起来也注入不了其它进程）"
+                    .into(),
+            ));
+        }
+        let operation_id = format!("frida-start-{}", uuid::Uuid::new_v4().simple());
+        let params = FridaServerStartParams {
+            operation_id,
+            binary_name,
+            port,
+            bind,
+        };
+        let result = self
+            .android
+            .agent()
+            .request::<_, FridaServerStartResult>(
+                serial,
+                FRIDA_SERVER_START,
+                &params,
+                SO_REPLACE_TIMEOUT,
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)));
+        audit_frida_server(
+            serial,
+            FRIDA_SERVER_START,
+            &result
+                .as_ref()
+                .map(describe_frida_start)
+                .map_err(|error| error.to_string()),
+        );
+        result
+    }
+
+    /// 停掉 frida-server（AR9.1）。杀 root 属主进程只能走设备侧特权脚本，
+    /// 但脚本前先按 uid 判断：shell 属主的实例 Agent 自己能杀，不该白要一次 root。
+    pub async fn frida_server_stop(
+        &self,
+        serial: &str,
+        binary_name: Option<String>,
+    ) -> CoreResult<FridaServerStopResult> {
+        self.require_agent_write_route(serial, FRIDA_SERVER_STOP)?;
+        let operation_id = format!("frida-stop-{}", uuid::Uuid::new_v4().simple());
+        let params = FridaServerStopParams {
+            operation_id,
+            binary_name,
+        };
+        let result = self
+            .android
+            .agent()
+            .request::<_, FridaServerStopResult>(
+                serial,
+                FRIDA_SERVER_STOP,
+                &params,
+                SO_REPLACE_TIMEOUT,
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)));
+        audit_frida_server(
+            serial,
+            FRIDA_SERVER_STOP,
+            &result
+                .as_ref()
+                .map(describe_frida_stop)
+                .map_err(|error| error.to_string()),
+        );
+        result
+    }
+
     /// 拼 `<verb> <dir>/<name>` 并做名称安全校验（所有托管文件操作共用入口）。
     fn hosted_shell(name: &str, verb: &str) -> CoreResult<String> {
         if !adb::is_safe_hosted_name(name) {
@@ -2328,6 +2448,49 @@ fn audit_package_write(serial: &str, method: &str, pkg: &str, outcome: &Result<S
             "包写操作失败"
         ),
     }
+}
+
+/// frida-server 生命周期审计：它等于「谁能往这台机器上塞一个可注入任意进程的
+/// 常驻服务」，必须留下谁、动了哪个二进制、结果如何。
+fn audit_frida_server(serial: &str, method: &str, outcome: &Result<String, String>) {
+    match outcome.as_ref() {
+        Ok(summary) => tracing::info!(
+            target: "audit",
+            serial,
+            method,
+            backend = "agent",
+            outcome = %summary,
+            "frida-server 生命周期已执行"
+        ),
+        Err(reason) => tracing::warn!(
+            target: "audit",
+            serial,
+            method,
+            backend = "agent",
+            error = %reason,
+            "frida-server 生命周期失败"
+        ),
+    }
+}
+
+fn describe_frida_start(result: &FridaServerStartResult) -> String {
+    format!(
+        "outcome={:?} verified={} pid={:?} uid={:?} {}:{} binary={}",
+        result.outcome,
+        result.verified,
+        result.pid,
+        result.uid,
+        result.bind,
+        result.port,
+        result.binary_name
+    )
+}
+
+fn describe_frida_stop(result: &FridaServerStopResult) -> String {
+    format!(
+        "outcome={:?} verified={} pid={:?} uid={:?} binary={}",
+        result.outcome, result.verified, result.pid, result.uid, result.binary_name
+    )
 }
 
 /// 审计摘要：只留「是否真执行、是否复核、落在哪」，不含文件内容与任何令牌。

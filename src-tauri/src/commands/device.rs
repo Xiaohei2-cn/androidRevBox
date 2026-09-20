@@ -3,8 +3,9 @@
 //! task_id，输出走 task://* 事件流（PHASES §1.3 不阻塞 IPC）。
 
 use agent_protocol::{
-    FilesystemPreviewResult, FilesystemStatResult, HostedRunRecord, HostedStopResult,
-    PackageUninstallResult, PackageWriteResult, ReplaceNativeLibraryResult,
+    FilesystemPreviewResult, FilesystemStatResult, FridaServerStartResult, FridaServerStatusResult,
+    FridaServerStopResult, HostedRunRecord, HostedStopResult, PackageUninstallResult,
+    PackageWriteResult, ReplaceNativeLibraryResult,
 };
 use serde::Deserialize;
 
@@ -331,6 +332,62 @@ pub async fn device_pkg_lib_dir(
     state
         .device
         .pkg_lib_dir(&args.serial, &args.pkg, &args.abi)
+        .await
+}
+
+/// frida-server 状态（AR9.1，只读；Agent 以 shell 身份即可探测，不需要 root）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FridaServerStartArgs {
+    pub serial: String,
+    /// 托管目录里的二进制名（默认 `frida-server`）；**只收文件名，不收路径**
+    #[serde(default)]
+    pub binary_name: Option<String>,
+    /// 监听端口（默认 27042）
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// `127.0.0.1`（默认）或 `0.0.0.0`
+    #[serde(default)]
+    pub bind: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FridaServerStopArgs {
+    pub serial: String,
+    #[serde(default)]
+    pub binary_name: Option<String>,
+}
+
+#[tauri::command]
+pub async fn device_frida_server_status(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+) -> CoreResult<FridaServerStatusResult> {
+    state.device.frida_server_status(&serial).await
+}
+
+/// 以 root 启动 frida-server：Agent 内跑写死的固定脚本，启动后复核「进程在 +
+/// uid=0 + 端口真在 LISTEN」三件事，任一项不过就自动停掉，不留半成品服务。
+#[tauri::command]
+pub async fn device_frida_server_start(
+    state: tauri::State<'_, AppState>,
+    args: FridaServerStartArgs,
+) -> CoreResult<FridaServerStartResult> {
+    state
+        .device
+        .frida_server_start(&args.serial, args.binary_name, args.port, args.bind)
+        .await
+}
+
+#[tauri::command]
+pub async fn device_frida_server_stop(
+    state: tauri::State<'_, AppState>,
+    args: FridaServerStopArgs,
+) -> CoreResult<FridaServerStopResult> {
+    state
+        .device
+        .frida_server_stop(&args.serial, args.binary_name)
         .await
 }
 

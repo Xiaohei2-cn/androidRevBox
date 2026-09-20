@@ -2,7 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowRight, CircleAlert, CircleCheck, Loader2, RadioTower } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { deviceApi, type DeviceEntry } from "@/api/device";
+import {
+  deviceApi,
+  type DeviceEntry,
+  type FridaServerStatus,
+  type FridaServerStartResult,
+} from "@/api/device";
 import { envApi } from "@/api/env";
 import { hookApi, type PreflightDto } from "@/api/hook";
 import { useAppNav, useActiveTab } from "@/app/nav";
@@ -161,6 +166,8 @@ export function SettingsPanel({
         </div>
       </Field>
 
+      {settings.deviceSerial && <FridaServerControl serial={settings.deviceSerial} t={t} />}
+
       <PreflightList preflight={preflight} remoteMode={settings.connMode === "remote"} t={t}
         onFix={(kind) => {
           if (kind === "adb" || kind === "python") gotoConfig(kind === "adb" ? "app.adb.path" : "app.python.path");
@@ -237,6 +244,120 @@ function Segmented<T extends string>({
 }
 
 type FixKind = "adb" | "python" | "frida" | "remote" | "runner" | "frida-server";
+
+/**
+ * 设备侧 frida-server 控制（AR9.1）。
+ *
+ * 以前这一栏只能提示用户「去托管二进制页自己点两下」，而远程模式的失败原因八成就是
+ * 服务没起或不是 root 起的。这里把三件事接进工作台：状态、以 root 启动、停止。
+ * 状态文案刻意区分 `running_as_shell`（连得上但注入不了别人）与 `indeterminate`
+ * （读不到 uid，不猜），因为这两件事的下一步动作完全不同。
+ */
+function FridaServerControl({
+  serial,
+  t,
+}: {
+  serial: string;
+  t: (key: string, vars?: Record<string, string | number>) => string;
+}) {
+  const [busy, setBusy] = useState<"start" | "stop" | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const { data, isError, error, refetch } = useQuery({
+    queryKey: ["frida", "server", serial],
+    queryFn: () => deviceApi.fridaServerStatus(serial),
+    refetchInterval: 15_000,
+  });
+
+  const start = async () => {
+    setBusy("start");
+    setNotice(null);
+    try {
+      const result: FridaServerStartResult = await deviceApi.fridaServerStart(serial);
+      if (result.outcome === "no_op") {
+        setNotice(t("hook.frida.server.alreadyRunning", { pid: result.pid ?? "-" }));
+      } else if (!result.verified) {
+        setNotice(t("hook.frida.server.notVerified"));
+      }
+      await refetch();
+    } catch (e) {
+      setNotice(String((e as Error)?.message ?? e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const stop = async () => {
+    setBusy("stop");
+    setNotice(null);
+    try {
+      await deviceApi.fridaServerStop(serial);
+      await refetch();
+    } catch (e) {
+      setNotice(String((e as Error)?.message ?? e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const describe = (status: FridaServerStatus): { text: string; tone: string } => {
+    switch (status.state) {
+      case "running_as_root":
+        return {
+          text: t("hook.frida.server.asRoot", {
+            pid: status.pid ?? "-",
+            address: `${status.listen_address ?? "127.0.0.1"}:${status.port ?? "-"}`,
+            version: status.version ? ` · frida ${status.version}` : "",
+          }),
+          tone: status.listening ? "text-emerald-500" : "text-amber-500",
+        };
+      case "running_as_shell":
+        return {
+          text: t("hook.frida.server.asShell", { uid: status.uid ?? "-" }),
+          tone: "text-destructive",
+        };
+      case "indeterminate":
+        return { text: t("hook.frida.server.indeterminate"), tone: "text-amber-500" };
+      default:
+        return { text: t("hook.frida.server.notRunning"), tone: "text-muted-foreground" };
+    }
+  };
+
+  const shown: { text: string; tone: string } = isError
+    ? { text: String((error as Error)?.message ?? error), tone: "text-destructive" }
+    : data
+      ? describe(data)
+      : { text: t("common.loading"), tone: "text-muted-foreground" };
+
+  return (
+    <div className="shrink-0 space-y-0.5 rounded bg-muted/30 p-1.5 text-[11px]">
+      <div className="flex items-center gap-1">
+        <RadioTower className="h-3 w-3 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 flex-1 truncate font-medium">{t("hook.frida.server.title")}</span>
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-5 shrink-0 px-1.5 text-[10px]"
+          disabled={busy !== null || !data?.running}
+          onClick={() => void stop()}
+        >
+          {t("hook.frida.server.stop")}
+        </Button>
+        <Button
+          size="sm"
+          className="h-5 shrink-0 px-1.5 text-[10px]"
+          disabled={busy !== null || (data?.running && data?.as_root && data?.listening)}
+          onClick={() => void start()}
+        >
+          {busy === "start" ? t("hook.frida.server.starting") : t("hook.frida.server.start")}
+        </Button>
+      </div>
+      <div className={cn("truncate", shown.tone)} title={shown.text}>
+        {shown.text}
+      </div>
+      {notice && <div className="break-all text-muted-foreground">{notice}</div>}
+    </div>
+  );
+}
 
 function PreflightList({
   preflight,

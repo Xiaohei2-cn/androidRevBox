@@ -266,10 +266,10 @@ export function SoReplacePage() {
             }
           >
             {result.verified
-              ? t("binary.so.success", { target: result.targetPath })
-              : t("binary.so.notVerified", { target: result.targetPath })}
+              ? t("binary.so.success", { target: result.target_path })
+              : t("binary.so.notVerified", { target: result.target_path })}
           </p>
-          {result.rolledBack && (
+          {result.rolled_back && (
             <p className="mt-1 text-amber-500" data-testid="so-replace-rolled-back">
               {t("binary.so.rolledBack")}
             </p>
@@ -291,9 +291,9 @@ export function SoReplacePage() {
               </li>
             ))}
           </ul>
-          {result.backupPath && (
+          {result.backup_path && (
             <p className="mt-1 break-all text-[11px] text-muted-foreground">
-              {t("binary.so.backupKept", { path: result.backupPath })}
+              {t("binary.so.backupKept", { path: result.backup_path })}
             </p>
           )}
         </div>

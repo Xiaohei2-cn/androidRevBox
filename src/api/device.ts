@@ -55,20 +55,20 @@ export interface FileStat {
   kind: FileKind;
   /** 权限位数值（含 setuid/setgid/sticky，不含文件类型位），如 0o755 = 493 */
   mode: number;
-  modeText: string;
+  mode_text: string;
   uid: number;
   gid: number;
   size: number;
   /** Unix epoch 秒；固定单位与时区，前端自己格式化 */
-  mtimeUnix: number;
-  symlinkTarget?: string | null;
+  mtime_unix: number;
+  symlink_target?: string | null;
   /** 当前 Agent 身份能否读内容（目录=能否列举）。false 时不要把 size=0 当成空文件 */
   readable: boolean;
 }
 
 export interface FileStatResult {
   /** 调用方原始输入 */
-  requestedPath: string;
+  requested_path: string;
   /** 规范化（符号链接已解析）后的真实路径 */
   path: string;
   stat: FileStat;
@@ -81,14 +81,17 @@ export interface HostedRunRecord {
   handle: string;
   name: string;
   pid: number;
-  /** `/proc/<pid>/stat` 第 22 字段；PID 被复用时它必然不同 */
-  startTimeTicks: number;
-  startedAtUnix: number;
-  logPath: string;
+  /** `/proc/<pid>/stat` 第 22 字段；PID 被复用时它必然不同。
+   *  ⚠️ 字段名与设备协议 wire 一致（snake_case）：`agent_protocol` 的 DTO 是直接
+   * 跨 IPC 返回的，没有第二套 camelCase 映射层；改这里之前先看
+   *  `src-tauri/tests/ipc_dto_wire_shape.rs`，那个测试钉的就是真实键名。 */
+  start_time_ticks: number;
+  started_at_unix: number;
+  log_path: string;
   root: boolean;
   state: HostedRunState;
   /** 只有 Agent 亲自启动并已回收的进程才有退出码 */
-  exitCode?: number | null;
+  exit_code?: number | null;
   detail?: string | null;
 }
 
@@ -98,9 +101,9 @@ export interface HostedStopResult {
   /** signaled=已发信号；already_gone=目标本来就不在（幂等成功） */
   outcome: "signaled" | "already_gone";
   /** 已用落盘的 start time 核对过：确认杀的就是当初启动的那个进程 */
-  identityVerified: boolean;
+  identity_verified: boolean;
   /** 持久化记录是否已删除（停止成功后不再进重启对账表） */
-  recordDropped: boolean;
+  record_dropped: boolean;
 }
 
 export type PreviewEncoding = "utf8" | "hex";
@@ -110,7 +113,7 @@ export interface FilePreviewResult {
   size: number;
   /** 本次内容在文件中的起始偏移（尾读时非 0） */
   offset: number;
-  returnedBytes: number;
+  returned_bytes: number;
   encoding: PreviewEncoding;
   text?: string | null;
   /** 含 NUL 或非法 UTF-8 时给小写十六进制，不做 lossy 文本转换 */
@@ -170,23 +173,23 @@ export type WriteOutcome = "executed" | "replayed" | "no_op";
 export interface PackageWriteResult {
   action: "launch" | "force_stop" | "uninstall";
   package: string;
-  operationId: string;
+  operation_id: string;
   outcome: WriteOutcome;
   /** 客观复核过：launch 看到新 pid、force_stop 看到 pid 消失 */
   verified: boolean;
   pid?: number;
   detail?: string;
-  ranAsRoot: boolean;
+  ran_as_root: boolean;
 }
 
 /** `package.uninstall` 的返回（AR8.1）。 */
 export interface PackageUninstallResult {
   package: string;
-  operationId: string;
+  operation_id: string;
   outcome: WriteOutcome;
   /** 复核结论：`pm path` 已为空 */
   verified: boolean;
-  keepData: boolean;
+  keep_data: boolean;
   steps: OperationStep[];
   detail?: string;
 }
@@ -201,15 +204,63 @@ export interface OperationStep {
 /** `package.replace_native_library` 的返回（AR8.4）。 */
 export interface ReplaceNativeLibraryResult {
   package: string;
-  targetPath: string;
-  stagedPath: string;
-  operationId: string;
+  target_path: string;
+  staged_path: string;
+  operation_id: string;
   outcome: WriteOutcome;
   verified: boolean;
-  replacedExisting: boolean;
+  replaced_existing: boolean;
   steps: OperationStep[];
-  rolledBack?: boolean;
-  backupPath?: string;
+  rolled_back?: boolean;
+  backup_path?: string;
+  detail?: string;
+}
+
+/** frida-server 的设备侧状态（AR9.1；字段名与协议 wire 一致）。 */
+export type FridaServerState =
+  | "not_running"
+  | "running_as_root"
+  | "running_as_shell"
+  | "indeterminate";
+
+export interface FridaServerStatus {
+  state: FridaServerState;
+  running: boolean;
+  /** 只有真读到 uid=0 才 true */
+  as_root: boolean;
+  binary_name: string;
+  pid?: number;
+  uid?: number;
+  listen_address?: string;
+  port?: number;
+  /** 端口是否真在 LISTEN（进程在 ≠ 监听上） */
+  listening: boolean;
+  version?: string;
+  detail?: string;
+}
+
+export interface FridaServerStartResult {
+  operation_id: string;
+  outcome: WriteOutcome;
+  verified: boolean;
+  binary_name: string;
+  bind: string;
+  port: number;
+  pid?: number;
+  uid?: number;
+  version?: string;
+  steps: OperationStep[];
+  detail?: string;
+}
+
+export interface FridaServerStopResult {
+  operation_id: string;
+  outcome: WriteOutcome;
+  verified: boolean;
+  binary_name: string;
+  pid?: number;
+  uid?: number;
+  steps: OperationStep[];
   detail?: string;
 }
 
@@ -411,6 +462,36 @@ export const deviceApi = {
   ): Promise<ReplaceNativeLibraryResult> {
     return invokeCommand<ReplaceNativeLibraryResult>("device_so_replace", {
       args: { serial, localPath, pkg, abi },
+    });
+  },
+  /** frida-server 状态（AR9.1，只读，Agent 以 shell 身份即可探测） */
+  fridaServerStatus(serial: string): Promise<FridaServerStatus> {
+    return invokeCommand<FridaServerStatus>("device_frida_server_status", { serial });
+  },
+  /**
+   * 以 root 启动 frida-server（AR9.1）。默认只绑 127.0.0.1：远程模式靠 `adb forward`，
+   * 绑 0.0.0.0 等于把可注入任意进程的控制面开放给同网段设备，所以不做成默认。
+   */
+  fridaServerStart(
+    serial: string,
+    opts: { binaryName?: string; port?: number; bind?: string } = {},
+  ): Promise<FridaServerStartResult> {
+    return invokeCommand<FridaServerStartResult>("device_frida_server_start", {
+      args: {
+        serial,
+        binaryName: opts.binaryName ?? null,
+        port: opts.port ?? null,
+        bind: opts.bind ?? null,
+      },
+    });
+  },
+  /** 停掉 frida-server：root 属主进程由设备侧特权脚本按身份核对后停止 */
+  fridaServerStop(
+    serial: string,
+    binaryName?: string,
+  ): Promise<FridaServerStopResult> {
+    return invokeCommand<FridaServerStopResult>("device_frida_server_stop", {
+      args: { serial, binaryName: binaryName ?? null },
     });
   },
   /** 任务状态事件（复用 task 协议） */

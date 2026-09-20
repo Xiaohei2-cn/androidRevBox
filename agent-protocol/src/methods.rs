@@ -30,6 +30,9 @@ pub mod method {
     pub const ACTIVITY_FORCE_STOP: &str = "activity.force_stop";
     pub const PACKAGE_UNINSTALL: &str = "package.uninstall";
     pub const PACKAGE_REPLACE_NATIVE_LIBRARY: &str = "package.replace_native_library";
+    pub const FRIDA_SERVER_STATUS: &str = "frida.server.status";
+    pub const FRIDA_SERVER_START: &str = "frida.server.start";
+    pub const FRIDA_SERVER_STOP: &str = "frida.server.stop";
 }
 
 /// AR8.4：Desktop 用 `adb push` 暂存「主机侧修补好的 so」的**唯一**允许目录。
@@ -37,6 +40,108 @@ pub mod method {
 /// 两侧共用这个常量：Desktop 只往这里推，Agent 只认这里的文件，
 /// 避免「推到 A、校验 B」这种靠文档维持的约定。每次操作再用唯一子目录隔开。
 pub const SO_STAGED_ROOT: &str = "/data/local/tmp/app-reverse-tools-so";
+
+/// frida-server 在设备上的实际状态（AR9.1）。
+///
+/// `running_as_shell` 是**必须单独存在**的一档：shell 身份起的 frida-server 能连上，
+/// 但 attach 不了别的进程，用户会看到「服务在跑却注入不进去」。把它并进 `running`
+/// 就是骗人，所以状态里带 uid 事实而不是一个布尔。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FridaServerState {
+    /// 没找到进程
+    NotRunning,
+    /// 以 uid=0 运行（可用）
+    RunningAsRoot,
+    /// 以非 root 运行（能连不能注入，需要重启）
+    RunningAsShell,
+    /// 进程在但读不到身份（权限或竞态），不得猜成前三种
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FridaServerStatusParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FridaServerStatusResult {
+    pub state: FridaServerState,
+    pub running: bool,
+    /// 只有真读到 uid=0 才是 true；读不到一律 false + `Indeterminate`
+    pub as_root: bool,
+    pub binary_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    /// 从 cmdline 里解析出的 `-l <addr>:<port>`，没有就是 Framework 默认监听
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// `/proc/net/tcp*` 里该端口是否真的处于 LISTEN（进程在 ≠ 监听上）
+    pub listening: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// 启动参数：**只收名字、端口与绑定地址**，路径由设备侧自己在托管目录里解析（D038）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FridaServerStartParams {
+    pub operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// `127.0.0.1`（默认）或 `0.0.0.0`。默认回环是有意的：远程模式靠 `adb forward`，
+    /// 绑 0.0.0.0 等于把 frida 控制面开放给同网段任何设备。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FridaServerStartResult {
+    pub operation_id: String,
+    pub outcome: WriteOutcome,
+    /// 启动后**复核**过：进程在、uid=0、端口在 LISTEN
+    pub verified: bool,
+    pub binary_name: String,
+    pub bind: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub steps: Vec<OperationStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FridaServerStopParams {
+    pub operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FridaServerStopResult {
+    pub operation_id: String,
+    pub outcome: WriteOutcome,
+    /// 复核过进程真的没了（不是「信号发出去了」）
+    pub verified: bool,
+    pub binary_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    pub steps: Vec<OperationStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
 
 /// Zygisk 模块生命周期。`installed_reboot_required` / `loaded` / `bridge_ready` 必须区分，
 /// 「文件已装」不等于「接口可用」（AR5.3 契约）。

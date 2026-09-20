@@ -124,6 +124,75 @@ pub(crate) fn validate_dir(path: &str) -> Result<(), AgentError> {
     Ok(())
 }
 
+/// 托管二进制名白名单（AR9.1）：**只允许文件名**，路径由设备侧自己拼在托管目录里。
+///
+/// 不接受调用方传完整路径是有意的：那样等于让宿主指定「以 root 执行哪个文件」，
+/// 特权层就变成通用执行器了。名字规则同 so 名但去掉 `.so` 约束（`frida-server` 没后缀）。
+pub(crate) fn validate_binary_name(name: &str) -> Result<(), AgentError> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '+'));
+    if ok {
+        Ok(())
+    } else {
+        Err(reject(
+            "invalid_binary_name",
+            format!("二进制名只能是字母数字与 _.-+，不含路径分隔: {name}"),
+        ))
+    }
+}
+
+/// 监听地址与端口（AR9.1）。地址**只收两个确定值**，端口必须 ≥ 1024：
+/// 低端口在 Android 上属特权组所有，root 起的服务也不该占；而多放行一个字符
+/// 就是往脚本里塞未经校验的内容。
+pub(crate) fn validate_listen(addr: &str, port: u16) -> Result<(), AgentError> {
+    if addr != "127.0.0.1" && addr != "0.0.0.0" {
+        return Err(reject(
+            "invalid_bind_address",
+            format!("绑定地址只允许 127.0.0.1 或 0.0.0.0: {addr}"),
+        ));
+    }
+    if port < 1024 {
+        return Err(reject(
+            "privileged_port",
+            format!("端口必须 ≥ 1024，收到 {port}"),
+        ));
+    }
+    Ok(())
+}
+
+/// 以 root 后台拉起 frida-server（AR9.1）。
+///
+/// `nohup setsid ... &` 是实测形状：直接后台起的进程会随 su 会话结束一起没了，
+/// setsid 脱离会话 + PPID 交给 init 才活得下来（Pixel 6 实测 `Uid 0 / PPID 1`）。
+/// 脚本**不负责判断成功**—— pid、uid、LISTEN 全部由 Rust 侧复核，
+/// 因为 `$!` 拿到的是 setsid 的 pid，与最终服务 pid 不保证相同。
+pub(crate) fn frida_start_script(name: &str, addr: &str, port: u16, log: &str) -> String {
+    format!(
+        "cd /data/local/tmp; : > {log}; chmod 666 {log}; \
+         test -x ./{name}; nohup setsid ./{name} -l {addr}:{port} > {log} 2>&1 & \
+         sleep 1; echo FRIDA_STARTED"
+    )
+}
+
+/// 以 root 停掉 frida-server（AR9.1）：**先核身份再杀**。
+///
+/// 逐个 `pidof` 结果都重新读一次 cmdline，避免 pid 复用杀错进程；
+/// 读不到身份的（别人的进程挤在同一名字下）只报不杀。
+pub(crate) fn frida_stop_script(name: &str) -> String {
+    format!(
+        "FOUND=0; DENIED=0; for P in $(pidof {name} 2>/dev/null); do FOUND=1; \
+         A=$(tr '\\0' ' ' < /proc/$P/cmdline 2>/dev/null | cut -d' ' -f1); A=${{A##*/}}; \
+         if [ \"$A\" = \"{name}\" ]; then kill $P 2>/dev/null || DENIED=1; else DENIED=1; fi; \
+         done; if [ $FOUND = 0 ]; then echo FRIDA_NOT_RUNNING; \
+         elif [ $DENIED = 1 ]; then echo FRIDA_KILL_DENIED; else echo FRIDA_STOPPED; fi"
+    )
+}
+
 /// 参数被拒：`invalid_request` + `reason`。让 Desktop/测试能分清「形状不对」与
 /// 「设备不让做」，而不是把所有失败糊成一句 internal。
 fn reject(reason: &str, message: impl Into<String>) -> AgentError {

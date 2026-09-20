@@ -2536,6 +2536,278 @@ mod tests {
         None
     }
 
+    /// AR9.1 真机腿：frida-server 全生命周期（root 起 / 状态 / 停 / 幂等 / 越权参数）。
+    ///
+    /// 刻意用**非默认端口**（27043）跑，避免和用户自己的工作流（27042）撞车；
+    /// 并且开头先确认这台机上没有正在跑的 frida-server——有就跳过，
+    /// 我们不能为了测试把用户正在用的注入服务停掉。
+    #[tokio::test]
+    #[ignore = "真机腿（会 root 起停 frida-server）；AR9_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_frida_server -- --ignored --nocapture"]
+    async fn real_agent_frida_server_lifecycle_round_trip() {
+        use agent_protocol::method::{FRIDA_SERVER_START, FRIDA_SERVER_STATUS, FRIDA_SERVER_STOP};
+        use agent_protocol::{
+            ErrorCode, FridaServerStartParams, FridaServerStartResult, FridaServerState,
+            FridaServerStatusParams, FridaServerStatusResult, FridaServerStopParams,
+            FridaServerStopResult, WriteOutcome,
+        };
+
+        let serial = std::env::var("AR9_TEST_SERIAL").expect("AR9_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        let environment = runner.environment().await;
+        let adb_path = environment.path.expect("本机应有 adb");
+        let sh = |command: String| {
+            let runner = runner.clone();
+            let adb_path = adb_path.clone();
+            let serial = serial.clone();
+            async move {
+                runner
+                    .run(
+                        &adb_path,
+                        &adb::build_args(Some(&serial), &adb::cmd_shell(&command)),
+                        Duration::from_secs(20),
+                    )
+                    .await
+                    .unwrap()
+                    .stdout
+            }
+        };
+        let status = || {
+            let client = client.clone();
+            async move {
+                client
+                    .request::<_, FridaServerStatusResult>(
+                        FRIDA_SERVER_STATUS,
+                        &FridaServerStatusParams {},
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("frida.server.status 应返回结构化状态")
+            }
+        };
+
+        // 前置一：二进制必须在托管目录里（没有就没什么可测的）
+        let listed = sh("ls -l /data/local/tmp/frida-server 2>&1".to_string()).await;
+        if !listed.contains("frida-server") {
+            eprintln!("[跳过] /data/local/tmp/frida-server 不存在，本腿无靶子: {listed}");
+            manager.disconnect(&serial).await.unwrap();
+            return;
+        }
+        // 前置二：不能停掉用户正在用的服务
+        let before = status().await;
+        if before.running {
+            eprintln!(
+                "[跳过] 设备上已有 frida-server 在跑（pid={:?} uid={:?} state={:?}），本腿不会把它停掉",
+                before.pid, before.uid, before.state
+            );
+            manager.disconnect(&serial).await.unwrap();
+            return;
+        }
+        assert_eq!(before.state, FridaServerState::NotRunning);
+        assert!(!before.as_root && !before.listening);
+        eprintln!("[frida] 起点：未运行；版本探测={:?}", before.version);
+
+        // ① 越权参数必须被结构化拒绝（低端口 / 非白名单地址 / 带路径的名字）
+        for params in [
+            serde_json::json!({"operation_id": "ar91-a", "port": 22}),
+            serde_json::json!({"operation_id": "ar91-b", "bind": "localhost"}),
+            serde_json::json!({"operation_id": "ar91-c", "binary_name": "../frida-server"}),
+            serde_json::json!({"operation_id": "", "port": 27043}),
+        ] {
+            let error = client
+                .request::<_, FridaServerStartResult>(
+                    FRIDA_SERVER_START,
+                    &params,
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect_err("非法参数必须被拒");
+            let error = match error {
+                crate::services::agent_client::AgentClientError::Remote(error) => error,
+                other => panic!("期望结构化错误，实际 {other:?}"),
+            };
+            assert_eq!(error.code, ErrorCode::InvalidRequest, "{params:?}");
+        }
+
+        // ② 以 root 起（非默认端口，避免撞用户工作流）
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let start_op = format!("ar91-start-{stamp}");
+        let started: FridaServerStartResult = client
+            .request(
+                FRIDA_SERVER_START,
+                &FridaServerStartParams {
+                    operation_id: start_op.clone(),
+                    binary_name: Some("frida-server".into()),
+                    port: Some(27043),
+                    bind: Some("127.0.0.1".into()),
+                },
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("以 root 启动 frida-server 应成功");
+        eprintln!(
+            "[frida.start] outcome={:?} verified={} pid={:?} uid={:?} version={:?} steps={:?}",
+            started.outcome,
+            started.verified,
+            started.pid,
+            started.uid,
+            started.version,
+            started
+                .steps
+                .iter()
+                .map(|s| (s.name.as_str(), s.ok))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(started.outcome, WriteOutcome::Executed);
+        assert!(
+            started.verified,
+            "三项复核必须全过，步骤链 {:?}",
+            started.steps
+        );
+        assert_eq!(
+            started.uid,
+            Some(0),
+            "起不来 root 就该失败，不能报 verified=true"
+        );
+        assert!(started.pid.unwrap_or(0) > 0);
+        assert!(
+            started.steps.iter().all(|step| step.ok),
+            "成功路径每步都得 ok: {:?}",
+            started.steps
+        );
+
+        // ③ 独立复核（不信 Agent 自证）：设备侧自己看 pid / uid / LISTEN
+        let pid = started.pid.expect("启动结果必须带回 pid");
+        let fact = sh(format!(
+            "grep -m1 '^Uid:' /proc/{pid}/status 2>&1; tr '\\0' ' ' < /proc/{pid}/cmdline 2>&1"
+        ))
+        .await;
+        eprintln!(
+            "[frida] 设备侧复核 pid={pid}: {}",
+            fact.replace('\n', " | ")
+        );
+        assert!(fact.contains("Uid:	0"), "必须是 root 进程: {fact}");
+        assert!(
+            fact.contains("27043"),
+            "cmdline 应带上我们指定的端口: {fact}"
+        );
+        let listening = sh("netstat -tln 2>/dev/null | grep -c 27043".to_string()).await;
+        assert_eq!(listening.trim(), "1", "端口必须真在 LISTEN");
+
+        let after = status().await;
+        eprintln!(
+            "[frida.status] state={:?} pid={:?} uid={:?} addr={:?} port={:?} listening={}",
+            after.state, after.pid, after.uid, after.listen_address, after.port, after.listening
+        );
+        assert_eq!(after.state, FridaServerState::RunningAsRoot);
+        assert!(after.running && after.as_root && after.listening);
+        assert_eq!(after.pid, Some(pid));
+        assert_eq!(after.port, Some(27043));
+        assert_eq!(after.listen_address.as_deref(), Some("127.0.0.1"));
+        assert!(after.version.is_some(), "版本号应能带回（17.x）");
+
+        // ④ 幂等：同 id 重发必须是 replayed；换新 id 必须是 no_op（不启第二个）
+        let replay: FridaServerStartResult = client
+            .request(
+                FRIDA_SERVER_START,
+                &FridaServerStartParams {
+                    operation_id: start_op.clone(),
+                    binary_name: Some("frida-server".into()),
+                    port: Some(27043),
+                    bind: Some("127.0.0.1".into()),
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("重发应返回已知结果");
+        assert_eq!(replay.outcome, WriteOutcome::Replayed);
+        assert_eq!(replay.pid, started.pid, "复用结果不得变成另一个进程");
+        let again: FridaServerStartResult = client
+            .request(
+                FRIDA_SERVER_START,
+                &FridaServerStartParams {
+                    operation_id: format!("ar91-start-again-{stamp}"),
+                    binary_name: Some("frida-server".into()),
+                    port: Some(27043),
+                    bind: Some("127.0.0.1".into()),
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("已在跑时不该报错，而是 no_op");
+        eprintln!(
+            "[frida.start] 二次调用 outcome={:?} verified={} pid={:?}",
+            again.outcome, again.verified, again.pid
+        );
+        assert_eq!(again.outcome, WriteOutcome::NoOp);
+        assert_eq!(again.pid, Some(pid), "不该起第二个实例");
+        let pids = sh("pidof frida-server".to_string()).await;
+        assert_eq!(
+            pids.split_whitespace().count(),
+            1,
+            "设备上只该有一个 frida-server: {pids}"
+        );
+
+        // ⑤ 停：root 属主进程只能由设备侧特权脚本杀，且必须复核消失
+        let stopped: FridaServerStopResult = client
+            .request(
+                FRIDA_SERVER_STOP,
+                &FridaServerStopParams {
+                    operation_id: format!("ar91-stop-{stamp}"),
+                    binary_name: Some("frida-server".into()),
+                },
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("停止应成功");
+        eprintln!(
+            "[frida.stop] outcome={:?} verified={} pid={:?} uid={:?}",
+            stopped.outcome, stopped.verified, stopped.pid, stopped.uid
+        );
+        assert_eq!(stopped.outcome, WriteOutcome::Executed);
+        assert!(stopped.verified, "必须复核到进程消失");
+        assert_eq!(stopped.pid, Some(pid));
+        assert_eq!(stopped.uid, Some(0), "停之前读到的 uid 要如实带回");
+        let gone = status().await;
+        assert_eq!(gone.state, FridaServerState::NotRunning);
+        assert!(!gone.running && !gone.listening);
+        assert_eq!(
+            sh("netstat -tln 2>/dev/null | grep -c 27043".to_string())
+                .await
+                .trim(),
+            "0",
+            "端口必须已释放"
+        );
+
+        // ⑥ 再停一次：no_op + verified（已经是期望状态）
+        let again: FridaServerStopResult = client
+            .request(
+                FRIDA_SERVER_STOP,
+                &FridaServerStopParams {
+                    operation_id: format!("ar91-stop-again-{stamp}"),
+                    binary_name: Some("frida-server".into()),
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("已停时不该报错");
+        assert_eq!(again.outcome, WriteOutcome::NoOp);
+        assert!(again.verified);
+
+        sh("rm -f /data/local/tmp/frida-server.artool.log".to_string()).await;
+        manager.disconnect(&serial).await.unwrap();
+        eprintln!("[frida] 全周期通过：起→复核→幂等→停→端口释放");
+    }
+
     /// AR9.1 前置真机腿：root 探测改由 Agent 执行后，结论必须与 Legacy `su -c id`
     /// 一致，而且要把「su 可用」与「Agent 自身有 root」分开带回——UI 之前把这两件事
     /// 混成一个绿色徽章，正是 D026 那批 `root=true` 支路必须留在 Legacy 的原因。

@@ -725,11 +725,11 @@ function FilesView({ serial }: { serial: string | null }) {
           )}
           {stat.data && (
             <p className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-muted-foreground">
-              <span className="font-mono">{stat.data.stat.modeText}</span>
+              <span className="font-mono">{stat.data.stat.mode_text}</span>
               <span>{stat.data.stat.kind}</span>
               <span>uid:gid {stat.data.stat.uid}:{stat.data.stat.gid}</span>
               <span>{formatSize(stat.data.stat.size)}</span>
-              <span>mtime {formatEpoch(stat.data.stat.mtimeUnix)}</span>
+              <span>mtime {formatEpoch(stat.data.stat.mtime_unix)}</span>
               <span className={stat.data.stat.readable ? undefined : "text-destructive"}>
                 {stat.data.stat.readable ? "可读" : "不可读（权限不足，不代表内容为空）"}
               </span>
@@ -743,7 +743,7 @@ function FilesView({ serial }: { serial: string | null }) {
           {preview.data && (
             <div className="mt-2">
               <p className="text-muted-foreground">
-                预览 {preview.data.returnedBytes} / {formatSize(preview.data.size)}
+                预览 {preview.data.returned_bytes} / {formatSize(preview.data.size)}
                 {preview.data.offset > 0 && `（偏移 ${preview.data.offset}）`}
                 {preview.data.truncated && "，已截断"}
                 {preview.data.encoding === "hex" && "，二进制按 hex 显示"}
@@ -1112,7 +1112,7 @@ export function AppsView({ serial }: { serial: string | null }) {
                 () => deviceApi.uninstall(serial, selectedApp.packageName),
                 "卸载",
                 (r) =>
-                  `${selectedApp.packageName} 已卸载 · 数据${"keepData" in r && r.keepData ? "保留" : "一并清除"}`,
+                  `${selectedApp.packageName} 已卸载 · 数据${"keep_data" in r && r.keep_data ? "保留" : "一并清除"}`,
                 // 卸成功（含幂等命中）就自己刷清单：以前这条链靠任务完成事件，现在没有卡了
                 (r) => {
                   if (r.outcome !== "executed" || r.verified) void refetch();

@@ -122,7 +122,7 @@ export function BinaryHosting() {
       const next = rows.map((row) => {
         const mine = runs
           .filter((r: HostedRunRecord) => r.name === row.name)
-          .sort((a, b) => b.startedAtUnix - a.startedAtUnix);
+          .sort((a, b) => b.started_at_unix - a.started_at_unix);
         const live = mine.find((r) => r.state === "running");
         if (live) {
           return {
@@ -266,7 +266,7 @@ export function BinaryHosting() {
           row.pid ?? undefined,
         );
         // 核过身份才算「确认杀的就是它」；未核过时把详情显示出来，不静默当成成功
-        if (!stopped.identityVerified && stopped.outcome === "signaled") {
+        if (!stopped.identity_verified && stopped.outcome === "signaled") {
           patchRow(row.name, {
             pid: null,
             running: false,

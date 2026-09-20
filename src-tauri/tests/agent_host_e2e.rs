@@ -130,9 +130,9 @@ async fn host_agent_full_lifecycle() {
             .await
             .expect("hello must succeed");
         assert_eq!(hello.protocol_version, 1);
-        assert_eq!(hello.providers.len(), 8);
-        // AR8.4 加 package.replace_native_library：27 项能力。
-        assert_eq!(hello.capabilities.len(), 27);
+        assert_eq!(hello.providers.len(), 9);
+        // AR8.4 加 package.replace_native_library、AR9.1 加 frida.server.*：30 项能力。
+        assert_eq!(hello.capabilities.len(), 30);
         assert!(
             hello.capabilities.iter().any(|capability| capability.method
                 == agent_protocol::method::ACTIVITY_FOREGROUND
@@ -165,6 +165,9 @@ async fn host_agent_full_lifecycle() {
                 agent_protocol::method::PACKAGE_REPLACE_NATIVE_LIBRARY,
                 "package",
             ),
+            (agent_protocol::method::FRIDA_SERVER_STATUS, "frida"),
+            (agent_protocol::method::FRIDA_SERVER_START, "frida"),
+            (agent_protocol::method::FRIDA_SERVER_STOP, "frida"),
             (agent_protocol::method::ACTIVITY_LAUNCH, "activity"),
             (agent_protocol::method::ACTIVITY_FORCE_STOP, "activity"),
             (agent_protocol::method::DEVICE_ROOT_CHECK, "shell"),

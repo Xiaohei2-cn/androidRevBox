@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod device;
 pub mod filesystem;
+pub mod frida;
 pub mod hosted;
 pub(crate) mod operations;
 pub mod package;
