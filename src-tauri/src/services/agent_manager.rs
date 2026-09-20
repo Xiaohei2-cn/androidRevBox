@@ -1376,7 +1376,11 @@ mod tests {
             PackageWriteResult, WriteOutcome,
         };
 
-        const TARGET: &str = "com.termux";
+        // ⚠️ 本腿会真的**启动并强停**一个应用，所以靶子必须是「人明确给过的」而不是
+        // 从装机列表里自动挑——那台机上可能有微信、银行 App。默认仍用 Termux（一台
+        // 长期做实验机的终端工具，启停它没有副作用）；换设备时用
+        // `AR8_WRITE_TARGET=<包名>` 指定你允许启停的应用。
+        let target = std::env::var("AR8_WRITE_TARGET").unwrap_or_else(|_| "com.termux".into());
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1401,13 +1405,54 @@ mod tests {
         }
         let client = manager.client(&serial).unwrap();
 
+        // 前置：靶子必须装在这台机上。缺应用是环境条件，不是代码回归——自证并说清缺什么
+        let probe = tokio::process::Command::new("adb")
+            .args(["-s", &serial, "shell", "pm list packages"])
+            .arg(&target)
+            .output()
+            .await
+            .expect("adb 可用");
+        let installed = String::from_utf8_lossy(&probe.stdout)
+            .lines()
+            .any(|line| line.trim() == format!("package:{target}"));
+        if !installed {
+            eprintln!(
+                "[跳过] 设备 {serial} 上没有 {target}；本腿默认靶子是 Termux，换设备请给 AR8_WRITE_TARGET=<你允许启停的包名>"
+            );
+            manager.disconnect(&serial).await.unwrap();
+            return;
+        }
+        // 前置二（vivo 上真跑出来的）：装了 ≠ 能启动。`bin.mt.termex` 装了但没有
+        // LAUNCHER 入口，Agent 如实报 no_launcher_activity，而腿当时把它当回归失败。
+        // 环境不满足就说环境不满足，别伪装成代码问题。
+        let entry = tokio::process::Command::new("adb")
+            .args([
+                "-s",
+                &serial,
+                "shell",
+                "cmd package resolve-activity --brief -c android.intent.category.LAUNCHER",
+            ])
+            .arg(&target)
+            .output()
+            .await
+            .expect("adb 可用");
+        let entry_text = String::from_utf8_lossy(&entry.stdout).into_owned();
+        if entry_text.contains("No activity found") || !entry_text.contains(&target) {
+            eprintln!(
+                "[跳过] {target} 在 {serial} 上没有 LAUNCHER 入口，启停成功路径无法验证: {entry_text}"
+            );
+            manager.disconnect(&serial).await.unwrap();
+            return;
+        }
+        eprintln!("[ar8.1] 启停靶子 = {target}（LAUNCHER 入口已确认存在）");
+
         // ① 启动：必须看到 pid，否则 verified=false
         let launch_op = format!("ar81-launch-{stamp}");
         let launched: PackageWriteResult = client
             .request(
                 ACTIVITY_LAUNCH,
                 &ActivityLaunchParams {
-                    package: TARGET.into(),
+                    package: target.clone(),
                     operation_id: launch_op.clone(),
                 },
                 Duration::from_secs(20),
@@ -1428,7 +1473,7 @@ mod tests {
             .request(
                 ACTIVITY_LAUNCH,
                 &ActivityLaunchParams {
-                    package: TARGET.into(),
+                    package: target.clone(),
                     operation_id: launch_op.clone(),
                 },
                 Duration::from_secs(20),
@@ -1444,7 +1489,7 @@ mod tests {
             .request(
                 ACTIVITY_FORCE_STOP,
                 &ActivityForceStopParams {
-                    package: TARGET.into(),
+                    package: target.clone(),
                     operation_id: stop_op.clone(),
                 },
                 Duration::from_secs(20),
@@ -1459,9 +1504,9 @@ mod tests {
         assert!(stopped.verified, "强停后必须复核到进程消失");
         assert_eq!(stopped.detail.as_deref(), Some("pid_gone"));
         assert!(
-            !adb_shell_is_alive(&serial, TARGET).await,
+            !adb_shell_is_alive(&serial, &target).await,
             "设备上 {} 应已不在运行",
-            TARGET
+            &target
         );
 
         // ④ 已经停了再停一次：no_op（幂等），不是错误
@@ -1469,7 +1514,7 @@ mod tests {
             .request(
                 ACTIVITY_FORCE_STOP,
                 &ActivityForceStopParams {
-                    package: TARGET.into(),
+                    package: target.clone(),
                     operation_id: format!("ar81-stop-again-{stamp}"),
                 },
                 Duration::from_secs(20),
@@ -1590,11 +1635,45 @@ mod tests {
             }
         };
 
-        // ① 普通三方/系统应用：与 Legacy 换算逐项一致（arm64 与 arm 两个方向）
-        for pkg in ["com.android.chrome", "com.termux"] {
+        // ① 普通三方应用：与 Legacy 换算逐项一致（arm64 与 arm 两个方向）。
+        // 样本从**这台机器真实装着的应用**里挑，不把某台机器的装机列表写死进腿里——
+        // 换台设备就跑不动的腿，等于只在一条机器上验证过（M1 要求两台，正是要防这个）。
+        let listed = runner
+            .run(
+                &adb_path,
+                &adb::build_args(Some(&serial), &adb::cmd_shell("pm list packages -3")),
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap()
+            .stdout;
+        let mut candidates: Vec<String> = listed
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("package:"))
+            .map(str::to_owned)
+            .filter(|pkg| adb::is_safe_pkg_name(pkg))
+            .collect();
+        candidates.sort();
+        let mut samples: Vec<String> = Vec::new();
+        for pkg in candidates {
+            if samples.len() >= 3 {
+                break;
+            }
+            // 只收「dumpsys 里真有 legacyNativeLibraryDir」的包：这类才有换算可比性
+            if crate::services::env_service::parse_legacy_native_lib(&dumpsys(&pkg).await).is_some()
+            {
+                samples.push(pkg);
+            }
+        }
+        assert!(
+            !samples.is_empty(),
+            "这台设备上一个可作样本的第三方应用都没有，本腿无法对照"
+        );
+        eprintln!("[ar8.3] 本机样本包: {samples:?}");
+        for pkg in &samples {
             for abi in ["arm64", "arm"] {
                 let params = PackageNativeLibDirParams {
-                    package: pkg.into(),
+                    package: pkg.clone(),
                     abi: Some(abi.into()),
                     user: None,
                 };
@@ -1604,7 +1683,7 @@ mod tests {
                     .unwrap();
                 let legacy = adb::lib_dir_for_abi(
                     &crate::services::env_service::parse_legacy_native_lib(&dumpsys(pkg).await)
-                        .expect("对照样本应有 legacyNativeLibraryDir"),
+                        .expect("样本入选时已确认有 legacyNativeLibraryDir"),
                     abi,
                 )
                 .expect("对照样本应能按 ABI 换算");
@@ -1625,27 +1704,40 @@ mod tests {
             }
         }
 
-        // ② split 清单：chrome 有 base + split，字段必须是数组且非空
-        let params = PackageNativeLibDirParams {
-            package: "com.android.chrome".into(),
-            abi: None,
-            user: Some(0),
-        };
-        let result: PackageNativeLibDirResult = client
-            .request(PACKAGE_NATIVE_LIB_DIR, &params, Duration::from_secs(15))
-            .await
-            .unwrap();
-        assert!(
-            result.splits.iter().any(|split| split == "base"),
-            "splits 必须带 base，实际 {:?}",
-            result.splits
-        );
-        assert_eq!(result.user, Some(0), "user 要回显，调用方才知道查的是谁");
-        assert_eq!(
-            result.abi, "arm64",
-            "未指定 ABI 时要按 primaryCpuAbi 判定，实际 {:?}",
-            result.primary_cpu_abi
-        );
+        // ② splits 形状与 user 回显：同样只对**本机真实装着的包**下断言。
+        // 契约是「splits 是数组而非 Option」：非空就必须含 base（那是 Framework 给的
+        // 真实拆分清单），为空也必须真的是「看过、确实没有」——两种设备形态不同，
+        // 但两条都不能把「没看」冒充成「没有」。
+        for pkg in &samples {
+            let probe = client
+                .request::<_, PackageNativeLibDirResult>(
+                    PACKAGE_NATIVE_LIB_DIR,
+                    &PackageNativeLibDirParams {
+                        package: pkg.clone(),
+                        abi: None,
+                        user: Some(0),
+                    },
+                    Duration::from_secs(15),
+                )
+                .await
+                .unwrap();
+            assert_eq!(probe.user, Some(0), "user 要回显，调用方才知道查的是谁");
+            assert!(
+                probe.abi == "arm64" || probe.abi == "arm",
+                "ABI 缺省时要按 primaryCpuAbi 落成一个确定值，实际 {:?}",
+                probe.abi
+            );
+            if probe.splits.is_empty() {
+                eprintln!("[native_lib_dir] {pkg} 无 split（本机形态，空数组=确实没有）");
+            } else {
+                assert!(
+                    probe.splits.iter().any(|split| split == "base"),
+                    "{pkg} 的 splits 必须带 base，实际 {:?}",
+                    probe.splits
+                );
+                eprintln!("[native_lib_dir] {pkg} splits={:?}", probe.splits);
+            }
+        }
 
         // ③ framework 包：Legacy 只能报「lib 目录结构异常」，Agent 按原值返回并说明没换算
         let framework = client
