@@ -1817,9 +1817,17 @@ mod tests {
             "成功路径每一步都该 ok，实际 {:?}",
             result.steps
         );
+        // 判「还在不在」只能用 `package:` 前缀：第三方包路径里天然带 `==`，
+        // 系统包路径又不带 `=`——拿字符猜会两头都判错（真机踩过的坑）。
+        let path_out = adb(format!("pm path {target}")).await;
+        let path_lines: Vec<&str> = path_out
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("package:"))
+            .collect();
         assert!(
-            !adb(format!("pm path {target}")).await.contains('='),
-            "设备上 pm path 应已为空"
+            path_lines.is_empty(),
+            "设备上 pm path 仍指向安装包: {path_lines:?}"
         );
         assert!(
             !adb(format!("pm list packages {target}"))
