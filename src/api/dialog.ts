@@ -22,6 +22,23 @@ export async function pickFile(
   return typeof picked === "string" ? picked : null;
 }
 
+/**
+ * 多选文件（AR8.2）：split 应用的 APK 是一组文件（`base.apk` + `split_config.*.apk`），
+ * 单选一个装不上——真机实测 `adb install -r base.apk` 直接
+ * `INSTALL_FAILED_MISSING_SPLIT`。取消返回 null。
+ */
+export async function pickFiles(
+  opts: {
+    title?: string;
+    defaultPath?: string;
+    filters?: { name: string; extensions: string[] }[];
+  } = {},
+): Promise<string[] | null> {
+  if (!hasTauri()) return null;
+  const picked = await open({ multiple: true, directory: false, ...opts });
+  return Array.isArray(picked) ? picked : null;
+}
+
 /** 选择单个目录；取消返回 null */
 export async function pickDirectory(title?: string): Promise<string | null> {
   if (!hasTauri()) return null;

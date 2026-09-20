@@ -354,8 +354,12 @@ export const deviceApi = {
   shell(serial: string, command: string): Promise<string> {
     return invokeCommand<string>("device_shell", { args: { serial, command } });
   },
-  install(serial: string, apkPath: string): Promise<string> {
-    return invokeCommand<string>("device_install", { args: { serial, apkPath } });
+  /**
+   * 安装：多件即 split 套件，设备侧会自动改用 `adb install-multiple -r`（AR8.2 方案 A）。
+   * 仍是长操作 → 返回 task_id，输出走 task:// 事件流。
+   */
+  install(serial: string, apkPaths: string[]): Promise<string> {
+    return invokeCommand<string>("device_install", { args: { serial, apkPaths } });
   },
   /**
    * 卸载（AR8.1 收尾）：Agent typed 结果 + 步骤链，**不产任务卡**。

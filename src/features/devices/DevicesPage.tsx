@@ -21,7 +21,7 @@ import { useI18n } from "@/i18n";
 import { PathText } from "@/components/ui/PathText";
 import { BrandIcon } from "@/components/ui/BrandIcon";
 import { cn } from "@/lib/utils";
-import { pickDirectory } from "@/api/dialog";
+import { pickDirectory, pickFiles } from "@/api/dialog";
 
 /**
  * 设备页（P3）：设备列表/信息/Shell/文件/应用/Logcat 六个分 tab。
@@ -788,7 +788,8 @@ function FilesView({ serial }: { serial: string | null }) {
 export function AppsView({ serial }: { serial: string | null }) {
   const { t } = useI18n();
   const [selectedApp, setSelectedApp] = useState<ZygiskAppItem | null>(null);
-  const [apkPath, setApkPath] = useState("");
+  /** 待安装 APK 列表：>1 件即 split 套件（AR8.2） */
+  const [apkPaths, setApkPaths] = useState<string[]>([]);
   const [context, setContext] = useState<{ x: number; y: number; app: ZygiskAppItem } | null>(null);
   const [exporting, setExporting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -1125,20 +1126,45 @@ export function AppsView({ serial }: { serial: string | null }) {
         </div>
         <div className="flex items-center gap-2">
           <input
-            value={apkPath}
-            onChange={(e) => setApkPath(e.target.value)}
-            placeholder="本机 APK 路径（P7 接原生选择器）"
+            value={apkPaths[0] ?? ""}
+            onChange={(e) => setApkPaths(e.target.value ? [e.target.value] : [])}
+            placeholder="本机 APK 路径；split 应用请用旁边按钮多选"
             className="h-8 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           />
           <Button
             size="sm"
-            disabled={!apkPath.trim()}
-            onClick={() => void runAction(() => deviceApi.install(serial, apkPath.trim()), "安装")}
+            variant="outline"
+            onClick={() =>
+              void pickFiles({
+                title: "选择 APK（split 套件可多选 base + split_config.*）",
+                filters: [{ name: "APK (*.apk)", extensions: ["apk"] }],
+              }).then((picked) => {
+                if (picked?.length) setApkPaths(picked);
+              })
+            }
+          >
+            <PackageOpen className="h-3.5 w-3.5" />
+            选多个…
+          </Button>
+          <Button
+            size="sm"
+            disabled={apkPaths.length === 0}
+            onClick={() =>
+              void runAction(
+                () => deviceApi.install(serial, apkPaths.map((p) => p.trim()).filter(Boolean)),
+                "安装",
+              )
+            }
           >
             <Upload className="h-3.5 w-3.5" />
             安装
           </Button>
         </div>
+        {apkPaths.length > 1 && (
+          <p className="text-xs text-muted-foreground">
+            已选 {apkPaths.length} 个 APK，将用 install-multiple 一次装入（split 应用必须整套）
+          </p>
+        )}
         {notice && <p className="text-xs text-muted-foreground">{notice}</p>}
         <div className="min-h-0 flex-1">
           {action ? (

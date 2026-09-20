@@ -395,21 +395,21 @@ pub async fn device_shell(
 #[serde(rename_all = "camelCase")]
 pub struct InstallArgs {
     pub serial: String,
-    /// 本机 APK 路径（P0 约束：选择文件在 P7 由原生 dialog 完成，本阶段直接传路径）
-    pub apk_path: String,
+    /// 本机 APK 路径列表：**多件即 split 套件**（base + split_config.*），
+    /// 单件时行为与迁移前完全一致（AR8.2）
+    pub apk_paths: Vec<String>,
 }
 
+/// 安装：仍走 `adb install`（AR8.2 方案 A 定案），多件自动换 `install-multiple`。
+/// 长操作产任务卡（与 push/shell 同类），不在此列的「不留卡」口径之内（D041）。
 #[tauri::command]
 pub async fn device_install(
     state: tauri::State<'_, AppState>,
     args: InstallArgs,
 ) -> CoreResult<String> {
-    if args.apk_path.trim().is_empty() || !std::path::Path::new(&args.apk_path).exists() {
-        return Err(CoreError::Internal("APK 文件不存在".to_string()));
-    }
     state
         .device
-        .start_install(&args.serial, &args.apk_path)
+        .start_install(&args.serial, &args.apk_paths)
         .await
 }
 

@@ -1937,8 +1937,28 @@ impl DeviceService {
             .await
     }
 
-    pub async fn start_install(&self, serial: &str, local_apk: &str) -> CoreResult<String> {
-        self.adb_task("adb.install", Some(serial), &adb::cmd_install(local_apk))
+    /// 安装（AR8.2 实测后定案：**保留 `adb install` 作传输层特例**，见 D042）。
+    ///
+    /// 只修实测暴露的真缺陷——split 套件必须走 `install-multiple`。设备侧会话安装
+    /// （方案 B）实测不比 A 快、错误文案同源，唯一优势是「取消后可 abandon 回收会话」，
+    /// 那一点不足以推翻稳定的 `adb install`，已作为 typed 能力记进 §10。
+    pub async fn start_install(&self, serial: &str, apks: &[String]) -> CoreResult<String> {
+        adb::check_install_paths(apks).map_err(CoreError::Internal)?;
+        let missing: Vec<&String> = apks
+            .iter()
+            .filter(|path| !std::path::Path::new(path).is_file())
+            .collect();
+        if !missing.is_empty() {
+            return Err(CoreError::Internal(format!(
+                "APK 文件不存在: {}",
+                missing
+                    .iter()
+                    .map(|path| path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        self.adb_task("adb.install", Some(serial), &adb::cmd_install_apks(apks))
             .await
     }
 
@@ -3234,6 +3254,148 @@ mod tests {
             eprintln!("[real] adb 未检测到：{}", env.hint.unwrap_or_default());
             assert!(!env.installed);
         }
+    }
+
+    /// AR8.2 真机腿（**非破坏**：同版本 `install -r` 原地重装，数据不动）：
+    /// 钉住「split 套件必须整套装」这条实测结论，并且必须用产品用的同一条命令构造
+    /// （`adb::cmd_install_apks`），否则测的是 adb 而不是我们的代码。
+    ///
+    /// 需要三个环境变量：`AR82_TEST_SERIAL`、`AR82_APK_DIR`（目录内放该应用**全部**
+    /// APK：base + 各 split_config.*）、`AR82_CONFIRM=yes`。可选 `AR82_CORRUPT=<文件>`
+    /// 追加一条错误可读性检查（拿改坏一件的套件装，必须看到 PackageManager 的原文理由）。
+    #[tokio::test]
+    #[ignore = "真机腿；AR82_TEST_SERIAL=<serial> AR82_APK_DIR=<目录> AR82_CONFIRM=yes cargo test -p app-reverse-tools real_adb_install -- --ignored --nocapture"]
+    async fn real_adb_install_multiple_handles_split_apk_set() {
+        let serial = std::env::var("AR82_TEST_SERIAL").unwrap_or_default();
+        let dir = std::env::var("AR82_APK_DIR").unwrap_or_default();
+        if serial.is_empty()
+            || dir.is_empty()
+            || std::env::var("AR82_CONFIRM").unwrap_or_default() != "yes"
+        {
+            eprintln!("[跳过] 本腿需要 AR82_TEST_SERIAL + AR82_APK_DIR + AR82_CONFIRM=yes");
+            return;
+        }
+        let mut apks: Vec<String> = std::fs::read_dir(&dir)
+            .expect("AR82_APK_DIR 必须可读")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("apk"))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|v| v.to_str())
+                    .is_some_and(|name| !name.contains("corrupt"))
+            })
+            .map(|path| path.display().to_string())
+            .collect();
+        apks.sort();
+        assert!(!apks.is_empty(), "{dir} 里没有 APK");
+        eprintln!("[ar8.2] 待装 APK {} 件: {:?}", apks.len(), apks);
+
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner = RealAdbRunner::new(config);
+        let env = runner.environment().await;
+        let path = env.path.expect("本机应有 adb");
+        let run = |subcommand: Vec<String>| {
+            let runner = &runner;
+            let path = path.clone();
+            let serial = serial.clone();
+            async move {
+                runner
+                    .run(
+                        &path,
+                        &adb::build_args(Some(&serial), &subcommand),
+                        Duration::from_secs(300),
+                    )
+                    .await
+                    .expect("adb install 应可执行")
+            }
+        };
+
+        // ① 目标包（从第一个 APK 文件名推不出包名，直接问设备上的现有安装）
+        let listed = run(adb::cmd_shell("pm list packages -3")).await;
+        let before: Vec<String> = listed
+            .stdout
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("package:"))
+            .map(str::to_owned)
+            .collect();
+
+        // ② 用产品的命令构造装一次：多件必须是 install-multiple
+        let built = adb::cmd_install_apks(&apks);
+        let verb = built.first().map(String::as_str).unwrap_or_default();
+        assert_eq!(
+            verb,
+            if apks.len() == 1 {
+                "install"
+            } else {
+                "install-multiple"
+            },
+            "命令选择错了：{built:?}"
+        );
+        let started = std::time::Instant::now();
+        let installed = run(built).await;
+        let elapsed = started.elapsed();
+        let text = format!("{} {}", installed.stdout.trim(), installed.stderr.trim());
+        eprintln!(
+            "[ar8.2] install-multiple rc={:?} 用时={} ms 输出={text}",
+            installed.exit_code,
+            elapsed.as_millis()
+        );
+        assert!(
+            installed.exit_code == Some(0) && text.contains("Success"),
+            "整套 split 应当装成功，实际: {text}"
+        );
+
+        // ③ 装完设备仍在、第三方包数量不减（同版本 -r 是原地重装）
+        let after = run(adb::cmd_shell("pm list packages -3")).await;
+        let after_list: Vec<String> = after
+            .stdout
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("package:"))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            after_list.len() >= before.len(),
+            "重装后第三方包数量反而少了: {} → {}",
+            before.len(),
+            after_list.len()
+        );
+
+        // ④ 反例：单拿 base.apk 装 split 应用必须失败，且理由要说得清（产品的老行为）
+        let base_only = apks.iter().find(|apk| {
+            apk.rsplit('/')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("base.apk"))
+        });
+        if let Some(base) = base_only {
+            let single = run(adb::cmd_install_apks(std::slice::from_ref(base))).await;
+            let text = format!("{} {}", single.stdout.trim(), single.stderr.trim());
+            eprintln!(
+                "[ar8.2] 只装 base.apk rc={:?} 输出={text}",
+                single.exit_code
+            );
+            assert_ne!(single.exit_code, Some(0), "单件装 split 应用本该失败");
+            assert!(
+                text.contains("INSTALL_FAILED_MISSING_SPLIT") || apks.len() == 1,
+                "失败理由必须是可读的 MISSING_SPLIT，实际: {text}"
+            );
+        }
+
+        // ⑤ 可选：坏件的错误可读性（方案 A/B 文案同源，这条同时约束两条路）
+        if let Ok(corrupt) = std::env::var("AR82_CORRUPT") {
+            let mut mixed = apks.clone();
+            mixed.pop();
+            mixed.push(corrupt);
+            let failed = run(adb::cmd_install_apks(&mixed)).await;
+            let text = format!("{} {}", failed.stdout.trim(), failed.stderr.trim());
+            eprintln!("[ar8.2] 坏件 rc={:?} 输出={text}", failed.exit_code);
+            assert_ne!(failed.exit_code, Some(0), "坏件必须装失败");
+            assert!(
+                text.contains("INSTALL_"),
+                "必须把 PackageManager 的原始理由带回给用户，实际: {text}"
+            );
+        }
+        eprintln!("[ar8.2] 结论：install-multiple 整套可用；单件 MISSING_SPLIT 可读");
     }
 
     /// AR8.4：Desktop 侧的入参把关必须与设备侧同形，而且不合法就不该算出暂存路径。

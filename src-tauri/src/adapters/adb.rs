@@ -808,6 +808,54 @@ pub fn cmd_uninstall(pkg: &str) -> Vec<String> {
 pub fn cmd_install(apk: &str) -> Vec<String> {
     vec!["install".into(), "-r".into(), apk.into()]
 }
+
+/// 安装一批 APK：1 件走 `install -r`，多件走 `install-multiple -r`。
+///
+/// 这条不是架构偏好，是 AR8.2 真机测出来的：Play 装来的应用（亚马逊购物 3 件、
+/// 176 MB）用 `adb install -r base.apk` **必败** ——
+/// `Failure [INSTALL_FAILED_MISSING_SPLIT: Missing split for ...]`，
+/// 而 `install-multiple -r` 三件一起就 `Success`。产品此前只有单件入口，
+/// 等于对绝大多数外部 APK 报「装不上」，却被读成「这台机的问题」。
+pub fn cmd_install_apks(apks: &[String]) -> Vec<String> {
+    let head: Vec<String> = if apks.len() == 1 {
+        ["install", "-r"].into_iter().map(str::to_owned).collect()
+    } else {
+        ["install-multiple", "-r"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut args = head;
+    args.extend(apks.iter().cloned());
+    args
+}
+
+/// 安装路径列表校验。规则只有三条，且**故意不管空格**：我们是参数数组执行、不过 shell，
+/// macOS 上「Application Support」这类路径合法，砍掉空格等于砍掉真实用户目录。
+/// 真正要防的是把路径写成 adb 的选项（`-t`、`--babi`、`--no-streaming`…）与空参数。
+pub fn check_install_paths(apks: &[String]) -> Result<(), String> {
+    if apks.is_empty() {
+        return Err("至少要有一个 APK 路径".into());
+    }
+    if apks.len() > 100 {
+        return Err(format!("一次最多 100 个 APK，收到 {}", apks.len()));
+    }
+    for apk in apks {
+        let trimmed = apk.trim();
+        if trimmed.is_empty() {
+            return Err("APK 路径为空".into());
+        }
+        if trimmed.starts_with('-') {
+            return Err(format!(
+                "APK 路径不能以 - 开头（会被当成 adb 选项）: {trimmed}"
+            ));
+        }
+        if trimmed.chars().any(|c| c == '\0' || c == '\n') {
+            return Err("APK 路径含换行或空字符".into());
+        }
+    }
+    Ok(())
+}
 pub fn cmd_push(local: &str, remote: &str) -> Vec<String> {
     vec!["push".into(), local.into(), remote.into()]
 }
@@ -1196,6 +1244,42 @@ mod tests {
         assert_eq!(cmd_logcat(None), ["logcat"]);
         assert_eq!(cmd_logcat(Some("  ")), ["logcat"]);
         assert_eq!(cmd_install("/tmp/a.apk"), ["install", "-r", "/tmp/a.apk"]);
+    }
+
+    /// AR8.2 实测：单件与多件必须分别走 install / install-multiple，
+    /// 且参数顺序是 `[-r, 路径...]`——路径不能混进选项位。
+    #[test]
+    fn install_uses_multiple_only_when_there_are_several_apks() {
+        let one = vec!["/tmp/a.apk".to_string()];
+        assert_eq!(cmd_install_apks(&one), ["install", "-r", "/tmp/a.apk"]);
+        let many = vec![
+            "/tmp/a/base.apk".to_string(),
+            "/tmp/a/split_config.arm64_v8a.apk".to_string(),
+            "/tmp/dir with space/基.apk".to_string(),
+        ];
+        assert_eq!(
+            cmd_install_apks(&many),
+            [
+                "install-multiple",
+                "-r",
+                "/tmp/a/base.apk",
+                "/tmp/a/split_config.arm64_v8a.apk",
+                "/tmp/dir with space/基.apk"
+            ]
+        );
+        assert!(
+            check_install_paths(&many).is_ok(),
+            "带空格与非 ASCII 的路径合法"
+        );
+        for bad in [
+            vec![],
+            vec!["   ".to_string()],
+            vec!["/tmp/a.apk".to_string(), "--no-streaming".to_string()],
+            vec!["-t".to_string()],
+            vec!["a\nb.apk".to_string()],
+        ] {
+            assert!(check_install_paths(&bad).is_err(), "{bad:?} 必须被拒");
+        }
         assert_eq!(cmd_push("/a", "/b/c"), ["push", "/a", "/b/c"]);
         assert_eq!(cmd_list_packages(true).last().unwrap(), "-3");
         assert_eq!(cmd_launch("com.x")[3], "com.x");
