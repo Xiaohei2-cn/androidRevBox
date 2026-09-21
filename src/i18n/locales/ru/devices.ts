@@ -19,6 +19,8 @@ export default {
   "devices.agent.version": "Версия Agent",
   "devices.agent.protocol": "Протокол",
   "devices.agent.providers": "Провайдеры",
+  "devices.agent.legacyFallbacks": "Откаты на ADB",
+  "devices.agent.legacyFallbackNone": "нет (всё через Agent)",
   "devices.agent.capabilities": "Возможности",
   "devices.agent.route": "Последний маршрут",
   "devices.agent.backend.agent": "Agent",

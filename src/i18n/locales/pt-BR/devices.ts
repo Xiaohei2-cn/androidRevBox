@@ -19,6 +19,8 @@ export default {
   "devices.agent.version": "Versão do Agent",
   "devices.agent.protocol": "Protocolo",
   "devices.agent.providers": "Providers",
+  "devices.agent.legacyFallbacks": "Retornos ao ADB",
+  "devices.agent.legacyFallbackNone": "nenhum (tudo via Agent)",
   "devices.agent.capabilities": "Recursos",
   "devices.agent.route": "Última rota",
   "devices.agent.backend.agent": "Agent",

@@ -35,6 +35,22 @@ pub struct AgentDiagnostics {
     pub health: Option<HealthResult>,
     pub health_error: Option<String>,
     pub routes: Vec<AgentRouteDiagnostics>,
+    /// 本次运行里**真的走过** Legacy ADB 回退的累计次数（按能力+原因分开计）。
+    ///
+    /// 为什么专门加这个：AR12 要删回退腿，而"能不能删"不该靠"我印象里现在都走 Agent"
+    /// 回答。`routes` 只保留每个能力最近一次决策、看不出频率；这里是累计计数，
+    /// 让删除决定变成可观察的事实：计数为 0 的能力才可以安全砍掉。
+    pub legacy_fallbacks: Vec<LegacyFallbackTotal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyFallbackTotal {
+    pub method: String,
+    pub reason: String,
+    pub count: u64,
+    /// 登记的删除条件（来自 Legacy 能力表）；没登记为 None
+    pub removal_stage: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

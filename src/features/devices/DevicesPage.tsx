@@ -412,7 +412,9 @@ function DeviceFullCard({ serial, transport }: { serial: string; transport: stri
   );
 }
 
-function AgentSessionSection({ serial }: { serial: string }) {
+/* 导出以便 M1 页面回归渲染（内部仍按原样使用）。 */
+/* 导出供 M1 页面回归渲染使用；内部用法不变。 */
+export function AgentSessionSection({ serial }: { serial: string }) {
   const { t } = useI18n();
   const queryClient = useQueryClient();
   const queryKey = ["agent", "diagnostics", serial] as const;
@@ -466,6 +468,24 @@ function AgentSessionSection({ serial }: { serial: string }) {
           <div className="contents">
             <dt className="text-muted-foreground">{t("devices.agent.providers")}</dt>
             <dd>{status.providers.length}</dd>
+          </div>
+          <div className="contents">
+            <dt className="text-muted-foreground">{t("devices.agent.legacyFallbacks")}</dt>
+            {/* 计数为 0 才是"可以删回退腿"的证据；有数字就说明这台机仍在靠 ADB 兜底 */}
+            <dd
+              className={
+                (data?.legacyFallbacks?.length ?? 0) > 0
+                  ? "font-mono text-amber-500"
+                  : "font-mono text-muted-foreground"
+              }
+              data-testid="agent-legacy-fallbacks"
+            >
+              {(data?.legacyFallbacks ?? []).length === 0
+                ? t("devices.agent.legacyFallbackNone")
+                : (data?.legacyFallbacks ?? [])
+                    .map((f) => `${f.method} × ${f.count}（${f.reason}）`)
+                    .join(" · ")}
+            </dd>
           </div>
           <div className="contents">
             <dt className="text-muted-foreground">{t("devices.agent.capabilities")}</dt>

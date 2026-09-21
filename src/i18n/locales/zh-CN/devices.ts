@@ -19,6 +19,8 @@ export default {
   "devices.agent.version": "Agent 版本",
   "devices.agent.protocol": "协议版本",
   "devices.agent.providers": "Provider",
+  "devices.agent.legacyFallbacks": "ADB 回退次数",
+  "devices.agent.legacyFallbackNone": "无（全部走 Agent）",
   "devices.agent.capabilities": "能力",
   "devices.agent.route": "最近路由",
   "devices.agent.backend.agent": "Agent",

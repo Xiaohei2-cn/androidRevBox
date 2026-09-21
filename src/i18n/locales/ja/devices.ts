@@ -19,6 +19,8 @@ export default {
   "devices.agent.version": "Agent バージョン",
   "devices.agent.protocol": "プロトコル",
   "devices.agent.providers": "Provider",
+  "devices.agent.legacyFallbacks": "ADB フォールバック回数",
+  "devices.agent.legacyFallbackNone": "なし（すべて Agent 経由）",
   "devices.agent.capabilities": "機能",
   "devices.agent.route": "最新ルート",
   "devices.agent.backend.agent": "Agent",

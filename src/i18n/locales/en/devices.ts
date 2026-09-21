@@ -19,6 +19,8 @@ export default {
   "devices.agent.version": "Agent version",
   "devices.agent.protocol": "Protocol",
   "devices.agent.providers": "Providers",
+  "devices.agent.legacyFallbacks": "ADB fallbacks",
+  "devices.agent.legacyFallbackNone": "none (all via Agent)",
   "devices.agent.capabilities": "Capabilities",
   "devices.agent.route": "Last route",
   "devices.agent.backend.agent": "Agent",

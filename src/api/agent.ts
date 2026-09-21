@@ -58,6 +58,16 @@ export interface AgentDiagnostics {
   health?: AgentHealth | null;
   healthError?: string | null;
   routes: AgentRouteDiagnostics[];
+  /** 本次会话里**真的走过** ADB 回退的累计次数（AR12 删除决定的依据） */
+  legacyFallbacks: LegacyFallbackTotal[];
+}
+
+export interface LegacyFallbackTotal {
+  method: string;
+  reason: string;
+  count: number;
+  /** 登记的删除条件，来自 Legacy 能力表 */
+  removalStage?: string | null;
 }
 
 export interface AgentRouteDiagnostics {

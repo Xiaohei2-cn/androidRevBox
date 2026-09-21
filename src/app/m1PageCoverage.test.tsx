@@ -61,8 +61,13 @@ vi.mock("@/app/nav", () => ({
   useActiveTab: () => true,
 }));
 vi.mock("@/hooks/useDragDropPath", () => ({ useDragDropPath: vi.fn() }));
+const agentMocks = vi.hoisted(() => ({ diagnostics: vi.fn(), install: vi.fn(), restart: vi.fn() }));
+vi.mock("@/api/agent", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/api/agent")>();
+  return { ...actual, agentApi: { ...actual.agentApi, ...agentMocks } };
+});
 
-import { DevicesPage } from "@/features/devices/DevicesPage";
+import { AgentSessionSection, DevicesPage } from "@/features/devices/DevicesPage";
 import { BinaryHosting } from "@/features/adb/BinaryHosting";
 import { ForwardManager } from "@/features/adb/ForwardManager";
 import { ProcPorts } from "@/features/adb/ProcPorts";
@@ -252,5 +257,58 @@ describe("任务中心", () => {
     // 详情里的退出码来自 typed 字段（不是解析任务名得来的）
     await waitFor(() => expect(document.body.textContent).toContain("退出码"));
     expect(document.body.textContent).toMatch(/1/);
+  });
+});
+
+describe("设备页 Agent 诊断 · Legacy 回退计数（AR12 的删除依据）", () => {
+  const base = {
+    status: {
+      serial: "PIXEL-1",
+      state: "ready",
+      agentVersion: "0.2.1",
+      protocolVersion: 1,
+      artifactSha256: "aa",
+      capabilities: [
+        { method: "package.list", version: 1, provider: "shell", available: true, probePending: false },
+      ],
+      providers: [
+        { name: "shell", version: "0.2.1", health: "ready", requiredPermissions: ["shell"], lastError: null },
+      ],
+      lastError: null,
+    },
+    health: null,
+    healthError: null,
+    routes: [],
+  };
+
+  it("计数为 0 时明确写\"全部走 Agent\"（这才是可删回退的证据）", async () => {
+    agentMocks.diagnostics.mockResolvedValue({ ...base, legacyFallbacks: [] });
+    renderPage(<AgentSessionSection serial="PIXEL-1" />);
+    const row = await screen.findByTestId("agent-legacy-fallbacks");
+    expect(row.textContent).toContain("无（全部走 Agent）");
+  });
+
+  it("走过回退时按能力与原因分别显示次数", async () => {
+    agentMocks.diagnostics.mockResolvedValue({
+      ...base,
+      legacyFallbacks: [
+        {
+          method: "package.list",
+          reason: "agent_unavailable",
+          count: 3,
+          removalStage: "AR12.1 after AR5.5",
+        },
+        {
+          method: "device.info",
+          reason: "unsupported_method",
+          count: 1,
+          removalStage: "AR12.1 after AR5.2",
+        },
+      ],
+    });
+    renderPage(<AgentSessionSection serial="PIXEL-1" />);
+    const row = await screen.findByTestId("agent-legacy-fallbacks");
+    expect(row.textContent).toContain("package.list × 3（agent_unavailable）");
+    expect(row.textContent).toContain("device.info × 1（unsupported_method）");
   });
 });

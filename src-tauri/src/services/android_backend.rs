@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use crate::core::error::{CoreError, CoreResult};
 use crate::models::agent::{
     AgentRouteDiagnostics, AgentSessionState, AgentSessionStatus, AndroidBackendSource,
+    LegacyFallbackTotal,
 };
 use crate::services::agent_client::AgentClientError;
 use crate::services::agent_manager::AgentManager;
@@ -288,6 +289,8 @@ pub struct CapabilityRouter {
     agent: AgentBackend,
     legacy: LegacyAdbBackend,
     routes: Mutex<HashMap<(String, String), AgentRouteDiagnostics>>,
+    /// `(设备, 能力, 原因) -> 累计次数`，见 `LegacyFallbackTotal` 的注释
+    fallback_totals: Mutex<HashMap<(String, String, String), u64>>,
 }
 
 impl CapabilityRouter {
@@ -300,6 +303,7 @@ impl CapabilityRouter {
             agent: AgentBackend::new(manager),
             legacy: LegacyAdbBackend::new(runner, legacy_capabilities),
             routes: Mutex::new(HashMap::new()),
+            fallback_totals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -378,6 +382,33 @@ impl CapabilityRouter {
         }
     }
 
+    /// 某台设备累计的 Legacy 回退次数：AR12 删除决定的依据。
+    pub fn fallback_totals_for_serial(&self, serial: &str) -> Vec<LegacyFallbackTotal> {
+        let mut totals: Vec<LegacyFallbackTotal> = self
+            .fallback_totals
+            .lock()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter(|((device, _, _), _)| device == serial)
+                    .map(|((_, method, reason), count)| LegacyFallbackTotal {
+                        method: method.clone(),
+                        reason: reason.clone(),
+                        count: *count,
+                        removal_stage: self.legacy.removal_stage(method).map(str::to_owned),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        totals.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.method.cmp(&right.method))
+        });
+        totals
+    }
+
     pub fn routes_for_serial(&self, serial: &str) -> Vec<AgentRouteDiagnostics> {
         let mut routes: Vec<_> = self
             .routes
@@ -451,14 +482,28 @@ impl CapabilityRouter {
             agent_version: status.agent_version,
             protocol_version: status.protocol_version,
         };
+        if let Ok(mut totals) = self.fallback_totals.lock() {
+            *totals
+                .entry((
+                    serial.to_owned(),
+                    method.to_owned(),
+                    fallback_reason.as_str().to_owned(),
+                ))
+                .or_insert(0) += 1;
+        }
+        // 进审计流（target="audit"）：一次静默降级就是一条该被看见的事件。
+        // §3.7 原本只要求"写操作必审计"，这里补的是另一半——**悄悄退回旧实现**
+        // 改变的是"用户拿到的答案来自谁"，同样必须留痕。
         tracing::warn!(
+            target: "audit",
             serial,
             method,
             reason = fallback_reason.as_str(),
+            backend = "legacy_adb",
             agent_version = ?decision.agent_version,
             protocol_version = ?decision.protocol_version,
             removal_stage = self.legacy.removal_stage(method),
-            "Android capability routed to Legacy ADB fallback"
+            "Android 能力走了 Legacy ADB 回退"
         );
         self.record(serial, method, decision.clone());
         Ok(decision)
@@ -566,6 +611,81 @@ mod tests {
             runner,
             Arc::new(AgentArtifactResolver::new(config, None)),
         ))
+    }
+    /// AR12 的第一步是"把删除决定变成可观察的事实"：回退一旦发生就要被计数，
+    /// 而且要按 (能力, 原因) 分开——`agent_unavailable` 与 `unsupported_method`
+    /// 的处置完全不同（前者要装/连 Agent，后者是 Agent 版本旧）。
+    #[tokio::test]
+    async fn legacy_fallbacks_are_counted_per_method_and_reason() {
+        let runner: Arc<dyn AdbRunner> = Arc::new(MockAdbRunner::new(true));
+        let router = CapabilityRouter::new(
+            manager(runner.clone()),
+            runner.clone(),
+            [LegacyCapability::new("package.list", "AR12.1 after AR5.5")],
+        );
+        assert!(
+            router.fallback_totals_for_serial("serial-a").is_empty(),
+            "起点必须干净"
+        );
+        for _ in 0..3 {
+            let decision = router
+                .select(
+                    "serial-a",
+                    "package.list",
+                    OperationKind::ReadOnlyIdempotent,
+                )
+                .unwrap();
+            assert_eq!(decision.backend, AndroidBackendSource::LegacyAdb);
+        }
+        let totals = router.fallback_totals_for_serial("serial-a");
+        assert_eq!(totals.len(), 1, "同一能力同一原因该合成一条: {totals:?}");
+        assert_eq!(totals[0].method, "package.list");
+        assert_eq!(totals[0].reason, "agent_unavailable");
+        assert_eq!(totals[0].count, 3);
+        assert_eq!(
+            totals[0].removal_stage.as_deref(),
+            Some("AR12.1 after AR5.5"),
+            "计数要自带删除条件，看的人不用再翻能力表"
+        );
+        // 换原因（Agent 在线但不支持该方法）另起一条，不与上面的混在一起
+        let router2 = CapabilityRouter::new(
+            manager(runner.clone()),
+            runner.clone(),
+            [LegacyCapability::new("package.list", "AR12.1 after AR5.5")],
+        );
+        let _ = router2.select(
+            "serial-b",
+            "package.list",
+            OperationKind::ReadOnlyIdempotent,
+        );
+        assert_eq!(
+            router2.fallback_totals_for_serial("serial-c").len(),
+            0,
+            "别的设备不该串进来"
+        );
+    }
+
+    /// 被"写操作不回退"规则**拒绝**的调用不算回退：它没有真的退回旧实现，
+    /// 记进去会让 AR12 的删除依据说谎。
+    #[tokio::test]
+    async fn refused_mutating_fallback_is_not_counted_as_a_fallback() {
+        let runner: Arc<dyn AdbRunner> = Arc::new(MockAdbRunner::new(true));
+        let router = CapabilityRouter::new(
+            manager(runner.clone()),
+            runner,
+            [LegacyCapability::new("package.uninstall", "AR12.1")],
+        );
+        let error = router
+            .select("serial-a", "package.uninstall", OperationKind::Mutating)
+            .expect_err("写操作不得回退");
+        assert!(
+            matches!(error, RouteError::MutatingFallbackForbidden(_)),
+            "{error:?}"
+        );
+        assert!(
+            router.fallback_totals_for_serial("serial-a").is_empty(),
+            "被拒绝的路由不该被计成一次真实回退"
+        );
     }
 
     fn ready_status(available: bool) -> AgentSessionStatus {
@@ -768,6 +888,66 @@ mod tests {
             decision.fallback_reason,
             Some(FallbackReason::UnsupportedMethod)
         );
+    }
+
+    /// AR12 的机读闸门（真机，`AR12_TEST_SERIAL`）：已迁移的能力必须**全部路由到 Agent**，
+    /// 且这台设备在本次会话里**一次 Legacy 回退都没发生**。
+    ///
+    /// 为什么值得单独一条腿：AR12 要删回退腿，而"能不能删"以前只能靠人回忆"最近是不是
+    /// 都走 Agent 了"。这里把它变成一个会红的断言——只要有任何一项还掉回退，就会以
+    /// `fallback_totals_for_serial` 非空的形式报出来，附带能力名、原因和登记的删除条件。
+    #[tokio::test]
+    #[ignore = "需要真机；AR12_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_router -- --ignored --nocapture"]
+    async fn real_router_sends_every_migrated_capability_to_agent() {
+        use crate::db::Db;
+        use crate::services::agent_artifact::AgentArtifactResolver;
+        use crate::services::config_service::ConfigService;
+        use crate::services::device_service::RealAdbRunner;
+
+        let Some(serial) = std::env::var("AR12_TEST_SERIAL")
+            .ok()
+            .filter(|v| !v.is_empty())
+        else {
+            eprintln!("[跳过] 本腿需要 AR12_TEST_SERIAL=<serial>");
+            return;
+        };
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = Arc::new(crate::services::agent_manager::AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config, None)),
+        ));
+        manager
+            .connect_resolved(&serial)
+            .await
+            .expect("Agent 应能安装并连上（真机）");
+        let router = CapabilityRouter::new(manager.clone(), runner, default_legacy_capabilities());
+
+        for capability in default_legacy_capabilities() {
+            let decision = router
+                .select(
+                    &serial,
+                    &capability.method,
+                    OperationKind::ReadOnlyIdempotent,
+                )
+                .unwrap_or_else(|error| panic!("{} 路由失败: {error:?}", capability.method));
+            assert_eq!(
+                decision.backend,
+                AndroidBackendSource::Agent,
+                "{} 仍在走 Legacy 回退",
+                capability.method
+            );
+        }
+        let totals = router.fallback_totals_for_serial(&serial);
+        assert!(
+            totals.is_empty(),
+            "本次会话出现了 Legacy 回退，AR12 还不能删这些腿: {totals:?}"
+        );
+        eprintln!(
+            "[ar12] {} 项已迁移能力全部路由到 Agent，本次会话零 Legacy 回退",
+            default_legacy_capabilities().len()
+        );
+        manager.disconnect(&serial).await.unwrap();
     }
 
     #[test]

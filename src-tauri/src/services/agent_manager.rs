@@ -328,6 +328,7 @@ impl AgentManager {
                 status: AgentSessionStatus::disconnected(serial),
                 health: None,
                 health_error: Some("invalid device serial".into()),
+                legacy_fallbacks: Vec::new(),
                 routes: Vec::new(),
             };
         }
@@ -347,6 +348,7 @@ impl AgentManager {
                     .or_else(|| Some("Agent session is not connected".into())),
                 status,
                 health: None,
+                legacy_fallbacks: Vec::new(),
                 routes: Vec::new(),
             };
         };
@@ -355,6 +357,7 @@ impl AgentManager {
                 status: session.status(),
                 health: Some(health),
                 health_error: None,
+                legacy_fallbacks: Vec::new(),
                 routes: Vec::new(),
             },
             Err(error) => {
@@ -364,6 +367,7 @@ impl AgentManager {
                     status: session.status(),
                     health: None,
                     health_error: Some(error.to_string()),
+                    legacy_fallbacks: Vec::new(),
                     routes: Vec::new(),
                 }
             }

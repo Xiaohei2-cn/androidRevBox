@@ -58,6 +58,7 @@ pub async fn agent_diagnostics(
     let serial = serial.trim();
     let mut diagnostics = state.agent.diagnostics(serial).await;
     diagnostics.routes = state.android.routes_for_serial(serial);
+    diagnostics.legacy_fallbacks = state.android.fallback_totals_for_serial(serial);
     Ok(diagnostics)
 }
 
