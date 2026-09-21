@@ -160,6 +160,21 @@ pub enum ZygiskLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ZygiskStatusParams {}
 
+/// 模块自描述的 handler（AR10.2）。桌面端不拼私有协议，只看这份声明：
+/// 每条方法的预算与「当前是否被熔断」是可核对的事实，而不是模块里的黑话。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleHandlerInfo {
+    pub cmd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    pub target: String,
+    pub permission: String,
+    pub timeout_ms: u64,
+    pub max_response_bytes: u64,
+    pub cancellable: bool,
+    pub fused: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZygiskStatusResult {
     pub lifecycle: ZygiskLifecycle,
@@ -181,6 +196,11 @@ pub struct ZygiskStatusResult {
     pub sub_protocol_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_latency_ms: Option<u64>,
+    /// 模块声明的 handler 注册表（AR10.2）。**故意不跳过空数组**：
+    /// 空数组=「问过了，模块没有 `handlers` 能力」（旧模块），字段缺失=「这个 Agent
+    /// 版本压根没问过」——排障时这两种情况要能分开，所以不能用 skip_serializing_if。
+    #[serde(default)]
+    pub module_handlers: Vec<ModuleHandlerInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -1117,6 +1137,7 @@ mod tests {
             device_locale: Some("zh-Hans-CN".into()),
             sub_protocol_version: 1,
             probe_latency_ms: Some(4),
+            module_handlers: Vec::new(),
             detail: None,
         };
         let value = serde_json::to_value(result).unwrap();
@@ -1124,6 +1145,17 @@ mod tests {
         assert_eq!(value["module_id"], "applist");
         assert_eq!(value["sub_protocol_version"], 1);
         assert_eq!(value.get("detail"), None);
+        // handler 注册表即使为空也必须在线上传过去：空数组=「问过了，模块没有」，
+        // 字段缺失=「这个 Agent 版本没问」。少了这条断言，以后有人加
+        // skip_serializing_if 就会把两种情况糊成一个。
+        assert_eq!(
+            value["module_handlers"]
+                .as_array()
+                .expect("必须有线上字段")
+                .len(),
+            0,
+            "空注册表也要序列化出来"
+        );
     }
 
     #[test]

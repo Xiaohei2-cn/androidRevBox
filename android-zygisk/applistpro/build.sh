@@ -27,4 +27,4 @@ rm -f applistpro.zip
 
 echo "==> 4/4 完成: $(pwd)/applistpro.zip"
 echo "    安装: adb push applistpro.zip /data/local/tmp && adb shell su -c 'ksud module install /data/local/tmp/applistpro.zip' && adb reboot"
-echo "    令牌: /data/adb/modules/applistpro/token (0600 root) —— Agent 侧读取后经 H 握手使用"
+echo "    令牌: /data/adb/applistpro.token (0600 root，模块目录内那份是兼容镜像) —— Agent 读取后经 H 握手使用"

@@ -12,10 +12,11 @@ use agent_protocol::method::{
     PACKAGE_EXPORT_APK, PACKAGE_EXPORT_CLEAN, PACKAGE_LIST_LOCALIZED, ZYGISK_STATUS,
 };
 use agent_protocol::{
-    AgentError, ErrorCode, LabelSource, LocalizedPackageItem, PackageExportApkParams,
-    PackageExportApkResult, PackageExportCleanParams, PackageExportCleanResult,
-    PackageListLocalizedParams, PackageListLocalizedResult, PackageScope, PackageWarning,
-    ProviderHealth, ProviderInfo, StagedApkFile, ZygiskLifecycle, ZygiskStatusResult,
+    AgentError, ErrorCode, LabelSource, LocalizedPackageItem, ModuleHandlerInfo,
+    PackageExportApkParams, PackageExportApkResult, PackageExportCleanParams,
+    PackageExportCleanResult, PackageListLocalizedParams, PackageListLocalizedResult, PackageScope,
+    PackageWarning, ProviderHealth, ProviderInfo, StagedApkFile, ZygiskLifecycle,
+    ZygiskStatusResult,
 };
 use serde::Deserialize;
 use serde_json::{Value, to_value};
@@ -44,6 +45,8 @@ pub const DEMO_SUB_PROTOCOL_VERSION: u32 = 1;
 pub const CAP_LIST: &str = "list";
 pub const CAP_MANIFEST: &str = "manifest";
 pub const CAP_EXPORT: &str = "export";
+/// 模块自描述注册表的能力名（AR10.2）。旧模块不宣告它，`module_handlers` 就是空数组。
+pub const CAP_HANDLERS: &str = "handlers";
 
 /// 兼容旧常量名：AR5.3 台账与文档里 v1 冻结为子协议 1。
 pub const MODULE_ID: &str = DEMO_MODULE_ID;
@@ -53,7 +56,12 @@ const MODULE_HOST: &str = "127.0.0.1";
 const MODULE_PORT: u16 = 11_500;
 const PRO_PORT: u16 = 11_501;
 const DEMO_PORT: u16 = MODULE_PORT;
-const PRO_TOKEN_PATH: &str = "/data/adb/modules/applistpro/token";
+/// 令牌文件的**新**位置：模块目录之外。`ksud module install` 会覆盖模块目录，
+/// 而开机后模块目录里的"外来文件"还可能被清理——真机上就出现过令牌文件几分钟后消失、
+/// v2 谁都进不来、Agent 一路退回 v1。运行期状态不该住在安装器拥有的目录里。
+const PRO_TOKEN_PATH: &str = "/data/adb/applistpro.token";
+/// 旧位置，只为"新 Agent + 尚未升级的模块"保留一次兜底读，不是首选。
+const PRO_TOKEN_PATH_LEGACY: &str = "/data/adb/modules/applistpro/token";
 const PRO_TOKEN_TTL: Duration = Duration::from_secs(300);
 /// 模块内部响应缓冲 4 MiB，留出余量后作为单行上限。
 const MAX_LINE_BYTES: u64 = 6 * 1024 * 1024;
@@ -221,6 +229,8 @@ struct Probe {
     device_locale: Option<String>,
     pro_locale: Option<String>,
     probe_latency_ms: u64,
+    /// 模块自描述的 handler 注册表（capability `handlers` 才有；旧模块为空）
+    handlers: Vec<ModuleHandlerInfo>,
     detail: Option<String>,
 }
 
@@ -262,11 +272,24 @@ impl ZygiskProvider {
         } else {
             match self.pro_token().await {
                 None => ProState::NeedsToken,
-                Some(token) => match handshake_pro(&token).await {
-                    Ok(hello) => ProState::Ready(hello),
+                Some(token) => match self.handshake_with_refresh_retry(&token).await {
+                    Ok(mut hello) => {
+                        // 模块宣告 `handlers` 才追问注册表；旧模块不认 `I`，
+                        // 这里失败必须静默——status 不能因为"多问一句"而变红。
+                        if hello.capabilities.iter().any(|c| c == CAP_HANDLERS)
+                            && let Ok(list) = fetch_module_handlers(&token).await
+                        {
+                            hello.handlers = list;
+                        }
+                        ProState::Ready(hello)
+                    }
                     Err(error) => ProState::HandshakeFailed(error.message),
                 },
             }
+        };
+        let pro_handlers = match &pro_state {
+            ProState::Ready(hello) => hello.handlers.clone(),
+            _ => Vec::new(),
         };
         let demo_alive = !matches!(pro_state, ProState::Ready(_))
             && bridge_alive(DEMO_PORT, CONNECT_TIMEOUT).await;
@@ -290,24 +313,27 @@ impl ZygiskProvider {
             device_locale,
             pro_locale,
             probe_latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            handlers: pro_handlers,
             detail: lifecycle.1,
         };
         self.store(probe.clone());
         probe
     }
 
-    /// 令牌只驻留内存（不进 Probe/日志/错误信息），模块升级后按 TTL 重读。
-    async fn pro_token(&self) -> Option<String> {
-        let cached = self
-            .pro_token
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .filter(|(_, at)| at.elapsed() < PRO_TOKEN_TTL);
-        if let Some((token, _)) = cached {
-            return Some(token);
+    /// 令牌只驻留内存（不进 Probe/日志/错误信息）。
+    ///
+    /// 不经缓存直接从模块目录读：`ksud module install` 会覆盖模块目录，令牌随之换人，
+    /// 缓存里那个当场作废——这正是"装完模块不重启就连不上"的另一半原因。
+    async fn read_pro_token(&self) -> Option<String> {
+        // 先读新位置；读不到再试旧位置一次（老模块只写旧位置）。两者都读不到才算没令牌。
+        match Self::read_token_file(PRO_TOKEN_PATH).await {
+            Some(token) => Some(token),
+            None => Self::read_token_file(PRO_TOKEN_PATH_LEGACY).await,
         }
-        let script = format!("cat {PRO_TOKEN_PATH}");
+    }
+
+    async fn read_token_file(path: &str) -> Option<String> {
+        let script = format!("cat {path}");
         let output = with_timeout(
             ROOT_TIMEOUT,
             Command::new("su").args(["-c", &script]).output(),
@@ -319,17 +345,51 @@ impl ZygiskProvider {
             return None;
         }
         let token = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let valid = token.len() == 128
-            && token
-                .chars()
-                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+        let valid = token.len() == 128 && token.chars().all(|c| c.is_ascii_hexdigit());
         if !valid {
             return None;
         }
-        if let Ok(mut guard) = self.pro_token.lock() {
-            *guard = Some((token.clone(), Instant::now()));
-        }
         Some(token)
+    }
+
+    /// 带 300 s 缓存的读取：正常路径不反复起 su。
+    async fn pro_token(&self) -> Option<String> {
+        let cached = self
+            .pro_token
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .filter(|(_, at)| at.elapsed() < PRO_TOKEN_TTL);
+        if let Some((token, _)) = cached {
+            return Some(token);
+        }
+        let token = self.read_pro_token().await?;
+        self.cache_pro_token(&token);
+        Some(token)
+    }
+
+    fn cache_pro_token(&self, token: &str) {
+        if let Ok(mut guard) = self.pro_token.lock() {
+            *guard = Some((token.to_owned(), Instant::now()));
+        }
+    }
+
+    /// 握手失败时按磁盘重读一次再试：模块刚升级过就靠这一步救回来，
+    /// 不需要重启手机，也不需要等缓存过期。
+    async fn handshake_with_refresh_retry(&self, token: &str) -> Result<ProHello, AgentError> {
+        match handshake_pro(token).await {
+            Ok(hello) => Ok(hello),
+            Err(first) => match self.read_pro_token().await {
+                Some(fresh) if fresh != token => match handshake_pro(&fresh).await {
+                    Ok(hello) => {
+                        self.cache_pro_token(&fresh);
+                        Ok(hello)
+                    }
+                    Err(_) => Err(first),
+                },
+                _ => Err(first),
+            },
+        }
     }
 
     async fn probe(&self) -> Probe {
@@ -372,6 +432,7 @@ impl ZygiskProvider {
             device_locale: probe.device_locale.clone(),
             sub_protocol_version: probe.variant.sub_protocol(),
             probe_latency_ms: Some(probe.probe_latency_ms),
+            module_handlers: probe.handlers.clone(),
             detail: probe.detail.clone(),
         }
     }
@@ -1050,6 +1111,8 @@ struct ProHello {
     version_code: u32,
     locale: String,
     capabilities: Vec<String>,
+    /// 不来自握手行：模块宣告 `handlers` 能力后，由 `I` 单独查回来（AR10.2）。
+    handlers: Vec<ModuleHandlerInfo>,
 }
 
 /// Agent↔模块私有子协议的兼容规则（AR10.1 固化，实现细节见
@@ -1100,6 +1163,7 @@ fn parse_pro_hello(line: &str) -> Result<ProHello, AgentError> {
         version_code,
         locale,
         capabilities,
+        handlers: Vec::new(),
     })
 }
 
@@ -1143,6 +1207,29 @@ async fn handshake_pro(token: &str) -> Result<ProHello, AgentError> {
         .ok_or_else(|| provider_unavailable("v2 模块握手无应答", Some("pro_handshake_eof")))?;
     // 不回显令牌：错误信息里只带模块返回的状态行
     parse_pro_hello(&String::from_utf8_lossy(&line))
+}
+
+/// 问模块要它自己的 handler 注册表（`I`）。帧内容是每行一个 JSON 对象。
+async fn fetch_module_handlers(token: &str) -> Result<Vec<ModuleHandlerInfo>, AgentError> {
+    let frames = pro_command_frames_with_token(token, "I\n", CAP_HANDLERS, "zygisk.status").await?;
+    Ok(parse_handler_frames(&frames))
+}
+
+/// 纯函数：从分帧结果里挑出结构完整的 handler。认不出的字段忽略、
+/// 单条坏掉不影响其它条——模块侧加了新字段不能反过来把旧 Agent 打挂。
+fn parse_handler_frames(frames: &[serde_json::Value]) -> Vec<ModuleHandlerInfo> {
+    let mut out = Vec::new();
+    for frame in frames {
+        if frame.get("final").and_then(serde_json::Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Ok(info) = serde_json::from_value::<ModuleHandlerInfo>(frame.clone()) {
+            if !info.cmd.is_empty() {
+                out.push(info);
+            }
+        }
+    }
+    out
 }
 
 /// 握手能力位门控（AR10.1 规则 2）。`capability` 传空串表示该命令不需要能力
@@ -1964,6 +2051,7 @@ mod tests {
             version_code: 2,
             locale: "zh-Hans-CN".into(),
             capabilities: vec!["list".into()],
+            handlers: Vec::new(),
         };
         // v2 握手成功：无论 v1 是否活着都用 v2
         for demo in [true, false] {
@@ -2032,6 +2120,7 @@ mod tests {
                 version_code: 2,
                 locale: "zh-Hans-CN".into(),
                 capabilities: vec!["list".into()],
+                handlers: Vec::new(),
             }),
             true,
         );
@@ -2089,6 +2178,36 @@ mod tests {
             let error = parse_pro_hello(line).expect_err("版本不匹配必须拒");
             assert_eq!(error.code, ErrorCode::IncompatibleVersion, "{line}");
         }
+    }
+
+    /// 模块自描述注册表的解析（AR10.2）：结构完整的帧转成 typed，坏帧与多余字段
+    /// 都不得让整份 status 变红——模块侧以后长出新字段是常态，不是异常。
+    #[test]
+    fn handler_registry_frames_tolerate_module_side_growth() {
+        let frames = vec![
+            serde_json::json!({
+                "cmd": "L", "capability": "list", "target": "system_server Java",
+                "permission": "token", "timeout_ms": 8000, "max_response_bytes": 6291456,
+                "cancellable": true, "fused": false
+            }),
+            serde_json::json!({
+                "cmd": "E", "capability": "export", "target": "x", "permission": "token",
+                "timeout_ms": 8000, "max_response_bytes": 1, "cancellable": false,
+                "fused": true, "shiny_new_field": 42
+            }),
+            serde_json::json!({"capability": "list"}),
+            serde_json::json!({"final": true}),
+        ];
+        let parsed = parse_handler_frames(&frames);
+        assert_eq!(parsed.len(), 2, "只应收下结构完整的两条: {parsed:?}");
+        assert_eq!(parsed[0].cmd, "L");
+        assert_eq!(parsed[0].capability.as_deref(), Some("list"));
+        assert!(!parsed[0].fused);
+        assert_eq!(parsed[1].cmd, "E");
+        assert!(
+            parsed[1].fused,
+            "熔断状态必须原样带回，界面上才说得出哪个方法被关了"
+        );
     }
 
     #[test]

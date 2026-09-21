@@ -2871,6 +2871,198 @@ mod tests {
         eprintln!("[frida] 全周期通过：起→复核→幂等→停→端口释放");
     }
 
+    /// AR10.2 真机腿：**单个 handler 失败只熔断它自己**，且熔断期间能力位自动收缩。
+    ///
+    /// 制造内部失败的办法是临时把模块的 `helper.dex` 改名（需要 root），让所有
+    /// 依赖 Java helper 的方法连续失败到阈值；随后必须还原文件并等过冷却窗口。
+    /// 因为会临时改模块目录，这一条要显式 `AR5_FUSE_PROBE=yes` 才跑，默认跳过。
+    ///
+    /// 这条腿一次验四件事，都是文档里容易写但没人证明的东西：
+    /// ①内部失败计入熔断、参数非法不计入；②熔断只关那几条方法，`zygisk.status`
+    /// 与注册表查询照答；③能力位随熔断收缩 → Agent 侧门控在**发命令前**就拒
+    /// （`capability_missing`），不再让调用方等超时；④冷却窗口过后自动恢复。
+    #[tokio::test]
+    #[ignore = "会临时改模块文件；APPLIST_TEST_SERIAL=<serial> AR5_FUSE_PROBE=yes cargo test -p app-reverse-tools real_agent_zygisk_single_handler -- --ignored --nocapture"]
+    async fn real_agent_zygisk_single_handler_failure_fuses_only_that_method() {
+        use agent_protocol::method::{PACKAGE_LIST_LOCALIZED, ZYGISK_STATUS};
+        use agent_protocol::{
+            ErrorCode, PackageListLocalizedParams, PackageScope, ZygiskStatusParams,
+            ZygiskStatusResult,
+        };
+        if std::env::var("AR5_FUSE_PROBE").unwrap_or_default() != "yes" {
+            eprintln!(
+                "[跳过] 本腿会临时改名 /data/adb/modules/applistpro/helper.dex，需要 AR5_FUSE_PROBE=yes 显式授权"
+            );
+            return;
+        }
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        let adb_path = runner.environment().await.path.expect("本机应有 adb");
+        let root = |command: String| {
+            let runner = runner.clone();
+            let adb_path = adb_path.clone();
+            let serial = serial.clone();
+            async move {
+                let out = runner
+                    .run(
+                        &adb_path,
+                        &adb::build_args(Some(&serial), &adb::cmd_shell(&adb::su_wrap(&command))),
+                        Duration::from_secs(20),
+                    )
+                    .await
+                    .unwrap();
+                out.stdout
+            }
+        };
+        let dex = "/data/adb/modules/applistpro/helper.dex";
+        let status = || {
+            let client = client.clone();
+            async move {
+                client
+                    .request::<_, ZygiskStatusResult>(
+                        ZYGISK_STATUS,
+                        &ZygiskStatusParams {},
+                        Duration::from_secs(15),
+                    )
+                    .await
+                    .expect("zygisk.status 必须答话")
+            }
+        };
+        let list_once = || async {
+            client
+                .request::<_, agent_protocol::PackageListLocalizedResult>(
+                    PACKAGE_LIST_LOCALIZED,
+                    &PackageListLocalizedParams {
+                        locale: None,
+                        scope: PackageScope::All,
+                        include_disabled: false,
+                    },
+                    Duration::from_secs(30),
+                )
+                .await
+        };
+
+        // 前置：模块必须是 v2 且宣告 handlers 能力（否则本腿没有对象，不是回归）
+        let before = status().await;
+        if before.module_handlers.is_empty() {
+            eprintln!(
+                "[跳过] 模块未回传 handler 注册表（capability handlers 缺失），本腿需要装了 AR10.2 之后模块的设备"
+            );
+            manager.disconnect(&serial).await.unwrap();
+            return;
+        }
+        assert!(
+            before.module_handlers.iter().any(|h| h.cmd == "L"),
+            "注册表里必须有清单方法: {:?}",
+            before.module_handlers
+        );
+        assert!(
+            before.module_handlers.iter().all(|h| !h.fused),
+            "起点必须没有熔断: {:?}",
+            before.module_handlers
+        );
+        assert!(list_once().await.is_ok(), "起点：清单能力必须可用");
+
+        // 参数非法**不该**计入熔断：连打 5 次非法 locale，能力必须还在
+        let bads: Vec<String> = vec![
+            "en-US;id".to_owned(),
+            "a]b".to_owned(),
+            "x9 y".to_owned(),
+            "z".repeat(40),
+        ];
+        for bad in &bads {
+            let error = client
+                .request::<_, agent_protocol::PackageListLocalizedResult>(
+                    PACKAGE_LIST_LOCALIZED,
+                    &PackageListLocalizedParams {
+                        locale: Some(bad.clone()),
+                        scope: PackageScope::All,
+                        include_disabled: false,
+                    },
+                    Duration::from_secs(20),
+                )
+                .await
+                .expect_err("非法 locale 必须被拒");
+            assert!(
+                matches!(
+                    error,
+                    crate::services::agent_client::AgentClientError::Remote(_)
+                ),
+                "应为结构化错误: {error:?}"
+            );
+        }
+        assert!(list_once().await.is_ok(), "参数错误被计入了熔断——方向反了");
+        eprintln!("[ar10.2] 参数非法 5 次后清单仍可用（不计入熔断）✓");
+
+        // 制造内部失败：临时改名 helper.dex（**必须**在 finally 之前还原）
+        root(format!("mv {dex} {dex}.off")).await;
+        let mut fuse_seen = false;
+        for round in 1..=6 {
+            let st = status().await;
+            if st.module_handlers.iter().any(|h| h.cmd == "L" && h.fused) {
+                fuse_seen = true;
+                eprintln!(
+                    "[ar10.2] 第 {round} 次探测：清单方法已熔断；同一次 status 里注册表与状态本身仍正常返回（fused 数={}）",
+                    st.module_handlers.iter().filter(|h| h.fused).count()
+                );
+                break;
+            }
+            let _ = list_once().await;
+        }
+        let restore_and_report = {
+            let dex = dex.to_owned();
+            async move { root(format!("mv {dex}.off {dex}")).await }
+        };
+        assert!(
+            fuse_seen,
+            "连续内部失败后没能进入熔断，说明注册表没有按方法记账"
+        );
+
+        // 熔断期间：status 照答、清单必须被**门控**拒掉（不是超时），
+        // 且理由要说清缺哪个能力 —— 这才是「能力位随熔断收缩」的端到端闭环
+        let error = list_once()
+            .await
+            .expect_err("熔断期间清单命令应当在发出去之前就被拒");
+        let error = match error {
+            crate::services::agent_client::AgentClientError::Remote(error) => error,
+            other => panic!("期望结构化错误，实际 {other:?}"),
+        };
+        assert_eq!(error.code, ErrorCode::UnsupportedMethod, "{error:?}");
+        let reason = error
+            .details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(reason, "capability_missing", "实际理由: {reason}");
+        eprintln!("[ar10.1/10.2] 熔断 → 能力位消失 → Agent 发命令前就拒 ✓");
+
+        restore_and_report.await;
+        // 冷却窗口 60 s：等到注册表里 fused=false 且清单恢复
+        let mut back = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            let st = status().await;
+            if st.module_handlers.iter().all(|h| !h.fused) && list_once().await.is_ok() {
+                back = true;
+                break;
+            }
+        }
+        let leftover = root(format!("ls {dex}.off 2>/dev/null | wc -l")).await;
+        assert_eq!(leftover.trim(), "0", "helper.dex 没还原干净，必须人工检查");
+        assert!(back, "冷却窗口之后清单能力没有自动回来");
+        eprintln!("[ar10.2] 冷却后自动恢复 ✓（helper.dex 已还原，无 .off 残留）");
+        manager.disconnect(&serial).await.unwrap();
+    }
+
     /// AR9.1 前置真机腿：root 探测改由 Agent 执行后，结论必须与 Legacy `su -c id`
     /// 一致，而且要把「su 可用」与「Agent 自身有 root」分开带回——UI 之前把这两件事
     /// 混成一个绿色徽章，正是 D026 那批 `root=true` 支路必须留在 Legacy 的原因。

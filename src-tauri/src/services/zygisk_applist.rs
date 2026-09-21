@@ -100,7 +100,38 @@ pub struct ZygiskStatus {
     pub device_locale: Option<String>,
     pub sub_protocol_version: u32,
     pub probe_latency_ms: Option<u64>,
+    /// 模块自描述的 handler 注册表（AR10.2）。这里过一层 camelCase 映射，
+    /// 是因为界面对象一直是本文件的模型，不该看见设备私有协议的字段命名。
+    pub module_handlers: Vec<ModuleHandlerDto>,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleHandlerDto {
+    pub cmd: String,
+    pub capability: Option<String>,
+    pub target: String,
+    pub permission: String,
+    pub timeout_ms: u64,
+    pub max_response_bytes: u64,
+    pub cancellable: bool,
+    pub fused: bool,
+}
+
+impl From<agent_protocol::ModuleHandlerInfo> for ModuleHandlerDto {
+    fn from(v: agent_protocol::ModuleHandlerInfo) -> Self {
+        Self {
+            cmd: v.cmd,
+            capability: v.capability,
+            target: v.target,
+            permission: v.permission,
+            timeout_ms: v.timeout_ms,
+            max_response_bytes: v.max_response_bytes,
+            cancellable: v.cancellable,
+            fused: v.fused,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -161,6 +192,11 @@ impl ZygiskApplistService {
             device_locale: result.device_locale,
             sub_protocol_version: result.sub_protocol_version,
             probe_latency_ms: result.probe_latency_ms,
+            module_handlers: result
+                .module_handlers
+                .into_iter()
+                .map(ModuleHandlerDto::from)
+                .collect(),
             detail: result.detail,
         })
     }
@@ -1095,6 +1131,7 @@ mod tests {
             device_locale: Some("zh-Hans-CN".into()),
             sub_protocol_version: 1,
             probe_latency_ms: Some(6),
+            module_handlers: Vec::new(),
             detail: Some("模块有新版本待重启加载".into()),
         };
         let value = serde_json::to_value(status).unwrap();
