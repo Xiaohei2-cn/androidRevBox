@@ -202,6 +202,9 @@ impl AgentBackend {
                     .find(|capability| capability.method == method)
                 {
                     Some(capability) if capability.available => BackendAvailability::Available,
+                    // 未知 ≠ 不可用：Agent 还没探完时把请求交给它，由探测完的 Agent 给
+                    // 权威答案（同样的 provider_unavailable 指引，只多一次往返）。
+                    Some(capability) if capability.probe_pending => BackendAvailability::Available,
                     Some(capability) => BackendAvailability::ProviderUnavailable(
                         capability.unavailable_reason.clone().unwrap_or_else(|| {
                             format!("provider {} is unavailable", capability.provider)
@@ -583,6 +586,7 @@ mod tests {
                 provider: "shell".into(),
                 available,
                 unavailable_reason: (!available).then(|| "shell provider faulted".into()),
+                probe_pending: false,
             }],
             local_port: Some(1234),
             last_error: None,

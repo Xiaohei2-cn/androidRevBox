@@ -72,12 +72,18 @@ impl Router {
                 let info = provider.info();
                 provider.methods().iter().map(move |method| {
                     let unavailable_reason = provider.unavailable_reason(method);
+                    // `available` 保持真实：探测没完成就是"不可用 + 理由"，不把未知
+                    // 粉饰成可用（e2e 里"缺模块不得声明清单可用"这条断言依赖它）。
+                    // 未知与不可用的区别由 `probe_pending` 单独表达，放行只发生在桌面端
+                    // 那一侧（它知道"多一次往返换真实答案"是划算的）。
+                    let pending = provider.probe_pending();
                     CapabilityInfo {
                         method: (*method).into(),
                         version: 1,
                         provider: info.name.clone(),
                         available: unavailable_reason.is_none(),
                         unavailable_reason,
+                        probe_pending: pending,
                     }
                 })
             })

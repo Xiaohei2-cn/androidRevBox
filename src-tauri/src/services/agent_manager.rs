@@ -658,6 +658,7 @@ mod tests {
                 provider: "system".into(),
                 available: capability_available,
                 unavailable_reason: None,
+                probe_pending: false,
             }],
         }
     }
@@ -2921,6 +2922,16 @@ mod tests {
                 out.stdout
             }
         };
+        // 开跑前先自愈：上一次运行如果在中途 panic，可能把 helper.dex 留在 .off 状态，
+        // 那样这一轮的"起点必须能用"就成了随机事件。先补回来再测。
+        root(format!(
+            "if [ -f {dex}.off ]; then mv {dex}.off {dex}; chmod 644 {dex}; fi",
+            dex = "/data/adb/modules/applistpro/helper.dex"
+        ))
+        .await;
+        // Agent 侧探测有 5 秒缓存（PROBE_TTL），熔断路径走特权脚本 + helper 失败计数，
+        // 至少要 3 次内部失败 + 一次缓存过期后才看得到。所以下面每轮都等到 TTL 之后再看。
+        const PROBE_WAIT: Duration = Duration::from_secs(6);
         let dex = "/data/adb/modules/applistpro/helper.dex";
         let status = || {
             let client = client.clone();
@@ -2963,9 +2974,28 @@ mod tests {
             "注册表里必须有清单方法: {:?}",
             before.module_handlers
         );
+        // 起点允许存在"上一轮实验留下的熔断"——它本来就是 60 秒自动恢复的设计。
+        // 所以这里不是断言"没有熔断"，而是等它自己好；等不到才说明冷却没生效。
+        let mut before = before;
+        for _ in 0..12 {
+            if before.module_handlers.iter().all(|h| !h.fused) {
+                break;
+            }
+            eprintln!(
+                "[ar10.2] 起点仍有方法在冷却中（上一轮实验留下），等 8 秒：{:?}",
+                before
+                    .module_handlers
+                    .iter()
+                    .filter(|h| h.fused)
+                    .map(|h| h.cmd.clone())
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            before = status().await;
+        }
         assert!(
             before.module_handlers.iter().all(|h| !h.fused),
-            "起点必须没有熔断: {:?}",
+            "冷却窗口过后仍显示熔断，说明自动恢复没生效: {:?}",
             before.module_handlers
         );
         assert!(list_once().await.is_ok(), "起点：清单能力必须可用");
@@ -3004,22 +3034,29 @@ mod tests {
         // 制造内部失败：临时改名 helper.dex（**必须**在 finally 之前还原）
         root(format!("mv {dex} {dex}.off")).await;
         let mut fuse_seen = false;
-        for round in 1..=6 {
+        for round in 1..=5 {
+            // 每轮制造 3 次内部失败，够越过阈值（FUSE_THRESHOLD=3）
+            for _ in 0..3 {
+                let _ = list_once().await;
+            }
+            // 等 Agent 的探测缓存过期，才会重新问模块要注册表
+            tokio::time::sleep(PROBE_WAIT).await;
             let st = status().await;
             if st.module_handlers.iter().any(|h| h.cmd == "L" && h.fused) {
                 fuse_seen = true;
                 eprintln!(
-                    "[ar10.2] 第 {round} 次探测：清单方法已熔断；同一次 status 里注册表与状态本身仍正常返回（fused 数={}）",
+                    "[ar10.2] 第 {round} 轮：清单方法已熔断，同一次 status 里注册表与状态本身仍正常返回（fused 数={}）",
                     st.module_handlers.iter().filter(|h| h.fused).count()
                 );
                 break;
             }
-            let _ = list_once().await;
         }
-        let restore_and_report = {
-            let dex = dex.to_owned();
-            async move { root(format!("mv {dex}.off {dex}")).await }
-        };
+        // 先还原，再断言：反过来会让一次失败把设备留在坏状态里。
+        let dex_now = dex.to_owned();
+        root(format!(
+            "mv {dex_now}.off {dex_now} 2>/dev/null; chmod 644 {dex_now} 2>/dev/null; echo restored"
+        ))
+        .await;
         assert!(
             fuse_seen,
             "连续内部失败后没能进入熔断，说明注册表没有按方法记账"
@@ -3045,8 +3082,7 @@ mod tests {
         assert_eq!(reason, "capability_missing", "实际理由: {reason}");
         eprintln!("[ar10.1/10.2] 熔断 → 能力位消失 → Agent 发命令前就拒 ✓");
 
-        restore_and_report.await;
-        // 冷却窗口 60 s：等到注册表里 fused=false 且清单恢复
+        // 冷却窗口 60 s（+ 探测缓存 6 s）：等到注册表里 fused=false 且清单恢复
         let mut back = false;
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_secs(8)).await;

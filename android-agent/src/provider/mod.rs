@@ -31,6 +31,11 @@ pub trait Provider: Send + Sync {
 
     /// 依赖外部组件（例如已安装的 Zygisk 模块）的 Provider 覆盖此方法，
     /// 让 `system.hello` / `capability.list` 报告真实可用性；返回 `None` 表示可用。
+    /// 探测尚未完成（不是"探测过、不可用"）。默认 false：多数 provider 无需预热。
+    fn probe_pending(&self) -> bool {
+        false
+    }
+
     fn unavailable_reason(&self, _method: &str) -> Option<String> {
         None
     }

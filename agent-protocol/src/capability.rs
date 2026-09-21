@@ -61,6 +61,14 @@ pub struct CapabilityInfo {
     pub available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
+    /// 「还没探测完」而不是「探测过、不可用」。
+    ///
+    /// 为什么需要单独一个布尔：Agent 现在先监听再后台预热（AR4.2 修启动顺序），
+    /// 所以第一次 hello 可能赶上探测还没结束。没有这个字段，桌面端会把"未知"
+    /// 当成"不可用"，在本地就把一个其实能服务的请求拦掉（今天真实踩到：status 已
+    /// 经很快，list 却被拒 "zygisk bridge 尚未探测完成"）。有它才能把判断交还给 Agent。
+    #[serde(default)]
+    pub probe_pending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +134,7 @@ mod tests {
                 provider: "shell".into(),
                 available: true,
                 unavailable_reason: None,
+                probe_pending: false,
             }],
         };
         let value = serde_json::to_value(result).unwrap();

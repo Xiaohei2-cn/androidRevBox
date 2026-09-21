@@ -72,10 +72,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
 const LINE_TIMEOUT: Duration = Duration::from_secs(60);
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_TTL: Duration = Duration::from_secs(5);
-/// 单次探测的总预算：必须小于桌面端 zygisk.status 的请求超时，否则调用方只会拿到
-/// 一个没有信息量的 deadline。
-const PROBE_BUDGET: Duration = Duration::from_secs(4);
+/// 单次探测的**兜底**预算：只用来挡住"某一步没挂上超时"这种意外，不是正常上限。
+///
+/// 为什么必须明显大于内层各步之和：外层 `timeout` 一旦真的取消 `probe_now()`，
+/// 它就再也走不到 `store()` —— 缓存永远是空的，于是每次请求都重探一次、每次都超时，
+/// 并且 capability 检查会永远停在"尚未探测完成"（这个坑我今天正是踩在 status 已经
+/// 变快、list 却被拒的时候）。正常上限由内层各步保证：su 2.5 s ×2、connect 0.8 s ×2、
+/// 握手/注册表 2 s ×2、getprop 若干，合计不超过约 7 s；桌面端状态查询给的是 20 s。
+const PROBE_BUDGET: Duration = Duration::from_secs(9);
 const ROOT_TIMEOUT: Duration = Duration::from_millis(2500);
+/// 探测路径上的单次等待上限（握手、注册表查询）。`LINE_TIMEOUT` 那 60 s 是给数据流式
+/// 响应用的（清单几千行、APK 分帧），拿它等一次握手等于没有超时。
+const PROBE_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct ZygiskProvider {
     probe: Mutex<Option<Probe>>,
@@ -285,7 +293,11 @@ impl ZygiskProvider {
                         // 模块宣告 `handlers` 才追问注册表；旧模块不认 `I`，
                         // 这里失败必须静默——status 不能因为"多问一句"而变红。
                         if hello.capabilities.iter().any(|c| c == CAP_HANDLERS)
-                            && let Ok(list) = fetch_module_handlers(&token).await
+                            && let Ok(Ok(list)) = tokio::time::timeout(
+                                PROBE_IO_TIMEOUT,
+                                fetch_module_handlers(&token),
+                            )
+                            .await
                         {
                             hello.handlers = list;
                         }
@@ -484,7 +496,10 @@ impl ZygiskProvider {
 
     async fn handle_status(&self, params: Value) -> Result<Value, AgentError> {
         let _probe_params: agent_protocol::ZygiskStatusParams = parse_params(params)?;
-        let probe = self.probe_now().await;
+        // 走 probe()，不要直接 probe_now()：这里绕过预算与单飞，正是"查状态能把整个
+        // 请求拖到超时"的原因——一次探测要起 su、连模块、握两次手，任何一格慢都不该
+        // 让 UI 干等；并发时也不该各探一遍。
+        let probe = self.probe().await;
         serialize(&self.status(&probe))
     }
 
@@ -884,6 +899,11 @@ impl Provider for ZygiskProvider {
         ZYGISK_METHODS
     }
 
+    /// 缓存空 = 后台预热还没出结果 = 未知。此时不该由桌面端替我们判定。
+    fn probe_pending(&self) -> bool {
+        self.cached().is_none()
+    }
+
     fn unavailable_reason(&self, method: &str) -> Option<String> {
         // 生命周期诊断本身永远可用，否则 UI 拿不到「为什么不可用」。
         if method == ZYGISK_STATUS {
@@ -1247,7 +1267,7 @@ async fn handshake_pro(token: &str) -> Result<ProHello, AgentError> {
         .map_err(|error| internal(format!("v2 握手写入失败: {error}")))?;
     let mut reader = LineReader::new(&mut stream);
     let line = reader
-        .next_line(LINE_TIMEOUT)
+        .next_line(PROBE_IO_TIMEOUT)
         .await?
         .ok_or_else(|| provider_unavailable("v2 模块握手无应答", Some("pro_handshake_eof")))?;
     // 不回显令牌：错误信息里只带模块返回的状态行

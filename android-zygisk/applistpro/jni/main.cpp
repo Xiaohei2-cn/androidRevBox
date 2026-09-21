@@ -741,6 +741,10 @@ static void serve_session(int cfd) {
                 if (wrote < 0 || off + wrote >= (int) (8u * 1024)) break;
                 off += wrote;
             }
+            // 结束帧的约定由 helper 负责产生（L/M/E 都是它写的）；`I` 不经过 helper，
+            // 少了这一行 Agent 就会一直等到超时——注册表看起来"模块没回"，其实是我漏帧。
+            off += snprintf(payload + off, sizeof(char) * (8u * 1024 - (size_t) off),
+                           "{\"final\":true,\"count\":%zu}\n", HANDLER_COUNT);
             stream_ndjson(cfd, payload);
             continue;
         }

@@ -1718,6 +1718,7 @@ mod tests {
                 provider: "system".into(),
                 available: true,
                 unavailable_reason: None,
+                probe_pending: false,
             }],
         };
         let value = serde_json::to_value(result).unwrap();
