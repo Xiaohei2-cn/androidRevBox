@@ -1993,19 +1993,19 @@ mod tests {
         };
         use sha2::{Digest, Sha256};
 
-        let missing = |name: &str| -> String {
-            format!(
-                "{name} is required（这条腿会往目标包安装目录写文件，四个参数必须显式给：\
-                 AR8_TEST_SERIAL / AR84_TARGET_PKG / AR84_SO / AR84_CONFIRM=yes）"
-            )
-        };
-        let serial = std::env::var("AR8_TEST_SERIAL")
-            .unwrap_or_else(|_| panic!("{}", missing("AR8_TEST_SERIAL")));
-        let pkg = std::env::var("AR84_TARGET_PKG")
-            .unwrap_or_else(|_| panic!("{}", missing("AR84_TARGET_PKG")));
-        let so = std::env::var("AR84_SO").unwrap_or_else(|_| panic!("{}", missing("AR84_SO")));
-        if std::env::var("AR84_CONFIRM").unwrap_or_default() != "yes" {
-            eprintln!("[跳过] 需要 AR84_CONFIRM=yes 才执行这条破坏性腿（会写 {pkg} 的安装目录）");
+        // 破坏性腿的参数没给就是没授权：安静跳过，不要 panic。
+        // 否则 `cargo test -- --ignored` 或回归脚本不带靶子时会报一次假失败，
+        // 久了人人都会把这条腿的红色当成噪音。（与卸载腿同一口径。）
+        let (serial, pkg, so, confirm) = (
+            std::env::var("AR8_TEST_SERIAL").unwrap_or_default(),
+            std::env::var("AR84_TARGET_PKG").unwrap_or_default(),
+            std::env::var("AR84_SO").unwrap_or_default(),
+            std::env::var("AR84_CONFIRM").unwrap_or_default(),
+        );
+        if serial.is_empty() || pkg.is_empty() || so.is_empty() || confirm != "yes" {
+            eprintln!(
+                "[跳过] SO 替换腿需要靶子与显式确认：AR8_TEST_SERIAL + AR84_TARGET_PKG + AR84_SO + AR84_CONFIRM=yes（当前 serial={serial} pkg={pkg} so={so} confirm={confirm}）"
+            );
             return;
         }
         assert!(adb::is_safe_so_name(&so), "AR84_SO 不合法: {so}");

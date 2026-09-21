@@ -72,11 +72,17 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
 const LINE_TIMEOUT: Duration = Duration::from_secs(60);
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_TTL: Duration = Duration::from_secs(5);
+/// 单次探测的总预算：必须小于桌面端 zygisk.status 的请求超时，否则调用方只会拿到
+/// 一个没有信息量的 deadline。
+const PROBE_BUDGET: Duration = Duration::from_secs(4);
 const ROOT_TIMEOUT: Duration = Duration::from_millis(2500);
 
 pub struct ZygiskProvider {
     probe: Mutex<Option<Probe>>,
     pro_token: Mutex<Option<(String, Instant)>>,
+    /// 探测单飞锁：并发请求共享一次探测，而不是各起一遍（每次都要 `su`，慢的时候
+    /// 能把整个请求预算吃光）。用 tokio 的异步互斥，std Mutex 不能跨 await 持有。
+    probe_flight: tokio::sync::Mutex<()>,
 }
 
 /// Agent 实际要用的模块通道。优先级：v2 自有模块 > v1 demo > 不可用。
@@ -245,12 +251,14 @@ impl ZygiskProvider {
         Self {
             probe: Mutex::new(None),
             pro_token: Mutex::new(None),
+            probe_flight: tokio::sync::Mutex::new(()),
         }
     }
 
     /// Agent 启动后先探一次，保证首个 `system.hello` 就带真实可用性。
     pub async fn warm_up(&self) {
-        self.probe_now().await;
+        // 走 probe()：与真实请求共享同一把单飞锁和同一个预算，不各探一遍。
+        self.probe().await;
     }
 
     fn cached(&self) -> Option<Probe> {
@@ -398,7 +406,44 @@ impl ZygiskProvider {
                 return cached;
             }
         }
-        self.probe_now().await
+        // 单飞 + 双检：拿到锁时可能已经有别的请求探测完了，直接用它的结果。
+        let _flight = self.probe_flight.lock().await;
+        if let Some(cached) = self.cached() {
+            if cached.at.elapsed() < PROBE_TTL {
+                return cached;
+            }
+        }
+        // 总预算：探测里有 su、TCP、模块握手等外部依赖，任何一格慢都不能把调用方拖死。
+        // 超时后不谎报"可用/不可用"：有旧结果就带着"这次没探完"的说明继续用，
+        // 没有旧结果就如实报未判定。
+        match tokio::time::timeout(PROBE_BUDGET, self.probe_now()).await {
+            Ok(probe) => probe,
+            Err(_) => match self.cached() {
+                Some(stale) => Probe {
+                    detail: Some(format!(
+                        "本次探测超过 {:?} 未完成，沿用 {:?} 前的结果（root/模块状态可能已变化）",
+                        PROBE_BUDGET,
+                        stale.at.elapsed()
+                    )),
+                    ..stale
+                },
+                None => Probe {
+                    at: Instant::now(),
+                    lifecycle: ZygiskLifecycle::Faulted,
+                    variant: Variant::Absent,
+                    bridge_ready: false,
+                    root: None,
+                    device_locale: None,
+                    pro_locale: None,
+                    probe_latency_ms: PROBE_BUDGET.as_millis() as u64,
+                    handlers: Vec::new(),
+                    detail: Some(format!(
+                        "探测超时（{:?}）：无法判定 root 与模块通道，不把未知当成不可用",
+                        PROBE_BUDGET
+                    )),
+                },
+            },
+        }
     }
 
     fn status(&self, probe: &Probe) -> ZygiskStatusResult {

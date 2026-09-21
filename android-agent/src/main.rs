@@ -34,19 +34,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = parse_args(env::args().skip(1))?;
     let auth_token = read_and_remove_auth_token(&config.auth_token_file)?;
     let zygisk = Arc::new(ZygiskProvider::new());
-    // 启动即探测一次：hello 的 capability 可用性必须是真实状态，而不是“未探测”。
-    zygisk.warm_up().await;
-    let router = Arc::new(system_router_with(auth_token, detect_permissions(), zygisk));
+    let router = Arc::new(system_router_with(
+        auth_token,
+        detect_permissions(),
+        zygisk.clone(),
+    ));
+    // 先监听、后预热，顺序不能反。以前这里是 `zygisk.warm_up().await` 在 bind 之前：
+    // 探测要起 `su`（读模块令牌、探 root），设备上 su 慢或者刚重启时，这段能吃掉好几秒，
+    // 而桌面端等 Agent 可连的预算只有 5 秒——结果进程活着、日志一个字没写、宿主连不上，
+    // 看起来像"Agent 起不来"，实际是"还没开始监听就被特权探测拖住了"。
+    // 现在 bind/打印 LISTENING 之后在后台预热；没预热完之前 capability 走
+    // `unavailable_reason=尚未探测完成`，是真状态而不是猜。
     match config.listen {
-        ListenTarget::Tcp(address) => serve_tcp(address, router).await?,
-        ListenTarget::Abstract(name) => serve_abstract(&name, router).await?,
+        ListenTarget::Tcp(address) => serve_tcp(address, router, zygisk).await?,
+        ListenTarget::Abstract(name) => serve_abstract(&name, router, zygisk).await?,
     }
     Ok(())
+}
+
+/// 后台预热：不能挡住 accept 循环，也不能被"客户端已连上"这件事依赖。
+fn warm_up_in_background(zygisk: Arc<ZygiskProvider>) {
+    tokio::spawn(async move {
+        zygisk.warm_up().await;
+    });
 }
 
 async fn serve_tcp(
     address: SocketAddr,
     router: Arc<android_agent::router::Router>,
+    zygisk: Arc<ZygiskProvider>,
 ) -> Result<(), Box<dyn Error>> {
     if !address.ip().is_loopback() {
         return Err(IoError::new(
@@ -57,6 +73,7 @@ async fn serve_tcp(
     }
     let listener = TcpListener::bind(address).await?;
     println!("LISTENING {}", listener.local_addr()?);
+    warm_up_in_background(zygisk);
 
     loop {
         tokio::select! {
@@ -82,12 +99,14 @@ async fn serve_tcp(
 async fn serve_abstract(
     name: &str,
     router: Arc<android_agent::router::Router>,
+    zygisk: Arc<ZygiskProvider>,
 ) -> Result<(), Box<dyn Error>> {
     let address = UnixSocketAddr::from_abstract_name(name.as_bytes())?;
     let listener = StdUnixListener::bind_addr(&address)?;
     listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(listener)?;
     println!("LISTENING localabstract:{name}");
+    warm_up_in_background(zygisk);
 
     loop {
         tokio::select! {
@@ -113,6 +132,7 @@ async fn serve_abstract(
 async fn serve_abstract(
     _name: &str,
     _router: Arc<android_agent::router::Router>,
+    _zygisk: Arc<ZygiskProvider>,
 ) -> Result<(), Box<dyn Error>> {
     Err(IoError::new(
         ErrorKind::Unsupported,
