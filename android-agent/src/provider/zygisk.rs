@@ -39,6 +39,12 @@ pub const PRO_MODULE_ID: &str = "applistpro";
 pub const PRO_SUB_PROTOCOL_VERSION: u32 = 2;
 pub const DEMO_SUB_PROTOCOL_VERSION: u32 = 1;
 
+/// v2 握手能力位（AR10.1）。名字两边共用同一份字符串，别在模块侧另拼一套。
+/// 新增方法时：模块宣告它 → 这里登记 → 调用点传进去，三处齐了才算接完。
+pub const CAP_LIST: &str = "list";
+pub const CAP_MANIFEST: &str = "manifest";
+pub const CAP_EXPORT: &str = "export";
+
 /// 兼容旧常量名：AR5.3 台账与文档里 v1 冻结为子协议 1。
 pub const MODULE_ID: &str = DEMO_MODULE_ID;
 pub const SUB_PROTOCOL_VERSION: u32 = DEMO_SUB_PROTOCOL_VERSION;
@@ -572,9 +578,10 @@ impl ZygiskProvider {
             "L {locale_arg} {scope} {}\n",
             u8::from(params.include_disabled)
         );
-        let frames = pro_command_frames_with_token(token, &request)
-            .await
-            .inspect_err(|error| self.mark_faulted(error))?;
+        let frames =
+            pro_command_frames_with_token(token, &request, CAP_LIST, PACKAGE_LIST_LOCALIZED)
+                .await
+                .inspect_err(|error| self.mark_faulted(error))?;
         let final_frame = frames
             .iter()
             .rev()
@@ -873,7 +880,8 @@ async fn stage_pro_export(
         .next_line(LINE_TIMEOUT)
         .await?
         .ok_or_else(|| provider_unavailable("v2 导出握手无应答", Some("pro_handshake_eof")))?;
-    parse_pro_hello(&String::from_utf8_lossy(&hello_line))?;
+    let hello = parse_pro_hello(&String::from_utf8_lossy(&hello_line))?;
+    ensure_capability(&hello, CAP_EXPORT, PACKAGE_EXPORT_APK)?;
 
     let request = format!("E {package_name}\n");
     reader.write_line(&request, LINE_TIMEOUT).await?;
@@ -1044,7 +1052,23 @@ struct ProHello {
     capabilities: Vec<String>,
 }
 
-/// `H 2 <token>` -> `OK 2 <version> <versionCode> <deviceLocale> <caps...>`
+/// Agent↔模块私有子协议的兼容规则（AR10.1 固化，实现细节见
+/// `android-zygisk/INTEGRATION.md`）。这四条不是愿望，而是**下面代码实际执行**的行为：
+///
+/// 1. **主版本号严格匹配**：`OK` 第二字段不等于 `PRO_SUB_PROTOCOL_VERSION` 立即判
+///    `incompatible`，不做"看起来差不多就试试"的猜测——线格式变化就是变化。
+///    增量能力一律走能力位（下一条），不靠版本号猜。
+/// 2. **能力位是唯一的增量通道**：握手行的尾部是空格分隔的能力名。
+///    新模块宣告老 Desktop 不认识的能力 → 老 Desktop 原样忽略，握手照常成功；
+///    老模块没宣告某个能力 → 对应 method 在**发出命令之前**就被拒
+///    （`unsupported_method` + `reason=capability_missing`），不是等到超时再猜。
+/// 3. **旧 Desktop + 新模块**必须可用：Agent 只按自己认识的能力名取值，
+///    因此新增能力对旧端是纯加法；破坏性改动才允许升版本号。
+/// 4. **v2 不可用不等于 Zygisk 不可用**：v2 探测失败时按既有顺序退回 v1 demo，
+///    并在 `zygisk.status` 里如实说明是哪一档（AR5.3 契约），Shell 能等价实现的
+///    普通能力仍按路由规则降级。
+///
+/// 握手应答行的线格式：`H 2 <token>` -> `OK 2 <version> <versionCode> <deviceLocale> <caps...>`。
 fn parse_pro_hello(line: &str) -> Result<ProHello, AgentError> {
     let mut parts = line.split_whitespace();
     if parts.next() != Some("OK") {
@@ -1121,11 +1145,37 @@ async fn handshake_pro(token: &str) -> Result<ProHello, AgentError> {
     parse_pro_hello(&String::from_utf8_lossy(&line))
 }
 
+/// 握手能力位门控（AR10.1 规则 2）。`capability` 传空串表示该命令不需要能力
+/// （例如 `S` 状态查询）。缺能力必须在**发命令之前**失败：让模块去猜一个它不认识的
+/// 命令，只会把「能力缺失」变成一次超时或一个莫名其妙的 `ERR unsupported_command`。
+fn ensure_capability(hello: &ProHello, capability: &str, method: &str) -> Result<(), AgentError> {
+    if capability.is_empty() || hello.capabilities.iter().any(|cap| cap == capability) {
+        return Ok(());
+    }
+    Err(AgentError::new(
+        ErrorCode::UnsupportedMethod,
+        format!(
+            "模块 {module} 未宣告 `{capability}` 能力，{method} 不可用（模块版本 {}）",
+            hello.version,
+            module = PRO_MODULE_ID,
+        ),
+    )
+    .with_details(serde_json::json!({
+        "reason": "capability_missing",
+        "capability": capability,
+        "method": method,
+        "module_version": hello.version,
+        "advertised": hello.capabilities,
+    })))
+}
+
 /// 发一条 v2 命令并读完分帧响应（末帧 `{"final":true}`）；ERR 行转成结构化错误。
 /// 令牌必须由 provider 显式传入：它不进日志、不进错误信息。
 async fn pro_command_frames_with_token(
     token: &str,
     request: &str,
+    capability: &str,
+    method: &str,
 ) -> Result<Vec<serde_json::Value>, AgentError> {
     let mut stream = connect_port(PRO_PORT, CONNECT_TIMEOUT).await?;
     let mut reader = LineReader::new(&mut stream);
@@ -1135,7 +1185,8 @@ async fn pro_command_frames_with_token(
         .next_line(LINE_TIMEOUT)
         .await?
         .ok_or_else(|| provider_unavailable("v2 模块握手无应答", Some("pro_handshake_eof")))?;
-    parse_pro_hello(&String::from_utf8_lossy(&hello))?;
+    let hello = parse_pro_hello(&String::from_utf8_lossy(&hello))?;
+    ensure_capability(&hello, capability, method)?;
 
     reader.write_line(request, LINE_TIMEOUT).await?;
 
@@ -2000,6 +2051,44 @@ mod tests {
         assert_eq!(Variant::Demo.sub_protocol(), DEMO_SUB_PROTOCOL_VERSION);
         assert_eq!(Variant::Demo.module_id(), DEMO_MODULE_ID);
         assert_eq!(Variant::Absent.sub_protocol(), 0);
+    }
+
+    /// AR10.1 兼容矩阵的四条规则都要能测：版本号严格、能力位是唯一增量通道、
+    /// 陌生能力名不影响旧端、缺能力必须在发命令之前失败。
+    #[test]
+    fn v2_capability_gate_follows_the_compat_matrix() {
+        // 规则 3：新模块多宣告了我们不认识的能力，旧 Agent 必须原样忽略而不是失败
+        let new_module =
+            parse_pro_hello("OK 2 2.1.0 21 zh-CN list manifest export device_info quantum")
+                .expect("多出来的能力名不得让握手失败");
+        assert_eq!(new_module.version, "2.1.0");
+        assert!(
+            new_module.capabilities.contains(&"quantum".to_owned()),
+            "能力位原样保留，将来要用再加"
+        );
+        assert!(ensure_capability(&new_module, CAP_EXPORT, PACKAGE_EXPORT_APK).is_ok());
+
+        // 规则 2：老模块没宣告 export → 拒，且要说清缺什么、它宣告了什么、模块版本
+        let old = parse_pro_hello("OK 2 1.0.0 10 zh-CN list manifest").unwrap();
+        let error = ensure_capability(&old, CAP_EXPORT, PACKAGE_EXPORT_APK)
+            .expect_err("缺能力必须拒,不能把命令丢给模块再猜");
+        assert_eq!(error.code, ErrorCode::UnsupportedMethod);
+        let details = error.details.expect("必须带结构化理由");
+        assert_eq!(details["reason"], "capability_missing");
+        assert_eq!(details["capability"], "export");
+        assert_eq!(details["module_version"], "1.0.0");
+        assert_eq!(details["advertised"].as_array().expect("数组").len(), 2);
+        // 一个能力都没宣告的模块（只握手不宣告）同样不能放行
+        let bare = parse_pro_hello("OK 2 0.9 9 zh-CN").unwrap();
+        assert!(ensure_capability(&bare, CAP_LIST, PACKAGE_LIST_LOCALIZED).is_err());
+        // 状态查询这类不需要能力的命令走空串,别把门控做成一刀切
+        assert!(ensure_capability(&bare, "", "zygisk.status").is_ok());
+
+        // 规则 1：版本号严格匹配,低了高了都是 incompatible,不"试试看"
+        for line in ["OK 1 1.0 1 zh-CN list", "OK 3 3.0 1 zh-CN list"] {
+            let error = parse_pro_hello(line).expect_err("版本不匹配必须拒");
+            assert_eq!(error.code, ErrorCode::IncompatibleVersion, "{line}");
+        }
     }
 
     #[test]
