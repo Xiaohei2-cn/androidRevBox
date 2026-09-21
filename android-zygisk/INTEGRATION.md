@@ -152,7 +152,31 @@ APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_zygisk -
 `/data/adb/modules/<id>/token` 的读取路径，以及 `zygisk.status` 里 `module_id` 的归属。
 优先级规则写死为"自有模块 > demo > 不可用"，别在调用点各自排序一遍。
 
-## 7. 卸载 / 禁用 / 恢复（现场最常问的）
+## 7. 改模块代码之后要做的操作（以及它不是"刷机"）
+
+**这里没有任何刷机动作**：不改 boot 镜像、不改分区、不刷 ROM、不解 BL。做的只是
+KernelSU 装模块这个常规功能 + 一次正常重启，跟你在管理器里点"安装模块"是同一件事。
+
+```bash
+bash android-zygisk/applistpro/build.sh                 # 只在电脑上编译
+adb push android-zygisk/applistpro/applistpro.zip /data/local/tmp/
+adb shell su -c 'ksud module install /data/local/tmp/applistpro.zip'
+adb reboot                                              # 唯一需要离手的 2~3 分钟
+```
+
+为什么省不掉那次重启：模块的 C++ 库由 Zygisk 在开机时注入 zygote，`helper.dex` 由它在
+进程 specialize 时加载；跑着的进程不会重读这些文件。想热替换也不是完全做不到，而是
+**做不到可验证**——实测 `su -c cp` 覆盖 `helper.dex` 能写进去、模块也会加载新 dex，
+但写完以后连 su 自己都对那个文件 `Permission denied`，等于往看不见的地方塞东西
+（D020）。所以走"重装 + 重启"。
+
+风险与退路：模块有 bug 最坏的常见表现是该模块功能不可用（`zygisk.status` 会报
+`faulted`），内核与系统本身不受影响；真要出问题，KernelSU 管理器里禁用/删除模块再重启
+即可回到原状。注意：AR10.5 的"启动安全（bootloop 防护）"我们**还没主动验证过**，
+现在只有"模块异常只会让 zygisk.status 报 faulted，不影响开机"这一条观察——所以
+第一次装新写的模块前，值得先确认你知道怎么在恢复模式下删模块，或者干脆等 AR10.5 验完。
+
+## 8. 卸载 / 禁用 / 恢复（现场最常问的）
 
 ```bash
 adb shell su -c 'ksud module disable applistpro'   # 退到 v1 demo（装着的话）
@@ -164,7 +188,7 @@ adb shell su -c 'ksud module remove applistpro'    # 或 KernelSU 管理器里�
 `package.export_apk` 明确报能力缺失，`package.list`（Shell 等价实现）照常工作。
 这条不靠记性——`real_agent_zygisk_absent_reports_honest_failure` 在无模块设备上验。
 
-## 8. 我们真踩过的坑（都在提交记录里有对应修复）
+## 9. 我们真踩过的坑（都在提交记录里有对应修复）
 
 - 判"文件/进程在不在"要问内核（`test -x`、`pm list packages` 精确等值），
   不要看 `ls` 输出里有没有那个名字——不存在时报错文本也带着那个名字。
