@@ -627,7 +627,8 @@ function Field({
   );
 }
 
-function FilesView({ serial }: { serial: string | null }) {
+/* 为了 M1 页面回归可测（`app/m1PageRegression.test.tsx`）而导出：内部仍按子 tab 使用。 */
+export function FilesView({ serial }: { serial: string | null }) {
   const [path, setPath] = useState("/sdcard");
   /** 选中待预览/查看元数据的文件（AR7.1：filesystem.stat + filesystem.preview） */
   const [selected, setSelected] = useState<string | null>(null);

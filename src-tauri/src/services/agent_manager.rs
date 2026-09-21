@@ -2544,11 +2544,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "真机腿（会 root 起停 frida-server）；AR9_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_frida_server -- --ignored --nocapture"]
     async fn real_agent_frida_server_lifecycle_round_trip() {
-        use agent_protocol::method::{FRIDA_SERVER_START, FRIDA_SERVER_STATUS, FRIDA_SERVER_STOP};
+        use agent_protocol::method::{
+            DEVICE_ROOT_CHECK, FRIDA_SERVER_START, FRIDA_SERVER_STATUS, FRIDA_SERVER_STOP,
+        };
         use agent_protocol::{
-            ErrorCode, FridaServerStartParams, FridaServerStartResult, FridaServerState,
-            FridaServerStatusParams, FridaServerStatusResult, FridaServerStopParams,
-            FridaServerStopResult, WriteOutcome,
+            DeviceRootCheckParams, DeviceRootCheckResult, ErrorCode, FridaServerStartParams,
+            FridaServerStartResult, FridaServerState, FridaServerStatusParams,
+            FridaServerStatusResult, FridaServerStopParams, FridaServerStopResult, WriteOutcome,
         };
 
         let serial = std::env::var("AR9_TEST_SERIAL").expect("AR9_TEST_SERIAL is required");
@@ -2592,13 +2594,15 @@ mod tests {
             }
         };
 
-        // 前置一：二进制必须在托管目录里（没有就没什么可测的）
-        let listed = sh("ls -l /data/local/tmp/frida-server 2>&1".to_string()).await;
-        if !listed.contains("frida-server") {
-            eprintln!("[跳过] /data/local/tmp/frida-server 不存在，本腿无靶子: {listed}");
-            manager.disconnect(&serial).await.unwrap();
-            return;
-        }
+        // 前置一：二进制是否真的可执行。**必须问内核，不能看 ls 的输出文本**——
+        // 文件不存在时 `ls` 的报错里同样带着 "frida-server"，靠 contains 判存在
+        // 是同一类坑（AR8.1 那条 `contains('=')` 的亲戚），vivo 上就是这么假通过的。
+        let probe = sh(
+            "test -x /data/local/tmp/frida-server && echo FRIDA_EXEC_OK || echo FRIDA_EXEC_NO"
+                .to_string(),
+        )
+        .await;
+        let have_binary = probe.contains("FRIDA_EXEC_OK");
         // 前置二：不能停掉用户正在用的服务
         let before = status().await;
         if before.running {
@@ -2612,6 +2616,11 @@ mod tests {
         assert_eq!(before.state, FridaServerState::NotRunning);
         assert!(!before.as_root && !before.listening);
         eprintln!("[frida] 起点：未运行；版本探测={:?}", before.version);
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         // ① 越权参数必须被结构化拒绝（低端口 / 非白名单地址 / 带路径的名字）
         for params in [
@@ -2635,11 +2644,65 @@ mod tests {
             assert_eq!(error.code, ErrorCode::InvalidRequest, "{params:?}");
         }
 
+        // ①' 非 root 设备（例如没 su 的 vivo）到这里为止：status 与参数校验已经验完，
+        // 而且必须**如实**报告「拿不到 root」而不是假装起好了。这条负例就是它的价值。
+        let root: DeviceRootCheckResult = client
+            .request(
+                DEVICE_ROOT_CHECK,
+                &DeviceRootCheckParams {},
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("device.root_check 应可用");
+        if !have_binary || !root.root {
+            let expected = if !have_binary {
+                "binary_unavailable"
+            } else {
+                // 有二进制但设备没授权 root：必须报 su_unavailable / su_failed，不能是 executed
+                "su_unavailable"
+            };
+            let error = client
+                .request::<_, FridaServerStartResult>(
+                    FRIDA_SERVER_START,
+                    &FridaServerStartParams {
+                        operation_id: format!("ar91-nocap-{stamp}"),
+                        binary_name: Some("frida-server".into()),
+                        port: Some(27043),
+                        bind: Some("127.0.0.1".into()),
+                    },
+                    Duration::from_secs(30),
+                )
+                .await
+                .expect_err("缺二进制或缺 root 时启动必须失败");
+            let error = match error {
+                crate::services::agent_client::AgentClientError::Remote(error) => error,
+                other => panic!("期望结构化错误，实际 {other:?}"),
+            };
+            let reason = error
+                .details
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            eprintln!(
+                "[frida] 能力不足分支（有二进制={have_binary} root={}）如实失败: code={:?} reason={reason}",
+                root.root, error.code
+            );
+            assert!(
+                reason == expected || (have_binary && reason.starts_with("su_")),
+                "理由必须是「缺二进制」或「拿不到 root」，实际 {reason}"
+            );
+            assert_eq!(
+                status().await.state,
+                FridaServerState::NotRunning,
+                "失败之后不得留下半个服务"
+            );
+            manager.disconnect(&serial).await.unwrap();
+            return;
+        }
+
         // ② 以 root 起（非默认端口，避免撞用户工作流）
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         let start_op = format!("ar91-start-{stamp}");
         let started: FridaServerStartResult = client
             .request(

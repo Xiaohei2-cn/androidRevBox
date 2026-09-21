@@ -253,7 +253,7 @@ type FixKind = "adb" | "python" | "frida" | "remote" | "runner" | "frida-server"
  * 状态文案刻意区分 `running_as_shell`（连得上但注入不了别人）与 `indeterminate`
  * （读不到 uid，不猜），因为这两件事的下一步动作完全不同。
  */
-function FridaServerControl({
+export function FridaServerControl({
   serial,
   t,
 }: {
