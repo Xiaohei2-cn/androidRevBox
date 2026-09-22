@@ -923,7 +923,15 @@ export function AppsView({ serial }: { serial: string | null }) {
     setNotice(null);
     try {
       const report = await zygiskApi.exportPackage(serial, app.packageName, destination);
-      setNotice(t("apps.saved", { count: report.files.length, size: formatSize(report.bytes) }));
+      const base =
+        report.kind === "xapk"
+          ? t("apps.savedXapk", {
+              parts: report.parts.length,
+              name: report.fileName,
+              size: formatSize(report.artifactBytes),
+            })
+          : t("apps.savedApk", { name: report.fileName, size: formatSize(report.artifactBytes) });
+      setNotice(report.complete ? base : `${base} ${t("apps.savedIncomplete", { count: report.skipped.length })}`);
     } catch (e) {
       setNotice(t("apps.saveFailed", { error: String((e as Error)?.message ?? e) }));
     } finally {

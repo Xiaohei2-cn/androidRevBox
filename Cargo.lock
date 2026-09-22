@@ -76,6 +76,7 @@ dependencies = [
  "agent-protocol",
  "anyhow",
  "async-trait",
+ "crc32fast",
  "getrandom 0.3.4",
  "libc",
  "libloading 0.8.9",

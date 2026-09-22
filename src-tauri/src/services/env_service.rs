@@ -1731,11 +1731,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_base_interpreter_reverse_finds_venv() {
         // 根因三回归：macOS 文件选择器 resolvesAliases 把 venv/bin/python 解析成
-        // base 真身返回——host 拿到的 picked 已是 ~/.pyenv/...；反查 venv 应回到 venv。
-        let venv_python = "/Users/citec/PycharmProjects/android_reverse_study/.venv/bin/python";
+        // base 真身返回——host 拿到的 picked 已是 ~/.pyenv/...；反查必须回到某个 venv。
+        //
+        // 刻意不钉死“哪一个 venv”：同一个 base 派生出多个项目 venv 时，任选其一都算
+        // 达标（本机就有两个），钉死某个项目路径会让这条腿随用户的目录漂移而误红。
+        // 真正要守住的是：结果必须落在“其 pyvenv.cfg 指回该 base”的 venv/bin 里。
         let base = "/Users/citec/.pyenv/versions/3.13.5/bin/python3.13";
-        if !std::path::Path::new(venv_python).exists() || !std::path::Path::new(base).exists() {
-            eprintln!("skip: 本机缺该 venv/base");
+        if !std::path::Path::new(base).exists() {
+            eprintln!("skip: 本机缺 pyenv base");
             return;
         }
         let db = Arc::new(crate::db::Db::in_memory().unwrap());
@@ -1746,13 +1749,20 @@ mod tests {
             "picked={} resolved={} how={}",
             r.picked_path, r.resolved_path, r.how
         );
-        let venv_bin = std::path::Path::new(venv_python).parent().unwrap();
-        assert_eq!(
-            std::path::Path::new(&r.resolved_path).parent(),
-            Some(venv_bin),
-            "应反查回该 venv 的 bin（python3/python 任一变体）"
-        );
         assert_eq!(r.how, "venv-reverse");
+        let resolved_bin = std::path::Path::new(&r.resolved_path).parent().unwrap();
+        assert_eq!(resolved_bin.file_name().unwrap(), "bin");
+        let venv_root = resolved_bin.parent().unwrap();
+        let cfg = std::fs::read_to_string(venv_root.join("pyvenv.cfg"))
+            .expect("反查结果必须真的落在某个 venv 根目录下");
+        assert!(
+            cfg.contains("/Users/citec/.pyenv/versions/3.13.5/"),
+            "该 venv 的 pyvenv.cfg 没有指向这个 base: {cfg}"
+        );
+        assert!(
+            r.resolved_path != base,
+            "反查失败：还是原样返回了 base 解释器"
+        );
     }
 
     #[tokio::test]

@@ -57,11 +57,24 @@ export interface ZygiskApkFile {
   size: number;
 }
 
+/** 一次导出的产物：无分包 -> 「应用名 版本号.apk」，有分包 -> 合并成同名 .xapk */
 export interface ZygiskExportReport {
   packageName: string;
-  files: ZygiskApkFile[];
-  destination: string;
+  /** "apk" | "xapk" */
+  kind: string;
+  fileName: string;
+  artifactPath: string;
+  artifactBytes: number;
+  /** 产物由哪些分片组成（保持设备侧原名，便于回溯 split 类型） */
+  parts: ZygiskApkFile[];
+  /** 各分片原始字节之和 */
   bytes: number;
+  appLabel: string;
+  versionName: string;
+  nameSource: string;
+  skipped: string[];
+  complete: boolean;
+  destination: string;
 }
 
 export const zygiskApi = {

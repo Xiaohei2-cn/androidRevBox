@@ -39,9 +39,18 @@ describe("zygiskApi", () => {
   it("exports base and split APKs through the agent staging command", async () => {
     const report = {
       packageName: "com.example.app",
-      files: [{ packageName: "com.example.app", name: "base.apk", size: 10 }],
-      destination: "/tmp/apks/com.example.app",
+      kind: "apk",
+      fileName: "示例应用 1.0.apk",
+      artifactPath: "/tmp/apks/示例应用 1.0.apk",
+      artifactBytes: 10,
+      parts: [{ packageName: "com.example.app", name: "base.apk", size: 10 }],
       bytes: 10,
+      appLabel: "示例应用",
+      versionName: "1.0",
+      nameSource: "zygisk_framework",
+      skipped: [],
+      complete: true,
+      destination: "/tmp/apks",
     };
     invokeCommand.mockResolvedValue(report);
 

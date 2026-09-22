@@ -225,6 +225,11 @@ pub struct PackageExportApkResult {
     pub session: String,
     pub files: Vec<StagedApkFile>,
     pub bytes: u64,
+    /// 模块明确跳过的分片（例如 `too_large`）。非空表示这次导出**不完整**，
+    /// Desktop 合并出来的 XAPK 也就缺件，必须让界面说出来而不能装作成功。
+    /// `default` 是为了兼容还没带这个字段的旧 Agent。
+    #[serde(default)]
+    pub skipped: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1683,6 +1688,7 @@ mod tests {
                 remote_path: "/data/local/tmp/x/base.apk".into(),
             }],
             bytes: 1234,
+            skipped: vec!["split_config.arm64_v8a.apk".into()],
         };
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(
@@ -1690,6 +1696,16 @@ mod tests {
             "/data/local/tmp/x/base.apk"
         );
         assert_eq!(value["files"][0]["name"], "base.apk");
+        // 线格式保持 snake_case，不加翻译层（D043）
+        assert_eq!(value["skipped"][0], "split_config.arm64_v8a.apk");
+        let without: PackageExportApkResult = serde_json::from_value(serde_json::json!({
+            "package_name": "com.example.app",
+            "session": "a1b2c3",
+            "files": [],
+            "bytes": 0
+        }))
+        .unwrap();
+        assert!(without.skipped.is_empty(), "旧 Agent 缺字段必须能解析");
     }
 
     #[test]

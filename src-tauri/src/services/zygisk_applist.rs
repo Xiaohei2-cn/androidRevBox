@@ -6,7 +6,7 @@
 //! 该能力不允许静默降级成 `pm`/Shell 结果（AR5.5 规则）：缺 Agent 或缺模块时
 //! 直接返回可诊断的 `provider_unavailable`。
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +23,7 @@ use crate::adapters::adb;
 use crate::core::error::{CoreError, CoreResult};
 use crate::models::agent::{AgentSessionState, AndroidBackendSource};
 use crate::services::android_backend::{AgentBackendError, CapabilityRouter, OperationKind};
+use crate::services::apk_bundle::{self, AppNaming, PulledPart};
 use crate::services::device_service::AdbRunner;
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(20);
@@ -142,13 +143,33 @@ pub struct ZygiskApkFile {
     pub size: u64,
 }
 
+/// 导出结果：一次导出的**产物**（单个 `.apk` 或 `.xapk`）+ 它的组成明细。
+///
+/// 命名规则由 `apk_bundle` 决定：无分包 -> `<显示名> <版本号>.apk`，
+/// 有分包 -> 合并成 `<显示名> <版本号>.xapk`。显示名与版本号是向 Zygisk 清单
+/// 现查的（设备语言为中文即中文名），不采用界面回传的字符串，避免用旧值命名。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ZygiskExportReport {
     pub package_name: String,
-    pub files: Vec<ZygiskApkFile>,
-    pub destination: String,
+    /// `apk` = 无分包单文件；`xapk` = 分包已合并进 zip 容器
+    pub kind: String,
+    pub file_name: String,
+    pub artifact_path: String,
+    pub artifact_bytes: u64,
+    /// 产物里的各分片（保持设备侧原名，便于回溯是哪个 split）
+    pub parts: Vec<ZygiskApkFile>,
+    /// 各分片原始字节之和（不含 zip 头与 manifest.json）
     pub bytes: u64,
+    pub app_label: String,
+    pub version_name: String,
+    /// `zygisk_framework` / `zygisk_manifest` / `zygisk_package_name` /
+    /// `fallback_not_in_list` / `fallback_list_unavailable`
+    pub name_source: String,
+    /// 模块明确跳过的超大分片；非空表示产物不完整，界面必须说清楚
+    pub skipped: Vec<String>,
+    pub complete: bool,
+    pub destination: String,
 }
 
 pub struct ZygiskApplistService {
@@ -224,7 +245,11 @@ impl ZygiskApplistService {
         Ok(map_localized_result(result))
     }
 
-    /// 导出 base + split APK：Agent 在设备侧暂存，Desktop 经 ADB pull 取回并校验大小。
+    /// 导出一个应用的 APK：Agent 在设备侧暂存 -> Desktop 经 ADB pull 取回并校验大小
+    /// -> 宿主侧装配成单个产物（无分包改名成 `.apk`，有分包合并成 `.xapk`）。
+    ///
+    /// 装配失败时保留暂存目录里的原件（用户至少还能拿到散装 split），
+    /// 但会把错误照实抛出，不伪装成“已保存”。
     pub async fn export_package(
         &self,
         serial: &str,
@@ -248,25 +273,110 @@ impl ZygiskApplistService {
             .await
             .map_err(agent_core_error)?;
 
-        let package_dir = destination.join(package_name);
-        tokio::fs::create_dir_all(&package_dir)
+        // 命名元数据现查现用：这一步失败只降级成包名命名，不影响文件取回。
+        let naming = self.naming_for(serial, package_name).await;
+
+        tokio::fs::create_dir_all(destination)
             .await
             .map_err(|error| CoreError::Internal(format!("创建导出目录失败: {error}")))?;
+        let stage_dir = stage_dir_for(destination, package_name, &staged.session);
+        tokio::fs::create_dir_all(&stage_dir)
+            .await
+            .map_err(|error| CoreError::Internal(format!("创建导出暂存目录失败: {error}")))?;
 
-        let pull = self.pull_staged_files(serial, &staged, &package_dir).await;
+        let pull = self.pull_staged_files(serial, &staged, &stage_dir).await;
         // 无论取回成功与否都回收设备侧暂存，避免残留 APK 副本。
         if let Err(error) = self.clean_staged(serial, &staged.session).await {
             tracing::warn!(serial, error = %error, "Zygisk 导出暂存清理失败");
         }
-        let files = pull?;
+        let pulled = pull?;
 
-        let bytes = files.iter().map(|file| file.size).sum::<u64>();
+        let artifact = match apk_bundle::assemble(&naming, pulled.clone(), destination).await {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                // 半截产物由 assemble 自己清掉；散装原件留在暂存目录里，
+                // 把路径写进错误信息，用户还能手工取用
+                return Err(CoreError::Internal(format!(
+                    "{error}（未合并的原始文件保留在 {}）",
+                    stage_dir.display()
+                )));
+            }
+        };
+        if let Err(error) = tokio::fs::remove_dir_all(&stage_dir).await {
+            tracing::warn!(error = %error, "导出装配暂存目录清理失败");
+        }
+
+        let parts: Vec<ZygiskApkFile> = pulled
+            .iter()
+            .map(|part| ZygiskApkFile {
+                package_name: staged.package_name.clone(),
+                name: part.name.clone(),
+                size: part.size,
+            })
+            .collect();
+        let bytes = pulled.iter().map(|part| part.size).sum::<u64>();
         Ok(ZygiskExportReport {
             package_name: staged.package_name,
-            files,
-            destination: package_dir.to_string_lossy().into_owned(),
+            kind: artifact.kind.as_str().to_owned(),
+            file_name: artifact.file_name,
+            artifact_path: artifact.path.to_string_lossy().into_owned(),
+            artifact_bytes: artifact.bytes,
+            parts,
             bytes,
+            app_label: naming.label,
+            version_name: naming.version_name,
+            name_source: naming.name_source,
+            complete: staged.skipped.is_empty(),
+            skipped: staged.skipped,
+            destination: destination.to_string_lossy().into_owned(),
         })
+    }
+
+    /// 产物命名用的显示名与版本号：只问 Zygisk 清单（`package.list_localized`）。
+    ///
+    /// 这是「按设备语言解析出的应用名」的唯一权威来源，ADB/`pm` 给不出中文名；
+    /// 代价是每次导出多一次清单查询，等模块补上「按包查询」的接口后换成单点请求。
+    async fn naming_for(&self, serial: &str, package_name: &str) -> AppNaming {
+        let fallback = |reason: &str| AppNaming {
+            package_name: package_name.to_owned(),
+            label: package_name.to_owned(),
+            version_name: String::new(),
+            version_code: None,
+            name_source: reason.to_owned(),
+        };
+        match self
+            .list(serial, None, LocalizedScope::All, true)
+            .await
+            .map(|list| {
+                list.items
+                    .into_iter()
+                    .find(|item| item.package_name == package_name)
+            }) {
+            Ok(Some(item)) => AppNaming {
+                package_name: package_name.to_owned(),
+                label: item.label,
+                version_name: item.version_name,
+                version_code: item.version_code,
+                name_source: format!("zygisk_{}", item.label_source),
+            },
+            Ok(None) => {
+                tracing::warn!(
+                    serial,
+                    package_name,
+                    "Zygisk 清单里没有该包，产物改用包名命名"
+                );
+                fallback("fallback_not_in_list")
+            }
+            Err(error) => {
+                tracing::warn!(
+                    serial,
+                    package_name,
+                    error = %error,
+                    "查询 Zygisk 清单失败，产物改用包名命名"
+                );
+                fallback("fallback_list_unavailable")
+            }
+        }
     }
 
     async fn pull_staged_files(
@@ -274,7 +384,7 @@ impl ZygiskApplistService {
         serial: &str,
         staged: &PackageExportApkResult,
         package_dir: &Path,
-    ) -> CoreResult<Vec<ZygiskApkFile>> {
+    ) -> CoreResult<Vec<PulledPart>> {
         let environment = self.runner.environment().await;
         let adb_path = environment
             .path
@@ -312,9 +422,9 @@ impl ZygiskApplistService {
                     metadata.len()
                 )));
             }
-            files.push(ZygiskApkFile {
-                package_name: staged.package_name.clone(),
+            files.push(PulledPart {
                 name,
+                path: target,
                 size: entry.size,
             });
         }
@@ -505,6 +615,16 @@ fn validate_package_name(package_name: &str) -> CoreResult<()> {
     }
 }
 
+/// 宿主侧装配用的临时目录：放在目标目录内，保证改名走同卷零拷贝。
+fn stage_dir_for(destination: &Path, package_name: &str, session: &str) -> PathBuf {
+    let tag: String = session
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(16)
+        .collect();
+    destination.join(format!(".apk-stage-{package_name}-{tag}"))
+}
+
 fn safe_filename(name: &str) -> CoreResult<String> {
     let path = Path::new(name);
     if name.is_empty()
@@ -532,6 +652,8 @@ mod tests {
     use std::collections::HashMap;
 
     use agent_protocol::{LabelSource, LocalizedPackageItem, PackageWarning};
+
+    use crate::services::apk_bundle;
 
     use super::*;
 
@@ -871,26 +993,201 @@ mod tests {
             }
         }
 
+        // 默认样本是 cutout overlay（最小的单包系统组件，跑得快）；
+        // APPLIST_EXPORT_PKG 可以换成任意应用来人工复核命名与产物类型。
+        let wanted = std::env::var("APPLIST_EXPORT_PKG").unwrap_or_default();
         let target = all
             .items
             .iter()
-            .find(|item| item.package_name.ends_with(".cutout.emulation.noCutout"))
-            .expect("样本设备缺少 cutout overlay 小包，无法做导出体积校验");
+            .find(|item| {
+                if wanted.is_empty() {
+                    item.package_name.ends_with(".cutout.emulation.noCutout")
+                } else {
+                    item.package_name == wanted
+                }
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "设备清单里没有 {}（默认样本是 cutout overlay 小包），无法做导出校验",
+                    if wanted.is_empty() {
+                        "cutout overlay 小包"
+                    } else {
+                        wanted.as_str()
+                    }
+                )
+            });
         let out_dir = tempfile::tempdir().unwrap();
         let report = service
             .export_package(&serial, &target.package_name, out_dir.path())
             .await
             .unwrap();
         assert_eq!(report.package_name, target.package_name);
-        assert!(!report.files.is_empty());
+        assert!(!report.parts.is_empty());
         assert_eq!(
             report.bytes,
-            report.files.iter().map(|file| file.size).sum::<u64>()
+            report.parts.iter().map(|file| file.size).sum::<u64>()
         );
-        for file in &report.files {
-            let bytes = std::fs::read(Path::new(&report.destination).join(&file.name)).unwrap();
-            assert_eq!(bytes.len() as u64, file.size, "{} 大小不符", file.name);
-            assert!(bytes.starts_with(b"PK"), "{} 缺少 zip 魔数", file.name);
+        assert!(report.complete, "模块跳过了分片: {:?}", report.skipped);
+        // 命名元数据必须来自 Zygisk 清单，而不是界面回传或包名猜测
+        assert!(
+            report.name_source.starts_with("zygisk"),
+            "命名来源异常: {}",
+            report.name_source
+        );
+        assert_eq!(report.version_name, target.version_name);
+        let naming = apk_bundle::AppNaming {
+            package_name: report.package_name.clone(),
+            label: report.app_label.clone(),
+            version_name: report.version_name.clone(),
+            version_code: target.version_code,
+            name_source: report.name_source.clone(),
+        };
+        let stem = naming.stem();
+        assert!(
+            report.file_name.starts_with(&stem) && !stem.is_empty(),
+            "产物名应以「Zygisk 显示名 + 版本号」开头: {:?} vs {:?}",
+            report.file_name,
+            stem
+        );
+        assert!(
+            !report.file_name.contains('/') && !report.file_name.contains(".."),
+            "产物名必须是单个安全的路径分量: {}",
+            report.file_name
+        );
+        assert_eq!(
+            report.kind,
+            if report.parts.len() == 1 {
+                "apk"
+            } else {
+                "xapk"
+            },
+            "单包要出 .apk、分包要出 .xapk"
+        );
+        let artifact = Path::new(&report.artifact_path);
+        assert_eq!(artifact.parent(), Some(out_dir.path()));
+        assert_eq!(
+            artifact.file_name().and_then(|name| name.to_str()),
+            Some(report.file_name.as_str())
+        );
+        assert_eq!(report.destination, out_dir.path().to_string_lossy());
+        let bytes = std::fs::read(artifact).unwrap();
+        assert_eq!(bytes.len() as u64, report.artifact_bytes);
+        assert!(bytes.starts_with(b"PK"), "产物缺少 zip/APK 魔数");
+        if report.kind == "xapk" {
+            let entries = apk_bundle::read_bundle(artifact).await.unwrap();
+            assert_eq!(entries[0].name, "manifest.json");
+            for part in &report.parts {
+                assert!(
+                    entries.iter().any(|entry| entry.name == part.name),
+                    "容器里缺少 {}",
+                    part.name
+                );
+            }
+            for entry in &entries {
+                let payload = apk_bundle::bundle_payload(artifact, entry).await.unwrap();
+                assert_eq!(
+                    apk_bundle::crc32(&payload),
+                    entry.crc,
+                    "{} CRC 不符",
+                    entry.name
+                );
+            }
+        } else {
+            // 无分包：产物就是那份 APK 本身，改名不重写内容
+            assert_eq!(bytes.len() as u64, report.parts[0].size);
+            assert_eq!(report.file_name, format!("{stem}.apk"));
+        }
+        // 需要人工用第三方解压工具复核时，把产物留在指定目录（默认不留）
+        if let Ok(keep) = std::env::var("APPLIST_EXPORT_KEEP_DIR") {
+            tokio::fs::create_dir_all(&keep).await.unwrap();
+            let held = Path::new(&keep).join(&report.file_name);
+            tokio::fs::copy(Path::new(&report.artifact_path), &held)
+                .await
+                .unwrap();
+            eprintln!(
+                "[zygisk.export] {} -> {}（{} 个分片 / {} 字节，副本 {}）",
+                report.package_name,
+                report.file_name,
+                report.parts.len(),
+                report.bytes,
+                held.display()
+            );
+        }
+        // 宿主侧装配的临时目录必须回收，目标目录里只留产物
+        let staged: Vec<String> = std::fs::read_dir(out_dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".apk-stage-"))
+            .collect();
+        assert!(staged.is_empty(), "装配暂存目录未清理: {staged:?}");
+
+        // 可选腿：真·分包应用 -> 必须合并成一个 .xapk。默认不跑（要拉几百 MB），
+        // 需要时 APPLIST_EXPORT_SPLIT_PKG=com.amazon.mShop.android.shopping 显式开启。
+        if let Ok(split_pkg) = std::env::var("APPLIST_EXPORT_SPLIT_PKG") {
+            let item = all
+                .items
+                .iter()
+                .find(|entry| entry.package_name == split_pkg)
+                .unwrap_or_else(|| panic!("{split_pkg} 不在设备清单里"));
+            let dir = tempfile::tempdir().unwrap();
+            let merged = service
+                .export_package(&serial, &item.package_name, dir.path())
+                .await
+                .unwrap();
+            assert!(
+                merged.parts.len() > 1,
+                "{split_pkg} 只有一个 APK，本腿没有意义（改用单包应用会假绿）"
+            );
+            assert_eq!(merged.kind, "xapk");
+            assert!(merged.file_name.ends_with(".xapk"));
+            assert!(
+                merged.parts.iter().any(|part| part.name == "base.apk"),
+                "分包应用必须有 base.apk: {:?}",
+                merged.parts
+            );
+            let merged_path = Path::new(&merged.artifact_path);
+            let entries = apk_bundle::read_bundle(merged_path).await.unwrap();
+            assert_eq!(
+                entries.len(),
+                merged.parts.len() + 1,
+                "容器里应是 manifest.json + 全部分包"
+            );
+            for part in &merged.parts {
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.name == part.name)
+                    .unwrap_or_else(|| panic!("容器里缺少 {}", part.name));
+                assert_eq!(entry.size, part.size, "{} 大小不符", part.name);
+                if part.name == "base.apk" {
+                    let head = &apk_bundle::bundle_payload(merged_path, entry)
+                        .await
+                        .unwrap()[..4];
+                    assert_eq!(&head[..2], b"PK", "base.apk 内容被改坏了");
+                }
+            }
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &apk_bundle::bundle_payload(merged_path, &entries[0])
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["package_name"], split_pkg);
+            assert_eq!(
+                manifest["file_paths"].as_array().unwrap().len(),
+                merged.parts.len()
+            );
+            assert!(
+                merged.artifact_bytes >= merged.bytes,
+                "容器不该比原始分包更小"
+            );
+            eprintln!(
+                "[zygisk.xapk] {} = {} 个分包 / {} 字节 -> {}",
+                split_pkg,
+                merged.parts.len(),
+                merged.bytes,
+                merged.file_name
+            );
         }
         // 设备侧暂存必须回收，避免残留 APK 副本
         let leftovers = runner

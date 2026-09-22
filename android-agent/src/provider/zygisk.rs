@@ -796,7 +796,7 @@ impl ZygiskProvider {
                 result
             }
         };
-        let (files, bytes) = match staged {
+        let (files, bytes, skipped) = match staged {
             Ok(value) => value,
             Err(error) => {
                 // 失败也要回收设备侧副本；清理结果不掩盖原始错误。
@@ -817,6 +817,7 @@ impl ZygiskProvider {
             session,
             files,
             bytes,
+            skipped,
         })
     }
 
@@ -997,7 +998,7 @@ async fn stage_pro_export(
     token: &str,
     package_name: &str,
     staging_dir: &str,
-) -> Result<(Vec<StagedApkFile>, u64), AgentError> {
+) -> Result<(Vec<StagedApkFile>, u64, Vec<String>), AgentError> {
     let mut stream = connect_port(PRO_PORT, CONNECT_TIMEOUT).await?;
     let mut reader = LineReader::new(&mut stream);
     let hello = format!("H {PRO_SUB_PROTOCOL_VERSION} {token}\n");
@@ -1027,12 +1028,12 @@ async fn stage_pro_export(
                 return Err(AgentError::new(
                     ErrorCode::NotFound,
                     format!(
-                        "模块未返回 {package_name} 的任何 APK 文件                             （跳过: {}）",
+                        "模块未返回 {package_name} 的任何 APK 文件（跳过: {}）",
                         skipped.join(",")
                     ),
                 ));
             }
-            return Ok((files, total));
+            return Ok((files, total, skipped));
         }
         if let Some(text) = line
             .get(..4)
@@ -1044,8 +1045,16 @@ async fn stage_pro_export(
             return Err(pro_error_to_agent(&code, &message));
         }
         if line.first() == Some(&b'T') {
-            // T <size> <pkg> <name> too_large：显式记录，不静默丢文件
-            skipped.push(String::from_utf8_lossy(&line).into_owned());
+            // T <size> <pkg> <name> too_large：显式记录，不静默丢文件。
+            // 只取文件名上报，宿主侧要能直接指出“产物里少了哪个分包”。
+            let text = String::from_utf8_lossy(&line).into_owned();
+            let name = text
+                .split_whitespace()
+                .nth(3)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(text.trim())
+                .to_owned();
+            skipped.push(name);
             continue;
         }
         if line.first() != Some(&b'F') {
@@ -1097,12 +1106,13 @@ async fn request_module_line(payload: &[u8]) -> Result<Vec<u8>, AgentError> {
 }
 
 /// 读模块 `D` 流并写入 0700 暂存目录：包名、文件名、单文件与总长度全部校验。
-/// 返回（文件列表, 总字节数）；失败清理由调用方负责。
+/// 返回（文件列表, 总字节数, 被跳过的分片）；失败清理由调用方负责。
+/// v1 demo 协议没有“跳过”这一说，恒定返回空列表。
 async fn stage_package_export(
     stream: &mut TcpStream,
     package_name: &str,
     staging_dir: &str,
-) -> Result<(Vec<StagedApkFile>, u64), AgentError> {
+) -> Result<(Vec<StagedApkFile>, u64, Vec<String>), AgentError> {
     let mut payload = Vec::with_capacity(package_name.len() + 4);
     payload.extend_from_slice(b"D");
     payload.extend_from_slice(package_name.as_bytes());
@@ -1127,7 +1137,7 @@ async fn stage_package_export(
             Err(error) => return Err(error),
         };
         if header == b"DONE".as_slice() {
-            return Ok((files, total));
+            return Ok((files, total, Vec::new()));
         }
         if header.starts_with(b"ERR") {
             return Err(internal(format!(
