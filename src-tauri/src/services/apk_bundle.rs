@@ -1,13 +1,19 @@
-//! APK 产物装配：把设备侧取回的 base + split 变成「应用名 + 版本号」的单个文件。
+//! APK 产物装配：把设备侧取回的 base + split 变成「应用名_版本号」的单个文件。
 //!
 //! 规则：
-//! * 只有一个文件（应用没有分包）→ 直接改名成 `<显示名> <版本号>.apk`；
-//! * 多个文件（base + split_*）→ 不压缩地装进 zip 容器并补一份 `manifest.json`，
-//!   即 `<显示名> <版本号>.xapk`；容器内的名字保持 `base.apk` / `split_*.apk` 原样，
-//!   因为安装器按这些名字识别 split 类型。
+//! * 只有一个文件（应用没有分包）→ 直接改名成 `<显示名>_<版本号>.apk`；
+//! * 多个文件（base + split_*）→ 装进 **SAI 的 `.apks`**（Split APKs Installer 格式）：
+//!   一个 store 打包的 zip，里面是 `meta.sai_v2.json`、`meta.sai_v1.json` 和按名字
+//!   排序的 APK。容器内的 APK 名字保持 `base.apk` / `split_*.apk` 原样，安装器按
+//!   这些名字识别 split 类型。
+//!
+//! 为什么是 `.apks` 而不是 `.xapk`（用户口径）：`.apks` 有 SAI 仓库里
+//! `META-FORMAT.md` + `ApksSingleBackupTaskExecutor` 这两份可读的权威实现，
+//! 字段、条目顺序、打包方式（全 STORED、统一时间戳）都能逐条对齐；`.xapk` 没有
+//! 统一规范，各工具的 `manifest.json` 方言互不兼容。
 //!
 //! 分工：分包**集合**与**按设备语言解析出的应用名/版本号**只能问 Framework，
-//! 这是 Zygisk 模块的职责（`E` 导出、`L` 本地化清单）；而设备侧 `toybox` 没有 zip
+//! 这是 Zygisk 模块的职责（`E` 导出、`P` 按包查询）；而设备侧 `toybox` 没有 zip
 //! 工具，APK 本身又已经压缩过（store 打包即可），文件也必然已经经 ADB pull 回到
 //! 电脑，所以「装进容器」这一步放在宿主侧做，既不给设备加负担也好校验回收。
 
@@ -23,6 +29,11 @@ use crate::core::error::{CoreError, CoreResult};
 const MAX_STEM_BYTES: usize = 180;
 const MAX_VERSION_BYTES: usize = 60;
 const MAX_PART_NAME_BYTES: usize = 200;
+/// SAI 的 `.apks` 里两个元数据文件名（逐字取自 SAI 源码常量）
+const SAI_META_V2: &str = "meta.sai_v2.json";
+const SAI_META_V1: &str = "meta.sai_v1.json";
+/// SAI v2 meta 里表示"这个包里装的就是 APK 文件"的组件类型
+const SAI_COMPONENT_APK_FILES: &str = "apk_files";
 const READ_CHUNK: usize = 64 * 1024;
 /// 同一目录内重名时的消歧上限。
 const MAX_SUFFIX: u32 = 999;
@@ -39,7 +50,7 @@ const EOCD_LEN: u64 = 22;
 pub enum BundleKind {
     /// 无分包：单个 APK
     Single,
-    /// 有分包：XAPK 容器
+    /// 有分包：SAI 的 .apks 容器
     Bundle,
 }
 
@@ -47,7 +58,7 @@ impl BundleKind {
     pub fn extension(self) -> &'static str {
         match self {
             Self::Single => "apk",
-            Self::Bundle => "xapk",
+            Self::Bundle => "apks",
         }
     }
 
@@ -70,15 +81,16 @@ pub struct AppNaming {
 }
 
 impl AppNaming {
-    /// 命名主串：`<显示名> <版本号>`；版本号缺失时退回 versionCode，两者都没有就只有名字。
+    /// 命名主串：`<显示名>_<版本号>`（用户要求用下划线，不用空格）；
+    /// 版本号缺失时退回 `v<versionCode>`，两者都没有就只有名字。
     pub fn stem(&self) -> String {
         let name = self.display_name();
         let version = sanitize(self.version_name.trim(), MAX_VERSION_BYTES);
         if !version.is_empty() {
-            return fit(&format!("{name} {version}"));
+            return fit(&format!("{name}_{version}"));
         }
         match self.version_code {
-            Some(code) => fit(&format!("{name} v{code}")),
+            Some(code) => fit(&format!("{name}_v{code}")),
             None => name,
         }
     }
@@ -201,60 +213,98 @@ pub async fn reserve_file_name(dir: &Path, stem: &str, ext: &str) -> CoreResult<
     )))
 }
 
-/// XAPK 的 `manifest.json`（AndroidFileHost v2 方言；顶层再冗余一份 `file_paths`，
-/// 两种读法的安装器都能拿到分包列表）。
+/// SAI `.apks` 的 v2 元数据。字段名逐字对齐 SAI 的 `SaiExportedAppMeta2`
+/// （`@SerializedName` 那一套），字段顺序无所谓但**缺字段是会被读成 null 的**。
+///
+/// `min_sdk` / `target_sdk` 在 SAI 里是 `@Nullable`，我们目前从 Framework 拿不到
+/// （`P` 命令没这两个字段），所以**刻意不写**——写 0 或猜一个值比留空更糟。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub struct XapkManifest {
-    pub manifest_version: u32,
-    pub name: String,
-    pub package_name: String,
+pub struct SaiMetaV2 {
+    pub meta_version: u32,
+    #[serde(rename = "package")]
+    pub package: String,
+    pub label: String,
     pub version_name: String,
     pub version_code: Option<u64>,
-    pub distribution_content_type: String,
-    /// UTC，秒级，无时区后缀（与常见 XAPK 写法一致）
-    pub date_created: String,
-    pub total_size: u64,
-    pub file_paths: Vec<String>,
-    pub app_list: Vec<XapkManifestApp>,
+    /// Unix 毫秒，与 SAI 一致
+    pub export_timestamp: u64,
+    pub split_apk: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_sdk: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_sdk: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backup_components: Vec<SaiBackupComponent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub struct XapkManifestApp {
-    pub name: String,
-    pub package_name: String,
-    pub version_name: String,
-    pub version_code: Option<u64>,
-    pub file_paths: Vec<String>,
+pub struct SaiBackupComponent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub size: u64,
 }
 
-pub fn build_manifest(naming: &AppNaming, parts: &[PulledPart], created: SystemTime) -> String {
-    let display = naming.display_name();
-    let file_paths: Vec<String> = parts
-        .iter()
-        .map(|part| sanitize(&part.name, MAX_PART_NAME_BYTES))
-        .collect();
-    let manifest = XapkManifest {
-        manifest_version: 2,
-        name: display.clone(),
-        package_name: naming.package_name.clone(),
+/// SAI `.apks` 的 v1 元数据（`SaiExportedAppMeta`），字段更少，老版本安装器读这份。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SaiMetaV1 {
+    #[serde(rename = "package")]
+    pub package: String,
+    pub label: String,
+    pub version_name: String,
+    pub version_code: Option<u64>,
+    pub export_timestamp: u64,
+}
+
+/// 生成两份 SAI 元数据（v2、v1）的 JSON 文本。
+pub fn build_sai_meta(
+    naming: &AppNaming,
+    parts: &[PulledPart],
+    created: SystemTime,
+) -> (String, String) {
+    let label = {
+        let display = naming.display_name();
+        if display.is_empty() {
+            naming.package_name.clone()
+        } else {
+            display
+        }
+    };
+    let timestamp = created
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let total_size = parts.iter().map(|part| part.size).sum::<u64>();
+    let v2 = SaiMetaV2 {
+        meta_version: 2,
+        package: naming.package_name.clone(),
+        label: label.clone(),
         version_name: naming.version_name.clone(),
         version_code: naming.version_code,
-        distribution_content_type: "application/vnd.android.package-archive".into(),
-        date_created: iso_utc(created),
-        total_size: parts.iter().map(|part| part.size).sum::<u64>(),
-        file_paths: file_paths.clone(),
-        app_list: vec![XapkManifestApp {
-            name: display,
-            package_name: naming.package_name.clone(),
-            version_name: naming.version_name.clone(),
-            version_code: naming.version_code,
-            file_paths,
+        export_timestamp: timestamp,
+        split_apk: parts.len() > 1,
+        min_sdk: None,
+        target_sdk: None,
+        backup_components: vec![SaiBackupComponent {
+            kind: SAI_COMPONENT_APK_FILES.to_owned(),
+            size: total_size,
         }],
     };
-    serde_json::to_string_pretty(&manifest)
-        .unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}\n"))
+    let v1 = SaiMetaV1 {
+        package: naming.package_name.clone(),
+        label,
+        version_name: naming.version_name.clone(),
+        version_code: naming.version_code,
+        export_timestamp: timestamp,
+    };
+    (to_json(&v2), to_json(&v1))
+}
+
+fn to_json<T: Serialize>(value: &T) -> String {
+    // 字段全是字符串/整数/数组，理论上不会失败；真失败也不能 panic，给出可诊断的 JSON
+    serde_json::to_string(value).unwrap_or_else(|error| format!("{{\"error\":\"{error}\"}}"))
 }
 
 /// 装配主流程：`parts` 是刚从设备取回、仍留在暂存目录里的原名文件，产物写进
@@ -277,10 +327,7 @@ pub async fn assemble(
 
     let written = match kind {
         BundleKind::Single => place_file(&parts[0].path, &target).await,
-        BundleKind::Bundle => {
-            let manifest = build_manifest(naming, &parts, SystemTime::now());
-            write_bundle(&target, manifest.as_bytes(), &parts).await
-        }
+        BundleKind::Bundle => write_bundle(&target, naming, &parts).await,
     };
     match written {
         Ok(bytes) => Ok(Artifact {
@@ -307,18 +354,41 @@ async fn place_file(source: &Path, target: &Path) -> CoreResult<u64> {
     metadata_size(target).await
 }
 
-/// 多包：写一个 store（不压缩）的 zip 容器 = XAPK。
-async fn write_bundle(target: &Path, manifest: &[u8], parts: &[PulledPart]) -> CoreResult<u64> {
+/// 多包：写一个 store（不压缩）的 zip 容器 = SAI 的 `.apks`。
+/// 条目顺序与时间戳照 SAI 自己的写入器（`ApksSingleBackupTaskExecutor`）：
+/// `meta.sai_v2.json` → `meta.sai_v1.json` → 按文件名排序的 APK，共用同一个导出时间戳。
+async fn write_bundle(target: &Path, naming: &AppNaming, parts: &[PulledPart]) -> CoreResult<u64> {
+    let created = SystemTime::now();
+    let (meta_v2, meta_v1) = build_sai_meta(naming, parts, created);
     let file = tokio::fs::File::create(target)
         .await
-        .map_err(|error| CoreError::Internal(format!("创建 XAPK 失败: {error}")))?;
+        .map_err(|error| CoreError::Internal(format!("创建 apks 失败: {error}")))?;
     let mut writer = BufWriter::with_capacity(READ_CHUNK, file);
-    let mut entries: Vec<ZipEntry> = Vec::with_capacity(parts.len() + 1);
-    let now = dos_of(SystemTime::now());
+    let mut entries: Vec<ZipEntry> = Vec::with_capacity(parts.len() + 2);
+    let now = dos_of(created);
 
-    let mut offset =
-        put_bytes(&mut writer, &mut entries, 0, "manifest.json", manifest, now).await?;
-    for part in parts {
+    let mut offset = put_bytes(
+        &mut writer,
+        &mut entries,
+        0,
+        SAI_META_V2,
+        meta_v2.as_bytes(),
+        now,
+    )
+    .await?;
+    offset = put_bytes(
+        &mut writer,
+        &mut entries,
+        offset,
+        SAI_META_V1,
+        meta_v1.as_bytes(),
+        now,
+    )
+    .await?;
+    // SAI 排序后写入；跟着排，两次导出的产物才有可比对性
+    let mut ordered: Vec<&PulledPart> = parts.iter().collect();
+    ordered.sort_by(|left, right| left.name.cmp(&right.name));
+    for part in ordered {
         let name = sanitize(&part.name, MAX_PART_NAME_BYTES);
         if name.is_empty() {
             return Err(CoreError::Internal("分包名为空".into()));
@@ -332,7 +402,7 @@ async fn write_bundle(target: &Path, manifest: &[u8], parts: &[PulledPart]) -> C
     writer
         .shutdown()
         .await
-        .map_err(|error| CoreError::Internal(format!("XAPK 写入未完成: {error}")))?;
+        .map_err(|error| CoreError::Internal(format!("apks 写入未完成: {error}")))?;
     drop(writer);
     // 写完立刻按中央目录读回来对一遍：条目数量、名字、长度、偏移、CRC 全对上才算成功。
     // 只读尾部与中央目录，不重读文件体，代价可忽略；换来的是「安装器一定读得懂这个容器」。
@@ -603,7 +673,7 @@ async fn metadata_size(path: &Path) -> CoreResult<u64> {
         .map_err(|error| CoreError::Internal(format!("读取产物大小失败: {error}")))
 }
 
-/// XAPK 容器里的一个条目（只解析中央目录，不预读文件体）。
+/// `.apks` 容器里的一个条目（只解析中央目录，不预读文件体）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleEntry {
     pub name: String,
@@ -666,7 +736,7 @@ pub async fn read_bundle(path: &Path) -> CoreResult<Vec<BundleEntry>> {
         }
         let method = read_u16(&cd, cursor + 10);
         if method != METHOD_STORE as u64 {
-            return Err(CoreError::Internal("XAPK 条目应当是 store 打包".into()));
+            return Err(CoreError::Internal("apks 条目应当是 store 打包".into()));
         }
         let crc = read_u32(&cd, cursor + 16) as u32;
         let size = read_u32(&cd, cursor + 24);
@@ -735,11 +805,6 @@ fn unix_secs(at: SystemTime) -> i64 {
     }
 }
 
-fn iso_utc(at: SystemTime) -> String {
-    let (year, month, day, hour, minute, second) = civil(unix_secs(at));
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
-}
-
 /// Howard Hinnant 的 days→civil（UTC）：不额外拉时区库。
 fn civil(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     let days = secs.div_euclid(86_400);
@@ -781,18 +846,19 @@ mod tests {
     }
 
     #[test]
-    fn stem_uses_localized_label_and_version() {
+    fn stem_joins_label_and_version_with_underscore() {
+        // 用户口径：名字与版本号之间用下划线，不用空格
         assert_eq!(
             naming("亚马逊购物", "32.17.0.100").stem(),
-            "亚马逊购物 32.17.0.100"
+            "亚马逊购物_32.17.0.100"
         );
         // 版本号缺失时退回 versionCode，两者都没有就只留名字
-        assert_eq!(naming("设置", "").stem(), "设置 v42");
+        assert_eq!(naming("设置", "").stem(), "设置_v42");
         let mut no_code = naming("设置", "");
         no_code.version_code = None;
         assert_eq!(no_code.stem(), "设置");
         // 名字解析不出来（清单回退成包名）时用包名，不产出空文件名
-        assert_eq!(naming("  ", "1.0").stem(), "com.example.app 1.0");
+        assert_eq!(naming("  ", "1.0").stem(), "com.example.app_1.0");
     }
 
     #[test]
@@ -811,8 +877,10 @@ mod tests {
         assert!(cut.len() <= 10);
     }
 
+    /// 两份 SAI 元数据的字段名必须逐字对齐 SAI 源码里的 @SerializedName——
+    /// 拼错的后果是"安装器读得到 APK、却显示不出应用信息"，界面上很难发现。
     #[test]
-    fn manifest_has_both_file_path_dialects() {
+    fn sai_meta_files_match_the_upstream_field_names() {
         let parts = vec![
             PulledPart {
                 name: "base.apk".into(),
@@ -825,24 +893,39 @@ mod tests {
                 size: 5,
             },
         ];
-        let json: HashMap<String, serde_json::Value> = serde_json::from_str(&build_manifest(
+        let (v2_text, v1_text) = build_sai_meta(
             &naming("亚马逊购物", "32.17.0.100"),
             &parts,
-            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_059_800),
-        ))
-        .unwrap();
-        assert_eq!(json["manifest_version"], 2);
-        assert_eq!(json["name"], "亚马逊购物");
-        assert_eq!(json["package_name"], "com.example.app");
-        assert_eq!(json["version_name"], "32.17.0.100");
-        assert_eq!(json["version_code"], 42);
-        assert_eq!(json["total_size"], 15);
-        assert_eq!(json["date_created"], "2026-09-22T06:50:00");
-        assert_eq!(json["file_paths"].as_array().unwrap().len(), 2);
-        assert_eq!(json["file_paths"][0], "base.apk");
-        let app = &json["app_list"][0];
-        assert_eq!(app["file_paths"][1], "split_config.arm64_v8a.apk");
-        assert_eq!(app["name"], "亚马逊购物");
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1_790_059_800_123),
+        );
+        let v2: HashMap<String, serde_json::Value> = serde_json::from_str(&v2_text).unwrap();
+        let v1: HashMap<String, serde_json::Value> = serde_json::from_str(&v1_text).unwrap();
+
+        assert_eq!(v2["meta_version"], 2);
+        assert_eq!(v2["package"], "com.example.app");
+        assert_eq!(v2["label"], "亚马逊购物");
+        assert_eq!(v2["version_name"], "32.17.0.100");
+        assert_eq!(v2["version_code"], 42);
+        assert_eq!(v2["export_timestamp"], 1_790_059_800_123_u64);
+        assert_eq!(v2["split_apk"], true);
+        assert_eq!(v2["backup_components"][0]["type"], "apk_files");
+        assert_eq!(v2["backup_components"][0]["size"], 15);
+        // 拿不到的字段宁可不写，也不填 0 假装知道
+        assert_eq!(v2.get("min_sdk"), None);
+        assert_eq!(v2.get("target_sdk"), None);
+
+        assert_eq!(v1["package"], "com.example.app");
+        assert_eq!(v1["label"], "亚马逊购物");
+        assert_eq!(v1["version_name"], "32.17.0.100");
+        assert_eq!(v1["version_code"], 42);
+        assert_eq!(v1["export_timestamp"], 1_790_059_800_123_u64);
+        assert_eq!(v1.get("split_apk"), None, "v1 不该出现 v2 才有的字段");
+
+        // 只有一个分片时 split_apk 必须是 false
+        let (single_v2, _) =
+            build_sai_meta(&naming("设置", "1"), &parts[..1], SystemTime::UNIX_EPOCH);
+        let parsed: HashMap<String, serde_json::Value> = serde_json::from_str(&single_v2).unwrap();
+        assert_eq!(parsed["split_apk"], false);
     }
 
     #[test]
@@ -861,19 +944,19 @@ mod tests {
     async fn reserve_name_deduplicates_in_same_directory() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            reserve_file_name(dir.path(), "亚马逊购物 1.0", "apk")
+            reserve_file_name(dir.path(), "亚马逊购物_1.0", "apk")
                 .await
                 .unwrap(),
-            "亚马逊购物 1.0.apk"
+            "亚马逊购物_1.0.apk"
         );
-        tokio::fs::write(dir.path().join("亚马逊购物 1.0.apk"), b"x")
+        tokio::fs::write(dir.path().join("亚马逊购物_1.0.apk"), b"x")
             .await
             .unwrap();
         assert_eq!(
-            reserve_file_name(dir.path(), "亚马逊购物 1.0", "apk")
+            reserve_file_name(dir.path(), "亚马逊购物_1.0", "apk")
                 .await
                 .unwrap(),
-            "亚马逊购物 1.0 (2).apk"
+            "亚马逊购物_1.0 (2).apk"
         );
         assert!(reserve_file_name(dir.path(), "  ", "apk").await.is_err());
     }
@@ -923,27 +1006,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(artifact.kind, BundleKind::Bundle);
-        assert_eq!(artifact.file_name, "亚马逊购物 32.17.xapk");
+        assert_eq!(artifact.file_name, "亚马逊购物_32.17.apks");
         assert!(artifact.path.starts_with(&out));
         assert!(artifact.bytes > base.len() as u64 + split.len() as u64);
+        // 条目顺序照 SAI：两份 meta，然后按文件名排序的 APK
         let entries = entries_of(&artifact.path).await;
         assert_eq!(
             entries
                 .iter()
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["manifest.json", "base.apk", "split_config.zh.apk"]
+            vec![
+                "meta.sai_v2.json",
+                "meta.sai_v1.json",
+                "base.apk",
+                "split_config.zh.apk"
+            ]
         );
-        assert_eq!(entries[1].1, base, "APK 字节必须原样保留");
-        assert_eq!(entries[2].1, split);
-        let manifest: HashMap<String, serde_json::Value> =
+        assert_eq!(entries[2].1, base, "APK 字节必须原样保留");
+        assert_eq!(entries[3].1, split);
+        // SAI 的安装路径只挑 .apk 结尾的条目，meta 放前面不影响它；
+        // 但 meta 内容决定它在备份列表里显示成什么
+        let meta: HashMap<String, serde_json::Value> =
             serde_json::from_slice(&entries[0].1).unwrap();
         assert_eq!(
-            manifest["total_size"],
+            meta["backup_components"][0]["size"],
             base.len() as u64 + split.len() as u64
         );
-        // 容器名不许改写：安装器按 base.apk / split_*.apk 识别分包
-        assert_eq!(manifest["file_paths"][1], "split_config.zh.apk");
+        assert_eq!(meta["split_apk"], true);
+        assert_eq!(meta["label"], "亚马逊购物");
+        let v1: HashMap<String, serde_json::Value> = serde_json::from_slice(&entries[1].1).unwrap();
+        assert_eq!(v1["package"], "com.example.app");
     }
 
     #[tokio::test]
@@ -966,7 +1059,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(artifact.kind, BundleKind::Single);
-        assert_eq!(artifact.file_name, "剪贴岛 1.2.3.apk");
+        assert_eq!(artifact.file_name, "剪贴岛_1.2.3.apk");
         assert_eq!(tokio::fs::read(&artifact.path).await.unwrap(), payload);
         assert!(
             !tokio::fs::try_exists(&staged).await.unwrap(),

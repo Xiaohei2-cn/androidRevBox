@@ -924,8 +924,8 @@ export function AppsView({ serial }: { serial: string | null }) {
     try {
       const report = await zygiskApi.exportPackage(serial, app.packageName, destination);
       const base =
-        report.kind === "xapk"
-          ? t("apps.savedXapk", {
+        report.kind === "apks"
+          ? t("apps.savedApks", {
               parts: report.parts.length,
               name: report.fileName,
               size: formatSize(report.artifactBytes),

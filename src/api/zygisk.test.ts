@@ -40,8 +40,8 @@ describe("zygiskApi", () => {
     const report = {
       packageName: "com.example.app",
       kind: "apk",
-      fileName: "示例应用 1.0.apk",
-      artifactPath: "/tmp/apks/示例应用 1.0.apk",
+      fileName: "示例应用_1.0.apk",
+      artifactPath: "/tmp/apks/示例应用_1.0.apk",
       artifactBytes: 10,
       parts: [{ packageName: "com.example.app", name: "base.apk", size: 10 }],
       bytes: 10,

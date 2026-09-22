@@ -227,7 +227,7 @@ pub struct PackageExportApkResult {
     pub files: Vec<StagedApkFile>,
     pub bytes: u64,
     /// 模块明确跳过的分片（例如 `too_large`）。非空表示这次导出**不完整**，
-    /// Desktop 合并出来的 XAPK 也就缺件，必须让界面说出来而不能装作成功。
+    /// Desktop 合并出来的 `.apks` 也就缺件，必须让界面说出来而不能装作成功。
     /// `default` 是为了兼容还没带这个字段的旧 Agent。
     #[serde(default)]
     pub skipped: Vec<String>,

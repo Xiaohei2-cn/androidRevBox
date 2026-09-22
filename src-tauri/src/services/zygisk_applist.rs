@@ -146,23 +146,23 @@ pub struct ZygiskApkFile {
     pub size: u64,
 }
 
-/// 导出结果：一次导出的**产物**（单个 `.apk` 或 `.xapk`）+ 它的组成明细。
+/// 导出结果：一次导出的**产物**（单个 `.apk` 或 `.apks`）+ 它的组成明细。
 ///
-/// 命名规则由 `apk_bundle` 决定：无分包 -> `<显示名> <版本号>.apk`，
-/// 有分包 -> 合并成 `<显示名> <版本号>.xapk`。显示名与版本号是向 Zygisk 清单
+/// 命名规则由 `apk_bundle` 决定：无分包 -> `<显示名>_<版本号>.apk`，
+/// 有分包 -> 合并成 SAI 格式的 `<显示名>_<版本号>.apks`。显示名与版本号是向 Zygisk
 /// 现查的（设备语言为中文即中文名），不采用界面回传的字符串，避免用旧值命名。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ZygiskExportReport {
     pub package_name: String,
-    /// `apk` = 无分包单文件；`xapk` = 分包已合并进 zip 容器
+    /// `apk` = 无分包单文件；`apks` = 分包已合并进 SAI 的 .apks 容器
     pub kind: String,
     pub file_name: String,
     pub artifact_path: String,
     pub artifact_bytes: u64,
     /// 产物里的各分片（保持设备侧原名，便于回溯是哪个 split）
     pub parts: Vec<ZygiskApkFile>,
-    /// 各分片原始字节之和（不含 zip 头与 manifest.json）
+    /// 各分片原始字节之和（不含 zip 头与两份 SAI meta）
     pub bytes: u64,
     pub app_label: String,
     pub version_name: String,
@@ -260,7 +260,7 @@ impl ZygiskApplistService {
     }
 
     /// 导出一个应用的 APK：Agent 在设备侧暂存 -> Desktop 经 ADB pull 取回并校验大小
-    /// -> 宿主侧装配成单个产物（无分包改名成 `.apk`，有分包合并成 `.xapk`）。
+    /// -> 宿主侧装配成单个产物（无分包改名成 `.apk`，有分包合并成 `.apks`）。
     ///
     /// 装配失败时保留暂存目录里的原件（用户至少还能拿到散装 split），
     /// 但会把错误照实抛出，不伪装成“已保存”。
@@ -662,7 +662,7 @@ fn map_localized_result(result: PackageListLocalizedResult) -> ZygiskAppList {
 /// 产物里缺了哪些分片。
 ///
 /// 两个来源合并成一件事实：①模块明说跳过的（`too_large`）；②设备侧声明了、
-/// 但这次没取回来的。合成单个 `.xapk` 之后，"少一个分包"从肉眼可见变成不可见，
+/// 但这次没取回来的。合成单个 `.apks` 之后，"少一个分包"从肉眼可见变成不可见，
 /// 所以宁可报"不完整"也不能默认成功。`declared` 为 `None`（老模块没有按包查询）
 /// 时只信①，不猜②。
 fn missing_parts(
@@ -1266,9 +1266,9 @@ mod tests {
             if report.parts.len() == 1 {
                 "apk"
             } else {
-                "xapk"
+                "apks"
             },
-            "单包要出 .apk、分包要出 .xapk"
+            "单包要出 .apk、分包要出 .apks"
         );
         let artifact = Path::new(&report.artifact_path);
         assert_eq!(artifact.parent(), Some(out_dir.path()));
@@ -1280,9 +1280,11 @@ mod tests {
         let bytes = std::fs::read(artifact).unwrap();
         assert_eq!(bytes.len() as u64, report.artifact_bytes);
         assert!(bytes.starts_with(b"PK"), "产物缺少 zip/APK 魔数");
-        if report.kind == "xapk" {
+        if report.kind == "apks" {
             let entries = apk_bundle::read_bundle(artifact).await.unwrap();
-            assert_eq!(entries[0].name, "manifest.json");
+            // 条目顺序照 SAI 自己的写入器：两份 meta 在最前
+            assert_eq!(entries[0].name, "meta.sai_v2.json");
+            assert_eq!(entries[1].name, "meta.sai_v1.json");
             for part in &report.parts {
                 assert!(
                     entries.iter().any(|entry| entry.name == part.name),
@@ -1329,7 +1331,7 @@ mod tests {
             .collect();
         assert!(staged.is_empty(), "装配暂存目录未清理: {staged:?}");
 
-        // 可选腿：真·分包应用 -> 必须合并成一个 .xapk。默认不跑（要拉几百 MB），
+        // 可选腿：真·分包应用 -> 必须合并成一个 .apks。默认不跑（要拉几百 MB），
         // 需要时 APPLIST_EXPORT_SPLIT_PKG=com.amazon.mShop.android.shopping 显式开启。
         if let Ok(split_pkg) = std::env::var("APPLIST_EXPORT_SPLIT_PKG") {
             let item = all
@@ -1346,8 +1348,14 @@ mod tests {
                 merged.parts.len() > 1,
                 "{split_pkg} 只有一个 APK，本腿没有意义（改用单包应用会假绿）"
             );
-            assert_eq!(merged.kind, "xapk");
-            assert!(merged.file_name.ends_with(".xapk"));
+            assert_eq!(merged.kind, "apks");
+            assert!(merged.file_name.ends_with(".apks"));
+            // 用户口径：名字与版本号之间用下划线，不用空格
+            assert!(
+                merged.file_name.contains('_'),
+                "产物名要用下划线连接名字与版本号: {}",
+                merged.file_name
+            );
             assert!(
                 merged.parts.iter().any(|part| part.name == "base.apk"),
                 "分包应用必须有 base.apk: {:?}",
@@ -1357,8 +1365,8 @@ mod tests {
             let entries = apk_bundle::read_bundle(merged_path).await.unwrap();
             assert_eq!(
                 entries.len(),
-                merged.parts.len() + 1,
-                "容器里应是 manifest.json + 全部分包"
+                merged.parts.len() + 2,
+                "容器里应是两份 SAI meta + 全部分包"
             );
             for part in &merged.parts {
                 let entry = entries
@@ -1373,23 +1381,39 @@ mod tests {
                     assert_eq!(&head[..2], b"PK", "base.apk 内容被改坏了");
                 }
             }
-            let manifest: serde_json::Value = serde_json::from_slice(
+            let meta: serde_json::Value = serde_json::from_slice(
                 &apk_bundle::bundle_payload(merged_path, &entries[0])
                     .await
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(manifest["package_name"], split_pkg);
-            assert_eq!(
-                manifest["file_paths"].as_array().unwrap().len(),
-                merged.parts.len()
-            );
+            // SAI 的 v2 meta：字段名逐字对齐上游，"这些分包属于同一个应用"就靠它
+            assert_eq!(meta["package"], split_pkg);
+            assert_eq!(meta["meta_version"], 2);
+            assert_eq!(meta["split_apk"], true);
+            assert_eq!(meta["backup_components"][0]["type"], "apk_files");
+            assert_eq!(meta["backup_components"][0]["size"], merged.bytes);
+            let v1: serde_json::Value = serde_json::from_slice(
+                &apk_bundle::bundle_payload(merged_path, &entries[1])
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(v1["package"], split_pkg);
+            assert_eq!(v1["label"], meta["label"]);
+            // 分包产物同样支持留一份人工复核副本（默认不留）
+            if let Ok(keep) = std::env::var("APPLIST_EXPORT_KEEP_DIR") {
+                tokio::fs::create_dir_all(&keep).await.unwrap();
+                let held = Path::new(&keep).join(&merged.file_name);
+                tokio::fs::copy(merged_path, &held).await.unwrap();
+                eprintln!("[zygisk.apks] 复核副本: {}", held.display());
+            }
             assert!(
                 merged.artifact_bytes >= merged.bytes,
                 "容器不该比原始分包更小"
             );
             eprintln!(
-                "[zygisk.xapk] {} = {} 个分包 / {} 字节 -> {}",
+                "[zygisk.apks] {} = {} 个分包 / {} 字节 -> {}",
                 split_pkg,
                 merged.parts.len(),
                 merged.bytes,

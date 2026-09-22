@@ -57,10 +57,10 @@ export interface ZygiskApkFile {
   size: number;
 }
 
-/** 一次导出的产物：无分包 -> 「应用名 版本号.apk」，有分包 -> 合并成同名 .xapk */
+/** 一次导出的产物：无分包 -> 「应用名_版本号.apk」，有分包 -> 合并成同名 .apks（SAI 格式） */
 export interface ZygiskExportReport {
   packageName: string;
-  /** "apk" | "xapk" */
+  /** "apk" | "apks" */
   kind: string;
   fileName: string;
   artifactPath: string;
