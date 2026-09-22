@@ -1,5 +1,10 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.apkInstall.pathPlaceholder": "Caminho do APK / APKS local (um arquivo basta)",
+  "devices.apkInstall.pickTitle": "Escolha o APK ou o contêiner .apks para instalar",
+  "devices.apkInstall.pick": "Escolher arquivo",
+  "devices.apkInstall.run": "Instalar",
+  "devices.apkInstall.bundleHint": "Isto é um contêiner: abrimos localmente e instalamos o conjunto inteiro, sem escolher splits",
   "devices.gotoInfo": "Info",
   "devices.gotoList": "Abrir lista de dispositivos",
   "devices.info.model": "Modelo",

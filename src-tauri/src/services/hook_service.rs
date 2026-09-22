@@ -259,6 +259,8 @@ impl HookService {
         )?;
 
         let spec = CommandSpec {
+            // frida 会话不留宿主临时文件，回收点恒为空
+            cleanup_paths: Vec::new(),
             executable: python.clone(),
             args: spec_args,
             cwd: Some(workdir.clone()),

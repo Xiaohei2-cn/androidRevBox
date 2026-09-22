@@ -97,6 +97,15 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
         None,
     ),
     (
+        // adb_task 是"起一个 adb 长任务"的分发器本体，它自己也是一处真实的长任务调用点：
+        // 把它登记上，而不是把它从扫描规则里绕过去（AR8.5 拆出 with_cleanup 版本时，
+        // 这个点曾从审计里静默消失过一次）。
+        "src/services/device_service.rs",
+        "adb_task",
+        Category::Transport,
+        None,
+    ),
+    (
         "src/services/device_service.rs",
         "replace_native_library",
         Category::Transport,
@@ -182,7 +191,7 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
 /// 期望的调用点总数（不是登记条目数：一个函数可能有 3 处调用）。
 const EXPECTED_SITES_PER_CATEGORY: &[(Category, usize)] = &[
     (Category::Bootstrap, 11),
-    (Category::Transport, 4),
+    (Category::Transport, 5),
     (Category::RawTool, 2),
     (Category::LegacyFallback, 9),
     (Category::RootBranch, 4),
@@ -248,6 +257,9 @@ fn production_shell_sites(text: &str) -> Vec<(String, usize)> {
         let is_hit = trimmed.contains("cmd_shell(")
             || trimmed.contains("\"shell\".into()")
             || trimmed.contains("adb_task(")
+            // AR8.5：安装带上了"任务收尾回收临时解包目录"，改走带 cleanup 的同一条路；
+            // 扫描器必须认这个名字，否则安装点会从审计里静默消失（这次就真的消失过一次）。
+            || trimmed.contains("adb_task_with_cleanup(")
             || trimmed.contains("\"adb.shell\"")
             || trimmed.contains("\"adb.logcat\"");
         let is_definition = trimmed.starts_with("pub fn ")

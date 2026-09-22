@@ -21,7 +21,7 @@ import { useI18n } from "@/i18n";
 import { PathText } from "@/components/ui/PathText";
 import { BrandIcon } from "@/components/ui/BrandIcon";
 import { cn } from "@/lib/utils";
-import { pickDirectory, pickFiles } from "@/api/dialog";
+import { pickDirectory, pickFile } from "@/api/dialog";
 
 /**
  * 设备页（P3）：设备列表/信息/Shell/文件/应用/Logcat 六个分 tab。
@@ -806,11 +806,23 @@ export function FilesView({ serial }: { serial: string | null }) {
   );
 }
 
+/**
+ * 与后端 `apk_bundle::is_bundle_path` 同一条判定：后缀 `.apks`，大小写不敏感。
+ * 界面只用它决定要不要提示"这是容器"，真正的解包判断在后端。
+ */
+function isApksPath(path: string): boolean {
+  const name = path.trim().toLowerCase();
+  return name.endsWith(".apks");
+}
+
 export function AppsView({ serial }: { serial: string | null }) {
   const { t } = useI18n();
   const [selectedApp, setSelectedApp] = useState<ZygiskAppItem | null>(null);
-  /** 待安装 APK 列表：>1 件即 split 套件（AR8.2） */
-  const [apkPaths, setApkPaths] = useState<string[]>([]);
+  /**
+   * 待安装文件：**只有一个路径**（AR8.2 的"多选 base + split"入口已收掉）。
+   * 分包应用的正确载体是 `.apks` 容器，由后端读开后整套装，用户不需要懂 split 概念。
+   */
+  const [apkPath, setApkPath] = useState("");
   const [context, setContext] = useState<{ x: number; y: number; app: ZygiskAppItem } | null>(null);
   const [exporting, setExporting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -1155,44 +1167,42 @@ export function AppsView({ serial }: { serial: string | null }) {
         </div>
         <div className="flex items-center gap-2">
           <input
-            value={apkPaths[0] ?? ""}
-            onChange={(e) => setApkPaths(e.target.value ? [e.target.value] : [])}
-            placeholder="本机 APK 路径；split 应用请用旁边按钮多选"
+            value={apkPath}
+            onChange={(e) => setApkPath(e.target.value)}
+            placeholder={t("devices.apkInstall.pathPlaceholder")}
             className="h-8 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           />
           <Button
             size="sm"
             variant="outline"
             onClick={() =>
-              void pickFiles({
-                title: "选择 APK（split 套件可多选 base + split_config.*）",
-                filters: [{ name: "APK (*.apk)", extensions: ["apk"] }],
+              void pickFile({
+                title: t("devices.apkInstall.pickTitle"),
+                filters: [{ name: "APK / APKS (*.apk, *.apks)", extensions: ["apk", "apks"] }],
               }).then((picked) => {
-                if (picked?.length) setApkPaths(picked);
+                if (picked) setApkPath(picked);
               })
             }
           >
             <PackageOpen className="h-3.5 w-3.5" />
-            选多个…
+            {t("devices.apkInstall.pick")}
           </Button>
           <Button
             size="sm"
-            disabled={apkPaths.length === 0}
+            disabled={apkPath.trim() === ""}
             onClick={() =>
               void runAction(
-                () => deviceApi.install(serial, apkPaths.map((p) => p.trim()).filter(Boolean)),
-                "安装",
+                () => deviceApi.install(serial, [apkPath.trim()]),
+                t("devices.apkInstall.run"),
               )
             }
           >
             <Upload className="h-3.5 w-3.5" />
-            安装
+            {t("devices.apkInstall.run")}
           </Button>
         </div>
-        {apkPaths.length > 1 && (
-          <p className="text-xs text-muted-foreground">
-            已选 {apkPaths.length} 个 APK，将用 install-multiple 一次装入（split 应用必须整套）
-          </p>
+        {isApksPath(apkPath) && (
+          <p className="text-xs text-muted-foreground">{t("devices.apkInstall.bundleHint")}</p>
         )}
         {notice && <p className="text-xs text-muted-foreground">{notice}</p>}
         <div className="min-h-0 flex-1">

@@ -44,6 +44,7 @@ use crate::core::ipc::{AppEvent, event_names};
 use crate::db::Db;
 use crate::models::agent::AndroidBackendSource;
 use crate::services::android_backend::{CapabilityRouter, OperationKind, RouteError};
+use crate::services::apk_bundle;
 use crate::services::config_service::ConfigService;
 use crate::services::process_service::CommandSpec;
 use crate::services::task_service::TaskService;
@@ -2032,6 +2033,22 @@ impl DeviceService {
         serial: Option<&str>,
         subcommand: &[String],
     ) -> CoreResult<String> {
+        self.adb_task_with_cleanup(kind, serial, subcommand, Vec::new())
+            .await
+    }
+
+    /// 同上，但带上"任务收尾后要回收的本地路径"。
+    ///
+    /// `.apks` 解出来的散装 APK 必须活到 adb 真正读完为止，所以回收点只能挂在任务上，
+    /// 不能由发起方立刻删；单独开一条 `..._with_cleanup` 是为了让 `adb_task` 这个
+    /// 已被审计登记的名字继续留在安装路径里（`tests/shell_call_sites.rs` 靠它认调用点）。
+    async fn adb_task_with_cleanup(
+        &self,
+        kind: &str,
+        serial: Option<&str>,
+        subcommand: &[String],
+        cleanup_paths: Vec<std::path::PathBuf>,
+    ) -> CoreResult<String> {
         let env = self.runner.environment().await;
         let path = env
             .path
@@ -2042,7 +2059,8 @@ impl DeviceService {
             cwd: None,
             timeout: None, // 长任务不设超时，由用户取消
             env_extra: HashMap::new(),
-            ..Default::default()
+            hide_window: false,
+            cleanup_paths,
         };
         self.tasks.start_with_kind(kind, spec)
     }
@@ -2064,6 +2082,7 @@ impl DeviceService {
     /// 那一点不足以推翻稳定的 `adb install`，已作为 typed 能力记进 §10。
     pub async fn start_install(&self, serial: &str, apks: &[String]) -> CoreResult<String> {
         adb::check_install_paths(apks).map_err(CoreError::Internal)?;
+        let inputs = plan_install_inputs(apks).map_err(CoreError::Internal)?;
         let missing: Vec<&String> = apks
             .iter()
             .filter(|path| !std::path::Path::new(path).is_file())
@@ -2078,7 +2097,32 @@ impl DeviceService {
                     .join(", ")
             )));
         }
-        self.adb_task("adb.install", Some(serial), &adb::cmd_install_apks(apks))
+
+        // .apks 只是一个 zip 容器，adb 和 PackageManager 都不认它（实测：
+        // `adb install x.apks` -> "filename doesn't end .apk or .apex"），
+        // 所以由我们自己读开：解到临时目录 -> 整套装。界面因此只需要选一个文件。
+        let (install_paths, cleanup) = match inputs {
+            InstallInputs::Files(paths) => (paths, Vec::new()),
+            InstallInputs::Bundle(container) => {
+                let workdir = apk_bundle::create_workdir().await?;
+                match apk_bundle::extract_bundle(std::path::Path::new(&container), &workdir).await {
+                    Ok(extracted) => (extracted, vec![workdir]),
+                    Err(error) => {
+                        let _cleanup = tokio::fs::remove_dir_all(&workdir).await;
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        let staged = !cleanup.is_empty();
+        let args = adb::cmd_install_apks(&install_paths);
+        tracing::info!(
+            serial,
+            parts = install_paths.len(),
+            staged,
+            "安装请求已受理（staged=true 表示来自 .apks 解包）"
+        );
+        self.adb_task_with_cleanup("adb.install", Some(serial), &args, cleanup)
             .await
     }
 
@@ -2339,6 +2383,30 @@ impl DeviceService {
                 Ok(())
             });
         }
+    }
+}
+
+/// 安装输入形态的判定（放在 impl 之外：它是纯函数，才能被单测直接钉住）。
+/// 一次安装请求的输入形态。界面只给一个文件，这里决定它该怎么装。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallInputs {
+    /// 散装 APK（1 件走 `install -r`，多件走 `install-multiple -r`）
+    Files(Vec<String>),
+    /// 一个 `.apks` 容器：先解包再整套装
+    Bundle(String),
+}
+
+/// 判定输入形态。规则要能被单测钉住，因为"混选"必须当场拒，不能悄悄挑一个装。
+fn plan_install_inputs(apks: &[String]) -> Result<InstallInputs, String> {
+    let bundles: Vec<&String> = apks
+        .iter()
+        .filter(|path| apk_bundle::is_bundle_path(path))
+        .collect();
+    match (bundles.len(), apks.len()) {
+        (0, _) => Ok(InstallInputs::Files(apks.to_vec())),
+        (1, 1) => Ok(InstallInputs::Bundle(apks[0].clone())),
+        (1, _) => Err(".apks 已经是完整的一套，不能和其它 APK 混选；请只选这个容器".to_owned()),
+        (many, _) => Err(format!("一次只能装一个 .apks 容器，收到 {many} 个")),
     }
 }
 
@@ -2985,6 +3053,36 @@ fn log_device_info_shadow_diff(serial: &str, agent: &DeviceInfo, legacy: &Device
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn install_inputs_separate_container_from_loose_apks() {
+        // 散装：1 件走 install -r，多件走 install-multiple -r（AR8.2 的既有口径）
+        assert_eq!(
+            plan_install_inputs(&["/tmp/a.apk".to_owned()]).unwrap(),
+            InstallInputs::Files(vec!["/tmp/a.apk".to_owned()])
+        );
+        assert_eq!(
+            plan_install_inputs(&["/tmp/a.apk".to_owned(), "/tmp/b.apk".to_owned()]).unwrap(),
+            InstallInputs::Files(vec!["/tmp/a.apk".to_owned(), "/tmp/b.apk".to_owned()])
+        );
+        // 容器：一个文件就是一套，交给解包分支
+        assert_eq!(
+            plan_install_inputs(&["/tmp/亚马逊购物_1.0.apks".to_owned()]).unwrap(),
+            InstallInputs::Bundle("/tmp/亚马逊购物_1.0.apks".to_owned())
+        );
+        // 混选必须当场拒：容器已经是完整一套，再塞散装只会让结果说不清
+        assert!(
+            plan_install_inputs(&["/tmp/a.apks".to_owned(), "/tmp/b.apk".to_owned()])
+                .unwrap_err()
+                .contains("混选")
+        );
+        // 两个容器同理（不知道你想装哪个）
+        assert!(
+            plan_install_inputs(&["/tmp/a.apks".to_owned(), "/tmp/b.apks".to_owned()])
+                .unwrap_err()
+                .contains("一次只能装一个")
+        );
+    }
     use super::*;
     use crate::db::Db;
 
@@ -3423,9 +3521,225 @@ mod tests {
     /// 钉住「split 套件必须整套装」这条实测结论，并且必须用产品用的同一条命令构造
     /// （`adb::cmd_install_apks`），否则测的是 adb 而不是我们的代码。
     ///
+    /// AR8.5 真机腿：**从 `.apks` 容器一路装到设备**。
+    ///
+    /// 为什么值得占一条真机腿：`.apks` 只是 zip 容器，实测 `adb install x.apks` 会被
+    /// adb 按后缀直接拒（"filename doesn't end .apk or .apex"），所以容器必须由产品
+    /// 自己读开。这条腿把整条链跑完并逐段断言：
+    /// 现取当前安装包 -> 写容器 -> adb 拒收容器（前提证据）-> 判定为容器形态 ->
+    /// 解包并逐字节比对 -> `install-multiple` 真装 -> 临时目录回收 ->
+    /// 反例（容器改坏一个字节必须在装机之前就拒绝解包）。
+    ///
+    /// 样本**从设备当前安装里自动挑**（可 `AR85_PKG=<pkg>` 指定）：写死目录会随
+    /// 用户重装而失效——本腿第一次跑就撞上"设备上的包与手头的包签名不同"，
+    /// 换成现取之后，装回去的字节与设备上的完全一致，`-r` 覆盖装不动应用数据。
+    ///
+    /// 需要 `AR82_TEST_SERIAL` 与 `AR82_CONFIRM=yes`（会往设备发一次真实安装）。
+    #[tokio::test]
+    #[ignore = "真机腿；AR82_TEST_SERIAL=<serial> AR82_CONFIRM=yes cargo test -p app-reverse-tools real_apks_container -- --ignored --nocapture"]
+    async fn real_apks_container_installs_through_the_whole_chain() {
+        use crate::services::apk_bundle::{AppNaming, BundleKind, PulledPart};
+
+        let serial = std::env::var("AR82_TEST_SERIAL").unwrap_or_default();
+        if serial.is_empty() || std::env::var("AR82_CONFIRM").unwrap_or_default() != "yes" {
+            eprintln!("[跳过] 本腿需要 AR82_TEST_SERIAL + AR82_CONFIRM=yes（会真装一次）");
+            return;
+        }
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner = RealAdbRunner::new(config);
+        let env = runner.environment().await;
+        let adb_path = env.path.expect("本机应有 adb");
+        let run = |subcommand: Vec<String>| {
+            let runner = &runner;
+            let adb_path = adb_path.clone();
+            let serial = serial.clone();
+            async move {
+                runner
+                    .run(
+                        &adb_path,
+                        &adb::build_args(Some(&serial), &subcommand),
+                        Duration::from_secs(600),
+                    )
+                    .await
+                    .expect("adb 应可执行")
+            }
+        };
+
+        // ① 选样本：优先环境变量，否则挑一个**多件**的三方包（容器路径才有意义）
+        let listed = run(adb::cmd_shell("pm list packages -3")).await;
+        let packages: Vec<String> = listed
+            .stdout
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("package:"))
+            .map(str::to_owned)
+            .collect();
+        // 样本包：默认自动挑第一个多件三方包，可用 AR85_PKG 钉住某个应用复跑
+        let wanted = std::env::var("AR85_PKG").unwrap_or_default();
+        let mut picked: Option<(String, Vec<String>)> = None;
+        for pkg in packages
+            .iter()
+            .filter(|pkg| wanted.is_empty() || **pkg == wanted)
+        {
+            let paths = run(adb::cmd_shell(&format!("pm path {pkg}"))).await;
+            let files: Vec<String> = paths
+                .stdout
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("package:"))
+                .map(str::to_owned)
+                .collect();
+            if files.len() < 2 {
+                continue;
+            }
+            picked = Some((pkg.clone(), files));
+            break;
+        }
+        let (package, remote_paths) = picked
+            .expect("设备上找不到一个多件的分包应用；请用 AR85_PKG=<pkg> 指定一个 split 应用");
+        eprintln!("[ar8.5] 样本 {package}，设备侧 {} 件", remote_paths.len());
+
+        // ② 现取设备上正在用的这些字节
+        let capture = tempfile::tempdir().unwrap();
+        let mut originals: Vec<std::path::PathBuf> = Vec::new();
+        for remote in &remote_paths {
+            let target = capture.path().join(
+                std::path::Path::new(remote)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref(),
+            );
+            let pulled = run(adb::cmd_pull(remote, &target.to_string_lossy())).await;
+            assert_eq!(pulled.exit_code, Some(0), "拉取 {remote} 失败: {pulled:?}");
+            originals.push(target);
+        }
+        originals.sort();
+        let sizes: Vec<u64> = originals
+            .iter()
+            .map(|file| std::fs::metadata(file).unwrap().len())
+            .collect();
+        let total_bytes: u64 = sizes.iter().sum();
+        eprintln!("[ar8.5] 现取完成，合计 {total_bytes} 字节");
+
+        // ③ 写容器（用产品的装配层，命名走"容器自检"避免污染用户目录语义）
+        let stage = tempfile::tempdir().unwrap();
+        let parts: Vec<PulledPart> = originals
+            .iter()
+            .zip(sizes.iter())
+            .map(|(file, size)| PulledPart {
+                name: file.file_name().unwrap().to_string_lossy().into_owned(),
+                path: file.clone(),
+                size: *size,
+            })
+            .collect();
+        let container = crate::services::apk_bundle::assemble(
+            &AppNaming {
+                package_name: package.clone(),
+                label: "容器自检".into(),
+                version_name: "1.0".into(),
+                version_code: Some(1),
+                name_source: "test".into(),
+            },
+            parts,
+            stage.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(container.kind, BundleKind::Bundle);
+        assert!(container.file_name.ends_with(".apks"));
+
+        // ④ adb 确实不吃容器（这条断言是"为什么要自己读开"的实测证据）
+        let refused = run(vec![
+            "install".into(),
+            container.path.to_string_lossy().into_owned(),
+        ])
+        .await;
+        assert_ne!(
+            refused.exit_code,
+            Some(0),
+            "adb 竟然接受了容器，本腿前提已变：{refused:?}"
+        );
+        eprintln!(
+            "[ar8.5] adb 拒收容器（预期）: {}",
+            format!("{}{}", refused.stdout, refused.stderr)
+                .lines()
+                .find(|line| line.contains("adb:"))
+                .unwrap_or("（无 adb 行）")
+                .trim()
+        );
+
+        // ⑤ 产品的输入判定 + 解包 + 逐字节复核
+        let as_strings = vec![container.path.to_string_lossy().into_owned()];
+        assert!(matches!(
+            plan_install_inputs(&as_strings).unwrap(),
+            InstallInputs::Bundle(_)
+        ));
+        let workdir = crate::services::apk_bundle::create_workdir().await.unwrap();
+        let extracted = crate::services::apk_bundle::extract_bundle(&container.path, &workdir)
+            .await
+            .unwrap();
+        assert_eq!(extracted.len(), originals.len(), "解出来的件数不对");
+        for (index, file) in extracted.iter().enumerate() {
+            let bytes = std::fs::read(file).unwrap();
+            assert_eq!(bytes.len() as u64, sizes[index], "第 {index} 件长度不对");
+            assert_eq!(
+                bytes,
+                std::fs::read(&originals[index]).unwrap(),
+                "解包内容与设备原件不一致：第 {index} 件"
+            );
+        }
+
+        // ⑥ 真装：命令必须是 install-multiple，设备必须回 Success
+        let args = adb::cmd_install_apks(&extracted);
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("install-multiple"),
+            "多件必须走 install-multiple"
+        );
+        let installed = run(args).await;
+        let output = format!("{}{}", installed.stdout, installed.stderr);
+        assert!(
+            installed.exit_code == Some(0) && output.contains("Success"),
+            "容器装回设备失败: {output}"
+        );
+        eprintln!(
+            "[ar8.5] 容器装回设备成功（{} 件 / {total_bytes} 字节）",
+            extracted.len()
+        );
+
+        // ⑦ 回收：临时目录必须消失（任务收尾那条路径）
+        crate::services::task_service::cleanup_task_paths(std::slice::from_ref(&workdir));
+        assert!(!workdir.exists(), "解包目录未回收");
+
+        // ⑧ 反例：容器被改坏一个字节 -> 解包在装机之前就拒绝，并且不留半个目录
+        let broken_dir = crate::services::apk_bundle::create_workdir().await.unwrap();
+        let mut raw = std::fs::read(&container.path).unwrap();
+        let entries = crate::services::apk_bundle::read_bundle(&container.path)
+            .await
+            .unwrap();
+        let base = entries
+            .iter()
+            .find(|entry| entry.name.to_lowercase().ends_with(".apk"))
+            .expect("容器里应有 APK 条目");
+        let data_at = base.offset as usize + 30 + base.name.len() + 16;
+        raw[data_at] ^= 0xff;
+        let broken = stage.path().join("broken.apks");
+        std::fs::write(&broken, &raw).unwrap();
+        let error = crate::services::apk_bundle::extract_bundle(&broken, &broken_dir)
+            .await
+            .expect_err("坏包必须被拒绝");
+        assert!(
+            error.to_string().to_uppercase().contains("CRC"),
+            "报错要指出完整性问题: {error}"
+        );
+        assert!(!broken_dir.exists(), "失败后不该留下解包目录");
+        eprintln!("[ar8.5] 坏容器被拒绝解包（预期）: {error}");
+    }
+
     /// 需要三个环境变量：`AR82_TEST_SERIAL`、`AR82_APK_DIR`（目录内放该应用**全部**
-    /// APK：base + 各 split_config.*）、`AR82_CONFIRM=yes`。可选 `AR82_CORRUPT=<文件>`
-    /// 追加一条错误可读性检查（拿改坏一件的套件装，必须看到 PackageManager 的原文理由）。
+    /// APK：base + 各 split_config.*，且必须是**设备当前安装的那一套**——覆盖安装要
+    /// 求签名一致，不一致本腿会明确跳过而不是报红）、`AR82_CONFIRM=yes`。
+    /// 可选 `AR82_CORRUPT=<文件>` 追加一条错误可读性检查（拿改坏一件的套件装，
+    /// 必须看到 PackageManager 的原文理由）。
     #[tokio::test]
     #[ignore = "真机腿；AR82_TEST_SERIAL=<serial> AR82_APK_DIR=<目录> AR82_CONFIRM=yes cargo test -p app-reverse-tools real_adb_install -- --ignored --nocapture"]
     async fn real_adb_install_multiple_handles_split_apk_set() {
@@ -3504,6 +3818,15 @@ mod tests {
             installed.exit_code,
             elapsed.as_millis()
         );
+        if text.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE") {
+            // 这不是代码回归，是前提不成立：`-r` 覆盖装要求签名一致，而用户随时可能
+            // 重装这个应用（本腿就撞上过一次：手头的三件套与设备上后来的单包版签名不同）。
+            // 与其让它常年红着被人忽略，不如明确说明该换哪份样本。
+            eprintln!(
+                "[跳过] AR82_APK_DIR 里的 APK 与设备当前安装不是同一套（签名不同）；请换成设备上现在这套的 APK，或直接跑 real_apks_container（它自己从设备现取）"
+            );
+            return;
+        }
         assert!(
             installed.exit_code == Some(0) && text.contains("Success"),
             "整套 split 应当装成功，实际: {text}"

@@ -3230,18 +3230,9 @@ mod tests {
         );
         let client = manager.client(&serial).unwrap();
 
-        assert!(
-            !adb_shell(&serial, "ls /data/local/tmp/toybox")
-                .await
-                .contains(PROBE),
-            "设备上已有 /data/local/tmp/{PROBE}，测试不覆盖用户文件"
-        );
-        let copied = adb_shell(
-            &serial,
-            &format!("cp /system/bin/{PROBE} /data/local/tmp/{PROBE} && chmod 755 /data/local/tmp/{PROBE} && echo copied"),
-        )
-        .await;
-        assert!(copied.contains("copied"), "探针准备失败: {copied}");
+        if !prepare_toybox_probe(&serial).await {
+            return;
+        }
 
         let started: HostedStartResult = client
             .request(
@@ -3470,17 +3461,12 @@ mod tests {
         }
         let client = manager.client(&serial).unwrap();
 
-        assert!(
-            !adb_shell(&serial, &format!("ls /data/local/tmp/{PROBE}"))
-                .await
-                .contains(PROBE),
-            "设备上已有 /data/local/tmp/{PROBE}，测试不覆盖用户文件，请先手工处理"
-        );
+        if !prepare_toybox_probe(&serial).await {
+            return;
+        }
         let copied = adb_shell(
             &serial,
-            &format!(
-                "cp /system/bin/{PROBE} /data/local/tmp/{PROBE} && chmod 644 /data/local/tmp/{PROBE} && echo copied"
-            ),
+            &format!("chmod 644 /data/local/tmp/{PROBE} && echo copied"),
         )
         .await;
         assert!(copied.contains("copied"), "探针文件准备失败: {copied}");
@@ -3523,7 +3509,12 @@ mod tests {
         assert_eq!(probe.mode_text, "-rw-r--r--");
         assert!(
             !listed.runs.iter().any(|run| run.name == PROBE),
-            "还没启动不该有运行记录"
+            "还没启动不该有运行记录，实际={:?}",
+            listed
+                .runs
+                .iter()
+                .map(|run| format!("{}#{}:{:?}", run.name, run.handle, run.state))
+                .collect::<Vec<_>>()
         );
         eprintln!(
             "[hosted.list] agent_binaries={} legacy_binaries={} truncated={} unreadable={}",
@@ -4017,8 +4008,89 @@ mod tests {
         manager.disconnect(&serial).await.unwrap();
     }
 
-    /// AR6.2 真机腿：Agent 端口互查与 Legacy shell 路径必须给出同一结论。
+    /// 准备好设备侧的 toybox 探针副本，返回 `false` 表示这台机不该跑本腿。
     ///
+    /// 两处修正都是真机跑出来的：
+    /// * **存在性要问内核**：原来判 `ls <路径>` 的输出里有没有文件名，可 `ls` 的报错
+    ///   本身就带文件名（`ls: /data/local/tmp/toybox: No such file or directory`），
+    ///   于是文件不存在时也会判成"已有"——一条永远红的腿。
+    /// * **自己的残留要能自愈**：两条宿主腿共用 `/data/local/tmp/toybox`（探针靠
+    ///   argv[0] 的 basename 派发 applet，名字不能改），任何一次中途被打断都会留下
+    ///   副本，把之后每一次运行都毒死。sha256 与 `/system/bin/toybox` 一致的就是我们
+    ///   自己的副本，直接接管；不一致才可能是用户的文件，那种情况仍然拒绝。
+    async fn prepare_toybox_probe(serial: &str) -> bool {
+        async fn probe_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        let present = probe_shell(
+            serial,
+            "if [ -e /data/local/tmp/toybox ]; then echo PRESENT; fi",
+        )
+        .await
+        .contains("PRESENT");
+        if !present {
+            let copied = probe_shell(
+                serial,
+                "cp /system/bin/toybox /data/local/tmp/toybox && chmod 755 /data/local/tmp/toybox && echo copied",
+            )
+            .await;
+            assert!(copied.contains("copied"), "探针准备失败: {copied}");
+            return true;
+        }
+        let hashes = probe_shell(
+            serial,
+            "sha256sum /data/local/tmp/toybox /system/bin/toybox 2>/dev/null | awk '{print $1}'",
+        )
+        .await;
+        let lines: Vec<&str> = hashes
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        if lines.len() == 2 && lines[0] == lines[1] {
+            // 接管残留时必须把**状态**一起归零，否则腿看到的不是干净起点：
+            // ①两条腿对执行位要求不同（一条 755、一条 644）；②中断那次跑还留着
+            // 运行日志、托管登记记录和一个活着的探针进程——「还没启动不该有运行记录」
+            // 这类断言会因此说谎（真机跑出来过）。杀进程走登记里的 pid，并且先核
+            // `/proc/<pid>/cmdline` 确明确实是我们那个路径——不用 `pidof toybox`
+            // （设备上叫 toybox 的进程未必是我们起的），也不用 `pgrep -f 路径`
+            // （它会匹配到自己这条命令行，真机跑出来过一次：把执行清理的 shell 自己杀了）。
+            // 登记记录里存的是应用名而不是路径，所以按名字匹配删除；用户的同名文件
+            // 在上一步 sha256 比对时就已经被排除掉了。
+            let normalized = probe_shell(
+                serial,
+                "chmod 755 /data/local/tmp/toybox; \\
+                 rm -f /data/local/tmp/.toybox.run.log; \\
+                 for f in /data/local/tmp/app-reverse-tools-hosted/*.json; do \\
+                   grep -q toybox $f || continue; \\
+                   pid=$(grep -o 'pid[^0-9]*[0-9]*' $f | tr -dc 0-9); \\
+                   if [ -n \"$pid\" ] && grep -q /data/local/tmp/toybox /proc/$pid/cmdline 2>/dev/null; then \\
+                     kill -9 $pid; \\
+                   fi; \\
+                   rm -f $f; \\
+                 done; \\
+                 echo normalized",
+            )
+            .await;
+            assert!(
+                normalized.contains("normalized"),
+                "接管残留副本时归一化失败: {normalized}"
+            );
+            eprintln!(
+                "[ar7] 接管上次中断留下的 toybox 副本（与 /system/bin 一致，不是用户文件），已归一化"
+            );
+            return true;
+        }
+        eprintln!("[跳过] 设备上有一个不是我们副本的 /data/local/tmp/toybox，测试不碰用户文件");
+        false
+    }
+
     /// 用 `toybox nc` 起一个 shell 自己属主的监听端口，这样两条路径都以 shell 身份
     /// 观察（Agent 也是 shell 启动的），比较的是解析能力而不是权限差异；
     /// 另取一个 root 属主监听端口验证「读不到属主」被如实报成 `unowned`+`skipped`。

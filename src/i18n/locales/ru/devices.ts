@@ -1,5 +1,10 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.apkInstall.pathPlaceholder": "Путь к APK / APKS на этой машине (достаточно одного файла)",
+  "devices.apkInstall.pickTitle": "Выберите APK или контейнер .apks для установки",
+  "devices.apkInstall.pick": "Выбрать файл",
+  "devices.apkInstall.run": "Установить",
+  "devices.apkInstall.bundleHint": "Это контейнер: мы раскроем его на этой машине и установим весь набор — выбирать сплиты не нужно",
   "devices.gotoInfo": "Инфо",
   "devices.gotoList": "К списку устройств",
   "devices.info.model": "Модель",

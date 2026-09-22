@@ -1,5 +1,10 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.apkInstall.pathPlaceholder": "本机 APK / APKS 路径（选一个文件就够）",
+  "devices.apkInstall.pickTitle": "选择要安装的 APK 或 .apks 容器",
+  "devices.apkInstall.pick": "选择文件",
+  "devices.apkInstall.run": "安装",
+  "devices.apkInstall.bundleHint": "这是个容器：程序会在本机读开后整套装入，不需要你多选分包",
   "devices.gotoInfo": "设备信息",
   "devices.gotoList": "前往设备列表",
   "devices.info.model": "型号",

@@ -1,5 +1,10 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.apkInstall.pathPlaceholder": "ローカルの APK / APKS パス（1 つ選べば十分）",
+  "devices.apkInstall.pickTitle": "インストールする APK または .apks を選択",
+  "devices.apkInstall.pick": "ファイルを選択",
+  "devices.apkInstall.run": "インストール",
+  "devices.apkInstall.bundleHint": "これはコンテナです：こちらで展開して一式まとめてインストールします。分割を選択する必要はありません",
   "devices.gotoInfo": "情報",
   "devices.gotoList": "デバイス一覧へ",
   "devices.info.model": "型番",

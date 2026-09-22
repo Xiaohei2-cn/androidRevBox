@@ -39,6 +39,7 @@ pub fn task_run(state: tauri::State<'_, AppState>, args: TaskRunArgs) -> CoreRes
         }
     }
     let spec = CommandSpec {
+        cleanup_paths: Vec::new(),
         executable: args.executable,
         args: args.args,
         cwd: args.cwd,

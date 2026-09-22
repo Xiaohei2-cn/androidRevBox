@@ -758,6 +758,217 @@ pub async fn read_bundle(path: &Path) -> CoreResult<Vec<BundleEntry>> {
     Ok(entries)
 }
 
+/// 是不是一个 `.apks` 容器（SAI 的后缀约定，大小写不敏感）。
+pub fn is_bundle_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("apks"))
+}
+
+/// 宿主侧解包容器用的工作目录前缀（回收与陈旧清扫都按这个名字认）。
+pub const WORKDIR_PREFIX: &str = "app-reverse-tools-apks-";
+/// 解出来的临时目录超过这个年龄才允许被清扫。
+///
+/// 门槛故意放得很高（3 天）：这条只是"进程被强杀/系统崩溃"的兜底，
+/// 而一次真机安装（176 MB 走 USB）实际只需几十秒。阈值一旦接近真实时长，
+/// 清扫就会去删**别的任务正在用的目录**——单测并行跑的时候就这么翻过一次车。
+pub const WORKDIR_MAX_AGE_DAYS: u64 = 3;
+
+/// 新建一次解包用的临时目录。每次调用都换名，避免两次安装互相覆盖。
+///
+/// 顺手先扫一遍陈旧目录：正式回收点在任务收尾（`CommandSpec::cleanup_paths`），
+/// 但进程被强杀 / 系统崩溃时那条路不会执行，一包 176 MB 留在临时目录里没人管。
+pub async fn create_workdir() -> CoreResult<PathBuf> {
+    sweep_stale_workdirs(SystemTime::now()).await;
+    let base = std::env::temp_dir().join(format!("{WORKDIR_PREFIX}{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir_all(&base)
+        .await
+        .map_err(|error| CoreError::Internal(format!("创建解包目录失败: {error}")))?;
+    Ok(base)
+}
+
+/// 清扫陈旧解包目录：只按前缀认，别的目录一概不碰；失败只记日志。
+///
+/// 存在的理由：临时目录的正式回收点在任务收尾（`CommandSpec::cleanup_paths`），
+/// 但进程被强杀、系统崩溃时那条路不会执行，176 MB 一包留在 /tmp 里没人回收。
+pub async fn sweep_stale_workdirs(now: SystemTime) {
+    let root = std::env::temp_dir();
+    let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+        return;
+    };
+    let limit = std::time::Duration::from_secs(WORKDIR_MAX_AGE_DAYS * 24 * 60 * 60);
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(WORKDIR_PREFIX) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata().await else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let fresh = metadata
+            .modified()
+            .ok()
+            .and_then(|at| now.duration_since(at).ok())
+            .is_none_or(|age| age < limit);
+        if fresh {
+            continue;
+        }
+        match tokio::fs::remove_dir_all(entry.path()).await {
+            Ok(()) => tracing::info!(path = %entry.path().display(), "清扫陈旧解包目录"),
+            Err(error) => tracing::debug!(error = %error, "陈旧解包目录清理失败（忽略）"),
+        }
+    }
+}
+
+/// 容器条目名的安全校验（zip-slip 防线）。
+///
+/// 我们自己写的容器名字都是干净的，但**解包入口必须假设盒子来自别人**：
+/// 一个条目叫 `../../evil.apk` 就能把解包变成任意路径写入。
+/// 规则：必须是纯文件名（无任何路径分隔、不能是 `.`/`..` 开头、不含控制字符），
+/// 且只允许字母数字与 `. _ - +`。
+fn safe_entry_name(name: &str) -> CoreResult<&str> {
+    let ok = !name.is_empty()
+        && name.len() <= MAX_PART_NAME_BYTES
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+') || c == ' ');
+    if ok {
+        Ok(name)
+    } else {
+        Err(CoreError::Internal(format!(
+            "容器里有不安全的条目名，拒绝解包: {name:?}"
+        )))
+    }
+}
+
+/// 把 `.apks` 容器解到 `workdir`，返回其中**可用于安装的 APK 路径**（按名字排序）。
+///
+/// 三条硬规则，都是为了"要么装得上、要么明确说清为什么装不上"：
+/// 1. 只取 `.apk` 结尾的条目（与 SAI 自己的 `ZipApkSource` 同一口径，大小写不敏感），
+///    所以两份 meta 与可能存在的 `icon.png` 不会被当成安装包；
+/// 2. 每个条目边写边算 CRC，与中央目录不一致就**整体失败并删掉解包目录**——
+///    半个 base.apk 交给 adb 只会换来一句含义模糊的解析错误；
+/// 3. 条目名过 `safe_entry_name`，防 zip-slip。
+pub async fn extract_bundle(source: &Path, workdir: &Path) -> CoreResult<Vec<String>> {
+    let entries = read_bundle(source).await?;
+    let mut apks: Vec<&BundleEntry> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .name
+                .rsplit('.')
+                .next()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("apk"))
+        })
+        .collect();
+    if apks.is_empty() {
+        return Err(CoreError::Internal(format!(
+            "{} 里没有任何 .apk 条目，不是可安装的容器",
+            source.display()
+        )));
+    }
+    for entry in &apks {
+        safe_entry_name(&entry.name)?;
+        if entry.size == 0 {
+            return Err(CoreError::Internal(format!("{} 是空文件", entry.name)));
+        }
+    }
+    apks.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut out = Vec::with_capacity(apks.len());
+    for entry in apks {
+        let target = workdir.join(&entry.name);
+        if let Err(error) = stream_entry_to_file(source, entry, &target).await {
+            let _cleanup = tokio::fs::remove_dir_all(workdir).await;
+            return Err(error);
+        }
+        out.push(target.to_string_lossy().into_owned());
+    }
+    Ok(out)
+}
+
+/// 从容器里把某个条目原样抄到本地文件，同时核对长度与 CRC。
+async fn stream_entry_to_file(source: &Path, entry: &BundleEntry, target: &Path) -> CoreResult<()> {
+    use tokio::io::AsyncSeekExt;
+    let mut from = tokio::fs::File::open(source)
+        .await
+        .map_err(|error| CoreError::Internal(format!("打开容器失败: {error}")))?;
+    let mut header = [0_u8; LOCAL_HEADER_LEN as usize];
+    from.seek(std::io::SeekFrom::Start(entry.offset))
+        .await
+        .map_err(|error| CoreError::Internal(format!("定位条目失败: {error}")))?;
+    from.read_exact(&mut header)
+        .await
+        .map_err(|error| CoreError::Internal(format!("读条目头失败: {error}")))?;
+    if &header[0..4] != b"PK\x03\x04" {
+        return Err(CoreError::Internal(format!("{} 的本地头不对", entry.name)));
+    }
+    let name_len = u16::from_le_bytes([header[26], header[27]]) as u64;
+    let stored_crc = u32::from_le_bytes([header[14], header[15], header[16], header[17]]);
+    let stored_size = u32::from_le_bytes([header[18], header[19], header[20], header[21]]) as u64;
+    if stored_crc != entry.crc || stored_size != entry.size {
+        // 本地头与中央目录互相矛盾：容器被改过，不能信任何一条
+        return Err(CoreError::Internal(format!(
+            "{} 的两处头部不一致（本地 {:08x}/{size}，中央 {:08x}/{})",
+            entry.name,
+            stored_crc,
+            entry.crc,
+            entry.size,
+            size = stored_size
+        )));
+    }
+    from.seek(std::io::SeekFrom::Start(
+        entry.offset + LOCAL_HEADER_LEN + name_len,
+    ))
+    .await
+    .map_err(|error| CoreError::Internal(format!("定位条目数据失败: {error}")))?;
+
+    let mut to = tokio::fs::File::create(target)
+        .await
+        .map_err(|error| CoreError::Internal(format!("写解包文件失败: {error}")))?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buffer = vec![0_u8; READ_CHUNK];
+    let mut left = entry.size;
+    while left > 0 {
+        let want = (left as usize).min(READ_CHUNK);
+        let read = from
+            .read(&mut buffer[..want])
+            .await
+            .map_err(|error| CoreError::Internal(format!("读容器失败: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        to.write_all(&buffer[..read])
+            .await
+            .map_err(|error| CoreError::Internal(format!("写解包文件失败: {error}")))?;
+        left -= read as u64;
+    }
+    to.flush().await.ok();
+    if left != 0 {
+        return Err(CoreError::Internal(format!(
+            "{} 只有 {} 字节可读，容器声明 {} 字节",
+            entry.name,
+            entry.size - left,
+            entry.size
+        )));
+    }
+    if hasher.finalize() != entry.crc {
+        return Err(CoreError::Internal(format!(
+            "{} 的 CRC 与容器声明不一致，包已被改动或损坏",
+            entry.name
+        )));
+    }
+    Ok(())
+}
+
 /// 读出容器里某个条目的原始字节（自检与测试用：确认分包内容一个字节都没变）。
 #[cfg(test)]
 pub async fn bundle_payload(path: &Path, entry: &BundleEntry) -> CoreResult<Vec<u8>> {
@@ -1103,6 +1314,198 @@ mod tests {
                 entry.file_name()
             );
         }
+    }
+
+    fn part(name: &str, path: PathBuf, size: u64) -> PulledPart {
+        PulledPart {
+            name: name.to_owned(),
+            path,
+            size,
+        }
+    }
+
+    /// 造一个容器供解包测试用：返回 (.apks 路径, 各条目的原始字节)
+    async fn make_bundle(dir: &Path, files: &[(&str, Vec<u8>)], stem: &str) -> PathBuf {
+        let stage = dir.join("stage");
+        tokio::fs::create_dir_all(&stage).await.unwrap();
+        let parts: Vec<PulledPart> = files
+            .iter()
+            .map(|(name, bytes)| {
+                let path = stage.join(name);
+                std::fs::write(&path, bytes).unwrap();
+                part(name, path, bytes.len() as u64)
+            })
+            .collect();
+        let total: u64 = parts.iter().map(|item| item.size).sum();
+        let artifact = assemble(&naming(stem, "1.0"), parts, dir).await.unwrap();
+        assert_eq!(artifact.kind, BundleKind::Bundle);
+        assert!(total > 0);
+        artifact.path
+    }
+
+    #[tokio::test]
+    async fn extract_bundle_round_trips_apks_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = b"PK\x03\x04base-bytes".to_vec();
+        let split = b"PK\x03\x04split-bytes-longer".to_vec();
+        let bundle = make_bundle(
+            dir.path(),
+            &[
+                ("base.apk", base.clone()),
+                ("split_config.zh.apk", split.clone()),
+            ],
+            "亚马逊购物",
+        )
+        .await;
+
+        let workdir = dir.path().join("out");
+        tokio::fs::create_dir_all(&workdir).await.unwrap();
+        let extracted = extract_bundle(&bundle, &workdir).await.unwrap();
+
+        // 两份 SAI meta 不是安装包：只有 .apk 条目会被解出来
+        assert_eq!(
+            extracted
+                .iter()
+                .map(|p| Path::new(p)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned())
+                .collect::<Vec<_>>(),
+            vec!["base.apk", "split_config.zh.apk"]
+        );
+        assert_eq!(std::fs::read(&extracted[0]).unwrap(), base);
+        assert_eq!(std::fs::read(&extracted[1]).unwrap(), split);
+        // 扩展名大小写不敏感（与 SAI 的 endsWith 口径一致）
+        let bundle2 = make_bundle(
+            &dir.path().join("upper"),
+            &[("base.apk", base.clone()), ("SPLIT_C.APk", split.clone())],
+            "大小写",
+        )
+        .await;
+        let workdir2 = dir.path().join("out2");
+        tokio::fs::create_dir_all(&workdir2).await.unwrap();
+        let names: Vec<String> = extract_bundle(&bundle2, &workdir2)
+            .await
+            .unwrap()
+            .iter()
+            .map(|path| {
+                Path::new(path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, vec!["SPLIT_C.APk", "base.apk"], "按名字排序");
+    }
+
+    #[tokio::test]
+    async fn extract_bundle_rejects_corrupt_and_useless_containers() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = vec![0xa5_u8; 4096];
+
+        // 1) 容器里一个 APK 都没有 -> 明确报错，不返回空列表让上层去猜
+        let no_apk = make_bundle(
+            &dir.path().join("noapk"),
+            &[
+                ("readme.txt", payload.clone()),
+                ("notes.txt", payload.clone()),
+            ],
+            "没有apk",
+        )
+        .await;
+        let workdir = dir.path().join("w1");
+        tokio::fs::create_dir_all(&workdir).await.unwrap();
+        let error = extract_bundle(&no_apk, &workdir).await.unwrap_err();
+        assert!(error.to_string().contains(".apk"), "{error}");
+
+        // 2) 数据被改过一个字节 -> CRC 不符，整体失败并清掉已经解出来的部分
+        let good = make_bundle(
+            &dir.path().join("corrupt"),
+            &[
+                ("base.apk", payload.clone()),
+                ("split_x.apk", payload.clone()),
+            ],
+            "坏包",
+        )
+        .await;
+        let mut bytes = std::fs::read(&good).unwrap();
+        let entries = read_bundle(&good).await.unwrap();
+        let target = entries.iter().find(|e| e.name == "base.apk").unwrap();
+        let data_at = target.offset as usize + 30 + target.name.len() + 10;
+        bytes[data_at] ^= 0xff;
+        std::fs::write(&good, &bytes).unwrap();
+        let workdir2 = dir.path().join("w2");
+        tokio::fs::create_dir_all(&workdir2).await.unwrap();
+        let error = extract_bundle(&good, &workdir2).await.unwrap_err();
+        assert!(error.to_string().contains("CRC"), "{error}");
+        assert!(
+            !workdir2.exists(),
+            "失败后不该留下半个解包目录: {:?}",
+            std::fs::read_dir(&workdir2).map(|mut r| r.next().map(|e| e.map(|e| e.file_name())))
+        );
+    }
+
+    #[test]
+    fn safe_entry_name_blocks_zip_slip() {
+        // 盒子可能来自任何人，条目名必须当成不可信输入
+        for bad in [
+            "../evil.apk",
+            "../../etc/x.apk",
+            "a/b.apk",
+            "a\\b.apk",
+            "/abs.apk",
+            ".hidden.apk",
+            "",
+            "..",
+            "中文名.apk",
+            "a\u{0}b.apk",
+        ] {
+            assert!(safe_entry_name(bad).is_err(), "{bad:?} 必须被拒");
+        }
+        for ok in [
+            "base.apk",
+            "split_config.zh.apk",
+            "SPLIT_C.APk",
+            "a-b_1.2+3.apk",
+        ] {
+            assert_eq!(safe_entry_name(ok).unwrap(), ok);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_workdir_sweep_only_touches_our_old_dirs() {
+        // 两条边界都要钉住：①自家但很新的目录不能动（可能正被别的任务用着）；
+        // ②只有带我们前缀的目录才允许被扫，别人家的一概不碰。
+        let root = std::env::temp_dir();
+        let mine = root.join(format!("{}sweep-case", WORKDIR_PREFIX));
+        let other = root.join("definitely-not-ours-sweep");
+        for dir in [&mine, &other] {
+            tokio::fs::create_dir_all(dir).await.unwrap();
+            tokio::fs::write(dir.join("x"), b"y").await.unwrap();
+        }
+
+        // ① 现在 = 真实时间：两个目录都是刚建的，一个都不该消失
+        sweep_stale_workdirs(SystemTime::now()).await;
+        assert!(mine.exists(), "新目录被误删，正在跑的安装会被抽掉文件");
+        assert!(other.exists(), "前缀不匹配的目录一律不碰");
+
+        // ② 把"现在"推到 4 天之后：只有自家那个消失
+        let future = SystemTime::now() + std::time::Duration::from_secs(4 * 24 * 60 * 60);
+        sweep_stale_workdirs(future).await;
+        assert!(!mine.exists(), "超过阈值的自家残留目录应被回收");
+        assert!(other.exists(), "清扫不能越界删别人的目录");
+        let _cleanup = tokio::fs::remove_dir_all(&other).await;
+    }
+
+    #[test]
+    fn is_bundle_path_follows_the_extension() {
+        assert!(is_bundle_path("/tmp/亚马逊购物_1.0.apks"));
+        assert!(is_bundle_path("/tmp/A.APKS"), "大小写不敏感");
+        assert!(!is_bundle_path("/tmp/a.apk"));
+        assert!(!is_bundle_path("/tmp/apks"));
+        assert!(!is_bundle_path("/tmp/a.zip"));
     }
 
     #[tokio::test]

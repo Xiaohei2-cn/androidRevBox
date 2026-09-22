@@ -4,6 +4,7 @@
 //! 命令返回 task_id 即结束，不在 IPC 上阻塞（长任务走事件流）。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -59,7 +60,7 @@ impl TaskService {
         &self,
         kind: &str,
         name: &str,
-        spec: CommandSpec,
+        mut spec: CommandSpec,
     ) -> CoreResult<String> {
         let name = if name.trim().is_empty() {
             build_task_name(&spec)
@@ -78,6 +79,8 @@ impl TaskService {
         let worker_id = id.clone();
 
         tauri::async_runtime::spawn(async move {
+            // 先把回收点摘出来：spec 会被 execute 消耗掉
+            let cleanup_paths = std::mem::take(&mut spec.cleanup_paths);
             let _ = task_repo::update(&db, &worker_id, "running", None, false);
             emit_status(&app, &worker_id, "running", None);
 
@@ -125,6 +128,7 @@ impl TaskService {
             };
 
             let _ = task_repo::update(&db, &worker_id, status, exit_code, true);
+            cleanup_task_paths(&cleanup_paths);
             emit_status(&app, &worker_id, status, exit_code);
             // 自清理：终态后令牌不再有用
             if let Ok(mut map) = registry.lock() {
@@ -174,6 +178,29 @@ struct TaskOutputPayload {
     chunk: String,
 }
 
+/// 回收发起方留下的临时路径（例如 `.apks` 解出来的散装 APK）。
+///
+/// 为什么必须挂在**任务收尾**而不是发起方：`adb install-multiple` 是异步任务，
+/// 发起方拿到 task_id 就返回了，那时 adb 还在读这些文件；提前删等于把安装打断。
+/// 反过来，成功/失败/取消三条路都得清，否则一次大包几百 MB 有去无回。
+/// 本来还有第二道防线（`apk_bundle::sweep_stale_workdirs` 扫陈旧目录），
+/// 但实测它会把**并行任务正在用的目录**当残留删掉（测试里两个任务同时跑就复现了），
+/// 所以撤掉：宁可漏在崩溃时留一个目录，也不能悄悄删掉正在使用的文件。
+pub(crate) fn cleanup_task_paths(paths: &[PathBuf]) {
+    for path in paths {
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        if let Err(error) = removed
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), error = %error, "任务临时路径回收失败");
+        }
+    }
+}
+
 fn emit_status(app: &tauri::AppHandle, id: &str, status: &str, exit_code: Option<i32>) {
     let evt = AppEvent::new(
         event_names::TASK_STATUS,
@@ -213,11 +240,32 @@ fn truncate_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cleanup_task_paths_removes_dirs_files_and_tolerates_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("bundle");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("base.apk");
+        std::fs::write(&file, b"payload").unwrap();
+        let single = root.path().join("loose.bin");
+        std::fs::write(&single, b"x").unwrap();
+        let gone = root.path().join("not-there");
+
+        cleanup_task_paths(&[dir.clone(), single.clone(), gone.clone()]);
+
+        assert!(!dir.exists(), "目录必须被回收");
+        assert!(!single.exists(), "文件必须被回收");
+        // 不存在不能报错：任务被取消时可能已经有一半被清掉了
+        cleanup_task_paths(&[dir, single, gone]);
+        cleanup_task_paths(&[]);
+    }
+
     use super::*;
 
     #[test]
     fn task_name_uses_basename_and_truncates() {
         let spec = CommandSpec {
+            cleanup_paths: Vec::new(),
             executable: "/bin/echo".into(),
             args: vec!["hello".into(), "world".into()],
             ..Default::default()
@@ -225,6 +273,7 @@ mod tests {
         assert_eq!(build_task_name(&spec), "echo hello world");
 
         let long = CommandSpec {
+            cleanup_paths: Vec::new(),
             executable: "/usr/bin/env".into(),
             args: vec!["x".repeat(500)],
             ..Default::default()

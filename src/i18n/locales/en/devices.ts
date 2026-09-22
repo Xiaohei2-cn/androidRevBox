@@ -1,5 +1,10 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.apkInstall.pathPlaceholder": "Local APK / APKS path (one file is enough)",
+  "devices.apkInstall.pickTitle": "Choose an APK or .apks container to install",
+  "devices.apkInstall.pick": "Choose file",
+  "devices.apkInstall.run": "Install",
+  "devices.apkInstall.bundleHint": "This is a container: we read it locally and install the whole set, no split picking",
   "devices.gotoInfo": "Info",
   "devices.gotoList": "Open device list",
   "devices.info.model": "Model",

@@ -7,6 +7,7 @@
 //! - Unix 用 SIGTERM/SIGKILL；Windows 用 taskkill /T（tree）[/F]。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -47,6 +48,12 @@ pub struct CommandSpec {
     pub env_extra: HashMap<String, String>,
     /// Windows：spawn 时加 CREATE_NO_WINDOW（长驻子进程如 frida runner 防黑窗）
     pub hide_window: bool,
+    /// 任务进入终态后要删掉的本地路径（目录或文件）。
+    ///
+    /// 为什么挂在命令规格上而不是让调用方自己删：`adb install-multiple` 是**异步任务**，
+    /// 调用方拿到 task_id 就返回了，那时临时文件还在被 adb 读。谁发起就该谁负责回收，
+    /// 但回收时机只有任务知道，所以交给任务收尾统一处理（成功/失败/取消都清）。
+    pub cleanup_paths: Vec<PathBuf>,
 }
 
 /// 取消令牌：watch 通道实现，可 await 取消信号（无竞态丢通知问题）。
@@ -318,6 +325,7 @@ mod tests {
             timeout,
             env_extra: HashMap::new(),
             hide_window: false,
+            cleanup_paths: Vec::new(),
         }
     }
 
