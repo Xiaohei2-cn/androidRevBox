@@ -67,4 +67,46 @@ try {
   console.warn("（跳过 Rust 白名单检查：config_service.rs 不可读）");
 }
 
+
+// 反向校验：代码里写死的 t("域.键") 必须真的存在于源语言词典。
+// `t` 的键不是类型化的（见 src/i18n/context.tsx），拼错只会静默回退成键名显示在界面上，
+// 所以这里补一道：新增文案改了键名却没同步改词典，CI 直接红。
+function collectUsedKeys() {
+  const used = new Map(); // key -> 出现位置（取第一个，便于直接跳过去看）
+  const srcDir = join(repoRoot, "src");
+  const skipFile = (name) =>
+    name.endsWith(".test.ts") || name.endsWith(".test.tsx") || name.includes("i18n-check");
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === "node_modules" || entry.name === "locales") continue;
+        walk(full);
+        continue;
+      }
+      if (!/\.(ts|tsx)$/.test(entry.name) || skipFile(entry.name)) continue;
+      const text = readFileSync(full, "utf8");
+      for (const m of text.matchAll(/\bt\(\s*"([a-z]+\.[A-Za-z0-9_.]+)"/g)) {
+        // 跳过注释行：文档里的 t("域.键") 是写法示例，不是真的取值
+        const lineStart = text.lastIndexOf("\n", m.index) + 1;
+        const head = text.slice(lineStart, m.index).trimStart();
+        if (head.startsWith("//") || head.startsWith("*") || head.startsWith("/*")) continue;
+        if (!used.has(m[1])) used.set(m[1], full.replace(repoRoot + "/", ""));
+      }
+    }
+  };
+  walk(srcDir);
+  return used;
+}
+
+const used = collectUsedKeys();
+const unknown = [...used].filter(([key]) => !zh.has(key));
+if (unknown.length) {
+  failed = true;
+  console.error(`✗ 代码里用了 ${unknown.length} 个词典中不存在的键（界面会直接显示键名）`);
+  for (const [key, where] of unknown) console.error(`   ${key}  ← ${where}`);
+} else {
+  console.log(`✓ 代码内 ${used.size} 个字面量键全部在 zh-CN 词典中存在`);
+}
+
 process.exit(failed ? 1 : 0);
