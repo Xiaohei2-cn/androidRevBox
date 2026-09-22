@@ -85,6 +85,7 @@ static const Handler HANDLERS[] = {
     {"L", "list",    "system_server Java",   "token", 8000,  6u * 1024 * 1024,  true},
     {"M", "manifest","system_server Java",   "token", 8000,  6u * 1024 * 1024,  true},
     {"E", "export",  "system_server Java + 文件读", "token", 8000, 6u * 1024 * 1024, true},
+    {"P", "describe","system_server Java",   "token", 8000,  64u * 1024,        true},
     {"I", "handlers","companion",            "token", 0,     8u * 1024,         true},
 };
 static const size_t HANDLER_COUNT = sizeof(HANDLERS) / sizeof(HANDLERS[0]);
@@ -780,6 +781,27 @@ static void serve_session(int cfd) {
             char *payload = run_helper(h, argv, &hr);
             if (!payload) {
                 if (hr != HELPER_OK) note_internal_failure(hidx, "list helper");
+                send_err(cfd, hr == HELPER_TIMEOUT ? "helper_timeout" : "helper_failed", nullptr);
+            } else {
+                note_success(hidx);
+                stream_ndjson(cfd, payload);
+            }
+            continue;
+        }
+
+        if (strcmp(h->cmd, "P") == 0) {
+            // P <pkg>：按包查一次 Framework 元数据（显示名/版本/分包集合）。
+            // 只接受一个参数，包名沿用 E 的字符集校验（不允许任何 shell 元字符与路径分隔）。
+            if (*rest == '\0' || strpbrk(rest, " \t\r\n") != nullptr ||
+                strpbrk(rest, "/\\ \"'`$;&|<>()") != nullptr || strlen(rest) > 256) {
+                send_err(cfd, "bad_package", rest);
+                continue;
+            }
+            char *argv[] = {(char *) "--one", rest, nullptr};
+            HelperResult hr = HELPER_OK;
+            char *payload = run_helper(h, argv, &hr);
+            if (!payload) {
+                if (hr != HELPER_OK) note_internal_failure(hidx, "describe helper");
                 send_err(cfd, hr == HELPER_TIMEOUT ? "helper_timeout" : "helper_failed", nullptr);
             } else {
                 note_success(hidx);

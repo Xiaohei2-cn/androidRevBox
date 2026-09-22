@@ -45,12 +45,15 @@ DTO 留在 `android-agent`/模块两侧，**不要**把它塞进 `agent-protocol
 | Agent→模块 | `S` | 状态查询，返回同 `OK` 形状（不需要能力位） |
 | Agent→模块 | `L <locale\|-> <all\|user\|system> <0\|1>` | 需要能力 `list` |
 | Agent→模块 | `E <package>` | 需要能力 `export`，返回分帧文件列表 |
+| Agent→模块 | `P <package>` | 需要能力 `describe`；单包元数据（显示名/版本/分包集合），两帧：条目 + `{"final":true,"count":1,"splitCount":N}`。包不存在回 `{"notFound":"<pkg>"}` + `count:0`（**不是** ERR，参数错不该把方法推进熔断） |
 | Agent→模块 | `X` | 结束会话 |
 | 任意响应 | `ERR <code>[ <msg>]` | 无消息时带尾随空格，所以按空白切分而不是整串比较 |
 | 数据帧 | 4 字节长度头 + JSON | 末帧含 `"final": true` |
 
-能力位常量：`CAP_LIST="list"`、`CAP_MANIFEST="manifest"`、`CAP_EXPORT="export"`
-（`android-agent/src/provider/zygisk.rs`，与模块 `OK` 行里那三个词**必须逐字相同**）。
+能力位常量：`CAP_LIST="list"`、`CAP_MANIFEST="manifest"`、`CAP_EXPORT="export"`、
+`CAP_DESCRIBE="describe"`、`CAP_HANDLERS="handlers"`
+（`android-agent/src/provider/zygisk.rs`，与模块 `OK` 行里那几个词**必须逐字相同**）。
+能力列表由 `HANDLERS[]` 单点生成（AR10.2 起），加命令只需要改注册表那一行。
 
 超时与上限（改数值前先想清楚它挡住哪种事故）：
 
@@ -94,8 +97,12 @@ DTO 留在 `android-agent`/模块两侧，**不要**把它塞进 `agent-protocol
    - 结果用分帧写出，最后一帧带 `"final": true`；行数超限要发 `ERR too_many_items`，
      不要静默截断（截断必须让上层知道）。
    - 需要 Framework API 时通过 helper 走（见第 6 步），不要在 native 里反射私有 API。
-   - 如果这是**新能力**：把它加进 `OK`/`STATUS` 行的能力列表（当前是硬编码
-     `"list manifest export"`，两处都要加，别只加一处）。
+   - 如果这是**新能力**：只往 `HANDLERS[]` 加一行（命令词、能力名、target、
+     permission、该命令自己的超时与响应上限、能否安全中断）。`OK`/`STATUS`
+     行的能力列表与注册表自描述都由这张表生成，**没有第二处可漏**（AR10.2 之前
+     是两处手写，加命令必漏一处；漏掉的那条对 Agent 就等于"模块没这能力"）。
+   - 只读命令的失败口径：参数/目标不合法 → `bad_*` 或结构化 `{"notFound":...}`，
+     **不计入熔断**；helper 超时/崩溃/超限才 `note_internal_failure`。
 2. **helper（`helper/src/pro/applist/HelperPro.java`）**
    - 只加静态入口，返回可 JSON 化的扁平结构；保持"冷启动约 0.4 s"的意识：
      一次查询一次进程，能合并就合并，别在循环里反复起。

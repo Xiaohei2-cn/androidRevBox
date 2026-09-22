@@ -54,6 +54,13 @@ M: <4B len><item json> ... <4B len>{"final":true,"count":N,"fallback":M,"localeU
           "requestedLocale","resolvedLocale"|null,"fallbackReason"|null,
           "versionName","versionCode","uid","isSystem","enabled"}
 
+C: P <pkg>\n                              # 按包查元数据（能力 describe）
+M: <4B len>{"pkg","label","labelSource","requestedLocale","resolvedLocale","fallbackReason",
+            "versionName","versionCode","uid","isSystem","enabled","deviceLocale",
+            "files":[{"name","size"}...]}
+   <4B len>{"final":true,"count":1,"splitCount":N}
+   <4B len>{"notFound":"<pkg>"} + {"final":true,"count":0}   # 包不存在：不是 ERR，不计熔断
+
 C: M\n                                   # 每包 base+split 文件清单（不传文件体）
 M: <4B len>{"pkg":"...","files":[{"name","path","size"}...]} ... <4B len>{"final":true,"count":N}
 
@@ -68,8 +75,8 @@ C: X\n                                   # 主动结束会话
 ```
 
 错误码：`auth_required` `auth_failed` `bad_handshake` `unsupported_protocol` `bad_request`
-`bad_locale` `bad_scope` `bad_package` `unknown_command` `helper_failed` `no_files`
-`too_many_items` `export_truncated` `too_large`。
+`bad_locale` `bad_scope` `bad_package` `unknown_command` `helper_failed` `helper_timeout`
+`method_fused` `no_files` `too_many_items` `export_truncated` `too_large`。
 
 限制：单次 helper 输出上限 8 MiB（超过即 `ERR helper_failed`，不返回半截清单）、
 条目上限 200000 行、导出总量上限 512 MiB。

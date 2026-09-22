@@ -24,6 +24,7 @@ pub mod method {
     pub const HOSTED_STOP: &str = "hosted.stop";
     pub const PACKAGE_EXPORT_APK: &str = "package.export_apk";
     pub const PACKAGE_EXPORT_CLEAN: &str = "package.export_clean";
+    pub const PACKAGE_DESCRIBE: &str = "package.describe";
     pub const ZYGISK_STATUS: &str = "zygisk.status";
     pub const PACKAGE_NATIVE_LIB_DIR: &str = "package.native_lib_dir";
     pub const ACTIVITY_LAUNCH: &str = "activity.launch";
@@ -230,6 +231,46 @@ pub struct PackageExportApkResult {
     /// `default` 是为了兼容还没带这个字段的旧 Agent。
     #[serde(default)]
     pub skipped: Vec<String>,
+}
+
+/// 按包问一次 Framework：本地化显示名、版本号、以及**这个包一共有哪几个 APK**。
+///
+/// 存在的理由只有一个：这几件事 ADB 答不上来（`pm` 给不出按设备语言解析的名字），
+/// 而导出与命名又必须知道它们。批量清单 `package.list_localized` 是 O(全机包数)，
+/// 为一个应用跑全机清单不划算，所以补这条单点查询（AR10.3 的第一个真实新接口）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageDescribeParams {
+    pub package_name: String,
+}
+
+/// 设备侧声明的一个 APK 分片（名字保持 `base.apk` / `split_*.apk` 原样）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescribedApkFile {
+    pub name: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageDescribeResult {
+    pub package_name: String,
+    pub label: String,
+    pub label_source: LabelSource,
+    pub requested_locale: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_locale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_code: Option<u64>,
+    /// 设备上真正生效的 locale（模块自报），命名口径的证据字段
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_locale: Option<String>,
+    pub is_system: bool,
+    pub enabled: bool,
+    /// 这个包声明的全部分片；导出结果比这里少就是缺件
+    pub apk_files: Vec<DescribedApkFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1675,6 +1716,53 @@ mod tests {
             serde_json::from_value(json!({"items": [], "success_count": 0, "fallback_count": 0}))
                 .unwrap();
         assert_eq!(legacy.channel, None);
+    }
+
+    #[test]
+    fn describe_result_keeps_wire_snake_case_and_optional_fields() {
+        let result = PackageDescribeResult {
+            package_name: "com.example.app".into(),
+            label: "示例应用".into(),
+            label_source: LabelSource::Framework,
+            requested_locale: "-".into(),
+            resolved_locale: Some("zh-Hans-CN".into()),
+            fallback_reason: None,
+            version_name: Some("1.2.3".into()),
+            version_code: Some(7),
+            device_locale: Some("zh-Hans-CN".into()),
+            is_system: false,
+            enabled: true,
+            apk_files: vec![
+                DescribedApkFile {
+                    name: "base.apk".into(),
+                    size: 10,
+                },
+                DescribedApkFile {
+                    name: "split_config.arm64_v8a.apk".into(),
+                    size: 20,
+                },
+            ],
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        // 线格式 snake_case（D043：跨 IPC 不加翻译层）
+        assert_eq!(value["apk_files"][1]["name"], "split_config.arm64_v8a.apk");
+        assert_eq!(value["version_code"], 7);
+        assert_eq!(value["labelSource"], serde_json::Value::Null);
+        let round: PackageDescribeResult = serde_json::from_value(value).unwrap();
+        assert_eq!(round, result);
+        // 老模块不回的可选字段缺省时必须能解析
+        let lean: PackageDescribeResult = serde_json::from_value(serde_json::json!({
+            "package_name": "com.example.app",
+            "label": "com.example.app",
+            "label_source": "package_name",
+            "requested_locale": "-",
+            "is_system": false,
+            "enabled": true,
+            "apk_files": [{"name": "base.apk", "size": 1}]
+        }))
+        .unwrap();
+        assert_eq!(lean.version_name, None);
+        assert_eq!(lean.device_locale, None);
     }
 
     #[test]

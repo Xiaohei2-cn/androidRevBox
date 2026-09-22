@@ -9,14 +9,15 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use agent_protocol::method::{
-    PACKAGE_EXPORT_APK, PACKAGE_EXPORT_CLEAN, PACKAGE_LIST_LOCALIZED, ZYGISK_STATUS,
+    PACKAGE_DESCRIBE, PACKAGE_EXPORT_APK, PACKAGE_EXPORT_CLEAN, PACKAGE_LIST_LOCALIZED,
+    ZYGISK_STATUS,
 };
 use agent_protocol::{
-    AgentError, ErrorCode, LabelSource, LocalizedPackageItem, ModuleHandlerInfo,
-    PackageExportApkParams, PackageExportApkResult, PackageExportCleanParams,
-    PackageExportCleanResult, PackageListLocalizedParams, PackageListLocalizedResult, PackageScope,
-    PackageWarning, ProviderHealth, ProviderInfo, StagedApkFile, ZygiskLifecycle,
-    ZygiskStatusResult,
+    AgentError, DescribedApkFile, ErrorCode, LabelSource, LocalizedPackageItem, ModuleHandlerInfo,
+    PackageDescribeParams, PackageDescribeResult, PackageExportApkParams, PackageExportApkResult,
+    PackageExportCleanParams, PackageExportCleanResult, PackageListLocalizedParams,
+    PackageListLocalizedResult, PackageScope, PackageWarning, ProviderHealth, ProviderInfo,
+    StagedApkFile, ZygiskLifecycle, ZygiskStatusResult,
 };
 use serde::Deserialize;
 use serde_json::{Value, to_value};
@@ -29,6 +30,7 @@ use super::{Provider, ProviderFuture, RequestContext};
 const ZYGISK_METHODS: &[&str] = &[
     ZYGISK_STATUS,
     PACKAGE_LIST_LOCALIZED,
+    PACKAGE_DESCRIBE,
     PACKAGE_EXPORT_APK,
     PACKAGE_EXPORT_CLEAN,
 ];
@@ -45,6 +47,9 @@ pub const DEMO_SUB_PROTOCOL_VERSION: u32 = 1;
 pub const CAP_LIST: &str = "list";
 pub const CAP_MANIFEST: &str = "manifest";
 pub const CAP_EXPORT: &str = "export";
+/// 按包查询（模块命令 `P`）。AR10.3 的第一个真实增量接口：导出与命名都要先知道
+/// "这个包在 Framework 眼里叫什么、一共几个分包"，而这两件事只有 Framework 答得上来。
+pub const CAP_DESCRIBE: &str = "describe";
 /// 模块自描述注册表的能力名（AR10.2）。旧模块不宣告它，`module_handlers` 就是空数组。
 pub const CAP_HANDLERS: &str = "handlers";
 
@@ -188,6 +193,43 @@ impl Variant {
             Self::Absent => "",
         }
     }
+}
+
+/// v2 `P` 帧：清单条目字段 + 该包声明的全部分片（模块侧 camelCase）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProDescribedPackage {
+    pkg: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    label_source: String,
+    #[serde(default)]
+    requested_locale: String,
+    #[serde(default)]
+    resolved_locale: Option<String>,
+    #[serde(default)]
+    fallback_reason: Option<String>,
+    #[serde(default)]
+    version_name: String,
+    #[serde(default)]
+    version_code: Option<i64>,
+    #[serde(default)]
+    device_locale: Option<String>,
+    #[serde(default)]
+    is_system: bool,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    files: Vec<ProDescribedFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProDescribedFile {
+    name: String,
+    #[serde(default)]
+    size: u64,
 }
 
 /// v2 `L` 帧条目（模块侧 camelCase）
@@ -768,6 +810,62 @@ impl ZygiskProvider {
         })
     }
 
+    /// `package.describe`：单点问模块 `P <pkg>`，拿回本地化显示名 + 版本 + 分包集合。
+    ///
+    /// 与 `package.list_localized` 的分工：批量清单服务"看列表"，本方法服务
+    /// "对某一个包做决定"（导出命名、校验缺件）。同一个包两边的结论必须一致，
+    /// 这条不变式由真机腿 `real_agent_zygisk_describe_matches_list` 钉住。
+    async fn handle_describe(&self, params: Value) -> Result<Value, AgentError> {
+        let params: PackageDescribeParams = parse_params(params)?;
+        validate_package_name(&params.package_name)?;
+        let probe = self.probe().await;
+        require_bridge(&probe)?;
+        let token = self.pro_token().await.ok_or_else(|| {
+            provider_unavailable(
+                "v2 模块令牌不可用（Agent 需要 root 才能读令牌）",
+                Some("pro_token_missing"),
+            )
+        })?;
+        let request = format!("P {}\n", params.package_name);
+        let frames =
+            pro_command_frames_with_token(&token, &request, CAP_DESCRIBE, PACKAGE_DESCRIBE)
+                .await
+                .inspect_err(|error| self.mark_faulted(error))?;
+
+        let mut described: Option<ProDescribedPackage> = None;
+        let mut not_found: Option<String> = None;
+        let mut split_count: Option<u64> = None;
+        for value in &frames {
+            if value.get("final").and_then(serde_json::Value::as_bool) == Some(true) {
+                split_count = value.get("splitCount").and_then(serde_json::Value::as_u64);
+                continue;
+            }
+            if let Some(raw) = value.get("notFound").and_then(serde_json::Value::as_str) {
+                not_found = Some(raw.to_owned());
+                continue;
+            }
+            let parsed: ProDescribedPackage =
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    incompatible(
+                        format!("模块按包查询响应无法解析: {error}"),
+                        Some("describe_bad_frame"),
+                    )
+                })?;
+            described = Some(parsed);
+        }
+
+        if let Some(pkg) = not_found {
+            return Err(AgentError::new(
+                ErrorCode::NotFound,
+                format!("设备上没有 {pkg} 这个包（或它对当前用户不可见）"),
+            ));
+        }
+        let item = described.ok_or_else(|| {
+            provider_unavailable("模块没有返回按包查询结果", Some("describe_empty"))
+        })?;
+        serialize(&map_described(item, split_count, &params.package_name)?)
+    }
+
     async fn handle_export(&self, params: Value) -> Result<Value, AgentError> {
         let params: PackageExportApkParams = parse_params(params)?;
         validate_package_name(&params.package_name)?;
@@ -932,6 +1030,7 @@ impl Provider for ZygiskProvider {
             match method {
                 ZYGISK_STATUS => self.handle_status(params).await,
                 PACKAGE_LIST_LOCALIZED => self.handle_list(params).await,
+                PACKAGE_DESCRIBE => self.handle_describe(params).await,
                 PACKAGE_EXPORT_APK => self.handle_export(params).await,
                 PACKAGE_EXPORT_CLEAN => self.handle_export_clean(params).await,
                 _ => Err(AgentError::new(
@@ -1310,6 +1409,73 @@ fn parse_handler_frames(frames: &[serde_json::Value]) -> Vec<ModuleHandlerInfo> 
 /// 握手能力位门控（AR10.1 规则 2）。`capability` 传空串表示该命令不需要能力
 /// （例如 `S` 状态查询）。缺能力必须在**发命令之前**失败：让模块去猜一个它不认识的
 /// 命令，只会把「能力缺失」变成一次超时或一个莫名其妙的 `ERR unsupported_command`。
+/// `P` 帧 → 公共 DTO 的映射规则（拆出来才能被单测钉住：字段缺一个都不会有人发现）。
+///
+/// 三条硬规则：
+/// * 分片为空 → 不谎报"这个包没有分包"，直接判模块响应不合格；
+/// * `splitCount` 与文件数不一致 → 模块自相矛盾，宁可报错也不给出半个清单；
+/// * `versionName` 空串一律变 `None`，让下游能区分"没有版本号"与"版本号是空"。
+fn map_described(
+    item: ProDescribedPackage,
+    split_count: Option<u64>,
+    requested: &str,
+) -> Result<PackageDescribeResult, AgentError> {
+    if item.pkg != requested {
+        return Err(incompatible(
+            "模块按包查询返回了别的包",
+            Some("describe_pkg_mismatch"),
+        ));
+    }
+    if item.files.is_empty() {
+        return Err(incompatible(
+            format!("模块未报告 {} 的任何 APK 文件", item.pkg),
+            Some("describe_no_files"),
+        ));
+    }
+    if let Some(reported) = split_count
+        && usize::try_from(reported) != Ok(item.files.len())
+    {
+        return Err(incompatible(
+            format!(
+                "模块自报 {reported} 个分片，实际给出 {} 个",
+                item.files.len()
+            ),
+            Some("describe_count_mismatch"),
+        ));
+    }
+    Ok(PackageDescribeResult {
+        package_name: item.pkg,
+        label: item.label,
+        label_source: match item.label_source.as_str() {
+            "framework" => LabelSource::Framework,
+            "manifest" => LabelSource::Manifest,
+            _ => LabelSource::PackageName,
+        },
+        requested_locale: if item.requested_locale.is_empty() {
+            "-".to_owned()
+        } else {
+            item.requested_locale
+        },
+        resolved_locale: item.resolved_locale,
+        fallback_reason: item.fallback_reason,
+        version_name: Some(item.version_name).filter(|value| !value.is_empty()),
+        version_code: item
+            .version_code
+            .and_then(|value| u64::try_from(value).ok()),
+        device_locale: item.device_locale,
+        is_system: item.is_system,
+        enabled: item.enabled,
+        apk_files: item
+            .files
+            .into_iter()
+            .map(|file| DescribedApkFile {
+                name: file.name,
+                size: file.size,
+            })
+            .collect(),
+    })
+}
+
 fn ensure_capability(hello: &ProHello, capability: &str, method: &str) -> Result<(), AgentError> {
     if capability.is_empty() || hello.capabilities.iter().any(|cap| cap == capability) {
         return Ok(());
@@ -2215,6 +2381,88 @@ mod tests {
         assert_eq!(Variant::Demo.sub_protocol(), DEMO_SUB_PROTOCOL_VERSION);
         assert_eq!(Variant::Demo.module_id(), DEMO_MODULE_ID);
         assert_eq!(Variant::Absent.sub_protocol(), 0);
+    }
+
+    /// `P` 帧的映射规则：能省的一律不能省，缺件与自相矛盾都必须报错。
+    #[test]
+    fn map_described_maps_fields_and_rejects_self_contradiction() {
+        // \u793a\u4f8b\u5e94\u7528 = 示例应用：raw byte string 里不能出现非 ASCII
+        let raw = br#"{"pkg":"com.example.app","label":"\u793a\u4f8b\u5e94\u7528","labelSource":"framework","requestedLocale":"-","resolvedLocale":"zh-Hans-CN","fallbackReason":null,"versionName":"1.2.3","versionCode":7,"deviceLocale":"zh-Hans-CN","isSystem":false,"enabled":true,"files":[{"name":"base.apk","size":10},{"name":"split_config.arm64_v8a.apk","size":20}]}"#;
+        let frame: ProDescribedPackage = serde_json::from_slice(raw).unwrap();
+        let ok = map_described(frame.clone(), Some(2), "com.example.app").unwrap();
+        assert_eq!(ok.package_name, "com.example.app");
+        assert_eq!(ok.label, "示例应用");
+        assert_eq!(ok.label_source, LabelSource::Framework);
+        assert_eq!(ok.version_name.as_deref(), Some("1.2.3"));
+        assert_eq!(ok.version_code, Some(7));
+        assert_eq!(ok.device_locale.as_deref(), Some("zh-Hans-CN"));
+        assert_eq!(ok.requested_locale, "-");
+        assert_eq!(ok.apk_files.len(), 2);
+        assert_eq!(ok.apk_files[1].size, 20);
+
+        // 自报分片数与实际条数不符：模块自己矛盾，不能挑一个信
+        let error = map_described(frame.clone(), Some(3), "com.example.app").unwrap_err();
+        assert_eq!(error.code, ErrorCode::IncompatibleVersion);
+        assert_eq!(
+            error.details.expect("要带理由")["reason"],
+            "describe_count_mismatch"
+        );
+
+        // 返回了别的包：这是协议级错误，绝不能当成请求的包用
+        let error = map_described(frame.clone(), Some(2), "com.other.app").unwrap_err();
+        assert_eq!(
+            error.details.expect("要带理由")["reason"],
+            "describe_pkg_mismatch"
+        );
+
+        // 一个分片都没有：不许报告"这个应用没有分包"
+        let mut empty = frame.clone();
+        empty.files = Vec::new();
+        let error = map_described(empty, Some(0), "com.example.app").unwrap_err();
+        assert_eq!(
+            error.details.expect("要带理由")["reason"],
+            "describe_no_files"
+        );
+
+        // versionName 空串必须变 None，让下游能区分"没有版本号"与"版本号是空"
+        let mut no_version = frame;
+        no_version.version_name = String::new();
+        no_version.version_code = None;
+        let mapped = map_described(no_version, Some(2), "com.example.app").unwrap();
+        assert_eq!(mapped.version_name, None);
+        assert_eq!(mapped.version_code, None);
+        // 未知 labelSource 一律降级成 package_name，不猜成 framework
+        let mut shady = mapped;
+        shady.label_source = LabelSource::Manifest;
+        assert_eq!(shady.label_source, LabelSource::Manifest);
+        let shady: ProDescribedPackage = serde_json::from_slice(
+            br#"{"pkg":"p","label":"p","labelSource":"weird","files":[{"name":"base.apk","size":1}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            map_described(shady, None, "p").unwrap().label_source,
+            LabelSource::PackageName
+        );
+    }
+
+    #[test]
+    fn describe_command_gates_on_its_own_capability() {
+        // v2.0 及更早的模块没有 describe：必须在发命令之前就拒，并说明模块版本
+        let old = parse_pro_hello("OK 2 2.0 2 zh-CN list manifest export handlers").unwrap();
+        let error = ensure_capability(&old, CAP_DESCRIBE, PACKAGE_DESCRIBE)
+            .expect_err("老模块缺 describe 必须拒");
+        assert_eq!(error.code, ErrorCode::UnsupportedMethod);
+        let details = error.details.expect("要带结构化理由");
+        assert_eq!(details["reason"], "capability_missing");
+        assert_eq!(details["capability"], "describe");
+        assert_eq!(details["module_version"], "2.0");
+
+        // v2.1 起模块从注册表生成能力列表，多出来的能力对旧 Agent 仍是纯加法
+        let new =
+            parse_pro_hello("OK 2 2.1 3 zh-CN list manifest export describe handlers quantum")
+                .unwrap();
+        assert!(ensure_capability(&new, CAP_DESCRIBE, PACKAGE_DESCRIBE).is_ok());
+        assert!(ensure_capability(&new, "quantum", "whatever.new").is_ok());
     }
 
     /// AR10.1 兼容矩阵的四条规则都要能测：版本号严格、能力位是唯一增量通道、

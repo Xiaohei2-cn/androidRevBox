@@ -11,6 +11,7 @@ package pro.applist;
 //
 // 模式（argv[0]）：
 //   --list <locale|-> <all|user|system> <0|1>
+//   --one <pkg>
 //   --manifest
 //   --files <pkg>
 
@@ -58,6 +59,57 @@ public class HelperPro {
                         out.write(p);
                         out.write('\n');
                     }
+                }
+            } else if ("--one".equals(mode)) {
+                // 按包查一次：显示名 + 版本 + 分包集合。
+                // 导出与命名只需要一个包，不该为它扫全机（--list 是 O(全机包数) 的
+                // getResourcesForApplication，真机上每包一次跨进程资源解析）。
+                // 恒用设备默认解析：产物文件名要的就是手机上显示的那个名字。
+                String want = args.length > 1 ? args[1] : "";
+                PackageInfo one = null;
+                try {
+                    one = pm.getPackageInfo(want, 0);
+                } catch (Throwable ignored) {
+                    one = null;
+                }
+                if (one == null || one.applicationInfo == null) {
+                    // 包不存在是调用方的问题：回结构化 notFound，不报 helper_failed，
+                    // 否则一个拼错的包名会把这条方法推进熔断。
+                    out.write("{\"notFound\":" + jsonStr(want) + "}\n");
+                    out.write("{\"final\":true,\"count\":0}\n");
+                } else {
+                    ApplicationInfo oai = one.applicationInfo;
+                    boolean osys = (oai.flags & ApplicationInfo.FLAG_SYSTEM) != 0
+                            || (oai.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0;
+                    String odev = currentLocale(ctx);
+                    String[] olabel = resolveLabel(pm, oai, "-", odev);
+                    List<String> opaths = apkPaths(oai);
+                    StringBuilder sb = new StringBuilder(352);
+                    sb.append("{\"pkg\":").append(jsonStr(one.packageName))
+                      .append(",\"label\":").append(jsonStr(olabel[0]))
+                      .append(",\"labelSource\":").append(jsonStr(olabel[1]))
+                      .append(",\"requestedLocale\":\"-\"")
+                      .append(",\"resolvedLocale\":")
+                      .append(olabel[2] == null ? "null" : jsonStr(olabel[2]))
+                      .append(",\"fallbackReason\":")
+                      .append(olabel[3] == null ? "null" : jsonStr(olabel[3]))
+                      .append(",\"versionName\":").append(jsonStr(one.versionName == null ? "" : one.versionName))
+                      .append(",\"versionCode\":").append(one.getLongVersionCode())
+                      .append(",\"uid\":").append(oai.uid)
+                      .append(",\"isSystem\":").append(osys)
+                      .append(",\"enabled\":").append(oai.enabled)
+                      .append(",\"deviceLocale\":").append(jsonStr(odev))
+                      .append(",\"files\":[");
+                    for (int j = 0; j < opaths.size(); j++) {
+                        if (j > 0) sb.append(',');
+                        File f = new File(opaths.get(j));
+                        sb.append("{\"name\":").append(jsonStr(f.getName()))
+                          .append(",\"size\":").append(f.length()).append('}');
+                    }
+                    sb.append("]}");
+                    out.write(sb.toString());
+                    out.write('\n');
+                    out.write("{\"final\":true,\"count\":1,\"splitCount\":" + opaths.size() + "}\n");
                 }
             } else if ("--manifest".equals(mode)) {
                 int count = 0;

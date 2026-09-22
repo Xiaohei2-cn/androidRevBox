@@ -131,8 +131,16 @@ async fn host_agent_full_lifecycle() {
             .expect("hello must succeed");
         assert_eq!(hello.protocol_version, 1);
         assert_eq!(hello.providers.len(), 9);
-        // AR8.4 加 package.replace_native_library、AR9.1 加 frida.server.*：30 项能力。
-        assert_eq!(hello.capabilities.len(), 30);
+        // AR8.4 加 package.replace_native_library、AR9.1 加 frida.server.*、
+        // AR10.3 加 package.describe：31 项能力。
+        assert_eq!(hello.capabilities.len(), 31);
+        // 新增的 Zygisk 单点查询：能力必须登记，且不允许由 Legacy ADB 冒充
+        let describe = hello
+            .capabilities
+            .iter()
+            .find(|capability| capability.method == agent_protocol::method::PACKAGE_DESCRIBE)
+            .expect("package.describe 必须由 zygisk provider 宣告");
+        assert_eq!(describe.provider, "zygisk");
         assert!(
             hello.capabilities.iter().any(|capability| capability.method
                 == agent_protocol::method::ACTIVITY_FOREGROUND
