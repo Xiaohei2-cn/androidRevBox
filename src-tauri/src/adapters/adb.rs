@@ -869,8 +869,38 @@ pub fn cmd_logcat(filter: Option<&str>) -> Vec<String> {
     }
     v
 }
+/// 目录列表命令。**刻意补一个尾部 `/`**：设备上 `ls -lA /sdcard` 只吐
+/// `/sdcard -> /storage/self/primary` 这一行（toybox 不解引用命令行里的符号链接），
+/// Legacy 文本解析于是得到一条名字叫 `/sdcard` 的"条目"，界面再拼一层就成了
+/// `/sdcard/sdcard`，元数据与预览跟着报 not_found（真机复现过）。
+/// 带尾部斜杠时列的是链接指向的目录内容，与 Agent 侧（先 canonicalize 再读）同结论。
 pub fn cmd_ls(path: &str) -> Vec<String> {
-    vec!["shell".into(), format!("ls -lA {path}")]
+    let target = if path.is_empty() || path.ends_with('/') {
+        path.to_owned()
+    } else {
+        format!("{path}/")
+    };
+    vec!["shell".into(), format!("ls -lA {target}")]
+}
+
+/// 把一段 `ls -lA` 输出解析成条目列表，并丢掉名字里带 `/` 的行。
+///
+/// 目录条目的名字**不可能**含 `/`；出现带 `/` 的名字说明 ls 打印的不是目录内容而是
+/// 命令行参数本身（符号链接、单个文件、或设备上的怪形态），把它当条目会让界面拼出
+/// `/sdcard/sdcard` 这种不存在的路径。宁可少一条也不给一个假条目。
+pub fn parse_ls_listing(text: &str) -> Vec<FileEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(entry) = parse_ls_long(line) else {
+            continue;
+        };
+        if entry.name.contains('/') {
+            tracing::debug!(name = %entry.name, "ls 输出里这条不是目录条目，忽略");
+            continue;
+        }
+        out.push(entry);
+    }
+    out
 }
 pub fn cmd_cat_preview(path: &str, max_bytes: u64) -> Vec<String> {
     vec!["shell".into(), format!("head -c {max_bytes} {path}")]
@@ -1146,6 +1176,40 @@ mod tests {
         assert_eq!(info.android_version, "14");
         assert_eq!(info.sdk_int, "34");
         assert_eq!(info.serial, "ser1");
+    }
+
+    #[test]
+    fn cmd_ls_always_targets_a_directory_not_the_link_itself() {
+        // 尾部斜杠是关键：少了它，`ls -lA /sdcard` 只会吐符号链接自身那一行
+        assert_eq!(cmd_ls("/sdcard"), ["shell", "ls -lA /sdcard/"]);
+        assert_eq!(
+            cmd_ls("/storage/emulated/0/"),
+            ["shell", "ls -lA /storage/emulated/0/"]
+        );
+        assert_eq!(cmd_ls(""), ["shell", "ls -lA "]);
+    }
+
+    #[test]
+    fn parse_ls_listing_drops_the_symlink_self_line() {
+        // 真机上 `ls -lA /sdcard` 的原文（尾部不带斜杠时就是这个形状）
+        let text = "total 0\nlrw-r--r-- 1 root root 21 2009-01-01 08:00 /sdcard -> /storage/self/primary\n";
+        let entries = parse_ls_listing(text);
+        assert!(
+            entries.is_empty(),
+            "符号链接自身那一行不能变成条目，否则界面会拼出 /sdcard/sdcard: {entries:?}"
+        );
+
+        // 正常目录内容全部保留（含带空格的名字）
+        let dir = "total 2\ndrwxrws--- 2 u0_a251 media_rw 3452 2025-11-17 21:04 Alarms\n\
+-rw-rw---- 1 u0_a251 media_rw 88 2026-02-12 17:54 .thumbcache_idx_001\n\
+lrw-r--r-- 1 shell shell 21 2026-01-01 08:00 link -> /init\n";
+        let entries = parse_ls_listing(dir);
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["Alarms", ".thumbcache_idx_001", "link"]
+        );
+        assert!(entries[0].is_dir && !entries[1].is_dir);
+        assert_eq!(entries[2].symlink.as_deref(), Some("/init"));
     }
 
     #[test]

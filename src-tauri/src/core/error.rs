@@ -17,6 +17,13 @@ pub enum CoreError {
     #[error("内部错误: {0}")]
     Internal(String),
 
+    /// 设备侧明确回答"这个东西不存在"。以前它跟真的内部故障挤在同一个变体里，
+    /// 于是文件页上一个普通的"路径没了"显示成
+    /// `内部错误: Agent returned not_found: lstat 失败 /storage/emulated/0/sdcard...`，
+    /// 用户只能猜是不是程序坏了。
+    #[error("设备上没有这个文件或目录：{0}")]
+    NotFound(String),
+
     #[error("Agent 不可用: {0}")]
     AgentUnavailable(String),
 
@@ -37,6 +44,7 @@ impl CoreError {
             CoreError::Serialization(_) => "SERIALIZATION",
             CoreError::Database(_) => "DATABASE",
             CoreError::Internal(_) => "INTERNAL",
+            CoreError::NotFound(_) => "NOT_FOUND",
             CoreError::AgentUnavailable(_) => "AGENT_UNAVAILABLE",
             CoreError::AgentIncompatible(_) => "AGENT_INCOMPATIBLE",
             CoreError::AgentTransportLost(_) => "AGENT_TRANSPORT_LOST",

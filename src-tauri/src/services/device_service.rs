@@ -705,7 +705,7 @@ impl DeviceService {
                 out.stderr.trim()
             )));
         }
-        Ok(out.stdout.lines().filter_map(adb::parse_ls_long).collect())
+        Ok(adb::parse_ls_listing(&out.stdout))
     }
 
     /// 第三方应用列表

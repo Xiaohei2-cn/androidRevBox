@@ -4000,12 +4000,81 @@ mod tests {
             sdcard.entries.len()
         );
 
-        adb_shell(
-            &serial,
-            "rm -f /data/local/tmp/ar71_probe.txt /data/local/tmp/ar71_escape",
-        )
-        .await;
-        manager.disconnect(&serial).await.unwrap();
+        // ⑦b 同一条路径的 **Legacy 回退**也必须给同样的结果。
+        //     用户报的文件页问题就出在这里：Agent 不在时列表走 `ls -lA`，而
+        //     `ls -lA /sdcard` 只吐符号链接自身那一行，旧解析把它的名字读成
+        //     `/sdcard`，界面拼一层就成了不存在的 `/sdcard/sdcard`，
+        //     元数据与预览各报一句 not_found（看着像程序坏了，其实是假条目）。
+        let legacy_sdcard = runner
+            .run(
+                &adb_path,
+                &adb::build_args(Some(&serial), &adb::cmd_ls("/sdcard")),
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            legacy_sdcard.exit_code,
+            Some(0),
+            "Legacy ls 应当能列 /sdcard: {}",
+            legacy_sdcard.stderr.trim()
+        );
+        let legacy_entries = adb::parse_ls_listing(&legacy_sdcard.stdout);
+        assert!(
+            !legacy_entries.is_empty(),
+            "Legacy 列表为空，说明这条回退路径已经不可用"
+        );
+        for entry in &legacy_entries {
+            assert!(
+                !entry.name.contains('/'),
+                "Legacy 条目名必须是纯文件名，拿到 {:?} 就会拼出不存在的路径",
+                entry.name
+            );
+        }
+        // `ls -lA` 恒含隐藏项，而上面那次请求是 include_hidden=false，所以这里再问一次
+        // "含隐藏项"的，才能与 Legacy 逐条对账（产品真正的列表路径 `list_files` 用的就是
+        // include_hidden=true，这条对账才代表界面上实际看到的东西）。
+        let agent_all: FilesystemListResult = client
+            .request(
+                FILESYSTEM_LIST,
+                &FilesystemListParams {
+                    path: "/sdcard".into(),
+                    include_hidden: true,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+        let mut agent_names: Vec<String> = agent_all
+            .entries
+            .iter()
+            .map(|item| item.name.clone())
+            .collect();
+        let mut legacy_names: Vec<String> = legacy_entries
+            .iter()
+            .map(|item| item.name.clone())
+            .collect();
+        agent_names.sort();
+        legacy_names.sort();
+        assert_eq!(
+            agent_names, legacy_names,
+            "符号链接目录上 Agent 与 Legacy 必须同结论，否则有没有 Agent 会给出两套路径"
+        );
+        assert!(
+            agent_names.iter().any(|name| name.starts_with('.')),
+            "include_hidden=true 却没列出隐藏项，说明这条对账没覆盖到差异点"
+        );
+        assert!(
+            sdcard
+                .entries
+                .iter()
+                .all(|item| !item.name.starts_with('.')),
+            "include_hidden=false 却回了隐藏项"
+        );
+        eprintln!(
+            "[filesystem.list] /sdcard Agent 与 Legacy 同结论：{} 条（含隐藏项）",
+            agent_names.len()
+        );
     }
 
     /// 准备好设备侧的 toybox 探针副本，返回 `false` 表示这台机不该跑本腿。
@@ -4015,9 +4084,14 @@ mod tests {
     ///   本身就带文件名（`ls: /data/local/tmp/toybox: No such file or directory`），
     ///   于是文件不存在时也会判成"已有"——一条永远红的腿。
     /// * **自己的残留要能自愈**：两条宿主腿共用 `/data/local/tmp/toybox`（探针靠
-    ///   argv[0] 的 basename 派发 applet，名字不能改），任何一次中途被打断都会留下
-    ///   副本，把之后每一次运行都毒死。sha256 与 `/system/bin/toybox` 一致的就是我们
-    ///   自己的副本，直接接管；不一致才可能是用户的文件，那种情况仍然拒绝。
+    ///   argv[0] 的 basename 派发 applet，名字不能改），任何一次中断都会留下
+    ///   "文件 + 托管登记 + 活着的进程"，之后每次运行都红；而接管残留时必须把**状态**
+    ///   一起归零，否则腿看到的不是干净起点（两条腿对执行位要求还不一样：755 与 644）。
+    ///   只有 sha256 与 `/system/bin/toybox` 完全一致才认定是我们自己留的副本；
+    ///   不一致就说明可能是用户的文件，那种情况仍然拒绝。
+    ///   杀进程按登记里的 pid 并核 `/proc/<pid>/cmdline`：不用 `pidof toybox`
+    ///   （设备上叫 toybox 的进程未必是我们起的），也不用 `pgrep -f 路径`
+    ///   （它会匹配到执行清理的那条 shell 自己，真机复现过一次）。
     async fn prepare_toybox_probe(serial: &str) -> bool {
         async fn probe_shell(serial: &str, command: &str) -> String {
             let output = tokio::process::Command::new("adb")
@@ -4054,27 +4128,18 @@ mod tests {
             .filter(|line| !line.is_empty())
             .collect();
         if lines.len() == 2 && lines[0] == lines[1] {
-            // 接管残留时必须把**状态**一起归零，否则腿看到的不是干净起点：
-            // ①两条腿对执行位要求不同（一条 755、一条 644）；②中断那次跑还留着
-            // 运行日志、托管登记记录和一个活着的探针进程——「还没启动不该有运行记录」
-            // 这类断言会因此说谎（真机跑出来过）。杀进程走登记里的 pid，并且先核
-            // `/proc/<pid>/cmdline` 确明确实是我们那个路径——不用 `pidof toybox`
-            // （设备上叫 toybox 的进程未必是我们起的），也不用 `pgrep -f 路径`
-            // （它会匹配到自己这条命令行，真机跑出来过一次：把执行清理的 shell 自己杀了）。
-            // 登记记录里存的是应用名而不是路径，所以按名字匹配删除；用户的同名文件
-            // 在上一步 sha256 比对时就已经被排除掉了。
             let normalized = probe_shell(
                 serial,
-                "chmod 755 /data/local/tmp/toybox; \\
-                 rm -f /data/local/tmp/.toybox.run.log; \\
-                 for f in /data/local/tmp/app-reverse-tools-hosted/*.json; do \\
-                   grep -q toybox $f || continue; \\
-                   pid=$(grep -o 'pid[^0-9]*[0-9]*' $f | tr -dc 0-9); \\
-                   if [ -n \"$pid\" ] && grep -q /data/local/tmp/toybox /proc/$pid/cmdline 2>/dev/null; then \\
-                     kill -9 $pid; \\
-                   fi; \\
-                   rm -f $f; \\
-                 done; \\
+                "chmod 755 /data/local/tmp/toybox; \
+                 rm -f /data/local/tmp/.toybox.run.log; \
+                 for f in /data/local/tmp/app-reverse-tools-hosted/*.json; do \
+                   grep -q toybox $f || continue; \
+                   pid=$(grep -o 'pid[^0-9]*[0-9]*' $f | tr -dc 0-9); \
+                   if [ -n \"$pid\" ] && grep -q /data/local/tmp/toybox /proc/$pid/cmdline 2>/dev/null; then \
+                     kill -9 $pid; \
+                   fi; \
+                   rm -f $f; \
+                 done; \
                  echo normalized",
             )
             .await;
@@ -4082,9 +4147,7 @@ mod tests {
                 normalized.contains("normalized"),
                 "接管残留副本时归一化失败: {normalized}"
             );
-            eprintln!(
-                "[ar7] 接管上次中断留下的 toybox 副本（与 /system/bin 一致，不是用户文件），已归一化"
-            );
+            eprintln!("[ar7] 接管上次中断留下的 toybox 副本（与 /system/bin 一致），已归一化");
             return true;
         }
         eprintln!("[跳过] 设备上有一个不是我们副本的 /data/local/tmp/toybox，测试不碰用户文件");

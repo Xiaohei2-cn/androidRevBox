@@ -575,6 +575,12 @@ fn agent_backend_core_error(error: AgentBackendError) -> CoreError {
         }
         AgentBackendError::Cancelled => CoreError::Internal("Agent request was cancelled".into()),
         AgentBackendError::Protocol(reason) => CoreError::Internal(reason),
+        // 业务错误里"目标不存在"占绝大多数（文件页点到一个已经没了的路径就是它），
+        // 它不是故障，必须用自己的变体说话；剩下的业务错误仍然按内部错误报出来，
+        // 因为那是设备侧真的拒绝了我们。
+        AgentBackendError::Business(error) if error.code == agent_protocol::ErrorCode::NotFound => {
+            CoreError::NotFound(error.message)
+        }
         AgentBackendError::Business(error) => {
             CoreError::Internal(format!("Agent returned {}: {}", error.code, error.message))
         }
@@ -596,6 +602,33 @@ fn session_state_name(state: AgentSessionState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// 文件页最常见的两个报错之一：设备侧说"没有这个东西"。它必须说人话，
+    /// 也不能顶着「内部错误」出现——那会让用户以为程序坏了（真机就是这样报的）。
+    #[test]
+    fn agent_not_found_becomes_a_dedicated_not_found_error() {
+        let error = agent_backend_core_error(AgentBackendError::Business(AgentError::new(
+            ErrorCode::NotFound,
+            "lstat 失败 /storage/emulated/0/sdcard: No such file or directory (os error 2)",
+        )));
+        assert_eq!(error.code(), "NOT_FOUND");
+        let text = error.to_string();
+        assert!(
+            text.contains("设备上没有这个文件或目录"),
+            "措辞要能直接看懂: {text}"
+        );
+        assert!(!text.contains("内部错误"), "不能伪装成内部故障: {text}");
+        assert!(
+            text.contains("/storage/emulated/0/sdcard"),
+            "要把设备侧给的路径原样带着: {text}"
+        );
+        // 其它业务错误仍然按内部故障报（那是设备侧真的拒绝了我们）
+        let rejected = agent_backend_core_error(AgentBackendError::Business(AgentError::new(
+            ErrorCode::InvalidRequest,
+            "路径越界",
+        )));
+        assert_eq!(rejected.code(), "INTERNAL");
+    }
     use agent_protocol::{CapabilityInfo, PROTOCOL_VERSION, PermissionInfo};
 
     use crate::db::Db;
