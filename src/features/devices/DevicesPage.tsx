@@ -801,6 +801,7 @@ export function FilesView({ serial }: { serial: string | null }) {
           <span className="shrink-0">{t("devices.files.mkdirInto", { path })}</span>
           <input
             autoFocus
+            aria-label={t("devices.files.mkdir")}
             value={editor.value}
             onChange={(e) => setEditor({ ...editor, value: e.target.value })}
             onKeyDown={(e) => e.key === "Enter" && applyMkdir()}
@@ -1008,7 +1009,12 @@ export function FilesView({ serial }: { serial: string | null }) {
               {t("devices.files.recursive")}
             </label>
           )}
-          <Button size="sm" variant="destructive" onClick={confirmDelete}>
+          <Button
+            size="sm"
+            variant="destructive"
+            data-testid="fs-remove-confirm"
+            onClick={confirmDelete}
+          >
             {t("devices.files.remove")}
           </Button>
           <Button size="sm" variant="ghost" onClick={() => setPendingDelete(null)}>

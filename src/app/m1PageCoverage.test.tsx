@@ -1,7 +1,8 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { I18nProvider } from "@/i18n/I18nProvider";
+import { FilesView } from "@/features/devices/DevicesPage";
 
 /**
  * AR9.4 · M1 页面覆盖（补齐渲染级没验到的那几个页面）。
@@ -33,6 +34,15 @@ const device = vi.hoisted(() => ({
   hostedList: vi.fn(),
   procPorts: vi.fn(),
   procByPort: vi.fn(),
+  ls: vi.fn(),
+  fileStat: vi.fn(),
+  filePreview: vi.fn(),
+  fsMkdir: vi.fn(),
+  fsRename: vi.fn(),
+  fsRemove: vi.fn(),
+  fsChmod: vi.fn(),
+  push: vi.fn(),
+  pull: vi.fn(),
   forwardList: vi.fn(),
   forwardSetup: vi.fn(),
   ip: vi.fn(),
@@ -312,3 +322,79 @@ describe("设备页 Agent 诊断 · Legacy 回退计数（AR12 的删除依据�
     expect(row.textContent).toContain("device.info × 1（unsupported_method）");
   });
 });
+
+  /**
+   * AR7.5：文件页的写侧接线。这里要看的不是"能不能编译"，而是**点一下之后
+   * 到底调了哪条能力、传了什么路径**——路径拼错一个斜杠，界面就会报一句
+   * 看起来像设备坏了的错（/sdcard/sdcard 那次就是这样）。
+   */
+  it("文件页：新建目录把拼好的完整路径交给 filesystem.mkdir", async () => {
+    device.ls.mockResolvedValue([{ name: "Download", isDir: true, size: 0, symlink: null, perms: "drwxrwx--x" }]);
+    device.fsMkdir.mockResolvedValue({
+      path: "/sdcard/新目录",
+      created: true,
+      mode: 0o777,
+      mode_text: "drwxrwxrwx",
+    });
+    renderPage(<FilesView serial="PIXEL-1" />);
+    fireEvent.click(await screen.findByText("新建目录"));
+    const box = await screen.findByRole("textbox", { name: "新建目录" });
+    fireEvent.change(box, { target: { value: "新目录" } });
+    fireEvent.click(screen.getByRole("button", { name: "执行" }));
+    await waitFor(() => expect(device.fsMkdir).toHaveBeenCalled());
+    expect(device.fsMkdir).toHaveBeenCalledWith("PIXEL-1", "/sdcard/新目录");
+    // 结论要说"建了还是本来就在"，不能只说成功
+    await waitFor(() => expect(document.body.textContent).toContain("目录已就绪"));
+  });
+
+  it("文件页：删除必须先确认，且目录的递归要显式勾选", async () => {
+    device.ls.mockResolvedValue([
+      { name: "old.log", isDir: false, size: 12, symlink: null, perms: "-rw-r--r--" },
+      { name: "stuff", isDir: true, size: 0, symlink: null, perms: "drwxr-xr-x" },
+    ]);
+    device.fsRemove.mockResolvedValue({
+      path: "/sdcard/old.log",
+      removed: true,
+      was_dir: false,
+      was_recursive: false,
+      freed_bytes: 12,
+    });
+    renderPage(<FilesView serial="PIXEL-1" />);
+    const row = (await screen.findByText("old.log")).closest("li")!;
+    fireEvent.click(within(row).getByRole("button", { name: "删除" }));
+    // 一次点击只该进入确认态，不能直接就把文件删了
+    expect(device.fsRemove).not.toHaveBeenCalled();
+    await screen.findByText(/确认删除/);
+    fireEvent.click(screen.getByTestId("fs-remove-confirm"));
+    await waitFor(() => expect(device.fsRemove).toHaveBeenCalledWith("PIXEL-1", "/sdcard/old.log", false));
+    await waitFor(() => expect(document.body.textContent).toContain("已删除 /sdcard/old.log"));
+
+    // 目录：确认条上必须出现"连内容一起删"这条显式选择
+    // 目录行渲染成 "stuff/"（斜杠是界面给的视觉提示），断言别被它骗到
+    const dirRow = screen.getByText(/^stuff\/$/).closest("li")!;
+    fireEvent.click(within(dirRow).getByRole("button", { name: "删除" }));
+    await waitFor(() =>
+      expect(screen.getByLabelText(/连目录内容一起删/)).toBeTruthy(),
+    );
+  });
+
+  it("文件页：改权限把八进制按数值送出去，并把设备回读的实际值显示出来", async () => {
+    device.ls.mockResolvedValue([{ name: "tool", isDir: false, size: 5, symlink: null, perms: "-rw-r--r--" }]);
+    device.fsChmod.mockResolvedValue({
+      path: "/sdcard/tool",
+      mode: 0o700,
+      mode_text: "-rwx------",
+      previous_mode: 0o644,
+      previous_mode_text: "-rw-r--r--",
+      verified: false,
+    });
+    renderPage(<FilesView serial="PIXEL-1" />);
+    const row = (await screen.findByText("tool")).closest("li")!;
+    fireEvent.click(within(row).getByRole("button", { name: "改权限" }));
+    const box = await screen.findByPlaceholderText(/八进制|Octal/);
+    fireEvent.change(box, { target: { value: "700" } });
+    fireEvent.click(screen.getByRole("button", { name: "执行" }));
+    await waitFor(() => expect(device.fsChmod).toHaveBeenCalledWith("PIXEL-1", "/sdcard/tool", 0o700));
+    // verified=false 要说"实际生效"，不能照抄请求值假装成功
+    await waitFor(() => expect(document.body.textContent).toContain("设备实际生效 -rwx------"));
+  });
