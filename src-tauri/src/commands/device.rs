@@ -257,6 +257,54 @@ pub async fn device_file_stat(
         .await
 }
 
+/// 新建目录（文件页的"增"，Agent only）。父目录必须已存在——不做 `mkdir -p`，
+/// 那会把打错的路径变成一次"成功"。
+#[tauri::command]
+pub async fn device_fs_mkdir(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    path: String,
+) -> CoreResult<agent_protocol::FilesystemMkdirResult> {
+    state.device.fs_mkdir(&serial, &path).await
+}
+
+/// 重命名 / 移动（文件页的"改"）。目标已存在时设备侧会拒绝，不静默覆盖。
+#[tauri::command]
+pub async fn device_fs_rename(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    from: String,
+    to: String,
+) -> CoreResult<agent_protocol::FilesystemRenameResult> {
+    state.device.fs_rename(&serial, &from, &to).await
+}
+
+/// 删除（文件页的"删"）。`recursive` 默认 false：非空目录会被拒并告知条目数。
+#[tauri::command]
+pub async fn device_fs_remove(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    path: String,
+    recursive: Option<bool>,
+) -> CoreResult<agent_protocol::FilesystemRemoveResult> {
+    state
+        .device
+        .fs_remove(&serial, &path, recursive.unwrap_or(false))
+        .await
+}
+
+/// 改权限（文件页的"改"另一半）。只接受 0o000-0o777；返回值是**读回来的实际值**，
+/// `/sdcard` 这类 FUSE 会吃掉某些位，界面必须显示实际值而不是请求值。
+#[tauri::command]
+pub async fn device_fs_chmod(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    path: String,
+    mode: u32,
+) -> CoreResult<agent_protocol::FilesystemChmodResult> {
+    state.device.fs_chmod(&serial, &path, mode).await
+}
+
 /// 受限预览（AR7.1，Agent only）：文本按 utf8 返回，二进制按小写 hex；
 /// `from_end=true` 是日志尾读语义。字节上限由 Agent 侧夹住（默认 64 KiB，最大 256 KiB）。
 #[tauri::command]

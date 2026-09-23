@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod device;
 pub mod filesystem;
+pub(crate) mod filesystem_write;
 pub mod frida;
 pub mod hosted;
 pub(crate) mod operations;

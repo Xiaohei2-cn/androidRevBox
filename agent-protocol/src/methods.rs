@@ -17,6 +17,10 @@ pub mod method {
     pub const FILESYSTEM_LIST: &str = "filesystem.list";
     pub const FILESYSTEM_STAT: &str = "filesystem.stat";
     pub const FILESYSTEM_PREVIEW: &str = "filesystem.preview";
+    pub const FILESYSTEM_MKDIR: &str = "filesystem.mkdir";
+    pub const FILESYSTEM_RENAME: &str = "filesystem.rename";
+    pub const FILESYSTEM_REMOVE: &str = "filesystem.remove";
+    pub const FILESYSTEM_CHMOD: &str = "filesystem.chmod";
     pub const HOSTED_LIST: &str = "hosted.list";
     pub const HOSTED_CHMOD: &str = "hosted.chmod";
     pub const HOSTED_START: &str = "hosted.start";
@@ -1054,6 +1058,84 @@ pub struct LocalizedPackageItem {
     pub uid: Option<u32>,
     pub is_system: bool,
     pub enabled: bool,
+}
+
+// ===== 文件页写操作（增删改）=====
+//
+// 这四条是"读三件套"（list/stat/preview）之外的写侧能力。口径与 AR7.1 一致：
+// 请求里只放**路径与模式**，不放任何 shell 文本；执行由 Agent 用 `std::fs` 做，
+// 完成后**必须读回复核**再返回，返回码不是结论。写操作的允许根与读侧**不同**，
+// 默认收窄到 `/sdcard` 与 `/data/local/tmp`（见 filesystem provider 的注释）。
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemMkdirParams {
+    /// 要新建的目录完整路径（父目录必须已存在：不做 mkdir -p，那会把打错的路径变成"成功"）
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemMkdirResult {
+    pub path: String,
+    /// false 表示这个目录本来就在（幂等命中，没有改动设备）
+    pub created: bool,
+    pub mode: u32,
+    pub mode_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemRenameParams {
+    pub from: String,
+    /// 完整目标路径（同一目录内改名时也只有 `to` 变最后一段；跨目录即"移动"）
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemRenameResult {
+    pub from: String,
+    pub to: String,
+    pub kind: FileKind,
+    pub mode: u32,
+    pub mode_text: String,
+    /// true 表示 from 与 to 是同一个位置（无需改动，幂等命中）
+    pub no_op: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemRemoveParams {
+    pub path: String,
+    /// 删目录必须显式声明递归：默认 false 时非空目录直接失败，
+    /// 不猜"用户大概想连里面的一起删"。
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemRemoveResult {
+    pub path: String,
+    /// 复核结论：再 stat 一次，确实不存在了才 true
+    pub removed: bool,
+    pub was_dir: bool,
+    pub was_recursive: bool,
+    /// 删掉的字节数（目录取自身大小，递归时累计），给界面一句"释放了多少"
+    pub freed_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemChmodParams {
+    pub path: String,
+    /// 只接受低 12 位（含 setuid/setgid/sticky）；其余位为非法请求
+    pub mode: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemChmodResult {
+    pub path: String,
+    pub mode: u32,
+    pub mode_text: String,
+    pub previous_mode: u32,
+    pub previous_mode_text: String,
+    /// 读回来的 mode 与请求一致
+    pub verified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

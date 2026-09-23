@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Copy, RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck, Cpu, Save } from "lucide-react";
+import { Copy, RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck, Cpu, Save, FolderPlus, Pencil, KeyRound, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { PathBar } from "@/features/files/PathBar";
 import { usePathHistory } from "@/features/files/usePathHistory";
@@ -651,11 +651,19 @@ function Field({
 
 /* 为了 M1 页面回归可测（`app/m1PageRegression.test.tsx`）而导出：内部仍按子 tab 使用。 */
 export function FilesView({ serial }: { serial: string | null }) {
+  const { t } = useI18n();
   /** 浏览历史（后退/前进/上一级）；`path` 是当前所在目录 */
   const nav = usePathHistory("/sdcard", serial);
   const path = nav.path;
   /** 选中待预览/查看元数据的文件（AR7.1：filesystem.stat + filesystem.preview） */
   const [selected, setSelected] = useState<string | null>(null);
+  /** 写操作（增删改）的界面态：一次只开一个行内对话框，避免叠出说不清的状态 */
+  type FileEditor = { kind: "mkdir" | "rename" | "chmod"; path: string; value: string };
+  const [editor, setEditor] = useState<FileEditor | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<{ path: string; name: string; isDir: boolean; recursive: boolean } | null>(null);
+  const [writeBusy, setWriteBusy] = useState(false);
+  const [writeNotice, setWriteNotice] = useState<string | null>(null);
+  const [writeError, setWriteError] = useState<string | null>(null);
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["device", "ls", serial, path],
     queryFn: () => deviceApi.ls(serial!, path),
@@ -673,10 +681,141 @@ export function FilesView({ serial }: { serial: string | null }) {
     enabled: !!serial && !!selectedPath,
   });
 
+  /**
+   * 写操作的统一入口（增删改）。
+   *
+   * 每条都刷一次列表并给一句"设备实际怎么样"的结论，而不是"请求发出去了"：
+   * 目录可能被 FUSE 吃掉权限位、非空目录会被设备侧拒绝、删除必须复核后才发现没删掉。
+   */
+  const runWrite = async (label: string, fn: () => Promise<string>) => {
+    if (!serial) return;
+    setWriteBusy(true);
+    setWriteError(null);
+    setWriteNotice(null);
+    try {
+      setWriteNotice(await fn());
+      void refetch();
+    } catch (e) {
+      setWriteError(`${label}: ${String((e as Error)?.message ?? e)}`);
+    } finally {
+      setWriteBusy(false);
+    }
+  };
+
+  const applyMkdir = () => {
+    const name = editor?.kind === "mkdir" ? editor.value.trim() : "";
+    if (!name) return;
+    const target = joinRemote(path, name);
+    setEditor(null);
+    void runWrite(t("devices.files.mkdir"), async () => {
+      const result = await deviceApi.fsMkdir(serial!, target);
+      return result.created
+        ? t("devices.files.mkdirDone", { path: result.path })
+        : t("devices.files.mkdirExists");
+    });
+  };
+
+  const uploadHere = () => {
+    void pickFile({ title: t("devices.files.upload") }).then((picked) => {
+      if (!picked || !serial) return;
+      const name = picked.split("/").pop() ?? "";
+      if (!name) return;
+      void runWrite(t("devices.files.upload"), async () => {
+        await deviceApi.push(serial, picked, joinRemote(path, name));
+        return t("devices.files.uploaded", { name });
+      });
+    });
+  };
+
+  const retrieve = (entry: string) => {
+    void pickDirectory(t("devices.files.retrieve")).then((dir) => {
+      if (!dir || !serial) return;
+      void runWrite(t("devices.files.retrieve"), async () => {
+        await deviceApi.pull(serial, joinRemote(path, entry), `${dir}/${entry}`);
+        return t("devices.files.retrieved", { name: entry });
+      });
+    });
+  };
+
+  const applyRename = () => {
+    if (!editor || editor.kind !== "rename" || !editor.value.trim()) return;
+    const target = editor.value.trim();
+    const to = target.startsWith("/") ? target : joinRemote(path, target);
+    const from = editor.path;
+    setEditor(null);
+    void runWrite(t("devices.files.rename"), async () => {
+      const result = await deviceApi.fsRename(serial!, from, to);
+      return t("devices.files.renameDone", { to: result.to });
+    });
+  };
+
+  const applyChmod = () => {
+    if (!editor || editor.kind !== "chmod") return;
+    const mode = Number.parseInt(editor.value.trim(), 8);
+    if (!Number.isFinite(mode) || mode < 0 || mode > 0o777) {
+      setWriteError(t("devices.files.modeLabel"));
+      return;
+    }
+    const target = editor.path;
+    setEditor(null);
+    void runWrite(t("devices.files.chmod"), async () => {
+      const result = await deviceApi.fsChmod(serial!, target, mode);
+      return result.verified
+        ? t("devices.files.chmodDone", { mode: result.mode_text })
+        : t("devices.files.chmodNotVerified", { mode: result.mode_text });
+    });
+  };
+
+  const confirmDelete = () => {
+    if (!pendingDelete) return;
+    const { path: target, recursive } = pendingDelete;
+    setPendingDelete(null);
+    void runWrite(t("devices.files.remove"), async () => {
+      const result = await deviceApi.fsRemove(serial!, target, recursive);
+      return t("devices.files.removeDone", { path: result.path, size: formatSize(result.freed_bytes) });
+    });
+  };
   if (!serial) return <Empty text="未选择设备" />;
+  const actionButton = { size: "sm", variant: "ghost" } as const;
   return (
     <div className="flex h-full min-h-0 flex-col gap-2">
       <PathBar nav={nav} onRefresh={() => void refetch()} />
+      <div className="flex shrink-0 items-center gap-1">
+        <Button
+          {...actionButton}
+          className="h-7"
+          disabled={writeBusy}
+          onClick={() => setEditor({ kind: "mkdir", path, value: "" })}
+        >
+          <FolderPlus className="h-3.5 w-3.5" />
+          {t("devices.files.mkdir")}
+        </Button>
+        <Button {...actionButton} className="h-7" disabled={writeBusy} onClick={uploadHere}>
+          <Upload className="h-3.5 w-3.5" />
+          {t("devices.files.upload")}
+        </Button>
+        {writeBusy && <span className="text-xs text-muted-foreground">{t("devices.files.busy")}</span>}
+      </div>
+      {editor?.kind === "mkdir" && (
+        <div className="flex shrink-0 items-center gap-2 rounded-lg border bg-muted/30 p-2 text-xs">
+          <span className="shrink-0">{t("devices.files.mkdirInto", { path })}</span>
+          <input
+            autoFocus
+            value={editor.value}
+            onChange={(e) => setEditor({ ...editor, value: e.target.value })}
+            onKeyDown={(e) => e.key === "Enter" && applyMkdir()}
+            className="h-7 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 font-mono focus-visible:outline-none"
+          />
+          <Button size="sm" onClick={applyMkdir}>
+            {t("devices.files.apply")}
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setEditor(null)}>
+            {t("devices.files.cancel")}
+          </Button>
+        </div>
+      )}
+      {writeNotice && <p className="shrink-0 text-xs text-muted-foreground">{writeNotice}</p>}
+      {writeError && <p className="shrink-0 text-xs text-destructive">{t("devices.files.failed", { error: writeError })}</p>}
       <div className="min-h-0 flex-1 overflow-auto rounded-lg border">
         {isLoading && <Empty text="加载中…" />}
         {error && (
@@ -685,43 +824,98 @@ export function FilesView({ serial }: { serial: string | null }) {
         {data && data.length === 0 && <Empty text="（空目录）" />}
         {data && (
           <ul className="divide-y text-xs">
-            {data.map((f) => (
-              <li key={f.name} className="flex items-center gap-2 px-3 py-1.5">
-                {f.isDir ? (
-                  <button
-                    type="button"
-                    className="flex min-w-0 flex-1 items-center gap-2 text-left hover:underline"
-                    onClick={() => {
-                      setSelected(null);
-                      nav.go(joinRemote(path, f.name));
-                    }}
-                  >
-                    <span className="break-all font-medium">{f.name}/</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className={cn(
-                      "min-w-0 flex-1 break-all text-left hover:underline",
-                      selected === f.name && "font-medium text-foreground underline",
-                    )}
-                    title="查看元数据与受限预览"
-                    onClick={() => setSelected(selected === f.name ? null : f.name)}
-                  >
-                    {f.name}
-                  </button>
-                )}
-                {f.symlink && <span className="text-muted-foreground">→ {f.symlink}</span>}
-                {f.perms && (
-                  <span className="hidden shrink-0 font-mono text-muted-foreground sm:inline">
-                    {f.perms}
+            {data.map((f) => {
+              const entryPath = joinRemote(path, f.name);
+              return (
+                <li key={f.name} className="flex items-center gap-2 px-3 py-1.5">
+                  {f.isDir ? (
+                    <button
+                      type="button"
+                      className="flex min-w-0 flex-1 items-center gap-2 text-left hover:underline"
+                      onClick={() => {
+                        setSelected(null);
+                        nav.go(entryPath);
+                      }}
+                    >
+                      <span className="break-all font-medium">{f.name}/</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className={cn(
+                        "min-w-0 flex-1 break-all text-left hover:underline",
+                        selected === f.name && "font-medium text-foreground underline",
+                      )}
+                      title="查看元数据与受限预览"
+                      onClick={() => setSelected(selected === f.name ? null : f.name)}
+                    >
+                      {f.name}
+                    </button>
+                  )}
+                  {f.symlink && <span className="text-muted-foreground">→ {f.symlink}</span>}
+                  {f.perms && (
+                    <span className="hidden shrink-0 font-mono text-muted-foreground sm:inline">
+                      {f.perms}
+                    </span>
+                  )}
+                  <span className="w-16 shrink-0 text-right tabular-nums text-muted-foreground">
+                    {f.isDir ? "-" : formatSize(f.size)}
                   </span>
-                )}
-                <span className="w-16 shrink-0 text-right tabular-nums text-muted-foreground">
-                  {f.isDir ? "-" : formatSize(f.size)}
-                </span>
-              </li>
-            ))}
+                  <span className="flex shrink-0 items-center gap-0.5 opacity-0 focus-within:opacity-100 hover:opacity-100">
+                    {!f.isDir && (
+                      <Button
+                        {...actionButton}
+                        className="h-6 w-6 px-0"
+                        title={t("devices.files.retrieve")}
+                        aria-label={t("devices.files.retrieve")}
+                        disabled={writeBusy}
+                        onClick={() => retrieve(f.name)}
+                      >
+                        <Download className="h-3 w-3" />
+                      </Button>
+                    )}
+                    <Button
+                      {...actionButton}
+                      className="h-6 w-6 px-0"
+                      title={t("devices.files.rename")}
+                      aria-label={t("devices.files.rename")}
+                      disabled={writeBusy}
+                      onClick={() => setEditor({ kind: "rename", path: entryPath, value: f.name })}
+                    >
+                      <Pencil className="h-3 w-3" />
+                    </Button>
+                    <Button
+                      {...actionButton}
+                      className="h-6 w-6 px-0"
+                      title={t("devices.files.chmod")}
+                      aria-label={t("devices.files.chmod")}
+                      disabled={writeBusy}
+                      onClick={() =>
+                        setEditor({
+                          kind: "chmod",
+                          path: entryPath,
+                          value: permsToOctal(f.perms),
+                        })
+                      }
+                    >
+                      <KeyRound className="h-3 w-3" />
+                    </Button>
+                    <Button
+                      {...actionButton}
+                      className="h-6 w-6 px-0 text-destructive hover:text-destructive"
+                      title={t("devices.files.remove")}
+                      aria-label={t("devices.files.remove")}
+                      disabled={writeBusy}
+                      onClick={() =>
+                        setPendingDelete({ path: entryPath, name: f.name, isDir: f.isDir, recursive: false })
+                      }
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </Button>
+                  </span>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>
@@ -772,31 +966,78 @@ export function FilesView({ serial }: { serial: string | null }) {
           )}
         </div>
       )}
-      <div className="flex shrink-0 gap-2">
-        <Button
-          size="sm"
-          variant="outline"
-          disabled
-          title="本地路径选择将随 P7 原生文件对话框接入"
-        >
-          <Upload className="h-3.5 w-3.5" />
-          Push…
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          disabled
-          title="本地保存路径选择将随 P7 原生文件对话框接入"
-        >
-          <Download className="h-3.5 w-3.5" />
-          Pull…
-        </Button>
-        <p className="self-center text-xs text-muted-foreground">
-          传输任务接口已就绪（device_push/pull），按钮待文件选择器
-        </p>
-      </div>
+      {editor && editor.kind !== "mkdir" && (
+        <div className="flex shrink-0 items-center gap-2 rounded-lg border bg-muted/30 p-2 text-xs">
+          <PathText value={editor.path} className="min-w-0 flex-1 truncate font-mono text-muted-foreground" />
+          <input
+            autoFocus
+            value={editor.value}
+            onChange={(e) => setEditor({ ...editor, value: e.target.value })}
+            onKeyDown={(e) => {
+              if (e.key !== "Enter") return;
+              if (editor.kind === "rename") applyRename();
+              else applyChmod();
+            }}
+            placeholder={editor.kind === "rename" ? t("devices.files.newNameLabel") : t("devices.files.modeLabel")}
+            className="h-7 w-56 shrink-0 rounded-md border border-input bg-transparent px-2 font-mono focus-visible:outline-none"
+          />
+          <Button
+            size="sm"
+            onClick={() => (editor.kind === "rename" ? applyRename() : applyChmod())}
+          >
+            {t("devices.files.apply")}
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setEditor(null)}>
+            {t("devices.files.cancel")}
+          </Button>
+        </div>
+      )}
+      {pendingDelete && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-2 text-xs">
+          <span className="font-medium text-destructive">
+            {t("devices.files.confirmRemove", { name: pendingDelete.name })}
+          </span>
+          <PathText value={pendingDelete.path} className="min-w-0 flex-1 truncate font-mono text-muted-foreground" />
+          {pendingDelete.isDir && (
+            <label className="flex shrink-0 items-center gap-1">
+              <input
+                type="checkbox"
+                checked={pendingDelete.recursive}
+                onChange={(e) => setPendingDelete({ ...pendingDelete, recursive: e.target.checked })}
+              />
+              {t("devices.files.recursive")}
+            </label>
+          )}
+          <Button size="sm" variant="destructive" onClick={confirmDelete}>
+            {t("devices.files.remove")}
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setPendingDelete(null)}>
+            {t("devices.files.cancel")}
+          </Button>
+        </div>
+      )}
     </div>
   );
+}
+
+/**
+ * `-rw-r--r--` → `644`。列表里的权限串是设备侧 `ls` 同源渲染的字符串，
+ * 拿它当默认值比瞎猜 644 诚实；解析不出来就返回空串，让界面逼用户显式填。
+ */
+function permsToOctal(perms?: string | null): string {
+  if (!perms || perms.length < 10) return "";
+  const bits = perms.slice(1, 10);
+  if (/[^rwxstT-]/.test(bits)) return "";
+  let out = "";
+  for (let group = 0; group < 3; group += 1) {
+    const triplet = bits.slice(group * 3, group * 3 + 3);
+    let value = 0;
+    if (triplet[0] !== "-") value += 4;
+    if (triplet[1] !== "-") value += 2;
+    if (triplet[2] !== "-" && triplet[2] !== "T" && triplet[2] !== "S") value += 1;
+    out += String(value);
+  }
+  return out;
 }
 
 /**

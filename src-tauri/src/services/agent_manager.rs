@@ -4154,6 +4154,302 @@ mod tests {
         false
     }
 
+    /// AR7.4 真机腿：文件页的**写侧**四条能力。
+    ///
+    /// 只验"命令跑通了"没有意义——写操作要验的是四件容易糊过去的事：
+    /// ①范围守卫（越界的写必须在动手之前被拒）；②根目录本身不可删；
+    /// ③幂等（同名目录再建一次要说"本来就存在"，不能报成功建了）；
+    /// ④读回复核（删完必须真的 stat 不到、改权限必须回读实际值，
+    ///    因为 `/sdcard` 是 FUSE，某些权限位会被静默吃掉）。
+    #[tokio::test]
+    #[ignore = "需要真机；AR7_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_filesystem_writes -- --ignored --nocapture"]
+    async fn real_agent_filesystem_writes_are_guarded_idempotent_and_verified() {
+        use agent_protocol::method::{
+            FILESYSTEM_CHMOD, FILESYSTEM_MKDIR, FILESYSTEM_REMOVE, FILESYSTEM_RENAME,
+        };
+        use agent_protocol::{
+            AgentError, ErrorCode, FilesystemChmodParams, FilesystemChmodResult,
+            FilesystemMkdirParams, FilesystemMkdirResult, FilesystemRemoveParams,
+            FilesystemRemoveResult, FilesystemRenameParams, FilesystemRenameResult,
+            FilesystemStatParams, FilesystemStatResult,
+        };
+
+        async fn adb_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        let serial = std::env::var("AR7_TEST_SERIAL").expect("AR7_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(
+            crate::db::Db::in_memory().unwrap(),
+        )));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        let status = manager.connect_resolved(&serial).await.unwrap();
+        fn agent_error(error: crate::services::agent_client::AgentClientError) -> AgentError {
+            match error {
+                crate::services::agent_client::AgentClientError::Remote(error) => error,
+                other => panic!("期望 Agent 结构化错误，实际 {other:?}"),
+            }
+        }
+        for method in [
+            FILESYSTEM_MKDIR,
+            FILESYSTEM_RENAME,
+            FILESYSTEM_REMOVE,
+            FILESYSTEM_CHMOD,
+        ] {
+            assert!(
+                status
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.method == method && capability.available),
+                "Agent 未发布 {method} capability（设备上的 Agent 可能是旧产物，重新安装并连接）"
+            );
+        }
+        let client = manager.client(&serial).unwrap();
+        let base = format!("/data/local/tmp/ar74-{}", std::process::id());
+        let dir = format!("{base}/nested");
+        let file = format!("{base}/payload.bin");
+        let moved = format!("{base}/renamed.bin");
+
+        // 干净起点（测试自身的准备动作，用 adb 不产品代码）
+        adb_shell(&serial, &format!("rm -rf {base}; mkdir -p {base}")).await;
+
+        // ① 范围守卫：越界的写必须在**碰到磁盘之前**被拒，且确实没落盘。
+        // 三条各测一种绕过方式：直接越界、被内核 DAC 挡住（连父目录都进不去）、
+        // 以及用 `..` 从允许根里往外跳。
+        let guarded: [(&str, &str); 3] = [
+            ("/system/app/probe", "write_path_not_allowed"),
+            ("/sdcard/../sdcard2/probe", "write_path_not_allowed"),
+            (
+                "/data/data/com.android.providers.settings/probe",
+                // 范围守卫跑在内核前面：连"这个目录 shell 本来也进不去"都不用等，
+                // 直接给一条说得清的拒绝理由
+                "write_path_not_allowed",
+            ),
+        ];
+        for (forbidden, expected_reason) in guarded {
+            let error = client
+                .request::<_, FilesystemMkdirResult>(
+                    FILESYSTEM_MKDIR,
+                    &FilesystemMkdirParams {
+                        path: forbidden.into(),
+                    },
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect_err(&format!("{forbidden} 必须被范围守卫拒掉"));
+            let error = agent_error(error);
+            assert_eq!(
+                error.code,
+                ErrorCode::PermissionDenied,
+                "{forbidden}: {error:?}"
+            );
+            assert_eq!(
+                error.details.unwrap()["reason"],
+                serde_json::json!(expected_reason),
+                "{forbidden} 的拒绝理由不对"
+            );
+            // 复核：拒了就是真没建，不能只是嘴上说拒
+            let ls = adb_shell(&serial, &format!("ls -d {forbidden} 2>/dev/null")).await;
+            assert!(
+                !ls.contains("probe"),
+                "{forbidden} 被拒之后竟然还在设备上: {ls}"
+            );
+        }
+        // 允许的根本身也不许删（Agent 自己的暂存与日志还要靠它）
+        for root in ["/data/local/tmp", "/sdcard"] {
+            let error = client
+                .request::<_, FilesystemRemoveResult>(
+                    FILESYSTEM_REMOVE,
+                    &FilesystemRemoveParams {
+                        path: root.into(),
+                        recursive: true,
+                    },
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect_err(&format!("{root} 是允许的根，不能被删"));
+            assert_eq!(
+                agent_error(error).details.unwrap()["reason"],
+                serde_json::json!("protected_root")
+            );
+        }
+
+        // ② 幂等：建一次 created=true，再建一次 created=false（设备未被改动）
+        let first = client
+            .request::<_, FilesystemMkdirResult>(
+                FILESYSTEM_MKDIR,
+                &FilesystemMkdirParams { path: dir.clone() },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(first.created, "首次新建必须报 created=true");
+        // `mode` 字段按协议只含权限位（文件类型位被掩掉），类型信息在 mode_text 首字符
+        assert_eq!(
+            first.mode_text.chars().next(),
+            Some('d'),
+            "新建的必须是目录，权限串要能自证: {first:?}"
+        );
+        let again = client
+            .request::<_, FilesystemMkdirResult>(
+                FILESYSTEM_MKDIR,
+                &FilesystemMkdirParams { path: dir.clone() },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(!again.created, "同名目录已存在时要如实报 created=false");
+        eprintln!(
+            "[ar7.4] mkdir 幂等：created {} -> {}",
+            first.created, again.created
+        );
+
+        // ③ 权限：改完读回实际值（/sdcard 上可能吃掉位，所以 verified 要单独看）
+        adb_shell(&serial, &format!("echo ar74 > {file}")).await;
+        let chmod = client
+            .request::<_, FilesystemChmodResult>(
+                FILESYSTEM_CHMOD,
+                &FilesystemChmodParams {
+                    path: file.clone(),
+                    mode: 0o600,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(chmod.verified, "权限读回应与请求一致: {chmod:?}");
+        assert_eq!(chmod.mode & 0o777, 0o600);
+        assert_eq!(chmod.mode_text, "-rw-------", "权限串要与 ls 同源");
+        // 特殊位一律拒绝（不替用户悄悄改执行语义）
+        let special = client
+            .request::<_, FilesystemChmodResult>(
+                FILESYSTEM_CHMOD,
+                &FilesystemChmodParams {
+                    path: file.clone(),
+                    mode: 0o4755,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect_err("setuid 位不在本能力范围内");
+        assert_eq!(
+            agent_error(special).details.unwrap()["reason"],
+            serde_json::json!("mode_bits_not_allowed")
+        );
+
+        // ④ 改名：新位置在、旧位置没了；目标已存在必须拒而不是覆盖
+        let renamed = client
+            .request::<_, FilesystemRenameResult>(
+                FILESYSTEM_RENAME,
+                &FilesystemRenameParams {
+                    from: file.clone(),
+                    to: moved.clone(),
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(!renamed.no_op);
+        let gone = client
+            .request::<_, FilesystemStatResult>(
+                agent_protocol::method::FILESYSTEM_STAT,
+                &FilesystemStatParams {
+                    path: file.clone(),
+                    follow_symlink: false,
+                },
+                Duration::from_secs(10),
+            )
+            .await;
+        assert!(gone.is_err(), "旧路径 {file} 改名后必须不存在");
+        let still_there = client
+            .request::<_, FilesystemStatResult>(
+                agent_protocol::method::FILESYSTEM_STAT,
+                &FilesystemStatParams {
+                    path: moved.clone(),
+                    follow_symlink: false,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("新路径必须可见");
+        assert_eq!(still_there.stat.mode_text, renamed.mode_text);
+        let collision = client
+            .request::<_, FilesystemRenameResult>(
+                FILESYSTEM_RENAME,
+                &FilesystemRenameParams {
+                    from: moved.clone(),
+                    to: dir.clone(),
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect_err("目标已存在时必须拒，不能覆盖");
+        assert_eq!(
+            agent_error(collision).details.unwrap()["reason"],
+            serde_json::json!("target_exists")
+        );
+        let same = client
+            .request::<_, FilesystemRenameResult>(
+                FILESYSTEM_RENAME,
+                &FilesystemRenameParams {
+                    from: moved.clone(),
+                    to: moved.clone(),
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(same.no_op, "原地改名要报 no_op");
+
+        // ⑤ 删：非空目录默认被拒并告知条目数；显式递归才真的删
+        let busy = client
+            .request::<_, FilesystemRemoveResult>(
+                FILESYSTEM_REMOVE,
+                &FilesystemRemoveParams {
+                    path: base.clone(),
+                    recursive: false,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .expect_err("非空目录不能默认递归删");
+        let details = agent_error(busy).details.expect("要带结构化理由");
+        assert_eq!(details["reason"], serde_json::json!("directory_not_empty"));
+        assert!(details["entries"].as_u64().unwrap_or(0) >= 2, "{details:?}");
+        let removed = client
+            .request::<_, FilesystemRemoveResult>(
+                FILESYSTEM_REMOVE,
+                &FilesystemRemoveParams {
+                    path: base.clone(),
+                    recursive: true,
+                },
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+        assert!(removed.removed && removed.was_dir && removed.was_recursive);
+        assert!(removed.freed_bytes > 0, "至少要报出释放的字节数");
+        eprintln!(
+            "[ar7.4] 写侧全链通过：dir={} chmod={} rename={} freed={}B",
+            first.created, chmod.mode_text, renamed.no_op, removed.freed_bytes
+        );
+        assert!(
+            !adb_shell(&serial, &format!("ls {base} 2>/dev/null"))
+                .await
+                .contains("ar74"),
+            "复核之后设备上不该还有 {base}"
+        );
+    }
+
     /// 用 `toybox nc` 起一个 shell 自己属主的监听端口，这样两条路径都以 shell 身份
     /// 观察（Agent 也是 shell 启动的），比较的是解析能力而不是权限差异；
     /// 另取一个 root 属主监听端口验证「读不到属主」被如实报成 `unowned`+`skipped`。

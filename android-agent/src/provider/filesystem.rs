@@ -15,7 +15,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
-use agent_protocol::method::{FILESYSTEM_LIST, FILESYSTEM_PREVIEW, FILESYSTEM_STAT};
+use agent_protocol::method::{
+    FILESYSTEM_CHMOD, FILESYSTEM_LIST, FILESYSTEM_MKDIR, FILESYSTEM_PREVIEW, FILESYSTEM_REMOVE,
+    FILESYSTEM_RENAME, FILESYSTEM_STAT,
+};
 use agent_protocol::{
     AgentError, ErrorCode, FileKind, FileStat, FilesystemListParams, FilesystemListResult,
     FilesystemPreviewParams, FilesystemPreviewResult, FilesystemStatParams, FilesystemStatResult,
@@ -25,7 +28,17 @@ use serde_json::Value;
 
 use super::{Provider, ProviderFuture, RequestContext};
 
-const FILESYSTEM_METHODS: &[&str] = &[FILESYSTEM_LIST, FILESYSTEM_STAT, FILESYSTEM_PREVIEW];
+const FILESYSTEM_METHODS: &[&str] = &[
+    FILESYSTEM_LIST,
+    FILESYSTEM_STAT,
+    FILESYSTEM_PREVIEW,
+    // 写侧（AR7.4）：增删改各自一条 method，权限与范围守卫单独成立，
+    // 不给任何 Legacy 回退腿——桌面端拼 `adb shell rm` 不是同一种东西
+    FILESYSTEM_MKDIR,
+    FILESYSTEM_RENAME,
+    FILESYSTEM_REMOVE,
+    FILESYSTEM_CHMOD,
+];
 /// 单次 `filesystem.list` 的条目上限。一帧上限 8 MiB（`MAX_FRAME_SIZE`），
 /// 2 万条按每条约 200 字节算约 4 MiB：宁可标 `truncated`，也不撑爆帧、不无界扫描。
 const MAX_LIST_ENTRIES: usize = 20_000;
@@ -60,6 +73,10 @@ impl Provider for FilesystemProvider {
                 FILESYSTEM_LIST => self.list(params).await,
                 FILESYSTEM_STAT => self.stat(params).await,
                 FILESYSTEM_PREVIEW => self.preview(params).await,
+                FILESYSTEM_MKDIR => super::filesystem_write::mkdir(params),
+                FILESYSTEM_RENAME => super::filesystem_write::rename(params),
+                FILESYSTEM_REMOVE => super::filesystem_write::remove(params),
+                FILESYSTEM_CHMOD => super::filesystem_write::chmod(params),
                 _ => Err(AgentError::new(
                     ErrorCode::UnsupportedMethod,
                     format!("unsupported filesystem method: {method}"),
@@ -333,7 +350,7 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 /// 拆出父目录与最后一节；根路径没有最后一节。
-fn split_last(path: &Path) -> (PathBuf, Option<String>) {
+pub(crate) fn split_last(path: &Path) -> (PathBuf, Option<String>) {
     match path.file_name() {
         Some(name) => (
             path.parent()
@@ -401,7 +418,7 @@ fn check_allowed_roots_with(canonical: &Path, roots: &[PathBuf]) -> Result<(), A
     })))
 }
 
-fn metadata_of(path: &Path, follow: bool) -> Result<std::fs::Metadata, AgentError> {
+pub(crate) fn metadata_of(path: &Path, follow: bool) -> Result<std::fs::Metadata, AgentError> {
     let result = if follow {
         std::fs::metadata(path)
     } else {
@@ -490,7 +507,7 @@ fn invalid_request(reason: &str, message: impl Into<String>) -> AgentError {
 
 /// errno → 结构化错误码。「路径打错」「没权限」「Agent 出问题」是三种完全不同的下一步，
 /// UI 要能分开，所以不能一律 internal。
-fn io_error(op: &str, path: &Path, error: std::io::Error) -> AgentError {
+pub(crate) fn io_error(op: &str, path: &Path, error: std::io::Error) -> AgentError {
     let errno = error.raw_os_error();
     let (code, reason) = match errno {
         Some(libc::ENOENT) => (ErrorCode::NotFound, "not_found"),
@@ -523,18 +540,18 @@ fn reason_of(error: &std::io::Error) -> String {
     format!("{:?} errno={:?}", error.kind(), error.raw_os_error())
 }
 
-fn display(path: &Path) -> String {
+pub(crate) fn display(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, AgentError> {
+pub(crate) fn parse_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, AgentError> {
     serde_json::from_value(params).map_err(|error| {
         AgentError::new(ErrorCode::InvalidRequest, "invalid filesystem parameters")
             .with_details(serde_json::json!({ "reason": error.to_string() }))
     })
 }
 
-fn serialize<T: serde::Serialize>(value: T) -> Result<Value, AgentError> {
+pub(crate) fn serialize<T: serde::Serialize>(value: T) -> Result<Value, AgentError> {
     serde_json::to_value(value).map_err(|error| {
         AgentError::new(
             ErrorCode::Internal,

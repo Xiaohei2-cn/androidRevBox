@@ -66,6 +66,44 @@ export interface FileStat {
   readable: boolean;
 }
 
+/** 文件写操作的结果（AR7.4）。⚠️ 字段名与 Agent 协议 wire 一致（snake_case）。 */
+export interface FsMkdirResult {
+  path: string;
+  /** false = 目录本来就在（幂等命中，设备未被改动） */
+  created: boolean;
+  mode: number;
+  mode_text: string;
+}
+
+export interface FsRenameResult {
+  from: string;
+  to: string;
+  kind: FileKind;
+  mode: number;
+  mode_text: string;
+  /** true = from 与 to 是同一路径，没有改动设备 */
+  no_op: boolean;
+}
+
+export interface FsRemoveResult {
+  path: string;
+  /** 设备侧删完再 stat 复核过的结论，不是"命令返回 0" */
+  removed: boolean;
+  was_dir: boolean;
+  was_recursive: boolean;
+  freed_bytes: number;
+}
+
+export interface FsChmodResult {
+  path: string;
+  /** 读回来的**实际**权限：/sdcard 是 FUSE，某些位会被吃掉，界面必须显示这个值 */
+  mode: number;
+  mode_text: string;
+  previous_mode: number;
+  previous_mode_text: string;
+  verified: boolean;
+}
+
 export interface FileStatResult {
   /** 调用方原始输入 */
   requested_path: string;
@@ -409,6 +447,22 @@ export const deviceApi = {
    * 安装：多件即 split 套件，设备侧会自动改用 `adb install-multiple -r`（AR8.2 方案 A）。
    * 仍是长操作 → 返回 task_id，输出走 task:// 事件流。
    */
+  /** 新建目录（增）。父目录必须已存在，不做 mkdir -p */
+  fsMkdir(serial: string, path: string): Promise<FsMkdirResult> {
+    return invokeCommand<FsMkdirResult>("device_fs_mkdir", { serial, path });
+  },
+  /** 重命名 / 移动（改）。目标已存在会被设备侧拒绝，不覆盖 */
+  fsRename(serial: string, from: string, to: string): Promise<FsRenameResult> {
+    return invokeCommand<FsRenameResult>("device_fs_rename", { serial, from, to });
+  },
+  /** 删除（删）。非空目录必须显式 recursive，否则设备侧直接拒 */
+  fsRemove(serial: string, path: string, recursive = false): Promise<FsRemoveResult> {
+    return invokeCommand<FsRemoveResult>("device_fs_remove", { serial, path, recursive });
+  },
+  /** 改权限（改）。mode 只接受 0o000-0o777 */
+  fsChmod(serial: string, path: string, mode: number): Promise<FsChmodResult> {
+    return invokeCommand<FsChmodResult>("device_fs_chmod", { serial, path, mode });
+  },
   install(serial: string, apkPaths: string[]): Promise<string> {
     return invokeCommand<string>("device_install", { args: { serial, apkPaths } });
   },

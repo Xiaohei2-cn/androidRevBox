@@ -12,26 +12,29 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_protocol::method::{
-    ACTIVITY_FORCE_STOP, ACTIVITY_LAUNCH, DEVICE_INFO, DEVICE_ROOT_CHECK, FILESYSTEM_LIST,
-    FILESYSTEM_PREVIEW, FILESYSTEM_STAT, FRIDA_SERVER_START, FRIDA_SERVER_STATUS,
-    FRIDA_SERVER_STOP, HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP,
-    PACKAGE_LIST, PACKAGE_NATIVE_LIB_DIR, PACKAGE_REPLACE_NATIVE_LIBRARY, PACKAGE_UNINSTALL,
-    PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS,
+    ACTIVITY_FORCE_STOP, ACTIVITY_LAUNCH, DEVICE_INFO, DEVICE_ROOT_CHECK, FILESYSTEM_CHMOD,
+    FILESYSTEM_LIST, FILESYSTEM_MKDIR, FILESYSTEM_PREVIEW, FILESYSTEM_REMOVE, FILESYSTEM_RENAME,
+    FILESYSTEM_STAT, FRIDA_SERVER_START, FRIDA_SERVER_STATUS, FRIDA_SERVER_STOP, HOSTED_CHMOD,
+    HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP, PACKAGE_LIST, PACKAGE_NATIVE_LIB_DIR,
+    PACKAGE_REPLACE_NATIVE_LIBRARY, PACKAGE_UNINSTALL, PROCESS_BY_PORT, PROCESS_KILL,
+    PROCESS_PORTS,
 };
 use agent_protocol::{
     ActivityForceStopParams, ActivityLaunchParams, DeviceInfoParams, DeviceInfoResult,
-    DeviceRootCheckParams, DeviceRootCheckResult, FileKind, FilesystemListParams,
-    FilesystemListResult, FilesystemPreviewParams, FilesystemPreviewResult, FilesystemStatParams,
-    FilesystemStatResult, FridaServerStartParams, FridaServerStartResult, FridaServerStatusParams,
-    FridaServerStatusResult, FridaServerStopParams, FridaServerStopResult, HostedBinaryInfo,
-    HostedChmodParams, HostedChmodResult, HostedListParams, HostedListResult, HostedRunRecord,
-    HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams, HostedStatusResult,
-    HostedStopParams, HostedStopResult, KillSignal, ListeningPort, PackageListParams,
-    PackageListResult, PackageNativeLibDirParams, PackageNativeLibDirResult, PackageScope,
-    PackageUninstallParams, PackageUninstallResult, PackageWriteResult, PortHoldingProcess,
-    PreviewEncoding, ProcessByPortParams, ProcessByPortResult, ProcessKillParams,
-    ProcessKillResult, ProcessPortsParams, ProcessPortsResult, ReplaceNativeLibraryParams,
-    ReplaceNativeLibraryResult, SO_STAGED_ROOT, SocketFamily,
+    DeviceRootCheckParams, DeviceRootCheckResult, FileKind, FilesystemChmodParams,
+    FilesystemChmodResult, FilesystemListParams, FilesystemListResult, FilesystemMkdirParams,
+    FilesystemMkdirResult, FilesystemPreviewParams, FilesystemPreviewResult,
+    FilesystemRemoveParams, FilesystemRemoveResult, FilesystemRenameParams, FilesystemRenameResult,
+    FilesystemStatParams, FilesystemStatResult, FridaServerStartParams, FridaServerStartResult,
+    FridaServerStatusParams, FridaServerStatusResult, FridaServerStopParams, FridaServerStopResult,
+    HostedBinaryInfo, HostedChmodParams, HostedChmodResult, HostedListParams, HostedListResult,
+    HostedRunRecord, HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams,
+    HostedStatusResult, HostedStopParams, HostedStopResult, KillSignal, ListeningPort,
+    PackageListParams, PackageListResult, PackageNativeLibDirParams, PackageNativeLibDirResult,
+    PackageScope, PackageUninstallParams, PackageUninstallResult, PackageWriteResult,
+    PortHoldingProcess, PreviewEncoding, ProcessByPortParams, ProcessByPortResult,
+    ProcessKillParams, ProcessKillResult, ProcessPortsParams, ProcessPortsResult,
+    ReplaceNativeLibraryParams, ReplaceNativeLibraryResult, SO_STAGED_ROOT, SocketFamily,
 };
 
 use async_trait::async_trait;
@@ -2126,6 +2129,132 @@ impl DeviceService {
             .await
     }
 
+    /// 设备侧新建目录（Agent only）。
+    ///
+    /// 写操作一律不给 Legacy 回退腿：桌面端拼 `adb shell mkdir` 既没有范围守卫也没有复核，
+    /// 与 Agent typed 不是同一种东西（D035/D038 的口径）。Agent 不在就明确失败。
+    pub async fn fs_mkdir(&self, serial: &str, path: &str) -> CoreResult<FilesystemMkdirResult> {
+        self.require_agent_write_route(serial, FILESYSTEM_MKDIR)?;
+        let result = self
+            .android
+            .agent()
+            .request::<_, FilesystemMkdirResult>(
+                serial,
+                FILESYSTEM_MKDIR,
+                &FilesystemMkdirParams {
+                    path: path.to_owned(),
+                },
+                WRITE_TIMEOUT,
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)));
+        audit_filesystem_write(
+            serial,
+            FILESYSTEM_MKDIR,
+            path,
+            &result.as_ref().map(|r| format!("created={}", r.created)),
+        );
+        result
+    }
+
+    /// 重命名 / 移动（同一套语义：目标完整路径可变）。目标已存在时 Agent 会拒，不覆盖。
+    pub async fn fs_rename(
+        &self,
+        serial: &str,
+        from: &str,
+        to: &str,
+    ) -> CoreResult<FilesystemRenameResult> {
+        self.require_agent_write_route(serial, FILESYSTEM_RENAME)?;
+        let result = self
+            .android
+            .agent()
+            .request::<_, FilesystemRenameResult>(
+                serial,
+                FILESYSTEM_RENAME,
+                &FilesystemRenameParams {
+                    from: from.to_owned(),
+                    to: to.to_owned(),
+                },
+                WRITE_TIMEOUT,
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)));
+        audit_filesystem_write(
+            serial,
+            FILESYSTEM_RENAME,
+            &format!("{from} -> {to}"),
+            &result.as_ref().map(|r| format!("no_op={}", r.no_op)),
+        );
+        result
+    }
+
+    /// 删除。`recursive=false` 时非空目录会被 Agent 拒（并告诉界面里面有多少项）。
+    pub async fn fs_remove(
+        &self,
+        serial: &str,
+        path: &str,
+        recursive: bool,
+    ) -> CoreResult<FilesystemRemoveResult> {
+        self.require_agent_write_route(serial, FILESYSTEM_REMOVE)?;
+        let result = self
+            .android
+            .agent()
+            .request::<_, FilesystemRemoveResult>(
+                serial,
+                FILESYSTEM_REMOVE,
+                &FilesystemRemoveParams {
+                    path: path.to_owned(),
+                    recursive,
+                },
+                WRITE_TIMEOUT,
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)));
+        audit_filesystem_write(
+            serial,
+            FILESYSTEM_REMOVE,
+            path,
+            &result
+                .as_ref()
+                .map(|r| format!("recursive={} bytes={}", r.was_recursive, r.freed_bytes)),
+        );
+        result
+    }
+
+    /// 改权限（只接受 0o000-0o777；Agent 读回来核验，`verified=false` 说明这个文件系统
+    /// 把某些位吃掉了——`/sdcard` 是 FUSE，这真会发生，必须让界面显示实际值而不是请求值）。
+    pub async fn fs_chmod(
+        &self,
+        serial: &str,
+        path: &str,
+        mode: u32,
+    ) -> CoreResult<FilesystemChmodResult> {
+        self.require_agent_write_route(serial, FILESYSTEM_CHMOD)?;
+        let result = self
+            .android
+            .agent()
+            .request::<_, FilesystemChmodResult>(
+                serial,
+                FILESYSTEM_CHMOD,
+                &FilesystemChmodParams {
+                    path: path.to_owned(),
+                    mode,
+                },
+                WRITE_TIMEOUT,
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)));
+        audit_filesystem_write(
+            serial,
+            FILESYSTEM_CHMOD,
+            path,
+            &result
+                .as_ref()
+                .map(|r| format!("mode={:o} verified={}", r.mode, r.verified)),
+        );
+        result
+    }
+
     /// 启动应用（AR8.1 收尾：改走 Agent typed，**不再产任务卡**）。
     ///
     /// 与旧 `adb_task("adb.launch")` 的区别不只是少一张卡：旧路径只能告诉你
@@ -2495,6 +2624,37 @@ fn plan_package_write(pkg: &str, id_prefix: &str) -> CoreResult<String> {
 
 /// §3.7 包写操作审计：卸载/强停/启动都会改设备状态，必须留下「谁、对哪个包、结果」。
 /// 只含结构化字段，不含令牌与命令正文。
+/// 文件写操作的审计行：与包写操作同一套 `target="audit"`，事后可 grep 出
+/// "谁在什么时间对设备上哪条路径动过手"。
+/// 泛型只为了调用方不必为了审计日志再克隆一次错误：`&CoreError` 本身就能 Display。
+fn audit_filesystem_write<E: std::fmt::Display>(
+    serial: &str,
+    method: &str,
+    path: &str,
+    outcome: &Result<String, E>,
+) {
+    match outcome {
+        Ok(summary) => tracing::info!(
+            target: "audit",
+            serial,
+            method,
+            path,
+            backend = "agent",
+            outcome = %summary,
+            "文件写操作已执行"
+        ),
+        Err(error) => tracing::warn!(
+            target: "audit",
+            serial,
+            method,
+            path,
+            backend = "agent",
+            error = %error,
+            "文件写操作失败"
+        ),
+    }
+}
+
 fn audit_package_write(serial: &str, method: &str, pkg: &str, outcome: &Result<String, String>) {
     match outcome.as_ref() {
         Ok(summary) => tracing::info!(

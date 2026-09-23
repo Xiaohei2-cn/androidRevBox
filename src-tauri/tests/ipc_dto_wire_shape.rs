@@ -15,7 +15,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use agent_protocol::{
-    FileKind, FileStat, FilesystemPreviewResult, FilesystemStatResult, FridaServerStartResult,
+    FileKind, FileStat, FilesystemChmodResult, FilesystemMkdirResult, FilesystemPreviewResult,
+    FilesystemRemoveResult, FilesystemRenameResult, FilesystemStatResult, FridaServerStartResult,
     FridaServerState, FridaServerStatusResult, FridaServerStopResult, HostedRunRecord,
     HostedRunState, HostedStopResult, KillOutcome, OperationStep, PackageUninstallResult,
     PackageWriteAction, PackageWriteResult, PreviewEncoding, ReplaceNativeLibraryResult,
@@ -65,6 +66,56 @@ fn run_record() -> HostedRunRecord {
 /// 前端接口名与 Rust 类型名不同的地方显式写出来（历史上就是这种别名最容易漏）。
 fn cases() -> Vec<(&'static str, Value, Vec<&'static str>)> {
     vec![
+        // ---- 文件页写侧（AR7.4）：前端接口名与 Rust 类型名不同，正是最容易漏的一对 ----
+        (
+            "FsMkdirResult",
+            serde_json::to_value(FilesystemMkdirResult {
+                path: "/sdcard/a".into(),
+                created: true,
+                mode: 0o755,
+                mode_text: "drwxr-xr-x".into(),
+            })
+            .unwrap(),
+            vec!["mode_text"],
+        ),
+        (
+            "FsRenameResult",
+            serde_json::to_value(FilesystemRenameResult {
+                from: "/sdcard/a".into(),
+                to: "/sdcard/b".into(),
+                kind: FileKind::Dir,
+                mode: 0o755,
+                mode_text: "drwxr-xr-x".into(),
+                no_op: false,
+            })
+            .unwrap(),
+            vec!["mode_text", "no_op"],
+        ),
+        (
+            "FsRemoveResult",
+            serde_json::to_value(FilesystemRemoveResult {
+                path: "/sdcard/b".into(),
+                removed: true,
+                was_dir: true,
+                was_recursive: false,
+                freed_bytes: 4096,
+            })
+            .unwrap(),
+            vec!["was_dir", "was_recursive", "freed_bytes"],
+        ),
+        (
+            "FsChmodResult",
+            serde_json::to_value(FilesystemChmodResult {
+                path: "/data/local/tmp/x".into(),
+                mode: 0o755,
+                mode_text: "-rwxr-xr-x".into(),
+                previous_mode: 0o644,
+                previous_mode_text: "-rw-r--r--".into(),
+                verified: true,
+            })
+            .unwrap(),
+            vec!["mode_text", "previous_mode", "previous_mode_text"],
+        ),
         (
             "FileStat",
             serde_json::to_value(file_stat()).unwrap(),
