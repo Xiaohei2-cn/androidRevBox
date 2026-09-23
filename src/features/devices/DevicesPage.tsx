@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck, Cpu, Save } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { PathBar } from "@/features/files/PathBar";
+import { usePathHistory } from "@/features/files/usePathHistory";
 import { SubTabs } from "@/components/nav/SubTabs";
 import { TaskLaunchPanel } from "@/components/task/TaskLaunchPanel";
 import { TaskSessionView } from "@/components/task/TaskSessionView";
@@ -649,7 +651,9 @@ function Field({
 
 /* 为了 M1 页面回归可测（`app/m1PageRegression.test.tsx`）而导出：内部仍按子 tab 使用。 */
 export function FilesView({ serial }: { serial: string | null }) {
-  const [path, setPath] = useState("/sdcard");
+  /** 浏览历史（后退/前进/上一级）；`path` 是当前所在目录 */
+  const nav = usePathHistory("/sdcard", serial);
+  const path = nav.path;
   /** 选中待预览/查看元数据的文件（AR7.1：filesystem.stat + filesystem.preview） */
   const [selected, setSelected] = useState<string | null>(null);
   const { data, isLoading, error, refetch } = useQuery({
@@ -672,18 +676,7 @@ export function FilesView({ serial }: { serial: string | null }) {
   if (!serial) return <Empty text="未选择设备" />;
   return (
     <div className="flex h-full min-h-0 flex-col gap-2">
-      <div className="flex shrink-0 items-center gap-2">
-        <input
-          value={path}
-          onChange={(e) => setPath(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && void refetch()}
-          className="h-8 flex-1 rounded-md border border-input bg-transparent px-2 font-mono text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-        />
-        <Button size="sm" variant="outline" onClick={() => void refetch()}>
-          <RefreshCw className="h-3.5 w-3.5" />
-          进入
-        </Button>
-      </div>
+      <PathBar nav={nav} onRefresh={() => void refetch()} />
       <div className="min-h-0 flex-1 overflow-auto rounded-lg border">
         {isLoading && <Empty text="加载中…" />}
         {error && (
@@ -700,7 +693,7 @@ export function FilesView({ serial }: { serial: string | null }) {
                     className="flex min-w-0 flex-1 items-center gap-2 text-left hover:underline"
                     onClick={() => {
                       setSelected(null);
-                      setPath(joinRemote(path, f.name));
+                      nav.go(joinRemote(path, f.name));
                     }}
                   >
                     <span className="break-all font-medium">{f.name}/</span>

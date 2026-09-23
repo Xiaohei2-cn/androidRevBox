@@ -1,5 +1,11 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.files.back": "戻る",
+  "devices.files.forward": "進む",
+  "devices.files.up": "ひとつ上",
+  "devices.files.enter": "移動",
+  "devices.files.refresh": "更新",
+  "devices.files.pathLabel": "デバイス上のパス（例 /sdcard/Download）",
   "devices.apkInstall.pathPlaceholder": "ローカルの APK / APKS パス（1 つ選べば十分）",
   "devices.apkInstall.pickTitle": "インストールする APK または .apks を選択",
   "devices.apkInstall.pick": "ファイルを選択",

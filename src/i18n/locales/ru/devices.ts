@@ -1,5 +1,11 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.files.back": "Назад",
+  "devices.files.forward": "Вперёд",
+  "devices.files.up": "На уровень выше",
+  "devices.files.enter": "Перейти",
+  "devices.files.refresh": "Обновить",
+  "devices.files.pathLabel": "Путь на устройстве, например /sdcard/Download",
   "devices.apkInstall.pathPlaceholder": "Путь к APK / APKS на этой машине (достаточно одного файла)",
   "devices.apkInstall.pickTitle": "Выберите APK или контейнер .apks для установки",
   "devices.apkInstall.pick": "Выбрать файл",

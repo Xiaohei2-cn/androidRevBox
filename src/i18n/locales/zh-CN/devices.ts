@@ -1,5 +1,11 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.files.back": "后退",
+  "devices.files.forward": "前进",
+  "devices.files.up": "上一级",
+  "devices.files.enter": "进入",
+  "devices.files.refresh": "刷新",
+  "devices.files.pathLabel": "设备上的路径，如 /sdcard/Download",
   "devices.apkInstall.pathPlaceholder": "本机 APK / APKS 路径（选一个文件就够）",
   "devices.apkInstall.pickTitle": "选择要安装的 APK 或 .apks 容器",
   "devices.apkInstall.pick": "选择文件",

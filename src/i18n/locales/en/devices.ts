@@ -1,5 +1,11 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.files.back": "Back",
+  "devices.files.forward": "Forward",
+  "devices.files.up": "Up one level",
+  "devices.files.enter": "Go",
+  "devices.files.refresh": "Refresh",
+  "devices.files.pathLabel": "Path on the device, e.g. /sdcard/Download",
   "devices.apkInstall.pathPlaceholder": "Local APK / APKS path (one file is enough)",
   "devices.apkInstall.pickTitle": "Choose an APK or .apks container to install",
   "devices.apkInstall.pick": "Choose file",
