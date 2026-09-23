@@ -64,7 +64,7 @@ function ShellBody() {
               主体 .app-surface 合成层的失效重合成，透明窗口上表现为「闪成桌面」一帧；
               visibility 只改绘制，不失效祖先合成层。
             - 查询状态与任务会话跨 tab 保活，隐藏页轮询由 useActiveTab 暂停。 */}
-        <main className="relative min-h-0 flex-1 overflow-hidden">
+        <main className="page-canvas relative min-h-0 flex-1 overflow-hidden">
           <PageHost active={tab === "dashboard"}>
             <DashboardPage />
           </PageHost>
@@ -120,7 +120,7 @@ function PageHost({
   return (
     <div
       className={cn(
-        "absolute inset-0 overflow-hidden p-4",
+        "absolute inset-0 overflow-hidden p-5",
         active ? "z-10" : "invisible",
       )}
       aria-hidden={!active}

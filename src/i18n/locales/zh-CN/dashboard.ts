@@ -1,5 +1,6 @@
 /** 仪表盘：环境/工具卡片、前台应用卡 */
 export default {
+  "dashboard.header.desc": "本机工具链与设备环境一览",
   "dashboard.adb.title": "ADB 环境",
   "dashboard.adb.connected": "已连接设备 {count}",
   "dashboard.adb.paused": "设备监听暂停",

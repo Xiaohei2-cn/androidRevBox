@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Play, RefreshCw, ShieldCheck, Square, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { AdbNotReadyState } from "@/components/ui/adb-gate";
 import {
   deviceApi,
   type DeviceEntry,
@@ -294,11 +295,7 @@ export function BinaryHosting() {
   };
 
   if (!adbReady) {
-    return (
-      <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
-        {env?.hint ?? t("common.loading")}
-      </div>
-    );
+    return <AdbNotReadyState hint={env?.hint} />;
   }
 
   return (
@@ -322,9 +319,9 @@ export function BinaryHosting() {
       <section className="flex min-h-0 flex-1 flex-col gap-1" aria-label={t("adb.binary.listTitle")}>
         <div className="flex shrink-0 items-center justify-between">
           <h3 className="text-xs font-semibold">{t("adb.binary.listTitle")}</h3>
-          <span className="text-[10px] text-muted-foreground">{t("adb.binary.listHint")}</span>
+          <span className="text-10px text-muted-foreground">{t("adb.binary.listHint")}</span>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden rounded-lg border bg-card">
+        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden rounded-xl border border-border/70 bg-card shadow-card">
           {isLoading && <p className="p-3 text-xs text-muted-foreground">{t("common.loading")}</p>}
           {isError && (
             <p className="p-3 break-all text-xs leading-relaxed text-destructive">
@@ -388,9 +385,9 @@ export function BinaryHosting() {
       <section className="flex shrink-0 max-h-[45%] flex-col gap-1" aria-label={t("adb.binary.hostTitle")}>
         <div className="flex shrink-0 items-center justify-between">
           <h3 className="text-xs font-semibold">{t("adb.binary.hostTitle")}</h3>
-          <span className="text-[10px] text-muted-foreground">{t("adb.binary.dblClickAdd")}</span>
+          <span className="text-10px text-muted-foreground">{t("adb.binary.dblClickAdd")}</span>
         </div>
-        <div className="min-h-0 flex-1 overflow-auto rounded-lg border bg-card">
+        <div className="min-h-0 flex-1 overflow-auto rounded-xl border border-border/70 bg-card shadow-card">
           {hosted.length === 0 ? (
             <p className="p-3 text-xs text-muted-foreground">{t("adb.binary.hostEmpty")}</p>
           ) : (
@@ -495,14 +492,14 @@ export function BinaryHosting() {
                       </select>
                     </div>
                     {row.error && (
-                      <p className="mt-1.5 break-all text-[11px] leading-relaxed text-destructive" data-testid={`err-${row.name}`}>
+                      <p className="mt-1.5 break-all text-11px leading-relaxed text-destructive" data-testid={`err-${row.name}`}>
                         {row.error}
                       </p>
                     )}
                     {row.pid !== null && (
                       <div className="mt-1.5 flex flex-wrap items-center gap-1.5" data-testid={`ports-${row.name}`}>
                         {row.ports.length === 0 ? (
-                          <span className="text-[10px] text-muted-foreground">
+                          <span className="text-10px text-muted-foreground">
                             {row.portsLoading ? t("adb.binary.portsLoading") : t("adb.binary.noPorts")}
                           </span>
                         ) : (

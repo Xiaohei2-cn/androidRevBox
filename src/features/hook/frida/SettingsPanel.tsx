@@ -87,7 +87,7 @@ export function SettingsPanel({
   };
 
   return (
-    <section className="flex h-full min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden rounded-lg border bg-card p-2.5 text-xs">
+    <section className="flex h-full min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden rounded-xl border border-border/70 bg-card shadow-card p-2.5 text-xs">
       <h3 className="shrink-0 font-medium">{t("hook.frida.settings")}</h3>
 
       {/* 设备 */}
@@ -157,7 +157,7 @@ export function SettingsPanel({
           <Button
             size="sm"
             variant="outline"
-            className="h-6 shrink-0 px-1.5 text-[11px]"
+            className="h-6 shrink-0 px-1.5 text-11px"
             disabled={!settings.deviceSerial || running}
             onClick={() => void fillForeground()}
           >
@@ -188,7 +188,7 @@ export function SettingsPanel({
         )}
       </div>
       {notice && (
-        <p className="shrink-0 break-all rounded bg-muted/50 px-1.5 py-1 text-[11px] text-muted-foreground">
+        <p className="shrink-0 break-all rounded bg-muted/50 px-1.5 py-1 text-11px text-muted-foreground">
           {notice}
         </p>
       )}
@@ -199,7 +199,7 @@ export function SettingsPanel({
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="flex shrink-0 flex-col gap-1">
-      <span className="text-[11px] text-muted-foreground">{label}</span>
+      <span className="text-11px text-muted-foreground">{label}</span>
       {children}
     </label>
   );
@@ -230,7 +230,7 @@ function Segmented<T extends string>({
           disabled={disabled}
           onClick={() => onChange(o.v)}
           className={cn(
-            "rounded px-2 py-0.5 text-[11px] transition-colors",
+            "rounded px-2 py-0.5 text-11px transition-colors",
             value === o.v
               ? "bg-background text-foreground shadow-sm"
               : "text-muted-foreground hover:text-foreground",
@@ -329,14 +329,14 @@ export function FridaServerControl({
       : { text: t("common.loading"), tone: "text-muted-foreground" };
 
   return (
-    <div className="shrink-0 space-y-0.5 rounded bg-muted/30 p-1.5 text-[11px]">
+    <div className="shrink-0 space-y-0.5 rounded bg-muted/30 p-1.5 text-11px">
       <div className="flex items-center gap-1">
         <RadioTower className="h-3 w-3 shrink-0 text-muted-foreground" />
         <span className="min-w-0 flex-1 truncate font-medium">{t("hook.frida.server.title")}</span>
         <Button
           size="sm"
           variant="outline"
-          className="h-5 shrink-0 px-1.5 text-[10px]"
+          className="h-5 shrink-0 px-1.5 text-10px"
           disabled={busy !== null || !data?.running}
           onClick={() => void stop()}
         >
@@ -344,7 +344,7 @@ export function FridaServerControl({
         </Button>
         <Button
           size="sm"
-          className="h-5 shrink-0 px-1.5 text-[10px]"
+          className="h-5 shrink-0 px-1.5 text-10px"
           disabled={busy !== null || (data?.running && data?.as_root && data?.listening)}
           onClick={() => void start()}
         >
@@ -372,7 +372,7 @@ function PreflightList({
 }) {
   if (!preflight) {
     return (
-      <div className="flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground">
+      <div className="flex shrink-0 items-center gap-1 text-11px text-muted-foreground">
         <Loader2 className="h-3 w-3 animate-spin" /> {t("hook.frida.preflightChecking")}
       </div>
     );
@@ -394,12 +394,12 @@ function PreflightList({
   const allOk = items.every((i) => i.ok);
   return (
     <div className="shrink-0 space-y-0.5 rounded bg-muted/30 p-1.5">
-      <div className="flex items-center gap-1 text-[11px] font-medium">
+      <div className="flex items-center gap-1 text-11px font-medium">
         <CircleCheck className={cn("h-3 w-3", allOk ? "text-emerald-500" : "text-muted-foreground")} />
         {t("hook.frida.preflight")}
       </div>
       {items.map((i) => (
-        <div key={i.label} className="flex items-center gap-1 text-[11px]">
+        <div key={i.label} className="flex items-center gap-1 text-11px">
           {i.ok ? (
             <CircleCheck className="h-3 w-3 shrink-0 text-emerald-500" />
           ) : (
@@ -412,7 +412,7 @@ function PreflightList({
             <button
               type="button"
               className={cn(
-                "shrink-0 inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[10px]",
+                "shrink-0 inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-10px",
                 i.fix === "remote" ? "bg-destructive/10 text-destructive hover:bg-destructive/20" : "bg-muted hover:bg-muted/70",
               )}
               onClick={() => onFix(i.fix!)}

@@ -1,5 +1,6 @@
 /** Dashboard: environment/tool cards, foreground app card */
 export default {
+  "dashboard.header.desc": "Overview of local toolchain and device environment",
   "dashboard.adb.title": "ADB environment",
   "dashboard.adb.connected": "{count} device(s) connected",
   "dashboard.adb.paused": "Device watching paused",

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { CheckCircle2, CircleSlash, Plus, RefreshCw, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { AdbNotReadyState } from "@/components/ui/adb-gate";
 import { deviceApi, type DeviceEntry, type ForwardRule } from "@/api/device";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
@@ -87,11 +88,7 @@ export function ForwardManager() {
     setVerify((s) => ({ ...s, [id]: v }));
 
   if (!adbReady) {
-    return (
-      <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
-        {env?.hint ?? t("common.loading")}
-      </div>
-    );
+    return <AdbNotReadyState hint={env?.hint} />;
   }
 
   return (
@@ -313,7 +310,7 @@ function ForwardRow({
     <div
       data-testid={`forward-row-${index}`}
       className={cn(
-        "grid grid-cols-[1fr_auto] items-center gap-2 rounded-lg border bg-card p-2",
+        "grid grid-cols-[1fr_auto] items-center gap-2 rounded-xl border border-border/70 bg-card shadow-card p-2",
         !configured && "opacity-80",
       )}
     >
@@ -391,27 +388,27 @@ function VerifyMark({ state }: { state: RowVerify }) {
   const { t } = useI18n();
   if (state.kind === "active") {
     return (
-      <span className="flex items-center gap-1 text-[10px] text-emerald-500" title={t("adb.forward.verifiedInactive")}>
+      <span className="flex items-center gap-1 text-10px text-emerald-500" title={t("adb.forward.verifiedInactive")}>
         <CheckCircle2 className="h-3 w-3" />
       </span>
     );
   }
   if (state.kind === "missing") {
     return (
-      <span className="flex items-center gap-1 text-[10px] text-amber-500" title={t("adb.forward.notFound")}>
+      <span className="flex items-center gap-1 text-10px text-amber-500" title={t("adb.forward.notFound")}>
         <XCircle className="h-3 w-3" />
       </span>
     );
   }
   if (state.kind === "invalid") {
     return (
-      <span className="flex items-center gap-1 text-[10px] text-red-500" title={t("adb.forward.invalid")}>
+      <span className="flex items-center gap-1 text-10px text-red-500" title={t("adb.forward.invalid")}>
         <XCircle className="h-3 w-3" />
       </span>
     );
   }
   return (
-    <span className="flex items-center text-[10px] text-muted-foreground" title={t("adb.forward.rowInactive")}>
+    <span className="flex items-center text-10px text-muted-foreground" title={t("adb.forward.rowInactive")}>
       <CircleSlash className={cn("h-3 w-3", state.kind === "checking" && "animate-spin")} />
     </span>
   );

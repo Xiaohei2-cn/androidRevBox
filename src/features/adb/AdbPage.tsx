@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { SubTabs } from "@/components/nav/SubTabs";
+import { PageHeader } from "@/components/ui/page-header";
 import { ForwardManager } from "@/features/adb/ForwardManager";
 import { BinaryHosting } from "@/features/adb/BinaryHosting";
 import { ProcPorts } from "@/features/adb/ProcPorts";
 import { Placeholder } from "@/components/nav/Placeholder";
 import { useAppNav } from "@/app/nav";
+import { useI18n } from "@/i18n";
 
 /**
  * ADB 页（原「终端」主 tab 改造）：多个子标签。
@@ -15,11 +17,15 @@ import { useAppNav } from "@/app/nav";
  */
 export function AdbPage() {
   const { pendingAdbTab } = useAppNav();
+  const { t } = useI18n();
   const [subTab, setSubTab] = useState("forward");
   useEffect(() => {
     if (pendingAdbTab) setSubTab(pendingAdbTab);
   }, [pendingAdbTab]);
   return (
+    <div className="flex h-full flex-col">
+      <PageHeader title={t("nav.terminal")} />
+      <div className="min-h-0 flex-1">
     <SubTabs
       value={subTab}
       onValueChange={setSubTab}
@@ -52,5 +58,7 @@ export function AdbPage() {
         },
       ]}
     />
+      </div>
+    </div>
   );
 }

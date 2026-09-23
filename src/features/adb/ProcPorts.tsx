@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowRightLeft, OctagonX, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { AdbNotReadyState } from "@/components/ui/adb-gate";
 import { deviceApi, type PortHolder } from "@/api/device";
 import { DeviceBar, InfoChip } from "@/features/adb/BinaryHosting";
 import { useI18n } from "@/i18n";
@@ -170,11 +171,7 @@ export function ProcPorts() {
   };
 
   if (!adbReady) {
-    return (
-      <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
-        {env?.hint ?? t("common.loading")}
-      </div>
-    );
+    return <AdbNotReadyState hint={env?.hint} />;
   }
 
   return (
@@ -198,14 +195,14 @@ export function ProcPorts() {
       />
 
       {!root && (
-        <p className="shrink-0 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-600 dark:text-amber-400">
+        <p className="shrink-0 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-11px text-amber-600 dark:text-amber-400">
           {t("adb.proc.rootTip")}
         </p>
       )}
 
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-2">
         {/* 端口 → 进程 */}
-        <section className="flex min-h-0 flex-col gap-2 rounded-lg border bg-card p-3" aria-label={t("adb.proc.byPort")}>
+        <section className="flex min-h-0 flex-col gap-2 rounded-xl border border-border/70 bg-card shadow-card p-3" aria-label={t("adb.proc.byPort")}>
           <h3 className="flex items-center gap-1.5 text-xs font-semibold">
             <ArrowRightLeft className="h-3.5 w-3.5 text-muted-foreground" />
             {t("adb.proc.byPort")}
@@ -266,7 +263,7 @@ export function ProcPorts() {
         </section>
 
         {/* 进程 → 端口 */}
-        <section className="flex min-h-0 flex-col gap-2 rounded-lg border bg-card p-3" aria-label={t("adb.proc.byPid")}>
+        <section className="flex min-h-0 flex-col gap-2 rounded-xl border border-border/70 bg-card shadow-card p-3" aria-label={t("adb.proc.byPid")}>
           <h3 className="flex items-center gap-1.5 text-xs font-semibold">
             <ArrowRightLeft className="h-3.5 w-3.5 text-muted-foreground" />
             {t("adb.proc.byPid")}

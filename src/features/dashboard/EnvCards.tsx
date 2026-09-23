@@ -1,10 +1,12 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, CircleSlash, RefreshCw, Settings2, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, CircleSlash, RefreshCw, Settings2 } from "lucide-react";
 import { envApi, type McpEnv } from "@/api/env";
 import { useAppNav } from "@/app/nav";
 import { useI18n } from "@/i18n";
 import { BrandIcon } from "@/components/ui/BrandIcon";
 import { PathText } from "@/components/ui/PathText";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { IconButton } from "@/components/ui/icon-button";
 import { cn } from "@/lib/utils";
 
 /**
@@ -25,6 +27,7 @@ export function PythonCard() {
       refresh={() => void refetch()}
       refreshing={isFetching}
       configKey="app.python.path"
+      loading={data === undefined}
       status={
         data === undefined
           ? { tone: "muted", label: t("common.loading") }
@@ -57,6 +60,7 @@ export function NodeCard() {
       refresh={() => void refetch()}
       refreshing={isFetching}
       configKey="app.node.path"
+      loading={data === undefined}
       status={
         data === undefined
           ? { tone: "muted", label: t("common.loading") }
@@ -99,6 +103,7 @@ export function FridaCard({ pythonReady }: { pythonReady: boolean | undefined })
       refreshing={isFetching}
       disabled={!enabled}
       configKey={enabled ? undefined : "app.python.path"}
+      loading={enabled && data === undefined}
       status={
         !enabled
           ? { tone: "muted", label: t("dashboard.frida.waitPython") }
@@ -177,6 +182,7 @@ export function McpCard({
       refresh={() => void refetch()}
       refreshing={isFetching}
       configKey={configKey}
+      loading={data === undefined}
       status={status}
     >
       {data === undefined ? null : (
@@ -227,6 +233,7 @@ export function EnvCard({
   refreshing,
   disabled,
   configKey,
+  loading,
   children,
 }: {
   testid: string;
@@ -239,51 +246,62 @@ export function EnvCard({
   disabled?: boolean;
   /** 提供后，标题行出现「去配置」按钮，点击跳转设置页并高亮该配置项 */
   configKey?: string;
+  /** 首帧探测未回时渲染骨架行，替代旧版「一行小字」的悬空加载态 */
+  loading?: boolean;
   children?: React.ReactNode;
 }) {
   const { gotoConfig } = useAppNav();
   const { t } = useI18n();
   return (
-    <div data-testid={testid} className="rounded-xl border bg-card p-4" aria-disabled={disabled}>
-      <div className="flex items-center gap-2">
-        <span className="flex h-4 w-4 shrink-0 items-center justify-center text-muted-foreground">
+    <Card data-testid={testid} className="flex flex-col" aria-disabled={disabled}>
+      <CardHeader>
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center text-muted-foreground">
           {icon}
         </span>
-        <span className="truncate text-sm font-semibold">{title}</span>
+        <CardTitle>{title}</CardTitle>
         {configKey && (
-          <button
-            type="button"
+          <IconButton
             aria-label={t("common.configure", { name: title })}
             title={t("common.gotoSettings")}
             onClick={() => gotoConfig(configKey)}
-            className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+            className="h-6 w-6"
             data-testid={`${testid}-goto-config`}
           >
             <Settings2 className="h-3.5 w-3.5" />
-          </button>
+          </IconButton>
         )}
-        <button
-          type="button"
+        <IconButton
           aria-label={t("common.refreshName", { name: title })}
           disabled={refreshing || disabled}
           onClick={refresh}
-          className="ml-auto rounded p-1 text-muted-foreground hover:bg-accent disabled:opacity-30"
+          className="ml-auto h-6 w-6"
         >
           <RefreshCw className={cn("h-3.5 w-3.5", refreshing && "animate-spin")} />
-        </button>
-      </div>
-      <div className="mt-2 flex items-center gap-1.5 text-sm font-medium">
-        <StatusMark tone={status.tone} />
-        <span data-testid={`${testid}-status`}>{status.label}</span>
-      </div>
-      <div className="mt-1.5 space-y-1">{children}</div>
-    </div>
+        </IconButton>
+      </CardHeader>
+      <CardContent className="mt-1 flex flex-1 flex-col gap-2">
+        <div className="flex items-center gap-1.5 text-sm font-medium">
+          <StatusMark tone={status.tone} />
+          <span data-testid={`${testid}-status`} className="min-w-0 truncate">
+            {status.label}
+          </span>
+        </div>
+        {loading ? (
+          <div className="space-y-1.5">
+            <div className="skeleton h-3 w-3/4" />
+            <div className="skeleton h-3 w-1/2" />
+          </div>
+        ) : (
+          <div className="space-y-1">{children}</div>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
 function StatusMark({ tone }: { tone: StatusTone }) {
   if (tone === "ok") return <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />;
-  if (tone === "warn") return <XCircle className="h-3.5 w-3.5 text-amber-500" />;
+  if (tone === "warn") return <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />;
   return <CircleSlash className="h-3.5 w-3.5 text-muted-foreground" />;
 }
 

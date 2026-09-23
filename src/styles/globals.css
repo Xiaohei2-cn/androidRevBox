@@ -27,7 +27,9 @@
     --border: 240 5.9% 88%;
     --input: 240 5.9% 88%;
     --ring: 243 75% 59%;
-    --radius: 0.6rem;
+    /* 圆角基线（UI 统一改版）：14px → rounded-lg=14 / md=12 / sm=10，
+       卡片用 rounded-2xl(16px)，落在 12–24px 的现代桌面区间。 */
+    --radius: 0.875rem;
 
     /* 窗口表面色板默认（浅色）：CSS 先行定义，React 水合前首帧即正确，
        消除「启动时像加载配置」的二次重绘（P7 闪烁修复） */
@@ -112,6 +114,31 @@
     user-select: all;
     -webkit-user-select: all;
     cursor: text;
+  }
+
+  /* 内容区底层：比窗口表面略深一档，让 bg-card 卡片浮起来
+     （透明窗口下 .app-surface 是半透明着色，这里再叠一层极浅的着色拉开层级）。 */
+  .page-canvas {
+    background-color: rgb(17 24 39 / 0.03);
+  }
+  .dark .page-canvas {
+    background-color: rgb(255 255 255 / 0.03);
+  }
+
+  /* 骨架屏微光（加载态统一语言，替代孤零零的一行小字） */
+  @keyframes skeleton-pulse {
+    0%,
+    100% {
+      opacity: 0.55;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+
+  .skeleton {
+    @apply rounded-md bg-muted;
+    animation: skeleton-pulse 1.6s ease-in-out infinite;
   }
 
   /* 配置跳转高亮：蓝框闪烁两下（P7「去配置」按钮） */

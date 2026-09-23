@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { FolderInput, Play, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { AdbNotReadyState } from "@/components/ui/adb-gate";
 import { deviceApi, type DeviceEntry, type ReplaceNativeLibraryResult } from "@/api/device";
 import { envApi } from "@/api/env";
 import { pickFile } from "@/api/dialog";
@@ -116,11 +117,7 @@ export function SoReplacePage() {
   };
 
   if (!adbReady) {
-    return (
-      <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
-        {env?.hint ?? t("common.loading")}
-      </div>
-    );
+    return <AdbNotReadyState hint={env?.hint} />;
   }
 
   return (
@@ -149,7 +146,7 @@ export function SoReplacePage() {
         </label>
       )}
 
-      <div className="flex min-h-0 flex-col gap-3 rounded-lg border bg-card p-3 text-xs">
+      <div className="flex min-h-0 flex-col gap-3 rounded-xl border border-border/70 bg-card shadow-card p-3 text-xs">
         {/* 本地 so 文件 */}
         <div className="flex items-center gap-2">
           <span className="w-16 shrink-0 text-muted-foreground">{t("binary.so.localFile")}</span>
@@ -215,7 +212,7 @@ export function SoReplacePage() {
         {/* 目标预览 */}
         <div className="flex items-start gap-2">
           <span className="w-16 shrink-0 pt-1 text-muted-foreground">{t("binary.so.target")}</span>
-          <div className="min-w-0 flex-1 rounded-md bg-muted/50 px-2 py-1 font-mono text-[11px] leading-relaxed break-all">
+          <div className="min-w-0 flex-1 rounded-md bg-muted/50 px-2 py-1 font-mono text-11px leading-relaxed break-all">
             {!canPreview ? (
               <span className="text-muted-foreground">{t("binary.so.targetIdle")}</span>
             ) : previewing ? (
@@ -237,7 +234,7 @@ export function SoReplacePage() {
         </div>
 
         {/* root 提示 */}
-        <p className="text-[11px] leading-relaxed text-muted-foreground">{t("binary.so.rootNote")}</p>
+        <p className="text-11px leading-relaxed text-muted-foreground">{t("binary.so.rootNote")}</p>
 
         <div className="flex justify-end">
           <Button
@@ -278,7 +275,7 @@ export function SoReplacePage() {
             {result.steps.map((step, index) => (
               <li
                 key={`${step.name}-${index}`}
-                className="flex items-start gap-1.5 font-mono text-[11px] leading-relaxed"
+                className="flex items-start gap-1.5 font-mono text-11px leading-relaxed"
                 data-testid={`so-replace-step-${step.name}`}
               >
                 <span className={step.ok ? "text-emerald-600" : "text-destructive"}>
@@ -292,7 +289,7 @@ export function SoReplacePage() {
             ))}
           </ul>
           {result.backup_path && (
-            <p className="mt-1 break-all text-[11px] text-muted-foreground">
+            <p className="mt-1 break-all text-11px text-muted-foreground">
               {t("binary.so.backupKept", { path: result.backup_path })}
             </p>
           )}

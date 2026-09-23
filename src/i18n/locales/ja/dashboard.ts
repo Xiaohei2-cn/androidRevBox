@@ -1,5 +1,6 @@
 /** ダッシュボード：環境カード／フォアグラウンドアプリ */
 export default {
+  "dashboard.header.desc": "ローカルツールチェーンとデバイス環境の概要",
   "dashboard.adb.title": "ADB 環境",
   "dashboard.adb.connected": "接続デバイス {count} 台",
   "dashboard.adb.paused": "デバイス監視は停止中",

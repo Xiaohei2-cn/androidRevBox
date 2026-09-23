@@ -104,7 +104,7 @@ export function FridaPage() {
         {session ? (
           <FridaConsole session={session} onStopped={onStopped} />
         ) : (
-          <div className="flex h-full flex-col items-center justify-center gap-2 rounded-lg border bg-card/50 text-xs text-muted-foreground">
+          <div className="flex h-full flex-col items-center justify-center gap-2 rounded-xl border border-border/70 bg-card shadow-card/50 text-xs text-muted-foreground">
             <p className="max-w-xs text-center leading-relaxed">{t("hook.frida.consoleIdle")}</p>
             {error && (
               <p className="max-w-md break-all rounded border border-destructive/50 bg-destructive/10 px-2 py-1 text-center text-destructive">

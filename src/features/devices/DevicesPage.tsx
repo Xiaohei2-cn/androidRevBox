@@ -2,6 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck, Cpu, Save, FolderPlus, Pencil, KeyRound, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
+import { StatusBadge } from "@/components/ui/status-badge";
+import { PageHeader } from "@/components/ui/page-header";
 import { PathBar } from "@/features/files/PathBar";
 import { usePathHistory } from "@/features/files/usePathHistory";
 import { SubTabs } from "@/components/nav/SubTabs";
@@ -90,29 +94,51 @@ export function DevicesPage() {
 
   if (!env) {
     return (
-      <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
-        检测 adb 环境…
+      <div className="flex h-full flex-col">
+        <PageHeader title="设备" />
+        <div className="grid min-h-0 flex-1 grid-cols-2 content-start gap-4">
+          <div className="skeleton h-28" />
+          <div className="skeleton h-28" />
+        </div>
       </div>
     );
   }
   if (!env.installed) {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
-        <p className="text-sm font-medium">未检测到 adb</p>
-        <p className="max-w-md text-xs leading-relaxed text-muted-foreground">{env.hint}</p>
-        <Button size="sm" variant="outline" onClick={() => void refetch()}>
-          <RefreshCw className="h-3.5 w-3.5" />
-          重试
-        </Button>
+      <div className="flex h-full flex-col">
+        <PageHeader title="设备" />
+        <EmptyState
+          icon={<Smartphone className="h-5 w-5" />}
+          title="未检测到 adb"
+          description={env.hint}
+          action={
+            <Button size="sm" variant="outline" onClick={() => void refetch()}>
+              <RefreshCw className="h-3.5 w-3.5" />
+              重试
+            </Button>
+          }
+        />
       </div>
     );
   }
 
   return (
-    <SubTabs
-      value={subTab}
-      onValueChange={setSubTab}
-      tabs={[
+    <div className="flex h-full flex-col">
+      <PageHeader
+        title="设备"
+        description={devices.length > 0 ? `已连接 ${devices.filter((d) => d.state === "device").length} 台设备` : "连接设备后在此管理 Shell、文件与应用"}
+        actions={
+          <Button size="sm" variant="outline" onClick={() => setRefreshTick((n) => n + 1)}>
+            <RefreshCw className="h-3.5 w-3.5" />
+            刷新
+          </Button>
+        }
+      />
+      <div className="min-h-0 flex-1">
+      <SubTabs
+        value={subTab}
+        onValueChange={setSubTab}
+        tabs={[
         {
           id: "list",
           label: "设备列表",
@@ -173,7 +199,9 @@ export function DevicesPage() {
           ),
         },
       ]}
-    />
+      />
+      </div>
+    </div>
   );
 }
 
@@ -191,26 +219,32 @@ function DeviceListView({
   const { t } = useI18n();
   const { gotoDeviceInfo } = useAppNav();
   if (isError) {
-    return <p className="text-xs text-destructive">adb devices 调用失败，检查设备授权或 adb 环境。</p>;
+    return (
+      <EmptyState
+        title="adb devices 调用失败"
+        description="检查设备授权或 adb 环境后，点击页头「刷新」重试。"
+      />
+    );
   }
   if (devices.length === 0) {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-2 text-muted-foreground">
-        <Smartphone className="h-8 w-8 opacity-40" />
-        <p className="text-xs">未连接设备。插入设备并允许 USB 调试后自动出现。</p>
-      </div>
+      <EmptyState
+        icon={<Smartphone className="h-5 w-5" />}
+        title="未连接设备"
+        description="插入设备并在弹窗中允许 USB 调试后，设备会自动出现在这里。"
+      />
     );
   }
   return (
-    <ul className="space-y-2">
+    <ul className="space-y-3">
       {devices.map((d) => (
         <li key={d.serial}>
           <button
             type="button"
             onClick={() => onSelect(d.serial)}
             className={cn(
-              "flex w-full items-center gap-3 rounded-lg border p-3 text-left text-xs transition-colors hover:bg-accent",
-              d.serial === selected && "border-primary bg-primary/10",
+              "flex w-full items-center gap-3 rounded-xl border bg-card px-4 py-3 text-left shadow-card transition-colors hover:bg-accent/50",
+              d.serial === selected && "border-primary ring-1 ring-primary",
             )}
           >
             <span
@@ -224,20 +258,13 @@ function DeviceListView({
               )}
             />
             <div className="min-w-0 flex-1">
-              <p className="break-all font-medium">{d.model || "未知型号"}</p>
-              <p className="break-all font-mono text-muted-foreground">{d.serial}</p>
+              <p className="break-all text-sm font-medium">{d.model || "未知型号"}</p>
+              <p className="break-all font-mono text-xs text-muted-foreground">{d.serial}</p>
             </div>
-            <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
-              {d.transport}
-            </span>
-            <span
-              className={cn(
-                "w-20 text-right text-xs",
-                d.state === "device" ? "text-emerald-500" : "text-amber-500",
-              )}
-            >
+            <StatusBadge tone="muted">{d.transport}</StatusBadge>
+            <StatusBadge tone={d.state === "device" ? "ok" : "warn"}>
               {STATE_LABEL[d.state] ?? d.state}
-            </span>
+            </StatusBadge>
             <Button
               size="sm"
               variant="outline"
@@ -360,26 +387,23 @@ function DeviceFullCard({ serial, transport }: { serial: string; transport: stri
   })();
 
   return (
-    <div
+    <Card
       data-device-card={serial}
-      className="w-full rounded-xl border bg-card p-4"
+      className="w-full"
     >
       {/* 上：设备信息 */}
-      <div className="flex items-center gap-2">
+      <CardHeader>
         <BrandIcon name="android" />
-        <span className="text-sm font-semibold">{data?.model || serial}</span>
-        <span
-          className={cn(
-            "ml-auto rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground",
-          )}
-        >
-          {transport}
+        <CardTitle>{data?.model || serial}</CardTitle>
+        <span className="ml-auto">
+          <StatusBadge tone="muted">{transport}</StatusBadge>
         </span>
-      </div>
+      </CardHeader>
+      <CardContent className="mt-2">
       <div
         data-testid={`root-banner-${serial}`}
         className={cn(
-          "mt-3 flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-bold tracking-wide",
+          "flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-bold tracking-wide",
           rootBanner.cls,
         )}
       >
@@ -402,15 +426,18 @@ function DeviceFullCard({ serial, transport }: { serial: string; transport: stri
           {t("devices.info.loadFailed", { error: String((error as Error)?.message ?? error) })}
         </p>
       )}
+      </CardContent>
 
       <AgentSessionSection serial={serial} />
 
       {/* 分割线 */}
-      <hr className="my-4 border-border" />
+      <hr className="mx-4 border-border" />
 
       {/* 下：前台应用（原仪表盘信息，按设备查询） */}
-      <ForegroundAppSection serial={serial} />
-    </div>
+      <div className="px-4 pb-4 pt-3">
+        <ForegroundAppSection serial={serial} />
+      </div>
+    </Card>
   );
 }
 
@@ -437,7 +464,7 @@ export function AgentSessionSection({ serial }: { serial: string }) {
   const busy = install.isPending || restart.isPending;
 
   return (
-    <section className="mt-4 border-t pt-3" data-testid={`agent-status-${serial}`}>
+    <section className="mx-4 mt-4 border-t pt-3" data-testid={`agent-status-${serial}`}>
       <div className="flex flex-wrap items-center gap-2">
         <Cpu className="h-4 w-4 text-muted-foreground" />
         <span className="text-xs font-semibold">Android Agent</span>
@@ -621,7 +648,7 @@ function KindDot({ kind }: { kind?: string }) {
   return (
     <span className="flex shrink-0 items-center gap-1" title={label}>
       <span className={cn("h-1.5 w-1.5 rounded-full", tone)} />
-      <span className="text-[10px] text-muted-foreground">{label}</span>
+      <span className="text-xs text-muted-foreground">{label}</span>
     </span>
   );
 }
@@ -817,7 +844,7 @@ export function FilesView({ serial }: { serial: string | null }) {
       )}
       {writeNotice && <p className="shrink-0 text-xs text-muted-foreground">{writeNotice}</p>}
       {writeError && <p className="shrink-0 text-xs text-destructive">{t("devices.files.failed", { error: writeError })}</p>}
-      <div className="min-h-0 flex-1 overflow-auto rounded-lg border">
+      <div className="min-h-0 flex-1 overflow-auto rounded-xl border border-border/70 bg-card shadow-card">
         {isLoading && <Empty text="加载中…" />}
         {error && (
           <Empty text={`读取失败：${String((error as Error)?.message ?? error)}`} />
@@ -928,7 +955,7 @@ export function FilesView({ serial }: { serial: string | null }) {
         )}
       </div>
       {selectedPath && (
-        <div className="shrink-0 rounded-lg border p-3 text-xs">
+        <div className="shrink-0 rounded-xl border bg-card p-3 text-xs shadow-card">
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
             <span className="font-medium">{selected}</span>
             <PathText value={stat.data?.path ?? selectedPath} testid="files-stat-path" className="font-mono text-muted-foreground" />
@@ -1203,9 +1230,9 @@ export function AppsView({ serial }: { serial: string | null }) {
       <div className="flex min-h-0 w-80 shrink-0 flex-col gap-2">
         <div className="flex shrink-0 items-center gap-2">
           <span className="text-xs font-medium">{t("apps.zygiskList")}</span>
-          <span className="text-[11px] text-muted-foreground">{t("apps.count", { count: apps.length })}</span>
+          <span className="text-11px text-muted-foreground">{t("apps.count", { count: apps.length })}</span>
           {data && data.channel === "zygisk_v2" && (
-            <span className="shrink-0 rounded bg-primary/10 px-1 text-[10px] text-primary">v2</span>
+            <span className="shrink-0"><StatusBadge tone="info" className="px-1.5 py-0">v2</StatusBadge></span>
           )}
           <Button
             size="sm"
@@ -1231,7 +1258,7 @@ export function AppsView({ serial }: { serial: string | null }) {
                 setScope(value);
               }}
               className={cn(
-                "rounded-full border px-2 py-0.5 text-[11px] hover:bg-accent",
+                "rounded-full border px-2 py-0.5 text-11px hover:bg-accent",
                 scope === value ? "border-primary text-foreground" : "text-muted-foreground",
               )}
             >
@@ -1246,29 +1273,29 @@ export function AppsView({ serial }: { serial: string | null }) {
             setIncludeDisabled((v) => !v);
           }}
           className={cn(
-            "w-fit shrink-0 rounded-full border px-2 py-0.5 text-[11px] hover:bg-accent",
+            "w-fit shrink-0 rounded-full border px-2 py-0.5 text-11px hover:bg-accent",
             includeDisabled ? "border-primary text-foreground" : "text-muted-foreground",
           )}
         >
           {t("apps.includeDisabled")}
         </button>
         {data && data.fallbackCount > 0 && (
-          <p className="shrink-0 text-[11px] text-muted-foreground">
+          <p className="shrink-0 text-11px text-muted-foreground">
             {t("apps.fallbackCount", { count: data.fallbackCount })}
             {data.deviceLocale ? ` · ${t("apps.deviceLocale", { locale: data.deviceLocale })}` : ""}
           </p>
         )}
         {data && data.channel !== "zygisk_v2" && (
-          <p className="shrink-0 text-[11px] text-destructive">
+          <p className="shrink-0 text-11px text-destructive">
             {t("apps.channelFallback", { channel: data.channel })}
           </p>
         )}
         {warnings.length > 0 && (
-          <p className="shrink-0 truncate text-[11px] text-muted-foreground" title={warnings.map((w) => w.message).join(" / ")}>
+          <p className="shrink-0 truncate text-11px text-muted-foreground" title={warnings.map((w) => w.message).join(" / ")}>
             {warnings[0].message}
           </p>
         )}
-        <div className="min-h-0 flex-1 overflow-auto rounded-lg border">
+        <div className="min-h-0 flex-1 overflow-auto rounded-xl border border-border/70 bg-card shadow-card">
           {apps.length === 0 && <Empty text={t("apps.empty")} />}
           <ul className="text-xs">
             {apps.map((app) => (
@@ -1295,26 +1322,21 @@ export function AppsView({ serial }: { serial: string | null }) {
               >
                 <span className="flex items-center gap-1.5">
                   <span className="min-w-0 flex-1 truncate">{app.label || app.packageName}</span>
-                  <span
-                    className={cn(
-                      "shrink-0 rounded px-1 text-[10px]",
-                      app.isSystem ? "bg-muted text-muted-foreground" : "bg-primary/10 text-primary",
-                    )}
-                  >
+                  <StatusBadge tone={app.isSystem ? "muted" : "info"} className="px-1.5 py-0">
                     {app.isSystem ? t("apps.badgeSystem") : t("apps.badgeUser")}
-                  </span>
+                  </StatusBadge>
                   {!app.enabled && (
-                    <span className="shrink-0 rounded bg-destructive/10 px-1 text-[10px] text-destructive">
+                    <StatusBadge tone="error" className="px-1.5 py-0">
                       {t("apps.badgeDisabled")}
-                    </span>
+                    </StatusBadge>
                   )}
                   {app.labelSource === "package_name" && (
-                    <span className="shrink-0 rounded bg-muted px-1 text-[10px] text-muted-foreground">
+                    <StatusBadge tone="muted" className="px-1.5 py-0">
                       {t("apps.badgeNoLabel")}
-                    </span>
+                    </StatusBadge>
                   )}
                 </span>
-                <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
+                <span className="mt-0.5 block truncate font-mono text-xs text-muted-foreground">
                   {app.packageName}
                 </span>
               </button>
@@ -1324,8 +1346,9 @@ export function AppsView({ serial }: { serial: string | null }) {
         </div>
       </div>
       <div className="flex min-w-0 flex-1 flex-col gap-3">
-        <div className="rounded-lg border p-3 text-xs">
-          <div className="font-medium">{selectedApp?.label ?? t("apps.noSelection")}</div>
+        <Card>
+          <CardContent className="text-xs">
+          <div className="text-sm font-medium">{selectedApp?.label ?? t("apps.noSelection")}</div>
           <div className="mt-1 break-all font-mono text-muted-foreground">
             {selectedApp?.packageName ?? t("apps.contextHint")}
           </div>
@@ -1353,7 +1376,8 @@ export function AppsView({ serial }: { serial: string | null }) {
               )}
             </>
           )}
-        </div>
+          </CardContent>
+        </Card>
         <div className="flex flex-wrap items-center gap-2">
           <Button
             size="sm"
@@ -1461,7 +1485,7 @@ export function AppsView({ serial }: { serial: string | null }) {
             )
           ) : writeResult ? (
             <div
-              className="rounded-md border px-2 py-1.5 text-xs"
+              className="rounded-xl border bg-card px-3 py-2 text-xs shadow-card"
               data-testid="package-write-result"
             >
               <p
@@ -1477,15 +1501,15 @@ export function AppsView({ serial }: { serial: string | null }) {
               </p>
               {/* 幂等命中与「本来就在期望状态」不能显示成一次新的成功 */}
               {writeResult.outcome === "replayed" && (
-                <p className="mt-1 text-[11px] text-amber-500">
+                <p className="mt-1 text-11px text-amber-500">
                   幂等命中：这个操作刚刚已经做过，本次没有再动设备
                 </p>
               )}
               {writeResult.outcome === "no_op" && (
-                <p className="mt-1 text-[11px] text-muted-foreground">目标本来就在期望状态</p>
+                <p className="mt-1 text-11px text-muted-foreground">目标本来就在期望状态</p>
               )}
               {writeResult.outcome === "executed" && !writeResult.verified && !writeResult.failed && (
-                <p className="mt-1 text-[11px] text-destructive">
+                <p className="mt-1 text-11px text-destructive">
                   命令执行了，但设备侧没复核到预期变化——别当成成功
                 </p>
               )}
@@ -1494,7 +1518,7 @@ export function AppsView({ serial }: { serial: string | null }) {
                   {writeResult.steps.map((step, index) => (
                     <li
                       key={`${step.name}-${index}`}
-                      className="flex items-start gap-1.5 font-mono text-[11px]"
+                      className="flex items-start gap-1.5 font-mono text-11px"
                       data-testid={`package-write-step-${step.name}`}
                     >
                       <span className={step.ok ? "text-emerald-600" : "text-destructive"}>

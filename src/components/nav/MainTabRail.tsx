@@ -61,7 +61,10 @@ export function MainTabRail() {
   const { tab, setTab } = useAppNav();
   const { t } = useI18n();
   return (
-    <nav aria-label={t("nav.aria")} className="flex w-24 shrink-0 flex-col items-end gap-1 overflow-y-auto pt-14">
+    <nav
+      aria-label={t("nav.aria")}
+      className="flex w-32 shrink-0 flex-col items-end gap-1.5 overflow-y-auto pt-14"
+    >
       {MAIN_TABS.map((item) => (
         <MainTabButton
           key={item.id}
@@ -83,6 +86,9 @@ export function MainTabRail() {
  * - 不做宽度 transition：backdrop-filter 区域逐帧变化同样触发重采样；
  *   悬停/选中的增宽即时生效。
  * - 不使用气泡提示（用户反馈：选中态本身就是中文标签）。
+ * UI 统一改版：未选中齿块加宽到 36px、图标 16px（旧版 28px/14px 视觉权重过低，
+ * 像缩在角落）；悬停以浅底反馈而非拉宽（拉宽会重采样合成层，保持即时）；
+ * 选中标签升回正文字号，与内容区标题体系对齐。
  */
 function MainTabButton({
   tab,
@@ -105,16 +111,16 @@ function MainTabButton({
       className={cn(
         "app-surface group relative flex h-10 shrink-0 select-none items-center justify-center rounded-l-xl border border-r-0 border-border/60",
         active
-          ? "max-w-24 bg-primary px-2.5 text-primary-foreground"
-          : "w-7 text-muted-foreground hover:w-8 hover:text-foreground",
+          ? "max-w-28 bg-primary px-3 text-primary-foreground"
+          : "w-9 text-muted-foreground hover:bg-accent hover:text-foreground",
       )}
     >
       {active ? (
-        <span className="max-w-full truncate text-[11px] font-medium leading-none">
+        <span className="max-w-full truncate text-sm font-medium leading-none">
           {label}
         </span>
       ) : (
-        <Icon className="h-3.5 w-3.5" />
+        <Icon className="h-4 w-4" />
       )}
     </button>
   );

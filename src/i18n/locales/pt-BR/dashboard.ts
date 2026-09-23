@@ -1,5 +1,6 @@
 /** Painel: cartões de ambiente e app em primeiro plano */
 export default {
+  "dashboard.header.desc": "Visão geral do toolchain local e do ambiente de dispositivos",
   "dashboard.adb.title": "Ambiente ADB",
   "dashboard.adb.connected": "{count} dispositivo(s) conectado(s)",
   "dashboard.adb.paused": "Monitoramento de dispositivos pausado",

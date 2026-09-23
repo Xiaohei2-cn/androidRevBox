@@ -79,14 +79,14 @@ export function ScriptList({
   const items = useMemo(() => files ?? [], [files]);
 
   return (
-    <section className="flex h-full min-h-0 flex-col gap-2 rounded-lg border bg-card p-2.5 text-xs">
+    <section className="flex h-full min-h-0 flex-col gap-2 rounded-xl border border-border/70 bg-card shadow-card p-2.5 text-xs">
       <div className="flex shrink-0 items-center gap-2">
         <h3 className="font-medium">{t("hook.frida.scripts")}</h3>
         {workdir && (
           <Button
             size="sm"
             variant="ghost"
-            className="h-6 gap-1 px-1.5 text-[11px]"
+            className="h-6 gap-1 px-1.5 text-11px"
             onClick={() => void setTick((n) => n + 1)}
             disabled={isFetching}
           >
@@ -97,14 +97,14 @@ export function ScriptList({
       </div>
 
       <div className="flex shrink-0 items-center gap-1.5">
-        <span className="text-[11px] text-muted-foreground">{t("hook.frida.workdir")}</span>
+        <span className="text-11px text-muted-foreground">{t("hook.frida.workdir")}</span>
         <span
-          className="path-selectable min-w-0 flex-1 truncate font-mono text-[11px]"
+          className="path-selectable min-w-0 flex-1 truncate font-mono text-11px"
           title={workdir ?? ""}
         >
           {workdir || <span className="text-muted-foreground">{t("hook.frida.noWorkdir")}</span>}
         </span>
-        <Button size="sm" variant="outline" className="h-6 shrink-0 gap-1 px-1.5 text-[11px]" onClick={() => void pickDir()}>
+        <Button size="sm" variant="outline" className="h-6 shrink-0 gap-1 px-1.5 text-11px" onClick={() => void pickDir()}>
           <FolderOpen className="h-3 w-3" />
           {workdir ? t("hook.frida.changeDir") : t("hook.frida.pickDir")}
         </Button>
@@ -112,15 +112,15 @@ export function ScriptList({
 
       <div className="min-h-0 flex-1 space-y-1 overflow-y-auto overflow-x-hidden">
         {!workdir ? (
-          <p className="pt-6 text-center text-[11px] leading-relaxed text-muted-foreground">
+          <p className="pt-6 text-center text-11px leading-relaxed text-muted-foreground">
             {t("hook.frida.pickDirHint")}
           </p>
         ) : error ? (
-          <p className="break-all rounded border border-destructive/50 bg-destructive/10 px-2 py-1 text-[11px] text-destructive">
+          <p className="break-all rounded border border-destructive/50 bg-destructive/10 px-2 py-1 text-11px text-destructive">
             {String((error as Error)?.message ?? error)}
           </p>
         ) : items.length === 0 ? (
-          <p className="pt-6 text-center text-[11px] text-muted-foreground">{t("hook.frida.empty")}</p>
+          <p className="pt-6 text-center text-11px text-muted-foreground">{t("hook.frida.empty")}</p>
         ) : (
           items.map((f) => (
             <div
@@ -132,14 +132,14 @@ export function ScriptList({
               <span className="path-selectable min-w-0 flex-1 truncate font-mono" title={f.path}>
                 {f.name}
               </span>
-              <span className="shrink-0 text-[10px] text-muted-foreground">{formatSize(f.size)}</span>
-              <span className="hidden shrink-0 text-[10px] text-muted-foreground sm:inline">
+              <span className="shrink-0 text-10px text-muted-foreground">{formatSize(f.size)}</span>
+              <span className="hidden shrink-0 text-10px text-muted-foreground sm:inline">
                 {formatMtime(f.mtime)}
               </span>
               <Button
                 size="sm"
                 variant="outline"
-                className="h-5 shrink-0 gap-0.5 px-1 text-[10px] opacity-0 group-hover:opacity-100"
+                className="h-5 shrink-0 gap-0.5 px-1 text-10px opacity-0 group-hover:opacity-100"
                 disabled={running}
                 onClick={(e) => {
                   e.stopPropagation();
@@ -154,7 +154,7 @@ export function ScriptList({
         )}
       </div>
       {notice && (
-        <p className="shrink-0 break-all text-[11px] text-destructive">{notice}</p>
+        <p className="shrink-0 break-all text-11px text-destructive">{notice}</p>
       )}
     </section>
   );

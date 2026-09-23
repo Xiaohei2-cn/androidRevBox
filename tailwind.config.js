@@ -59,6 +59,11 @@ export default {
         md: "calc(var(--radius) - 2px)",
         sm: "calc(var(--radius) - 4px)",
       },
+      boxShadow: {
+        /** 卡片浮起：极浅两层，透明窗口下不显脏（替代纯 1px 边框的扁平感） */
+        card: "0 1px 2px rgb(17 24 39 / 0.04), 0 4px 16px rgb(17 24 39 / 0.05)",
+        "card-hover": "0 2px 4px rgb(17 24 39 / 0.06), 0 10px 28px rgb(17 24 39 / 0.09)",
+      },
     },
   },
   plugins: [],

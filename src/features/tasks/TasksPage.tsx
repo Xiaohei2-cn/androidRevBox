@@ -2,8 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Ban, Play, LoaderCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { PageHeader } from "@/components/ui/page-header";
+import { StatusBadge as SharedStatusBadge, type BadgeTone } from "@/components/ui/status-badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { taskApi, tokenizeCommand, type TaskDto, type TaskLogDto } from "@/api/task";
 import { cn } from "@/lib/utils";
@@ -120,74 +123,86 @@ export function TasksPage() {
     selected?.status === "running" || selected?.status === "pending";
 
   return (
-    <div className="flex h-full gap-4">
-      <section className="flex w-[340px] shrink-0 flex-col gap-2">
-        <div className="flex flex-col gap-2 rounded-lg border p-3">
-          <Label htmlFor="task-cmd">执行命令</Label>
-          <Input
-            id="task-cmd"
-            data-testid="task-cmd"
-            placeholder="如：ping -c 4 127.0.0.1"
-            value={commandLine}
-            onChange={(e) => setCommandLine(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !runMutation.isPending) runMutation.mutate();
-            }}
-          />
-          <div className="flex items-center gap-2">
+    <div className="flex h-full flex-col">
+      <PageHeader title="任务中心" description="命令任务的发起、实时输出与历史回放" />
+      <div className="flex min-h-0 flex-1 gap-4">
+      <section className="flex w-[340px] shrink-0 flex-col gap-3">
+        <Card>
+          <CardContent className="flex flex-col gap-2">
+            <Label htmlFor="task-cmd">执行命令</Label>
             <Input
-              data-testid="task-timeout"
-              placeholder="超时秒（可选）"
-              className="w-32"
-              type="number"
-              min={0.1}
-              value={timeoutSec}
-              onChange={(e) => setTimeoutSec(e.target.value)}
+              id="task-cmd"
+              data-testid="task-cmd"
+              placeholder="如：ping -c 4 127.0.0.1"
+              value={commandLine}
+              onChange={(e) => setCommandLine(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !runMutation.isPending) runMutation.mutate();
+              }}
             />
-            <Button
-              data-testid="task-run"
-              size="sm"
-              className="ml-auto"
-              disabled={runMutation.isPending}
-              onClick={() => runMutation.mutate()}
-            >
-              {runMutation.isPending ? (
-                <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Play className="h-3.5 w-3.5" />
-              )}
-              运行
-            </Button>
-          </div>
-          {runMutation.error && (
-            <p className="text-xs text-destructive">
-              {String((runMutation.error as Error).message)}
-            </p>
-          )}
-        </div>
-
-        <div className="min-h-0 flex-1 overflow-auto rounded-lg border">
-          {tasks.length === 0 && (
-            <p className="p-4 text-center text-xs text-muted-foreground">
-              暂无任务，输入命令开始第一个
-            </p>
-          )}
-          <ul className="divide-y">
-            {tasks.map((t) => (
-              <TaskListItem
-                key={t.id}
-                task={t}
-                selected={t.id === selectedId}
-                onClick={() => setSelectedId(t.id)}
+            <div className="flex items-center gap-2">
+              <Input
+                data-testid="task-timeout"
+                placeholder="超时秒（可选）"
+                className="w-36"
+                type="number"
+                min={0.1}
+                value={timeoutSec}
+                onChange={(e) => setTimeoutSec(e.target.value)}
               />
-            ))}
-          </ul>
-        </div>
+              <Button
+                data-testid="task-run"
+                size="sm"
+                className="ml-auto"
+                disabled={runMutation.isPending}
+                onClick={() => runMutation.mutate()}
+              >
+                {runMutation.isPending ? (
+                  <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Play className="h-3.5 w-3.5" />
+                )}
+                运行
+              </Button>
+            </div>
+            {runMutation.error && (
+              <p className="text-xs text-destructive">
+                {String((runMutation.error as Error).message)}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="flex min-h-0 flex-1 flex-col">
+          <CardHeader className="pb-2">
+            <CardTitle>历史任务</CardTitle>
+            <span className="ml-auto text-xs tabular-nums text-muted-foreground">
+              {tasks.length}
+            </span>
+          </CardHeader>
+          <div className="mx-4 mb-4 min-h-0 flex-1 overflow-auto rounded-lg border border-border/70 bg-background">
+            {tasks.length === 0 && (
+              <p className="p-4 text-center text-xs text-muted-foreground">
+                暂无任务，输入命令开始第一个
+              </p>
+            )}
+            <ul className="divide-y">
+              {tasks.map((t) => (
+                <TaskListItem
+                  key={t.id}
+                  task={t}
+                  selected={t.id === selectedId}
+                  onClick={() => setSelectedId(t.id)}
+                />
+              ))}
+            </ul>
+          </div>
+        </Card>
       </section>
 
       <section className="flex min-w-0 flex-1 flex-col gap-2">
         {!selected ? (
-          <div className="flex h-full items-center justify-center rounded-lg border border-dashed text-xs text-muted-foreground">
+          <div className="flex h-full items-center justify-center rounded-xl border border-dashed text-xs text-muted-foreground">
             选择左侧任务查看输出
           </div>
         ) : (
@@ -242,6 +257,7 @@ export function TasksPage() {
           </>
         )}
       </section>
+      </div>
     </div>
   );
 }
@@ -261,7 +277,7 @@ function TaskListItem({
         type="button"
         onClick={onClick}
         className={cn(
-          "flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-accent",
+          "flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs transition-colors hover:bg-accent",
           selected && "bg-accent",
         )}
       >
@@ -289,6 +305,14 @@ function StatusDot({ status }: { status: TaskDto["status"] }) {
   return <span className={cn("h-2 w-2 shrink-0 rounded-full", color)} />;
 }
 
+const TASK_STATUS_TONE: Record<TaskDto["status"], BadgeTone> = {
+  pending: "muted",
+  running: "info",
+  success: "ok",
+  failed: "error",
+  cancelled: "muted",
+};
+
 function StatusBadge({ status }: { status: TaskDto["status"] }) {
   const map: Record<TaskDto["status"], string> = {
     pending: "等待中",
@@ -297,11 +321,7 @@ function StatusBadge({ status }: { status: TaskDto["status"] }) {
     failed: "失败",
     cancelled: "已取消",
   };
-  return (
-    <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-      {map[status]}
-    </span>
-  );
+  return <SharedStatusBadge tone={TASK_STATUS_TONE[status]}>{map[status]}</SharedStatusBadge>;
 }
 
 function InfoView({ task }: { task: TaskDto }) {
@@ -315,16 +335,18 @@ function InfoView({ task }: { task: TaskDto }) {
     ["结束", task.finishedAt === null ? "-" : formatFull(task.finishedAt)],
   ];
   return (
-    <div className="rounded-lg border p-3">
-      <dl className="grid grid-cols-[80px_1fr] gap-y-1.5 text-xs">
-        {rows.map(([k, v]) => (
-          <div key={k} className="contents">
-            <dt className="text-muted-foreground">{k}</dt>
-            <dd className="break-all font-mono">{v}</dd>
-          </div>
-        ))}
-      </dl>
-    </div>
+    <Card>
+      <CardContent>
+        <dl className="grid grid-cols-[80px_1fr] gap-y-1.5 text-xs">
+          {rows.map(([k, v]) => (
+            <div key={k} className="contents">
+              <dt className="text-muted-foreground">{k}</dt>
+              <dd className="break-all font-mono">{v}</dd>
+            </div>
+          ))}
+        </dl>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -369,7 +391,7 @@ function OutputView({
     <div
       ref={boxRef}
       data-testid="task-output"
-      className="h-full overflow-auto rounded-lg border bg-black/80 p-3 font-mono text-sm leading-relaxed dark:bg-black/40"
+      className="h-full overflow-auto rounded-xl border bg-black/80 p-3 font-mono text-sm leading-relaxed dark:bg-black/40"
     >
       {lines.length === 0 && (
         <span className="text-muted-foreground">{running ? "等待输出…" : "（无输出）"}</span>

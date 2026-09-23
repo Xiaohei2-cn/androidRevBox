@@ -4,7 +4,9 @@ import { FolderOpen } from "lucide-react";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { PageHeader } from "@/components/ui/page-header";
 import { SubTabs } from "@/components/nav/SubTabs";
 import { Placeholder } from "@/components/nav/Placeholder";
 import {
@@ -54,7 +56,9 @@ export function SettingsPage() {
     : null;
 
   return (
-    <div className="h-full pt-1">
+    <div className="flex h-full flex-col pt-1">
+      <PageHeader title={t("nav.settings")} />
+      <div className="min-h-0 flex-1">
       <SubTabs
         activateSignal={targetTab}
         tabs={[
@@ -93,13 +97,14 @@ export function SettingsPage() {
             id: "about",
             label: t("settings.tab.about"),
             content: (
-              <div className="mx-auto flex max-w-xl flex-col gap-8 pt-2">
+              <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 pt-2">
                 <AboutSection />
               </div>
             ),
           },
         ]}
       />
+      </div>
     </div>
   );
 }
@@ -110,52 +115,64 @@ function DisplayTab() {
   const { t } = useI18n();
 
   return (
-    <div className="mx-auto flex max-w-xl flex-col gap-8 pt-2">
-      <section className="flex flex-col gap-3">
-        <Label>{t("settings.theme.label")}</Label>
-        <div
-          className="inline-flex w-fit rounded-lg bg-muted p-1"
-          role="radiogroup"
-          aria-label={t("settings.theme.aria")}
-        >
-          {THEME_OPTIONS.map((option) => (
-            <button
-              key={option.value}
-              type="button"
-              role="radio"
-              aria-checked={theme === option.value}
-              onClick={() => setTheme(option.value)}
-              className={cn(
-                "rounded-md px-4 py-1.5 text-sm transition-colors",
-                theme === option.value
-                  ? "bg-background text-foreground shadow-sm"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {t(`settings.theme.${option.value}`)}
-            </button>
-          ))}
-        </div>
-        <p className="text-xs text-muted-foreground">{t("settings.theme.hint")}</p>
-      </section>
+    <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 pt-2">
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("settings.theme.label")}</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <div
+            className="inline-flex w-fit rounded-lg bg-muted p-1"
+            role="radiogroup"
+            aria-label={t("settings.theme.aria")}
+          >
+            {THEME_OPTIONS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                role="radio"
+                aria-checked={theme === option.value}
+                onClick={() => setTheme(option.value)}
+                className={cn(
+                  "rounded-md px-4 py-1.5 text-sm transition-colors",
+                  theme === option.value
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {t(`settings.theme.${option.value}`)}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs text-muted-foreground">{t("settings.theme.hint")}</p>
+        </CardContent>
+      </Card>
 
-      <section className="flex flex-col gap-3">
-        <div className="flex items-center justify-between">
-          <Label htmlFor="opacity-slider">{t("settings.opacity.label")}</Label>
-          <span className="text-sm tabular-nums text-muted-foreground">
-            {opacity}%
-          </span>
-        </div>
-        <Slider
-          id="opacity-slider"
-          min={MIN_OPACITY}
-          max={100}
-          step={5}
-          value={[opacity]}
-          onValueChange={(values) => setOpacity(values[0])}
-        />
-        <p className="text-xs text-muted-foreground">{t("settings.opacity.hint")}</p>
-      </section>
+      <Card>
+        <CardHeader>
+          <div className="flex w-full items-center justify-between">
+            <CardTitle>
+              <Label htmlFor="opacity-slider" className="text-sm font-semibold leading-none">
+                {t("settings.opacity.label")}
+              </Label>
+            </CardTitle>
+            <span className="text-sm tabular-nums text-muted-foreground">
+              {opacity}%
+            </span>
+          </div>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <Slider
+            id="opacity-slider"
+            min={MIN_OPACITY}
+            max={100}
+            step={5}
+            value={[opacity]}
+            onValueChange={(values) => setOpacity(values[0])}
+          />
+          <p className="text-xs text-muted-foreground">{t("settings.opacity.hint")}</p>
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -165,34 +182,40 @@ function LanguageTab() {
   const { t, locale, setLocale } = useI18n();
 
   return (
-    <div className="mx-auto flex max-w-xl flex-col gap-3 pt-2">
-      <Label>{t("settings.language.label")}</Label>
-      <div
-        className="inline-flex w-fit flex-wrap gap-1"
-        role="radiogroup"
-        aria-label={t("settings.language.label")}
-        data-testid="locale-radiogroup"
-      >
-        {LOCALES.map((l) => (
-          <button
-            key={l}
-            type="button"
-            role="radio"
-            aria-checked={locale === l}
-            data-testid={`locale-${l}`}
-            onClick={() => setLocale(l as Locale)}
-            className={cn(
-              "rounded-md border px-3 py-1.5 text-xs transition-colors",
-              locale === l
-                ? "border-primary bg-primary text-primary-foreground"
-                : "text-muted-foreground hover:bg-accent hover:text-foreground",
-            )}
+    <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 pt-2">
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("settings.language.label")}</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <div
+            className="inline-flex w-fit flex-wrap gap-1"
+            role="radiogroup"
+            aria-label={t("settings.language.label")}
+            data-testid="locale-radiogroup"
           >
-            {LOCALE_LABELS[l]}
-          </button>
-        ))}
-      </div>
-      <p className="text-xs text-muted-foreground">{t("settings.language.hint")}</p>
+            {LOCALES.map((l) => (
+              <button
+                key={l}
+                type="button"
+                role="radio"
+                aria-checked={locale === l}
+                data-testid={`locale-${l}`}
+                onClick={() => setLocale(l as Locale)}
+                className={cn(
+                  "rounded-md border px-3 py-1.5 text-xs transition-colors",
+                  locale === l
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                )}
+              >
+                {LOCALE_LABELS[l]}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs text-muted-foreground">{t("settings.language.hint")}</p>
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -203,48 +226,56 @@ function EnvironmentTab() {
   const queryClient = useQueryClient();
 
   return (
-    <div className="mx-auto flex max-w-xl flex-col gap-8 pt-2">
-      <section className="flex flex-col gap-3">
-        <Label>{t("settings.adb.label")}</Label>
-        <AdbPathSection onProbed={() => {
-          // adb 环境变了：仪表盘/设备页的查询立即失效重取
-          void queryClient.invalidateQueries({ queryKey: ["adb"] });
-          void queryClient.invalidateQueries({ queryKey: ["devices"] });
-        }} />
-      </section>
+    <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 pt-2">
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("settings.adb.label")}</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <AdbPathSection onProbed={() => {
+            // adb 环境变了：仪表盘/设备页的查询立即失效重取
+            void queryClient.invalidateQueries({ queryKey: ["adb"] });
+            void queryClient.invalidateQueries({ queryKey: ["devices"] });
+          }} />
+        </CardContent>
+      </Card>
 
-      <section className="flex flex-col gap-3">
-        <Label>{t("settings.tools.label")}</Label>
-        <p className="text-xs text-muted-foreground">{t("settings.tools.hint")}</p>
-        <ConfigInputRow
-          label={t("settings.tools.pythonPath")}
-          configKey="app.python.path"
-          placeholder={t("settings.tools.pythonPath.placeholder")}
-          mono
-          kind="file"
-          onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
-        />
-        <ConfigInputRow
-          label={t("settings.tools.nodePath")}
-          configKey="app.node.path"
-          placeholder={t("settings.tools.nodePath.placeholder")}
-          mono
-          kind="file"
-          onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
-        />
-        <ConfigInputRow
-          label={t("settings.tools.idaPort")}
-          configKey="app.tools.ida_mcp_port"
-          placeholder={t("settings.tools.idaPort.placeholder")}
-          onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
-        />
-        <ConfigInputRow
-          label={t("settings.tools.jadxPort")}
-          configKey="app.tools.jadx_mcp_port"
-          placeholder={t("settings.tools.jadxPort.placeholder")}
-          onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
-        />
-      </section>
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("settings.tools.label")}</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <p className="text-xs text-muted-foreground">{t("settings.tools.hint")}</p>
+          <ConfigInputRow
+            label={t("settings.tools.pythonPath")}
+            configKey="app.python.path"
+            placeholder={t("settings.tools.pythonPath.placeholder")}
+            mono
+            kind="file"
+            onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
+          />
+          <ConfigInputRow
+            label={t("settings.tools.nodePath")}
+            configKey="app.node.path"
+            placeholder={t("settings.tools.nodePath.placeholder")}
+            mono
+            kind="file"
+            onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
+          />
+          <ConfigInputRow
+            label={t("settings.tools.idaPort")}
+            configKey="app.tools.ida_mcp_port"
+            placeholder={t("settings.tools.idaPort.placeholder")}
+            onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
+          />
+          <ConfigInputRow
+            label={t("settings.tools.jadxPort")}
+            configKey="app.tools.jadx_mcp_port"
+            placeholder={t("settings.tools.jadxPort.placeholder")}
+            onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
+          />
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -255,33 +286,37 @@ function SystemTab() {
   const { t } = useI18n();
 
   return (
-    <div className="mx-auto flex max-w-xl flex-col gap-8 pt-2">
-      <section className="flex flex-col gap-3">
-        <Label>{t("settings.log.label")}</Label>
-        <div className="inline-flex w-fit gap-1">
-          {LOG_LEVEL_OPTIONS.map((option) => (
-            <button
-              key={option.value}
-              type="button"
-              role="radio"
-              aria-checked={logLevel === option.value}
-              onClick={() => setLogLevel(option.value)}
-              className={cn(
-                "rounded-md border px-3 py-1.5 font-mono text-xs transition-colors",
-                logLevel === option.value
-                  ? "border-primary bg-primary text-primary-foreground"
-                  : "text-muted-foreground hover:bg-accent hover:text-foreground",
-              )}
-            >
-              {option.label}
-            </button>
-          ))}
-        </div>
-        <p className="text-xs text-muted-foreground">
-          {t("settings.log.hint")}
-          {!hydrated && t("settings.log.syncing")}
-        </p>
-      </section>
+    <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 pt-2">
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("settings.log.label")}</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <div className="inline-flex w-fit gap-1">
+            {LOG_LEVEL_OPTIONS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                role="radio"
+                aria-checked={logLevel === option.value}
+                onClick={() => setLogLevel(option.value)}
+                className={cn(
+                  "rounded-md border px-3 py-1.5 font-mono text-xs transition-colors",
+                  logLevel === option.value
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                )}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {t("settings.log.hint")}
+            {!hydrated && t("settings.log.syncing")}
+          </p>
+        </CardContent>
+      </Card>
 
     </div>
   );
@@ -446,9 +481,12 @@ function AboutSection() {
   });
 
   return (
-    <section className="flex flex-col gap-3">
-      <Label>{t("settings.about.label")}</Label>
-      <dl data-testid="about-section" className="space-y-1.5 text-xs">
+    <Card>
+      <CardHeader>
+        <CardTitle>{t("settings.about.label")}</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <dl data-testid="about-section" className="space-y-1.5 text-xs">
         <AboutRow label={t("settings.about.appVersion")} value={data?.appVersion} testid="about-app-version" />
         <AboutRow label={t("settings.about.tauriVersion")} value={data?.tauriVersion} testid="about-tauri-version" />
         <AboutRow
@@ -456,8 +494,9 @@ function AboutSection() {
           value={data ? `${data.os} · ${data.arch}` : undefined}
           testid="about-platform"
         />
-      </dl>
-    </section>
+        </dl>
+      </CardContent>
+    </Card>
   );
 }
 

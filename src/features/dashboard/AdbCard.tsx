@@ -10,7 +10,8 @@ import { useActiveTab, useAppNav } from "@/app/nav";
 import { useI18n } from "@/i18n";
 import { BrandIcon } from "@/components/ui/BrandIcon";
 import { PathText } from "@/components/ui/PathText";
-import { cn } from "@/lib/utils";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { StatusBadge } from "@/components/ui/status-badge";
 
 /**
  * 仪表盘 adb 卡片：环境指示（含未配置提示）、版本查看、设备连接轮询。
@@ -55,100 +56,95 @@ export function AdbCard() {
   const others = devices.filter((d) => d.state !== "device");
 
   return (
-    <div className="rounded-xl border bg-card p-4">
-      <div className="flex items-center gap-2">
+    <Card className="flex flex-col">
+      <CardHeader>
         <BrandIcon name="android" />
-        <span className="text-sm font-semibold">{t("dashboard.adb.title")}</span>
-        <span
-          data-testid="adb-status"
-          className={cn(
-            "ml-auto flex items-center gap-1 text-xs",
-            env?.installed ? "text-emerald-500" : "text-destructive",
-          )}
-        >
+        <CardTitle>{t("dashboard.adb.title")}</CardTitle>
+        <span className="ml-auto" data-testid="adb-status">
           {env === undefined ? (
-            t("common.loading")
+            <StatusBadge tone="muted">{t("common.loading")}</StatusBadge>
           ) : env.installed ? (
-            <>
-              <CheckCircle2 className="h-3.5 w-3.5" />
+            <StatusBadge tone="ok">
+              <CheckCircle2 className="mr-1 h-3 w-3" />
               {t("common.ready")}
-            </>
+            </StatusBadge>
           ) : (
-            <>
-              <XCircle className="h-3.5 w-3.5" />
+            <StatusBadge tone="error">
+              <XCircle className="mr-1 h-3 w-3" />
               {t("common.notDetected")}
-            </>
+            </StatusBadge>
           )}
         </span>
-      </div>
+      </CardHeader>
+      <CardContent className="mt-1 flex flex-1 flex-col">
+        {env?.installed ? (
+          <div className="space-y-1 text-xs text-muted-foreground">
+            <p data-testid="adb-version" className="font-mono">
+              adb {env.version}
+              {env.build ? ` · ${env.build}` : ""}
+            </p>
+            <p className="flex items-center gap-1 font-mono text-xs">
+              <PathText value={env.path} className="min-w-0 flex-1" />
+              <span className="shrink-0 rounded bg-muted px-1.5 py-px text-xs">
+                {SOURCE_LABEL[env.source ?? "unknown"] ?? env.source}
+              </span>
+            </p>
+            {env.probeError && (
+              <p className="text-amber-500">探测异常：{env.probeError}</p>
+            )}
+          </div>
+        ) : (
+          <p data-testid="adb-hint" className="text-xs text-amber-500">
+            {env?.hint ?? "正在检测 adb 环境变量…"}
+          </p>
+        )}
 
-      {env?.installed ? (
-        <div className="mt-2 space-y-1 text-xs text-muted-foreground">
-          <p data-testid="adb-version" className="font-mono">
-            adb {env.version}
-            {env.build ? ` · ${env.build}` : ""}
-          </p>
-          <p className="flex items-center gap-1 font-mono text-xs">
-            <PathText value={env.path} className="min-w-0 flex-1" />
-            <span className="shrink-0 rounded bg-muted px-1 py-px text-xs">
-              {SOURCE_LABEL[env.source ?? "unknown"] ?? env.source}
+        <div className="mt-3 border-t pt-3">
+          <div className="flex items-center gap-1.5 text-xs">
+            <Usb className="h-3.5 w-3.5 text-muted-foreground" />
+            <span data-testid="adb-device-count" className="font-medium">
+              {env?.installed
+              ? t("dashboard.adb.connected", { count: ready.length })
+              : t("dashboard.adb.paused")}
             </span>
-          </p>
-          {env.probeError && (
-            <p className="text-amber-500">探测异常：{env.probeError}</p>
+            {others.length > 0 && (
+              <span className="text-amber-500">
+                {t("dashboard.adb.others", { count: others.length })}
+              </span>
+            )}
+          </div>
+          {devicesError && (
+            <p className="mt-1 text-xs text-destructive">{t("dashboard.adb.listFailed")}</p>
+          )}
+          {ready.length > 0 && (
+            <ul className="mt-2 space-y-1">
+              {ready.slice(0, 4).map((d) => (
+                <li key={d.serial} className="flex items-center gap-2 text-xs">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                  <span className="font-mono">{d.model || d.serial}</span>
+                  <span className="text-muted-foreground">
+                    <PathText value={d.serial} />
+                  </span>
+                  <StatusBadge tone="muted" className="px-1.5 py-0">
+                    {d.transport}
+                  </StatusBadge>
+                  <button
+                    type="button"
+                    aria-label={t("devices.gotoList")}
+                    title={t("devices.gotoList")}
+                    data-testid={`goto-devices-${d.serial}`}
+                    onClick={() => gotoDeviceList()}
+                    className="ml-auto flex items-center rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
+                  >
+                    <ChevronRight className="h-3.5 w-3.5" />
+                  </button>
+                </li>
+              ))}
+            </ul>
           )}
         </div>
-      ) : (
-        <p data-testid="adb-hint" className="mt-2 text-xs text-amber-500">
-          {env?.hint ?? "正在检测 adb 环境变量…"}
-        </p>
-      )}
-
-      <div className="mt-3 border-t pt-3">
-        <div className="flex items-center gap-1.5 text-xs">
-          <Usb className="h-3.5 w-3.5 text-muted-foreground" />
-          <span data-testid="adb-device-count" className="font-medium">
-            {env?.installed
-            ? t("dashboard.adb.connected", { count: ready.length })
-            : t("dashboard.adb.paused")}
-          </span>
-          {others.length > 0 && (
-            <span className="text-amber-500">
-              {t("dashboard.adb.others", { count: others.length })}
-            </span>
-          )}
-        </div>
-        {devicesError && (
-          <p className="mt-1 text-xs text-destructive">{t("dashboard.adb.listFailed")}</p>
-        )}
-        {ready.length > 0 && (
-          <ul className="mt-2 space-y-1">
-            {ready.slice(0, 4).map((d) => (
-              <li key={d.serial} className="flex items-center gap-2 text-xs">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                <span className="font-mono">{d.model || d.serial}</span>
-                <span className="text-muted-foreground">
-                  <PathText value={d.serial} />
-                </span>
-                <span className="rounded bg-muted px-1 text-xs text-muted-foreground">
-                  {d.transport}
-                </span>
-                <button
-                  type="button"
-                  aria-label={t("devices.gotoList")}
-                  title={t("devices.gotoList")}
-                  data-testid={`goto-devices-${d.serial}`}
-                  onClick={() => gotoDeviceList()}
-                  className="ml-auto flex items-center rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground"
-                >
-                  <ChevronRight className="h-3.5 w-3.5" />
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-    </div>
+      </CardContent>
+    </Card>
   );
 }
 

@@ -133,7 +133,7 @@ export function FridaConsole({
   const origin = events[0]?.ts ?? null;
 
   return (
-    <section className="flex h-full min-h-0 flex-col gap-2 rounded-lg border bg-card p-2.5 text-xs">
+    <section className="flex h-full min-h-0 flex-col gap-2 rounded-xl border border-border/70 bg-card shadow-card p-2.5 text-xs">
       <SessionHeader
         session={session}
         status={status}
@@ -206,12 +206,12 @@ function SessionHeader({
       <span className="path-selectable min-w-0 flex-1 truncate font-mono font-medium" title={session.name}>
         {session.name}
       </span>
-      <span className="shrink-0 text-[11px] text-muted-foreground">
+      <span className="shrink-0 text-11px text-muted-foreground">
         {t("hook.frida.rowCount", { shown, total })}
       </span>
       <button
         type="button"
-        className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] hover:bg-muted/70"
+        className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-10px hover:bg-muted/70"
         title={t("hook.frida.copyTaskId")}
         onClick={() => {
           onCopyTaskId();
@@ -221,11 +221,11 @@ function SessionHeader({
       >
         {copied ? t("common.copied") : session.taskId.slice(0, 8)}
       </button>
-      <Button size="sm" variant="ghost" className="h-5 shrink-0 gap-0.5 px-1 text-[10px]" onClick={onGotoTasks}>
+      <Button size="sm" variant="ghost" className="h-5 shrink-0 gap-0.5 px-1 text-10px" onClick={onGotoTasks}>
         <ExternalLink className="h-2.5 w-2.5" />
         {t("hook.frida.taskCenter")}
       </Button>
-      <label className="flex shrink-0 cursor-pointer items-center gap-1 text-[11px] text-muted-foreground">
+      <label className="flex shrink-0 cursor-pointer items-center gap-1 text-11px text-muted-foreground">
         <input type="checkbox" checked={rawMode} onChange={(e) => onRawMode(e.target.checked)} />
         {t("hook.frida.rawMode")}
       </label>
@@ -257,7 +257,7 @@ function FilterBar({ filter, onChange }: { filter: FridaFilter; onChange: (f: Fr
           type="button"
           onClick={() => onChange({ ...filter, [c.key]: !filter[c.key] })}
           className={cn(
-            "rounded-full border px-2 py-0.5 text-[10px] transition-colors",
+            "rounded-full border px-2 py-0.5 text-10px transition-colors",
             filter[c.key]
               ? "border-foreground/30 bg-muted text-foreground"
               : "border-border/50 text-muted-foreground opacity-50",
@@ -267,7 +267,7 @@ function FilterBar({ filter, onChange }: { filter: FridaFilter; onChange: (f: Fr
         </button>
       ))}
       <input
-        className="h-6 min-w-0 flex-1 rounded border border-input bg-transparent px-1.5 font-mono text-[11px]"
+        className="h-6 min-w-0 flex-1 rounded border border-input bg-transparent px-1.5 font-mono text-11px"
         placeholder={t("hook.frida.filterPh")}
         value={filter.kw}
         onChange={(e) => onChange({ ...filter, kw: e.target.value })}
@@ -276,7 +276,7 @@ function FilterBar({ filter, onChange }: { filter: FridaFilter; onChange: (f: Fr
         type="button"
         onClick={() => onChange({ ...filter, regex: !filter.regex })}
         className={cn(
-          "rounded border px-1.5 py-0.5 font-mono text-[10px]",
+          "rounded border px-1.5 py-0.5 font-mono text-10px",
           filter.regex ? "border-sky-500 text-sky-500" : "text-muted-foreground",
         )}
         title=".*"
@@ -284,7 +284,7 @@ function FilterBar({ filter, onChange }: { filter: FridaFilter; onChange: (f: Fr
         .*
       </button>
       {(filter.kw || filter.regex) && (
-        <Button size="sm" variant="ghost" className="h-5 px-1 text-[10px]" onClick={() => onChange(DEFAULT_FILTER)}>
+        <Button size="sm" variant="ghost" className="h-5 px-1 text-10px" onClick={() => onChange(DEFAULT_FILTER)}>
           {t("hook.frida.clear")}
         </Button>
       )}
@@ -355,7 +355,7 @@ function EventStream({
       <div
         ref={parentRef}
         onScroll={onScroll}
-        className="h-full overflow-auto rounded-lg border bg-black/80 p-2 font-mono text-[11px] leading-relaxed dark:bg-black/40"
+        className="h-full overflow-auto rounded-lg border bg-black/80 p-2 font-mono text-11px leading-relaxed dark:bg-black/40"
       >
         {events.length === 0 ? (
           <span className={cn("text-muted-foreground", running && "animate-pulse")}>{emptyText}</span>
@@ -412,14 +412,14 @@ export function EventRow({ e, raw, origin }: { e: ConsoleEvent; raw: boolean; or
   const time = renderTime(e.ts, origin);
   return (
     <div className={cn("group flex items-start gap-2 whitespace-pre-wrap break-all rounded px-1", raw ? "text-zinc-400" : color)}>
-      <span className="shrink-0 select-none text-[10px] text-zinc-600">{time}</span>
+      <span className="shrink-0 select-none text-10px text-zinc-600">{time}</span>
       {raw ? (
         <span className="path-selectable min-w-0 flex-1">{e.line}</span>
       ) : (
         <span className="path-selectable min-w-0 flex-1">
           {rawlessBody(e.evt, t)}
           {e.evt.kind === "error" && e.evt.stack && (
-            <details className="mt-0.5 text-[10px] text-red-400/80">
+            <details className="mt-0.5 text-10px text-red-400/80">
               <summary className="cursor-pointer select-none">{t("hook.frida.stack")}</summary>
               <pre className="whitespace-pre-wrap">{e.evt.stack}</pre>
             </details>
@@ -439,7 +439,7 @@ export function EventRow({ e, raw, origin }: { e: ConsoleEvent; raw: boolean; or
       >
         <Copy className="h-3 w-3" />
       </button>
-      {copied && <span className="shrink-0 text-[10px] text-zinc-500">{t("common.copied")}</span>}
+      {copied && <span className="shrink-0 text-10px text-zinc-500">{t("common.copied")}</span>}
     </div>
   );
 }

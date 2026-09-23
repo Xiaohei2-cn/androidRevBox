@@ -1,5 +1,6 @@
 /** Панель: карточки окружения и активного приложения */
 export default {
+  "dashboard.header.desc": "Обзор локального тулчейна и окружения устройств",
   "dashboard.adb.title": "Окружение ADB",
   "dashboard.adb.connected": "Подключено устройств: {count}",
   "dashboard.adb.paused": "Отслеживание устройств приостановлено",
