@@ -378,6 +378,36 @@ describe("设备页 Agent 诊断 · Legacy 回退计数（AR12 的删除依据�
     );
   });
 
+  /**
+   * 钉住"动作必须看得见"这件事。上一版把行内动作写成 `opacity-0` + 悬停显示，
+   * jsdom 不解析 CSS，所以三条接线测试全绿，而用户在界面上找不到删除与取回入口
+   * ——测试通过不等于功能存在。类名检查能挡住"再用 opacity-0 藏起来"这种回退。
+   */
+  it("文件页：删除与取回入口默认可见，不靠悬停才出现", async () => {
+    device.ls.mockResolvedValue([
+      { name: "tool", isDir: false, size: 5, symlink: null, perms: "-rw-r--r--" },
+      { name: "stuff", isDir: true, size: 0, symlink: null, perms: "drwxr-xr-x" },
+    ]);
+    renderPage(<FilesView serial="PIXEL-1" />);
+    const fileRow = (await screen.findByText("tool")).closest("li")!;
+    const actions = within(fileRow).getByTestId("fs-row-actions");
+    expect(actions.className).not.toContain("opacity-0");
+    // 每一行都要能看见四个动作入口；目录额外没有"改权限以外"的缺失
+    expect(
+      within(fileRow)
+        .getAllByRole("button")
+        .map((b) => b.getAttribute("aria-label"))
+        .filter(Boolean),
+    ).toEqual(["取回本地…", "重命名", "改权限", "删除"]);
+    const dirRow = screen.getByText(/^stuff\/$/).closest("li")!;
+    expect(
+      within(dirRow)
+        .getAllByRole("button")
+        .map((b) => b.getAttribute("aria-label"))
+        .filter(Boolean),
+    ).toEqual(["取回本地…", "重命名", "改权限", "删除"]);
+  });
+
   it("文件页：改权限把八进制按数值送出去，并把设备回读的实际值显示出来", async () => {
     device.ls.mockResolvedValue([{ name: "tool", isDir: false, size: 5, symlink: null, perms: "-rw-r--r--" }]);
     device.fsChmod.mockResolvedValue({
