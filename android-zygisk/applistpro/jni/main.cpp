@@ -75,18 +75,24 @@ struct Handler {
     int timeout_ms;           // **该 handler 自己**的 helper 等待上限
     size_t max_response;      // 该 handler 的响应字节上限
     bool cancellable;         // 客户端断开/X 时能否安全中断（不会留半成品）
+    // 该命令的响应（**包括错误**）是否走"4 字节长度前缀 + 载荷"的帧。
+    // 规则：跟随命令本身的模式——I/L/P/M 全程帧；E 与握手前的应答全程裸行。
+    // 为什么必须把错误也算进去：错误写成裸行时，帧读取方会把头 4 个 ASCII 字节
+    // 当长度用，报出"响应单帧超过大小上限"，真实原因（helper_timeout 等）全丢。
+    bool framed;
 };
 
 // 能力位只有这一个来源：`OK`/`STATUS` 行的能力列表从这里拼。
 // 改之前是两处各写一遍 "list manifest export"，加命令必然漏一处——
 // 漏掉的那条对 Agent 就等于"模块没这能力"，很难看出来。
 static const Handler HANDLERS[] = {
-    {"S", nullptr,    "companion",            "token", 0,     512,               true},
-    {"L", "list",    "system_server Java",   "token", 8000,  6u * 1024 * 1024,  true},
-    {"M", "manifest","system_server Java",   "token", 8000,  6u * 1024 * 1024,  true},
-    {"E", "export",  "system_server Java + 文件读", "token", 8000, 6u * 1024 * 1024, true},
-    {"P", "describe","system_server Java",   "token", 8000,  64u * 1024,        true},
-    {"I", "handlers","companion",            "token", 0,     8u * 1024,         true},
+    //                                                     取消  响应分帧
+    {"S", nullptr,    "companion",            "token", 0,     512,               true,  false},
+    {"L", "list",     "system_server Java",   "token", 8000,  6u * 1024 * 1024,  true,  true},
+    {"M", "manifest", "system_server Java",   "token", 8000,  6u * 1024 * 1024,  true,  true},
+    {"E", "export",   "system_server Java + 文件读", "token", 8000, 6u * 1024 * 1024, true, false},
+    {"P", "describe", "system_server Java",   "token", 8000,  64u * 1024,        true,  true},
+    {"I", "handlers", "companion",            "token", 0,     8u * 1024,         true,  true},
 };
 static const size_t HANDLER_COUNT = sizeof(HANDLERS) / sizeof(HANDLERS[0]);
 
@@ -219,6 +225,22 @@ static bool send_err(int fd, const char *code, const char *msg) {
     int n = snprintf(buf, sizeof(buf), "ERR %s %s\n", code, msg ? msg : "");
     if (n <= 0) return false;
     return write_all(fd, buf, (size_t) n);
+}
+
+// 帧模式命令的错误：同一个 `ERR code msg\n` 文本，但**装进一帧**再发。
+// 载荷逐字保持原样，Agent 侧的 `ERR ` 解析不用改，改的只是"有没有长度前缀"。
+static bool send_err_frame(int fd, const char *code, const char *msg) {
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf), "ERR %s %s\n", code, msg ? msg : "");
+    if (n <= 0) return false;
+    return write_frame(fd, buf, (size_t) n);
+}
+
+// 按该命令自己声明的响应模式回错误。h=nullptr（命令词残缺/不认识）时按行回，
+// 因为那种情况下没有任何可靠依据去猜客户端在读哪种模式。
+static bool send_err_for(int fd, const Handler *h, const char *code, const char *msg) {
+    if (h && h->framed) return send_err_frame(fd, code, msg);
+    return send_err(fd, code, msg);
 }
 
 // ===== 令牌 / 模块元数据 =====
@@ -568,13 +590,14 @@ static bool stream_ndjson(int cfd, char *payload) {
         if (nl) *nl = '\0';
         if (*line) {
             if (strncmp(line, "{\"error\":", 9) == 0) {
-                send_err(cfd, "helper_failed", line + 9);
+                // 本函数只服务帧模式命令（I/L/P/M），错误也必须是帧
+                send_err_frame(cfd, "helper_failed", line + 9);
                 ok = false;
                 break;
             }
             ok = write_frame(cfd, line, strlen(line));
             if (++lines > MAX_FRAME_LINES) {
-                send_err(cfd, "too_many_items", nullptr);
+                send_err_frame(cfd, "too_many_items", nullptr);
                 ok = false;
                 break;
             }
@@ -703,7 +726,7 @@ static void serve_session(int cfd) {
             continue;
         }
         if (handler_fused(hidx)) {
-            send_err(cfd, "method_fused", h->cmd);
+            send_err_for(cfd, h, "method_fused", h->cmd);
             continue;
         }
 
@@ -720,7 +743,7 @@ static void serve_session(int cfd) {
             // stream_ndjson 负责释放，所以这里必须是堆内存。
             char *payload = (char *) malloc(8u * 1024);
             if (!payload) {
-                send_err(cfd, "helper_failed", "oom");
+                send_err_frame(cfd, "helper_failed", "oom");
                 continue;
             }
             int off = 0;
@@ -754,7 +777,7 @@ static void serve_session(int cfd) {
             char locale[128] = "-", scope[16] = "all";
             int include_disabled = 0;
             if (sscanf(rest, "%127s %15s %d", locale, scope, &include_disabled) < 2) {
-                send_err(cfd, "bad_request", "L <locale|-> <all|user|system> <0|1>");
+                send_err_for(cfd, h, "bad_request", "L <locale|-> <all|user|system> <0|1>");
                 continue;
             }
             if (strcmp(locale, "-") != 0) {
@@ -766,12 +789,12 @@ static void serve_session(int cfd) {
                          c == '-' || c == '_' || c == '.';
                 }
                 if (!ok) {
-                    send_err(cfd, "bad_locale", locale);
+                    send_err_for(cfd, h, "bad_locale", locale);
                     continue;
                 }
             }
             if (strcmp(scope, "all") && strcmp(scope, "user") && strcmp(scope, "system")) {
-                send_err(cfd, "bad_scope", scope);
+                send_err_for(cfd, h, "bad_scope", scope);
                 continue;
             }
             char disabled[8];
@@ -781,7 +804,7 @@ static void serve_session(int cfd) {
             char *payload = run_helper(h, argv, &hr);
             if (!payload) {
                 if (hr != HELPER_OK) note_internal_failure(hidx, "list helper");
-                send_err(cfd, hr == HELPER_TIMEOUT ? "helper_timeout" : "helper_failed", nullptr);
+                send_err_for(cfd, h, hr == HELPER_TIMEOUT ? "helper_timeout" : "helper_failed", nullptr);
             } else {
                 note_success(hidx);
                 stream_ndjson(cfd, payload);
@@ -794,7 +817,7 @@ static void serve_session(int cfd) {
             // 只接受一个参数，包名沿用 E 的字符集校验（不允许任何 shell 元字符与路径分隔）。
             if (*rest == '\0' || strpbrk(rest, " \t\r\n") != nullptr ||
                 strpbrk(rest, "/\\ \"'`$;&|<>()") != nullptr || strlen(rest) > 256) {
-                send_err(cfd, "bad_package", rest);
+                send_err_for(cfd, h, "bad_package", rest);
                 continue;
             }
             char *argv[] = {(char *) "--one", rest, nullptr};
@@ -802,7 +825,7 @@ static void serve_session(int cfd) {
             char *payload = run_helper(h, argv, &hr);
             if (!payload) {
                 if (hr != HELPER_OK) note_internal_failure(hidx, "describe helper");
-                send_err(cfd, hr == HELPER_TIMEOUT ? "helper_timeout" : "helper_failed", nullptr);
+                send_err_for(cfd, h, hr == HELPER_TIMEOUT ? "helper_timeout" : "helper_failed", nullptr);
             } else {
                 note_success(hidx);
                 stream_ndjson(cfd, payload);
@@ -816,7 +839,7 @@ static void serve_session(int cfd) {
             char *payload = run_helper(h, argv, &hr);
             if (!payload) {
                 if (hr != HELPER_OK) note_internal_failure(hidx, "manifest helper");
-                send_err(cfd, hr == HELPER_TIMEOUT ? "helper_timeout" : "helper_failed", nullptr);
+                send_err_for(cfd, h, hr == HELPER_TIMEOUT ? "helper_timeout" : "helper_failed", nullptr);
             } else {
                 note_success(hidx);
                 stream_ndjson(cfd, payload);

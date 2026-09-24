@@ -199,6 +199,14 @@ pub struct ZygiskStatusResult {
     pub device_locale: Option<String>,
     /// Agent <-> 模块私有子协议版本（当前冻结为 Q/E/D 线协议 = 1）。
     pub sub_protocol_version: u32,
+    /// v2 模块在监听，但**子协议版本或应答格式对不上**（模块比本端新、或端口被别的东西占了）。
+    ///
+    /// 为什么不直接把 lifecycle 改成 `incompatible` 就完事：AR10.5 真机注入发现，
+    /// v2 不兼容时 v1 demo 往往还在正常服务，`bridge_ready=true` 是真话（清单确实出得来），
+    /// 但界面必须同时知道"你装的那个 v2 模块本端说不了"，否则会一直显示"一切就绪"。
+    /// 两个事实都得在场，谁也不能盖掉谁。`default` 让旧 Agent 不带该字段时仍可解析。
+    #[serde(default)]
+    pub module_incompatible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_latency_ms: Option<u64>,
     /// 模块声明的 handler 注册表（AR10.2）。**故意不跳过空数组**：
@@ -1267,6 +1275,7 @@ mod tests {
             probe_latency_ms: Some(4),
             module_handlers: Vec::new(),
             detail: None,
+            module_incompatible: false,
         };
         let value = serde_json::to_value(result).unwrap();
         assert_eq!(value["lifecycle"], "installed_reboot_required");
@@ -1798,6 +1807,21 @@ mod tests {
             serde_json::from_value(json!({"items": [], "success_count": 0, "fallback_count": 0}))
                 .unwrap();
         assert_eq!(legacy.channel, None);
+    }
+
+    #[test]
+    fn zygisk_status_keeps_incompatible_flag_optional_on_the_wire() {
+        let lean: ZygiskStatusResult = serde_json::from_value(serde_json::json!({
+            "lifecycle": "bridge_ready",
+            "bridge_ready": true,
+            "root_available": false,
+            "sub_protocol_version": 2
+        }))
+        .unwrap();
+        assert!(
+            !lean.module_incompatible,
+            "旧 Agent 不发这个字段时应默认为 false，不能凭空报不兼容"
+        );
     }
 
     #[test]

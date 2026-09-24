@@ -104,7 +104,12 @@ pub struct ZygiskProvider {
 enum ProState {
     Ready(ProHello),
     NeedsToken,
-    HandshakeFailed(String),
+    /// `incompatible` = 应答读到了，但子协议版本/格式对不上；
+    /// 与"连不上、无应答"是两类故障，处置动作完全不同（换模块 vs 查模块起没起）。
+    HandshakeFailed {
+        incompatible: bool,
+        reason: String,
+    },
     Dead,
 }
 
@@ -113,6 +118,9 @@ struct Selection {
     variant: Variant,
     pro_locale: Option<String>,
     note: Option<String>,
+    /// v2 应答了但版本/格式不匹配（AR10.5）：这条必须一路带到 status，
+    /// 不能被"退回 v1 且可用"这件事盖掉。
+    pro_incompatible: bool,
 }
 
 /// 通道选择矩阵：v2 握手成功优先；v2 因缺 root 令牌或握手失败不可用时，
@@ -123,6 +131,7 @@ fn select_variant(pro: ProState, demo_alive: bool) -> Selection {
             variant: Variant::Pro,
             pro_locale: Some(hello.locale),
             note: None,
+            pro_incompatible: false,
         },
         ProState::NeedsToken if demo_alive => Selection {
             variant: Variant::Demo,
@@ -131,21 +140,25 @@ fn select_variant(pro: ProState, demo_alive: bool) -> Selection {
                 "v2 模块在监听但 Agent 读不到令牌（需要 root），已退回 v1 demo 通道：指定 locale 与 labelSource 证据不可用"
                     .to_owned(),
             ),
+            pro_incompatible: false,
         },
         ProState::NeedsToken => Selection {
             variant: Variant::ProLocked,
             pro_locale: None,
             note: None,
+            pro_incompatible: false,
         },
-        ProState::HandshakeFailed(reason) if demo_alive => Selection {
+        ProState::HandshakeFailed { incompatible, reason } if demo_alive => Selection {
             variant: Variant::Demo,
             pro_locale: None,
             note: Some(format!("{reason}；已退回 v1 demo 通道，指定 locale 不可用")),
+            pro_incompatible: incompatible,
         },
-        ProState::HandshakeFailed(reason) => Selection {
+        ProState::HandshakeFailed { incompatible, reason } => Selection {
             variant: Variant::ProLocked,
             pro_locale: None,
             note: Some(reason),
+            pro_incompatible: incompatible,
         },
         ProState::Dead if demo_alive => Selection {
             variant: Variant::Demo,
@@ -156,11 +169,13 @@ fn select_variant(pro: ProState, demo_alive: bool) -> Selection {
                 "未检测到 v2 模块（未安装或未监听），已退回 v1 demo 通道：指定 locale 与 labelSource 证据不可用"
                     .to_owned(),
             ),
+            pro_incompatible: false,
         },
         ProState::Dead => Selection {
             variant: Variant::Absent,
             pro_locale: None,
             note: None,
+            pro_incompatible: false,
         },
     }
 }
@@ -263,6 +278,11 @@ struct ModuleFacts {
     pending_update: bool,
     disabled_marker: bool,
     remove_marker: bool,
+    /// v2 模块的 `helper.dex` 不在（AR10.5 启动安全现场）。握手与注册表问答用不到它，
+    /// 所以缺了也照样 bridge_ready——**正因如此必须单独说出来**，否则界面上一片绿，
+    /// 而清单/导出/按包查询条条失败。真机现场：开机前把它改名，系统照常起（没 bootloop），
+    /// 状态却什么都看不出来，只有调用清单时才报 helper_failed。
+    helper_missing: bool,
     version: Option<String>,
     version_code: Option<u32>,
 }
@@ -284,6 +304,10 @@ struct Probe {
     root: Option<RootFacts>,
     device_locale: Option<String>,
     pro_locale: Option<String>,
+    /// v2 应答了但版本/格式不匹配（AR10.5）。可以与 `bridge_ready` 同时为真：
+    /// 前者说"你装的 v2 本端说不了"，后者说"当前在用的那条通道是通的"。
+    /// 只报 lifecycle 会把这件事盖掉——真机注入时看到的就是"版本不兼容"显示成"一切就绪"。
+    pro_incompatible: bool,
     probe_latency_ms: u64,
     /// 模块自描述的 handler 注册表（capability `handlers` 才有；旧模块为空）
     handlers: Vec<ModuleHandlerInfo>,
@@ -345,7 +369,10 @@ impl ZygiskProvider {
                         }
                         ProState::Ready(hello)
                     }
-                    Err(error) => ProState::HandshakeFailed(error.message),
+                    Err(error) => ProState::HandshakeFailed {
+                        incompatible: error.code == ErrorCode::IncompatibleVersion,
+                        reason: error.message,
+                    },
                 },
             }
         };
@@ -359,12 +386,47 @@ impl ZygiskProvider {
         let variant = selected.variant;
         let pro_locale = selected.pro_locale;
         let pro_error = selected.note;
+        let pro_incompatible = selected.pro_incompatible;
         let bridge_ready = matches!(variant, Variant::Pro | Variant::Demo);
         let root = probe_root().await;
         let device_locale = detect_device_locale().await;
-        let mut lifecycle = classify_lifecycle(variant, root.as_ref());
+        let mut lifecycle = classify_lifecycle(
+            variant,
+            root.as_ref(),
+            pro_incompatible,
+            pro_error.as_deref(),
+        );
+        // 下面两句都是"恢复路径不同，措辞就必须不同"：说错一句，用户就会去点错按钮。
+        if let Some(facts) = root.as_ref() {
+            // ① 被**禁用**：说"未安装或未监听"会把人支去重装 ZIP，真动作是启用后重启。
+            if facts.pro.disabled_marker && !matches!(variant, Variant::Pro) {
+                push_detail_hint(
+                    &mut lifecycle.1,
+                    &format!(
+                        "模块 {PRO_MODULE_ID} 当前被禁用：在 KernelSU/Magisk 里启用后重启才会生效（不需要重装）"
+                    ),
+                );
+            }
+            // ② v2 通道活着但 helper.dex 没了：握手/注册表看不出问题，只有真跑 Java 的
+            //    方法才失败。不单独说，界面就是"就绪 + 干啥都错"。
+            if matches!(variant, Variant::Pro) && facts.pro.helper_missing {
+                push_detail_hint(
+                    &mut lifecycle.1,
+                    &format!(
+                        "模块 {PRO_MODULE_ID} 的 helper.dex 缺失：握手与注册表正常，但清单/导出/按包查询都会失败，重装模块 zip 后重启即可恢复（不是刷机）"
+                    ),
+                );
+            }
+        }
+        // note 本身就是一句完整原因（例如"v2 模块协议版本不匹配: 3；已退回 v1 demo 通道"）。
+        // 以前这里无条件再拼一句"；v2 握手未通过"，AR10.5 真机注入看到的就是同一件事说两遍。
+        // 现在只在没有原因时补，且已说过的内容不重复。
         if let Some(reason) = pro_error {
-            lifecycle.1 = Some(format!("{reason}；v2 握手未通过"));
+            lifecycle.1 = Some(match lifecycle.1 {
+                None => reason,
+                Some(existing) if existing.contains(&reason) => existing,
+                Some(existing) => format!("{existing}；{reason}"),
+            });
         }
         let probe = Probe {
             at: Instant::now(),
@@ -374,6 +436,7 @@ impl ZygiskProvider {
             root,
             device_locale,
             pro_locale,
+            pro_incompatible,
             probe_latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             handlers: pro_handlers,
             detail: lifecycle.1,
@@ -489,6 +552,7 @@ impl ZygiskProvider {
                     root: None,
                     device_locale: None,
                     pro_locale: None,
+                    pro_incompatible: false,
                     probe_latency_ms: PROBE_BUDGET.as_millis() as u64,
                     handlers: Vec::new(),
                     detail: Some(format!(
@@ -523,6 +587,7 @@ impl ZygiskProvider {
         ZygiskStatusResult {
             lifecycle: probe.lifecycle,
             bridge_ready: probe.bridge_ready,
+            module_incompatible: probe.pro_incompatible,
             root_available: probe.root.is_some(),
             module_id: module_id.map(str::to_owned),
             module_version: module.and_then(|m| m.version.clone()),
@@ -790,7 +855,7 @@ impl ZygiskProvider {
                 package_name: None,
                 code: "locale_unproven".into(),
                 message: format!(
-                    "{unproven_locale} 个应用无法确认是否按 {requested_locale} 命中资源                     （Android 不导出资源匹配结果），已按 labelSource/resolvedLocale 如实标注"
+                    "{unproven_locale} 个应用无法确认是否按 {requested_locale} 命中资源（Android 不导出资源匹配结果），已按 labelSource/resolvedLocale 如实标注"
                 ),
             });
         }
@@ -1350,6 +1415,59 @@ fn parse_pro_error(line: &str) -> Option<(String, String)> {
     Some((code, message))
 }
 
+/// 前 4 个"长度字节"其实是被当成长度读掉的文本：把这一行剩下的字节读回来。
+/// 独立函数而不是 LineReader 方法，是为了让帧循环里对 `stream` 的借用不打架。
+async fn read_text_tail(
+    stream: &mut TcpStream,
+    head: &[u8; 4],
+    timeout: Duration,
+) -> Result<Vec<u8>, AgentError> {
+    let mut line = head.to_vec();
+    let mut byte = [0_u8; 1];
+    loop {
+        if u64::try_from(line.len()).unwrap_or(u64::MAX) > MAX_LINE_BYTES {
+            return Err(internal("模块响应单行超过大小上限"));
+        }
+        let read = with_timeout(timeout, stream.read(&mut byte))
+            .await
+            .map_err(|_| deadline("等待模块响应超时"))?
+            .map_err(|error| internal(format!("读取模块响应失败: {error}")))?;
+        if read == 0 || byte[0] == b'\n' {
+            return Ok(line);
+        }
+        line.push(byte[0]);
+    }
+}
+
+/// 4 个"长度字节"全是可打印 ASCII（字母、数字、`{}"`、`$` 之类）时，基本可以断定
+/// 模块发的不是帧而是文本行——二进制长度最高字节通常远小于 0x20。
+fn frame_head_looks_like_text(head: &[u8; 4]) -> bool {
+    head.iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+}
+
+/// 把"本该是帧、其实是裸文本行"的应答转成一条说得清真相的错误。
+/// 模块自己给的 `ERR code msg` 仍然按原映射走（错误码语义不变），只在末尾补一句
+/// 这是分帧规则不一致——它是用户升级模块的唯一理由，不说就等于让人瞎猜。
+fn unframed_reply_error(raw: &[u8]) -> AgentError {
+    let text = String::from_utf8_lossy(raw).trim_end().to_string();
+    let shown: String = text.chars().take(160).collect();
+    match parse_pro_error(&text) {
+        Some((code, message)) => {
+            let mut error = pro_error_to_agent(&code, &message);
+            error.message = format!(
+                "{}（模块回了未分帧的文本行：v2.1 及更早的模块会这样，升级模块后按帧返回）",
+                error.message
+            );
+            error
+        }
+        None => incompatible(
+            format!("v2 模块响应未分帧，读到的是文本行: {shown}"),
+            Some("pro_frame_unframed"),
+        ),
+    }
+}
+
 fn pro_error_to_agent(code: &str, message: &str) -> AgentError {
     let detail = if message.is_empty() {
         format!("v2 模块返回 {code}")
@@ -1506,17 +1624,20 @@ async fn pro_command_frames_with_token(
     method: &str,
 ) -> Result<Vec<serde_json::Value>, AgentError> {
     let mut stream = connect_port(PRO_PORT, CONNECT_TIMEOUT).await?;
-    let mut reader = LineReader::new(&mut stream);
-    let hello_request = format!("H {PRO_SUB_PROTOCOL_VERSION} {token}\n");
-    reader.write_line(&hello_request, LINE_TIMEOUT).await?;
-    let hello = reader
-        .next_line(LINE_TIMEOUT)
-        .await?
-        .ok_or_else(|| provider_unavailable("v2 模块握手无应答", Some("pro_handshake_eof")))?;
-    let hello = parse_pro_hello(&String::from_utf8_lossy(&hello))?;
-    ensure_capability(&hello, capability, method)?;
-
-    reader.write_line(request, LINE_TIMEOUT).await?;
+    // 握手与请求写入是"行"，之后开始读"帧"：把 reader 关进这个作用域，
+    // 出了大括号它对 stream 的可变借用就结束了（不需要 drop，也不会有双重借用）。
+    {
+        let mut reader = LineReader::new(&mut stream);
+        let hello_request = format!("H {PRO_SUB_PROTOCOL_VERSION} {token}\n");
+        reader.write_line(&hello_request, LINE_TIMEOUT).await?;
+        let hello = reader
+            .next_line(LINE_TIMEOUT)
+            .await?
+            .ok_or_else(|| provider_unavailable("v2 模块握手无应答", Some("pro_handshake_eof")))?;
+        let hello = parse_pro_hello(&String::from_utf8_lossy(&hello))?;
+        ensure_capability(&hello, capability, method)?;
+        reader.write_line(request, LINE_TIMEOUT).await?;
+    }
 
     let mut frames = Vec::new();
     loop {
@@ -1529,7 +1650,17 @@ async fn pro_command_frames_with_token(
             })?;
         let len = u32::from_be_bytes(head) as usize;
         if len > MAX_LINE_BYTES as usize {
-            return Err(internal("v2 响应单帧超过大小上限"));
+            // "长度"大得离谱时，先怀疑那 4 个字节根本不是长度：v2.1 及更早的模块把
+            // 错误写成裸文本行（`ERR helper_timeout ...`），帧读取就会把 `ERR ` 当成
+            // 1.1 GB 的长度，于是真原因（helper 超时）被一句"超过大小上限"盖掉。
+            // 这里把那行读出来照实报，并说明这是分帧规则不一致（=该升级模块了）。
+            if frame_head_looks_like_text(&head) {
+                let tail = read_text_tail(&mut stream, &head, LINE_TIMEOUT).await?;
+                return Err(unframed_reply_error(&tail));
+            }
+            return Err(internal(format!(
+                "v2 响应单帧超过大小上限：模块声明 {len} 字节，本端上限 {MAX_LINE_BYTES} 字节"
+            )));
         }
         let mut body = vec![0_u8; len];
         with_timeout(LINE_TIMEOUT, stream.read_exact(&mut body))
@@ -1767,6 +1898,9 @@ const ROOT_PROBE_SCRIPT: &str = concat!(
     " if [ -f \"/data/adb/modules/$m/remove\" ]; then echo \"REMOVING $m\"; fi;",
     " if [ -f \"/data/adb/modules/$m/module.prop\" ]; then echo \"PROP_BEGIN $m\";",
     " cat \"/data/adb/modules/$m/module.prop\"; echo \"PROP_END\"; fi;",
+    // helper.dex 只有 v2 模块用（v1 demo 没有，所以别对 applist 报缺）
+    " if [ \"$m\" = applistpro ] && [ ! -f \"/data/adb/modules/$m/helper.dex\" ]; then",
+    "   echo \"NOHELPER $m\"; fi;",
     " done;",
     "for d in /data/adb/zygisksu /data/adb/zygisk /data/adb/ap/zygisk /data/adb/kzygisk; do",
     " if [ -e \"$d\" ]; then echo \"ZYGIMPL=$(basename \"$d\")\"; fi; done;",
@@ -1821,7 +1955,7 @@ fn classify_root_output(text: &str) -> RootFacts {
         let mut parts = line.splitn(2, ' ');
         let marker = parts.next().unwrap_or("");
         let target = match marker {
-            "INSTALLED" | "PENDING" | "DISABLED" | "REMOVING" => match parts.next() {
+            "INSTALLED" | "PENDING" | "DISABLED" | "REMOVING" | "NOHELPER" => match parts.next() {
                 Some("applistpro") => Some(&mut facts.pro),
                 Some("applist") => Some(&mut facts.demo),
                 _ => None,
@@ -1833,6 +1967,7 @@ fn classify_root_output(text: &str) -> RootFacts {
             ("PENDING", Some(module)) => module.pending_update = true,
             ("DISABLED", Some(module)) => module.disabled_marker = true,
             ("REMOVING", Some(module)) => module.remove_marker = true,
+            ("NOHELPER", Some(module)) => module.helper_missing = true,
             _ => {
                 if let Some(value) = line.strip_prefix("ZYGIMPL=")
                     && facts.zygisk_impl.is_none()
@@ -1845,12 +1980,24 @@ fn classify_root_output(text: &str) -> RootFacts {
     }
     facts
 }
+/// 往 detail 前面补一句"该怎么做"的说明，已经有这句话就不重复。
+/// 为什么放最前面：这句是给用户看的动作，技术原因是给排障看的。
+fn push_detail_hint(detail: &mut Option<String>, hint: &str) {
+    *detail = Some(match detail.take() {
+        Some(existing) if existing.contains(hint) => existing,
+        Some(existing) => format!("{hint}；{existing}"),
+        None => hint.to_owned(),
+    });
+}
+
 /// 生命周期判定：先由「实际探测到的通道」决定，再用 root 事实细化原因。
 /// v2 可达但没令牌（ProLocked）不能冒充可用，报成 installed_reboot_required 之外
 /// 最贴近的状态：模块已装但 Agent 无法鉴权 -> faulted + 明确 detail。
 fn classify_lifecycle(
     variant: Variant,
     root: Option<&RootFacts>,
+    pro_incompatible: bool,
+    pro_reason: Option<&str>,
 ) -> (ZygiskLifecycle, Option<String>) {
     let facts = match root {
         None => {
@@ -1904,10 +2051,18 @@ fn classify_lifecycle(
                 Some("仅 v1 demo 模块可用（无鉴权、无法按指定 locale 解析）".to_owned()),
             )
         }
+        // v2 应答了但本端说不了它的子协议版本：这才是 `Incompatible` 真正的产地。
+        // 以前这个枚举值没有任何路径能产出（探测把握手失败一律当成"缺 root 令牌"），
+        // 于是界面永远显示"就绪"，用户看到的是一个不兼容的模块却被判成一切正常。
+        Variant::ProLocked if pro_incompatible => (ZygiskLifecycle::Incompatible, None),
+        // 握手真的失败过（连上没回话、应答不是本协议）：这时"读不到令牌"是**另一个话题**，
+        // 摆在前面会把人支去弄授权，而真原因挂在后半句。AR10.5 注入 close 模式时看到的就是
+        // 这种"两句都有、第一句无关"的字符串，所以这里让原因自己说话。
+        Variant::ProLocked if pro_reason.is_some() => (ZygiskLifecycle::Faulted, None),
         Variant::ProLocked => (
             ZygiskLifecycle::Faulted,
             Some(format!(
-                "/data/adb/modules/{PRO_MODULE_ID}/token 读不到：Agent 需要 root 才能取令牌，                 而 v1 demo 模块也不在监听"
+                "/data/adb/modules/{PRO_MODULE_ID}/token 读不到：Agent 需要 root 才能取令牌，而 v1 demo 模块也不在监听"
             )),
         ),
         Variant::Absent => {
@@ -2227,29 +2382,104 @@ mod tests {
     fn pending_update_on_either_channel_reports_reboot_required() {
         let facts = classify_root_output(ROOT_SAMPLE);
         // v2 端口活着但 modules_update 里还有新版本 -> 当前应答来自重启前的 .so
-        let (lifecycle, detail) = classify_lifecycle(Variant::Pro, Some(&facts));
+        let (lifecycle, detail) = classify_lifecycle(Variant::Pro, Some(&facts), false, None);
         assert_eq!(lifecycle, ZygiskLifecycle::InstalledRebootRequired);
         assert!(detail.unwrap().contains("重启前"));
 
         let mut clean = facts.clone();
         clean.pro.pending_update = false;
         assert_eq!(
-            classify_lifecycle(Variant::Pro, Some(&clean)).0,
+            classify_lifecycle(Variant::Pro, Some(&clean), false, None).0,
             ZygiskLifecycle::BridgeReady
         );
     }
 
+    /// AR10.5：把"v2 不兼容"与"v2 缺令牌"分开。这两种情况的处置动作完全不同
+    /// （换匹配的模块 vs 给 Shell 授权），混在一起就会像修复前那样：不兼容被报成
+    /// "读不到令牌"，或者干脆被"v1 还能用"盖成一切就绪。
+    #[test]
+    fn incompatible_module_version_is_its_own_lifecycle_not_token_or_ready() {
+        let facts = classify_root_output(ROOT_SAMPLE);
+
+        // ① v2 不兼容且 v1 不在：必须落到 Incompatible，且不能出现"读不到令牌"的误导
+        let (lifecycle, detail) = classify_lifecycle(Variant::ProLocked, Some(&facts), true, None);
+        assert_eq!(lifecycle, ZygiskLifecycle::Incompatible);
+        assert!(
+            !detail.unwrap_or_default().contains("令牌"),
+            "不兼容时不该扯令牌"
+        );
+
+        // ② 同样不兼容但 v1 活着：通道确实在用（BridgeReady 是真话），
+        //    但 module_incompatible 这个事实由 probe 带着，不会被"就绪"抹平
+        let (lifecycle, _) = classify_lifecycle(Variant::Demo, Some(&facts), true, None);
+        assert_eq!(lifecycle, ZygiskLifecycle::BridgeReady);
+
+        // ③ 真的只是缺令牌：仍然报 Faulted + 令牌路径，不冒充版本问题
+        let (lifecycle, detail) = classify_lifecycle(Variant::ProLocked, None, false, None);
+        assert_eq!(lifecycle, ZygiskLifecycle::Faulted);
+        assert!(detail.unwrap_or_default().contains("令牌"));
+
+        // ④ 连上了却没回话（版本没毛病）：原因必须是唯一那句。
+        //    前面挂一句"读不到令牌"会把人支去弄授权，那是另一件事。
+        let (lifecycle, detail) = classify_lifecycle(
+            Variant::ProLocked,
+            Some(&facts),
+            false,
+            Some("v2 模块握手无应答"),
+        );
+        assert_eq!(lifecycle, ZygiskLifecycle::Faulted);
+        assert!(
+            !detail.unwrap_or_default().contains("令牌"),
+            "缺令牌的说法与本次故障无关"
+        );
+    }
+
+    /// 通道选择矩阵：握手失败的两种来源要分开走，"是否不兼容"要一路带到状态里。
+    #[test]
+    fn handshake_failure_keeps_its_category_through_selection() {
+        let failed = ProState::HandshakeFailed {
+            incompatible: true,
+            reason: "v2 模块协议版本不匹配: 3".to_owned(),
+        };
+
+        // v1 活着 → 退回 v1，但不兼容这个事实必须留着
+        let selection = select_variant(failed.clone(), true);
+        assert_eq!(selection.variant, Variant::Demo);
+        assert!(selection.pro_incompatible);
+        assert!(
+            selection
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("不匹配"),
+            "{:?}",
+            selection.note
+        );
+
+        // v1 不在 → ProLocked 位置由 classify 翻成 Incompatible
+        let selection = select_variant(failed.clone(), false);
+        assert_eq!(selection.variant, Variant::ProLocked);
+        assert!(selection.pro_incompatible);
+
+        // "连不上/无应答"不是版本问题：不能被标成不兼容
+        let dead = ProState::HandshakeFailed {
+            incompatible: false,
+            reason: "v2 模块握手无应答".to_owned(),
+        };
+        assert!(!select_variant(dead, false).pro_incompatible);
+    }
+
     #[test]
     fn lifecycle_without_root_stays_honest() {
-        let (ready, detail) = classify_lifecycle(Variant::Pro, None);
+        let (ready, detail) = classify_lifecycle(Variant::Pro, None, false, None);
         assert_eq!(ready, ZygiskLifecycle::BridgeReady);
         assert!(detail.unwrap().contains("root 不可用"));
 
-        let (locked, detail) = classify_lifecycle(Variant::ProLocked, None);
+        let (locked, detail) = classify_lifecycle(Variant::ProLocked, None, false, None);
         assert_eq!(locked, ZygiskLifecycle::Faulted);
         assert!(detail.unwrap().contains("读不到令牌"));
 
-        let (unknown, detail) = classify_lifecycle(Variant::Absent, None);
+        let (unknown, detail) = classify_lifecycle(Variant::Absent, None, false, None);
         assert_eq!(unknown, ZygiskLifecycle::Faulted);
         assert!(detail.unwrap().contains("无法区分"));
     }
@@ -2260,27 +2490,27 @@ mod tests {
         facts.pro.installed = false;
         facts.demo.installed = false;
         assert_eq!(
-            classify_lifecycle(Variant::Absent, Some(&facts)).0,
+            classify_lifecycle(Variant::Absent, Some(&facts), false, None).0,
             ZygiskLifecycle::NotInstalled
         );
 
         facts.demo.installed = true;
         facts.demo.disabled_marker = true;
         assert_eq!(
-            classify_lifecycle(Variant::Absent, Some(&facts)).0,
+            classify_lifecycle(Variant::Absent, Some(&facts), false, None).0,
             ZygiskLifecycle::ZygiskDisabled
         );
 
         facts.demo.disabled_marker = false;
         facts.pro.pending_update = false;
         assert_eq!(
-            classify_lifecycle(Variant::Absent, Some(&facts)).0,
+            classify_lifecycle(Variant::Absent, Some(&facts), false, None).0,
             ZygiskLifecycle::Loaded
         );
 
         facts.zygisk_impl = None;
         assert_eq!(
-            classify_lifecycle(Variant::Absent, Some(&facts)).0,
+            classify_lifecycle(Variant::Absent, Some(&facts), false, None).0,
             ZygiskLifecycle::ZygiskDisabled
         );
     }
@@ -2311,11 +2541,24 @@ mod tests {
             Variant::ProLocked
         );
         // 握手失败同样显式退回
-        let broken = select_variant(ProState::HandshakeFailed("bad proto".into()), true);
+        let broken = select_variant(
+            ProState::HandshakeFailed {
+                incompatible: false,
+                reason: "bad proto".to_owned(),
+            },
+            true,
+        );
         assert_eq!(broken.variant, Variant::Demo);
         assert!(broken.note.unwrap().contains("bad proto"));
         assert_eq!(
-            select_variant(ProState::HandshakeFailed("bad proto".into()), false).variant,
+            select_variant(
+                ProState::HandshakeFailed {
+                    incompatible: false,
+                    reason: "bad proto".to_owned(),
+                },
+                false
+            )
+            .variant,
             Variant::ProLocked
         );
         // v2 完全不在：有 v1 走 v1，否则 Absent
@@ -2333,7 +2576,10 @@ mod tests {
         let cases = [
             (ProState::NeedsToken, "需要 root"),
             (
-                ProState::HandshakeFailed("v2 握手未通过".into()),
+                ProState::HandshakeFailed {
+                    incompatible: false,
+                    reason: "v2 握手未通过".to_owned(),
+                },
                 "v2 握手未通过",
             ),
             (ProState::Dead, "未检测到 v2 模块"),
@@ -2530,6 +2776,37 @@ mod tests {
         assert!(
             parsed[1].fused,
             "熔断状态必须原样带回，界面上才说得出哪个方法被关了"
+        );
+    }
+
+    #[test]
+    fn frame_head_that_is_actually_text_is_not_called_an_oversize_frame() {
+        // v2.1 及更早的模块把错误写成裸行：`ERR helper_timeout ` 的头 4 个 ASCII 字节
+        // 会被当成 1.16 GB 的"帧长度"。以前这里只会吐一句"响应单帧超过大小上限"，
+        // 真原因（helper 超时）和它该怎么修，全被这句话吃掉了。
+        assert!(frame_head_looks_like_text(b"ERR "));
+        assert!(frame_head_looks_like_text(b"{\"pk"));
+        // 正常帧的长度前缀高位是 0（载荷最大 6 MiB），不可能全是可打印字符
+        assert!(!frame_head_looks_like_text(&[0x00, 0x00, 0x01, 0x20]));
+        assert!(!frame_head_looks_like_text(&[0x00, 0x5c, 0x00, 0x00]));
+
+        let err = unframed_reply_error(b"ERR helper_timeout \n");
+        assert!(
+            err.message.contains("helper_timeout"),
+            "模块给的原因必须原样带出: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("未分帧"),
+            "要说出这是分帧规则不一致: {err:?}"
+        );
+
+        // 不是 ERR 的文本行：按"应答不是协议"处理，同样不许说成大小上限
+        let other = unframed_reply_error(b"{pkg: broken");
+        assert_eq!(other.code, ErrorCode::IncompatibleVersion, "{other:?}");
+        assert!(
+            other.message.contains("{pkg"),
+            "要能把读到的字节带出来: {other:?}"
         );
     }
 

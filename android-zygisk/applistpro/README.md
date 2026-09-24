@@ -37,8 +37,14 @@ Desktop **不直连**本模块端口：Agent 的 `ZygiskProvider` 负责私有�
 ```
 C: H 2 <128hex>\n
 M: OK 2 <version> <versionCode> <deviceLocale> list manifest export\n
-   ERR auth_required | bad_handshake | unsupported_protocol | auth_failed\n   (随后断开)
+   ERR auth_required | bad_handshake | unsupported_protocol | auth_failed\n   (随后断开；握手之前还没有帧，所以这里是裸行)
 ```
+
+**响应形状跟随命令自己**（v2.2 定案）：`S` 与 `E` 的响应是裸文本行，`L`/`P`/`M`/`I` 的
+响应是"4 字节大端长度 + 载荷"的帧，**错误也一样装进帧**。v2.1 及之前把 `ERR` 一律写成
+裸行，于是帧读取方把 `ERR ` 这 4 个 ASCII 字节当成 1 163 022 880 字节的帧长，界面上只剩
+"响应单帧超过大小上限"，模块真正说的 `helper_timeout` 全被吃掉——Agent 侧现在对旧模块
+有容错（照文本行读出来报），新模块则按这里的约定发帧。
 
 握手成功后同一连接可反复发命令（30 s 空闲自动关闭）：
 
@@ -48,7 +54,8 @@ M: STATUS 2 <version> <versionCode> <deviceLocale> list manifest export\n
 
 C: L <locale|-> <all|user|system> <0|1>\n
 M: <4B len><item json> ... <4B len>{"final":true,"count":N,"fallback":M,"localeUnproven":K,"deviceLocale":"...","enumeratedFlags":F}
-   ERR helper_failed | bad_request | bad_locale | bad_scope | too_many_items\n
+   <4B len>ERR helper_failed | bad_request | bad_locale | bad_scope | too_many_items\n
+   （v2.2：这些错误也在帧里；v2.1 是裸行）
 
    item: {"pkg","label","labelSource":"framework|package_name|manifest",
           "requestedLocale","resolvedLocale"|null,"fallbackReason"|null,

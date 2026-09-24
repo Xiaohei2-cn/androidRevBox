@@ -49,6 +49,30 @@ def read_line(sock):
     return buf[:-1].decode(errors="replace")
 
 
+def read_frame_body(sock):
+    """读一帧的原始载荷，**不**假设它是 JSON。
+
+    AR10.5 之后错误也是一帧，载荷是 `ERR code msg` 文本行；用 read_frames 会因为
+    解析 JSON 当场抛异常，正好把要验的东西验丢了。
+    """
+    head = b""
+    while len(head) < 4:
+        chunk = sock.recv(4 - len(head))
+        if not chunk:
+            return None
+        head += chunk
+    size = struct.unpack(">I", head)[0]
+    if size > 8 * 1024 * 1024:
+        return f"<帧长度异常: {size}>"
+    body = b""
+    while len(body) < size:
+        chunk = sock.recv(min(65536, size - len(body)))
+        if not chunk:
+            break
+        body += chunk
+    return body.decode(errors="replace").strip()
+
+
 def read_frames(sock, stop_after=None):
     items = []
     while True:
@@ -102,17 +126,35 @@ def main():
         check("未鉴权命令被拒", err_code(read_line(s)) == "auth_required")
         s.close()
 
-        s = connect()
-        for cmd, code in [
-            ("E ../escape\n", "ERR bad_package"),
-            ("E com.x;reboot\n", "ERR bad_package"),
-            ('L $(id) all 0\n', "ERR bad_locale"),
-            ("L xx bogus 0\n", "ERR bad_scope"),
-            ("NOPE\n", "ERR unknown_command"),
+        # 第三列不是笔误：`I/L/P/M` 的响应（含错误）走长度前缀帧，`E` 与不认识的命令词
+        # 走行协议。v2.1 之前模块把所有错误都写成裸行，帧读取方会把 `ERR ` 那 4 个字节
+        # 当长度用，报出"响应单帧超过大小上限"，真原因（helper_timeout 之类）整个丢掉
+        # ——AR10.5 用假模块抓到，v2.2 修在模块侧，这条检查就是它的回归。
+        for cmd, code, framed in [
+            ("E ../escape\n", "ERR bad_package", False),
+            ("E com.x;reboot\n", "ERR bad_package", False),
+            ('L $(id) all 0\n', "ERR bad_locale", True),
+            ("L xx bogus 0\n", "ERR bad_scope", True),
+            ("P bad pkg\n", "ERR bad_package", True),
+            ("NOPE\n", "ERR unknown_command", False),
         ]:
-            s.sendall(cmd.encode())
-            got = read_line(s) or ""
-            check(f"非法输入拒绝 {cmd.strip()}", got.startswith(code) and err_code(got) == code.split()[1], got)
+            # 每条一个连接：模块分帧不对时，读到的字节会把后面所有检查一起带偏
+            # （真机 v2.1 上就是这个现象：第一条之后全是乱码，连清单都读不出来）。
+            try:
+                probe = connect()
+                probe.sendall(cmd.encode())
+                got = (read_frame_body(probe) if framed else read_line(probe)) or ""
+            except (OSError, AssertionError) as error:
+                got = f"<连接异常 {type(error).__name__}: {error}>"
+            else:
+                probe.sendall(b"X\n")
+                probe.close()
+            kind = "帧" if framed else "行"
+            check(f"非法输入拒绝（{kind}）{cmd.strip()}",
+                  got.startswith(code) and err_code(got) == code.split()[1], got)
+
+        # 上面每条非法输入都用的是独立连接，这里重新开一条走后面的正常流程
+        s = connect(timeout=90)
 
         # 2 指定 locale：必须有跨语言证据，且不得回声
         def ask(cmd):

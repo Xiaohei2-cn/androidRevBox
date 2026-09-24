@@ -47,6 +47,8 @@ export interface ZygiskStatus {
   zygiskImpl: string | null;
   deviceLocale: string | null;
   subProtocolVersion: number;
+  /** v2 模块在监听但子协议版本对不上（可以与 bridgeReady 同时为真） */
+  moduleIncompatible: boolean;
   probeLatencyMs: number | null;
   detail: string | null;
 }

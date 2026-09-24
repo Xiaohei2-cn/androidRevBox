@@ -3103,6 +3103,234 @@ mod tests {
         manager.disconnect(&serial).await.unwrap();
     }
 
+    /// AR10.4 真机腿：**framework（system_server）软重启后，Agent 不需要人工重连**。
+    ///
+    /// 为什么值得单独立一条腿：Zygisk 模块的 companion 是从 zygote fork 出来的守护进程，
+    /// system_server 一死，zygote 重建、companion 也跟着换人，11501 端口会短暂没人听、
+    /// 甚至换一个新进程重新绑定。这条链路只要有一个"死连接"被留在 Agent 里，用户看到的
+    /// 就是"重启一次手机后应用清单再也不出来了"。
+    ///
+    /// 分两层看，别混成一句话：
+    /// ① **Agent ↔ 模块 companion**（本阶段真正的目标）：全程只用同一个内存会话，
+    ///    断言 Agent 进程 pid 前后不变（软重启没把它带走）、故障窗口内的调用老实报错
+    ///    （不许假成功）、窗口结束后 v2 通道**不需要任何人动手**就自己回来。
+    /// ② **Desktop ↔ Agent 的 adb forward**：软重启有时会连带把 adbd 一起重启（实测两种
+    ///    结果都出现过：一次 17 s 自愈、一次 forward 被打掉报 TransportLost）。这一层不是
+    ///    Zygisk 生命周期，但会让人误以为"①没做到"，所以本腿把它显式量出来：需要几次
+    ///    重连才恢复。当前产品答案是"下一次连接动作（设备页→连接 Agent）恢复"，
+    ///    自动重连没做——这条差异记在 §10，不做到腿里冒充已验证。
+    ///
+    /// 因为会 kill system_server（手机会黑屏重启桌面约 10~30 秒），必须
+    /// `AR104_KILL_SYSTEM_SERVER=yes` 显式授权才跑。
+    #[tokio::test]
+    #[ignore = "会 kill system_server（软重启）；APPLIST_TEST_SERIAL=<serial> AR104_KILL_SYSTEM_SERVER=yes cargo test -p app-reverse-tools real_agent_survives_framework_restart -- --ignored --nocapture"]
+    async fn real_agent_survives_framework_restart() {
+        use agent_protocol::method::{PACKAGE_LIST_LOCALIZED, ZYGISK_STATUS};
+        use agent_protocol::{
+            PackageListLocalizedParams, PackageScope, ZygiskStatusParams, ZygiskStatusResult,
+        };
+        if std::env::var("AR104_KILL_SYSTEM_SERVER").unwrap_or_default() != "yes" {
+            eprintln!(
+                "[跳过] 本腿会 kill system_server 触发 framework 软重启，需要 AR104_KILL_SYSTEM_SERVER=yes 显式授权"
+            );
+            return;
+        }
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = Arc::new(AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        ));
+        manager.connect_resolved(&serial).await.unwrap();
+        let adb_path = runner.environment().await.path.expect("本机应有 adb");
+        let root = {
+            let runner = runner.clone();
+            let serial = serial.clone();
+            move |command: String| {
+                let runner = runner.clone();
+                let adb_path = adb_path.clone();
+                let serial = serial.clone();
+                async move {
+                    let out = runner
+                        .run(
+                            &adb_path,
+                            &adb::build_args(
+                                Some(&serial),
+                                &adb::cmd_shell(&adb::su_wrap(&command)),
+                            ),
+                            Duration::from_secs(20),
+                        )
+                        .await
+                        .unwrap_or_default();
+                    out.stdout.trim().to_string()
+                }
+            }
+        };
+        let first_pid =
+            |text: String| -> String { text.split_whitespace().next().unwrap_or("").to_string() };
+
+        // 每次都用 manager 里**当前**那个 client：软重启可能打掉 adb forward，
+        // 重连之后 client 会被换掉，抓住旧的不放就变成"自己在跟自己说话的假自愈"。
+        let status_once = {
+            let manager = manager.clone();
+            let serial = serial.clone();
+            move || {
+                let manager = manager.clone();
+                let serial = serial.clone();
+                async move {
+                    let client = manager.client(&serial).expect("会话还在连接中");
+                    client
+                        .request::<_, ZygiskStatusResult>(
+                            ZYGISK_STATUS,
+                            &ZygiskStatusParams {},
+                            Duration::from_secs(10),
+                        )
+                        .await
+                }
+            }
+        };
+        let list_once = {
+            let manager = manager.clone();
+            let serial = serial.clone();
+            move || {
+                let manager = manager.clone();
+                let serial = serial.clone();
+                async move {
+                    let client = manager.client(&serial).expect("会话还在连接中");
+                    client
+                        .request::<_, agent_protocol::PackageListLocalizedResult>(
+                            PACKAGE_LIST_LOCALIZED,
+                            &PackageListLocalizedParams {
+                                locale: None,
+                                scope: PackageScope::All,
+                                include_disabled: false,
+                            },
+                            Duration::from_secs(10),
+                        )
+                        .await
+                }
+            }
+        };
+
+        // ── 前置：v2 通道必须本来就是好的，否则"自愈"没有对象 ──
+        let before = status_once().await.expect("起点 zygisk.status 应当答话");
+        if before.sub_protocol_version != 2 || !before.bridge_ready {
+            eprintln!(
+                "[跳过] 起点不在 v2 通道（sub_protocol={} bridge={} lifecycle={:?}），本腿需要已装 applistpro 并已恢复 root 的设备",
+                before.sub_protocol_version, before.bridge_ready, before.lifecycle
+            );
+            manager.disconnect(&serial).await.unwrap();
+            return;
+        }
+        let ss_before = first_pid(root("pidof system_server".into()).await);
+        let agent_before = first_pid(root("pidof app_reverse_tools_agent".into()).await);
+        assert!(!ss_before.is_empty(), "读不到 system_server pid");
+        assert!(
+            !agent_before.is_empty(),
+            "读不到 Agent pid——Agent 没在跑的话本腿没有意义"
+        );
+        eprintln!(
+            "[ar10.4] 起点 system_server={ss_before} agent={agent_before} locale={:?}",
+            before.device_locale
+        );
+
+        // ── 动手：SIGKILL system_server，等同 framework 崩一次 ──
+        let killed = root(format!("kill -9 {ss_before} 2>&1; echo rc=$?")).await;
+        eprintln!("[ar10.4] 已 kill system_server：{killed}");
+
+        let started = std::time::Instant::now();
+        let mut reconnects = 0_u32;
+        let mut saw_outage = false;
+        let mut honest_failure = String::new();
+        let mut recovered = None;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let ss_now = first_pid(root("pidof system_server".into()).await);
+            let list = list_once().await;
+            let st = status_once().await;
+            let el = started.elapsed().as_secs();
+            let tag = match &list {
+                Ok(r) => format!("list=ok({}项)", r.items.len()),
+                Err(e) => {
+                    saw_outage = true;
+                    if honest_failure.is_empty() {
+                        honest_failure = format!("{e:?}");
+                    }
+                    "list=fail".to_string()
+                }
+            };
+            let st_tag = match &st {
+                Ok(s) => format!(
+                    "bridge={} proto={} incompatible={} lifecycle={:?} module={:?} 注册表={}条",
+                    s.bridge_ready,
+                    s.sub_protocol_version,
+                    s.module_incompatible,
+                    s.lifecycle,
+                    s.module_version,
+                    s.module_handlers.len()
+                ),
+                Err(e) => format!("status=fail({e:?})"),
+            };
+            eprintln!("[ar10.4] +{el}s system_server={ss_now} {tag} {st_tag}");
+            // 第②层：会话的传输被软重启打掉时，做一次重连（等价于用户点一次
+            // "连接 Agent"），然后继续按①的判据观察。重连次数会被打进结论。
+            if format!("{st:?}").contains("TransportLost")
+                || format!("{list:?}").contains("TransportLost")
+            {
+                eprintln!("[ar10.4] +{el}s 传输被打掉（adbd 随 framework 一起重启），做一次重连");
+                reconnects += 1;
+                manager
+                    .connect_resolved(&serial)
+                    .await
+                    .expect("软重启后重新连接 Agent 失败");
+            }
+            let fresh_framework = !ss_now.is_empty() && ss_now != ss_before;
+            if fresh_framework
+                && let Ok(s) = &st
+                && s.bridge_ready
+                && s.sub_protocol_version == 2
+                && matches!(&list, Ok(r) if !r.items.is_empty())
+            {
+                recovered = Some((el, ss_now, list.unwrap().items.len()));
+                break;
+            }
+        }
+        let (took, ss_after, n_pkgs) = recovered.expect(
+            "kill system_server 后 120 秒内 v2 通道没有自愈：AR10.4 的\"进程重启重连\"没做到",
+        );
+        let agent_after = first_pid(root("pidof app_reverse_tools_agent".into()).await);
+        eprintln!(
+            "[ar10.4] 自愈用时 {took}s；Agent pid {agent_before} -> {agent_after}（不该变）；清单 {n_pkgs} 项；桌面侧重连次数={reconnects}"
+        );
+        assert_eq!(
+            agent_after, agent_before,
+            "Agent 进程被 framework 重启带走了：说明拉起方式不抗软重启"
+        );
+        assert_ne!(
+            ss_after, ss_before,
+            "system_server 没换 pid，说明这次 kill 没生效"
+        );
+        // 故障窗口里如果确实失败过，报错口径必须老实（不能是空清单这种假成功）
+        if saw_outage {
+            eprintln!("[ar10.4] 窗口内首个失败样本：{honest_failure}");
+            assert!(
+                !honest_failure.is_empty(),
+                "标记了失败却没有样本，本腿的判据需要重写"
+            );
+        } else {
+            eprintln!("[ar10.4] 未观察到故障窗口（companion 换人比 Agent 重试更快），只记为未覆盖");
+        }
+        // 注意：`su_wrap` 用单引号包裹整条命令，命令串里再出现单引号会被当场拒掉
+        // （本腿第一版就栽在这里，见 INTEGRATION.md 第 9 节），所以只用双引号。
+        let scene = root("echo -n companion=; ps -A -o NAME | grep -c companion64; echo -n token_mtime=; stat -c %y /data/adb/modules/applistpro/token".into()).await;
+        eprintln!("[ar10.4] 收尾现场：{scene}");
+        manager.disconnect(&serial).await.unwrap();
+        eprintln!(
+            "[ar10.4] 通过：Agent↔模块通道自愈（0 人工干预）；桌面↔Agent 传输层重连次数={reconnects}"
+        );
+    }
+
     /// AR9.1 前置真机腿：root 探测改由 Agent 执行后，结论必须与 Legacy `su -c id`
     /// 一致，而且要把「su 可用」与「Agent 自身有 root」分开带回——UI 之前把这两件事
     /// 混成一个绿色徽章，正是 D026 那批 `root=true` 支路必须留在 Legacy 的原因。

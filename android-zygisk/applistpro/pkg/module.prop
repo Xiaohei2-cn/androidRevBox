@@ -1,6 +1,6 @@
 id=applistpro
 name=ApplistPro Zygisk (v2 基线)
-version=v2.1
-versionCode=3
+version=v2.2
+versionCode=4
 author=citec
-description=Zygisk companion v2: 令牌鉴权 + 指定 locale 应用清单 + 分包导出 + 按包查询（自有模块，不复用 demo 协议）
+description=Zygisk companion v2: 令牌鉴权 + 指定 locale 应用清单 + 分包导出 + 按包查询 + 错误按帧返回（自有模块，不复用 demo 协议）

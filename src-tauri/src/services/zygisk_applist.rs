@@ -103,6 +103,9 @@ pub struct ZygiskStatus {
     pub zygisk_impl: Option<String>,
     pub device_locale: Option<String>,
     pub sub_protocol_version: u32,
+    /// v2 模块在监听但子协议版本对不上（AR10.5）。可以与 `bridgeReady` 同时为真：
+    /// 当前在用的通道（可能是 v1）确实通，但你装的那个 v2 模块本端说不了。
+    pub module_incompatible: bool,
     pub probe_latency_ms: Option<u64>,
     /// 模块自描述的 handler 注册表（AR10.2）。这里过一层 camelCase 映射，
     /// 是因为界面对象一直是本文件的模型，不该看见设备私有协议的字段命名。
@@ -226,6 +229,7 @@ impl ZygiskApplistService {
             zygisk_impl: result.zygisk_impl,
             device_locale: result.device_locale,
             sub_protocol_version: result.sub_protocol_version,
+            module_incompatible: result.module_incompatible,
             probe_latency_ms: result.probe_latency_ms,
             module_handlers: result
                 .module_handlers
@@ -1016,7 +1020,7 @@ mod tests {
 
         let status = service.status(&serial).await.unwrap();
         eprintln!(
-            "[zygisk.status] lifecycle={} bridge={} root={} module={} impl={} locale={} latency={:?}ms",
+            "[zygisk.status] lifecycle={} bridge={} root={} module={} impl={} locale={} latency={:?}ms incompatible={}",
             status.lifecycle,
             status.bridge_ready,
             status.root_available,
@@ -1027,6 +1031,7 @@ mod tests {
             status.zygisk_impl.clone().unwrap_or_default(),
             status.device_locale.clone().unwrap_or_default(),
             status.probe_latency_ms,
+            status.module_incompatible,
         );
         assert!(status.bridge_ready, "bridge 未就绪: {:?}", status.detail);
         assert_eq!(status.lifecycle, "bridge_ready");
@@ -1612,6 +1617,252 @@ mod tests {
         assert_eq!(report.app_label, described.label);
     }
 
+    /// AR10.5 真机故障注入腿：模块以各种坏方式应答时，状态必须说真话、也不能挂死。
+    ///
+    /// 注入端是 `android-zygisk/applistpro/tools/fake_v2_handshake.py`（配合 `adb reverse`
+    /// 把设备 11501 引到电脑上）。跑法见该工具文件头与 INTEGRATION.md 的"故障注入验证"一节。
+    ///
+    /// 每加一种注入模式，都要在这里补一条断言：这条腿的价值就在于"界面上那句原因是真的"，
+    /// 而不是"跑通了"。
+    ///
+    /// 为什么要专门一条腿：AR10.5 之前这些状态是**纸面存在**的——枚举里有
+    /// `incompatible`，但探测路径把握手失败一律当成"读不到令牌"，界面上永远显示
+    /// "就绪"；用户手里的模块明明版本对不上，却被告知一切正常。
+    #[tokio::test]
+    #[ignore = "需要真机 + 假模块注入；AR105_FAULT=proto3|garbage|close|slow|nocap|errframe|errline|disabled|helpermissing APPLIST_TEST_SERIAL=<serial> [AR105_MUTATE_MODULE=yes] cargo test -p app-reverse-tools real_agent_zygisk_fault -- --ignored --nocapture"]
+    async fn real_agent_zygisk_fault_modes_are_reported_honestly() {
+        use crate::services::device_service::RealAdbRunner;
+
+        let fault = std::env::var("AR105_FAULT").unwrap_or_default();
+        let serial = std::env::var("APPLIST_TEST_SERIAL").unwrap_or_default();
+        if fault.is_empty() || serial.is_empty() {
+            eprintln!(
+                "[跳过] 本腿需要 AR105_FAULT=<模式> + APPLIST_TEST_SERIAL，且假模块已在电脑上监听"
+            );
+            return;
+        }
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(Arc::new(
+            crate::services::config_service::ConfigService::new(Arc::new(
+                crate::db::Db::in_memory().unwrap(),
+            )),
+        )));
+        let (android, agent) = router_with_agent(runner.clone());
+        let service = ZygiskApplistService::new(android, runner.clone());
+
+        // helpermissing 模式：临时把模块目录里的 helper.dex 改名，让 Agent 的 root 探测
+        // 读到"文件不在"（不需要重启手机——探测每次都重读磁盘）。这一步必须发生在连接
+        // Agent **之前**：连接会重启 Agent 并做一次全新探测，缓存里的旧结论会把现场抹掉。
+        let dex = "/data/adb/modules/applistpro/helper.dex";
+        let mutate = fault == "helpermissing";
+        if mutate && std::env::var("AR105_MUTATE_MODULE").unwrap_or_default() != "yes" {
+            eprintln!(
+                "[跳过] helpermissing 模式会临时改名 helper.dex，需要 AR105_MUTATE_MODULE=yes"
+            );
+            return;
+        }
+        let adb_path = runner
+            .environment()
+            .await
+            .path
+            .expect("本机应有 adb")
+            .to_string();
+        let root = |command: String| {
+            let runner = runner.clone();
+            let adb_path = adb_path.clone();
+            let serial = serial.clone();
+            async move {
+                let out = runner
+                    .run(
+                        &adb_path,
+                        &crate::adapters::adb::build_args(
+                            Some(&serial),
+                            &crate::adapters::adb::cmd_shell(&crate::adapters::adb::su_wrap(
+                                &command,
+                            )),
+                        ),
+                        std::time::Duration::from_secs(20),
+                    )
+                    .await
+                    .unwrap_or_default();
+                out.stdout.trim().to_string()
+            }
+        };
+        if mutate {
+            // 先自愈上一次可能留下的残留，再动手
+            root(format!(
+                "if [ -f {dex}.off ] && [ ! -f {dex} ]; then mv {dex}.off {dex}; fi"
+            ))
+            .await;
+            root(format!("mv {dex} {dex}.off")).await;
+        }
+        agent
+            .connect_resolved(&serial)
+            .await
+            .expect("Agent 安装/连接失败（注入实验要求 Agent 在跑）");
+
+        let started = std::time::Instant::now();
+        let status = service
+            .status(&serial)
+            .await
+            .expect("zygisk.status 本身不该因为模块坏了就失败");
+        // **先还原再断言**：断言失败也不能把设备留在缺文件的状态里
+        if mutate {
+            root(format!(
+                "mv {dex}.off {dex} 2>/dev/null; chmod 644 {dex} 2>/dev/null; ls {dex}.off 2>/dev/null | wc -l"
+            ))
+            .await;
+            let leftover = root(format!("ls {dex}.off 2>/dev/null | wc -l")).await;
+            assert_eq!(leftover.trim(), "0", "helper.dex 没还原干净，必须人工检查");
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "[ar10.5:{fault}] lifecycle={} bridge={} incompatible={} 用时={}ms detail={:?}",
+            status.lifecycle,
+            status.bridge_ready,
+            status.module_incompatible,
+            elapsed.as_millis(),
+            status.detail
+        );
+
+        // 现场信息先摊开：`module_version` 来自模块目录里的 module.prop（真模块），
+        // 而握手应答里的版本只在 detail 里——两者不一致本身就说明"注入的是应答，
+        // 不是磁盘上的模块"，这是这条腿读结果时最容易搞混的地方。
+        eprintln!(
+            "[ar10.5:{fault}] 磁盘模块={:?} handler 注册表={} 条（真模块在线时该非空）",
+            status.module_version,
+            status.module_handlers.len()
+        );
+
+        let detail = status.detail.clone().unwrap_or_default();
+        match fault.as_str() {
+            // 版本比本端新：必须被认成"不兼容"，不能报"就绪"，也不能推给"读不到令牌"
+            "proto3" => {
+                assert!(status.module_incompatible, "版本不兼容必须被标出来");
+                assert!(
+                    !detail.contains("令牌"),
+                    "不兼容时不该扯令牌，那会把人引去授权而不是换模块: {detail}"
+                );
+                if !status.bridge_ready {
+                    assert_eq!(status.lifecycle, "incompatible", "{:?}", status.lifecycle);
+                } else {
+                    assert!(
+                        detail.contains("退回 v1") && detail.contains("locale"),
+                        "版本不兼容却还有 v1 在跑时，界面必须同时知道这两件事: {detail}"
+                    );
+                }
+            }
+            // 应答根本不是协议（模块被换坏 / 端口被别的程序占了）/ 连上就断
+            //
+            // 这里**不能**要求 bridge_ready=false：v1 demo 模块还活着的时候，"有条通道能用"
+            // 就是真话（清单确实出得来）。要紧的是另一件事——只要退到了 v1，就必须把
+            // "指定 locale 不可用"说出口，否则界面绿着却给了错口径的数据。
+            "garbage" | "close" => {
+                let expect = if fault == "garbage" {
+                    "应答异常"
+                } else {
+                    "无应答"
+                };
+                assert!(
+                    detail.contains(expect),
+                    "v2 的故障形状要说清（期望「{expect}」）: {detail}"
+                );
+                assert!(
+                    !detail.contains("令牌"),
+                    "没道理把格式问题说成令牌问题: {detail}"
+                );
+                if status.bridge_ready {
+                    assert!(
+                        detail.contains("退回 v1") && detail.contains("locale"),
+                        "既然还在用 v1 通道，就必须说明它的口径差异: {detail}"
+                    );
+                }
+            }
+            // 迟迟不回：探测总预算必须兜住，不能把调用方拖死
+            "slow" => {
+                assert!(
+                    elapsed < std::time::Duration::from_secs(30),
+                    "status 被慢模块拖到 {:?}，预算没起作用",
+                    elapsed
+                );
+                assert!(detail.contains("超时"), "慢模块要说成超时: {detail}");
+                if status.bridge_ready {
+                    assert!(detail.contains("退回 v1"), "退到 v1 要说明: {detail}");
+                }
+            }
+            // 合法握手但不宣告任何能力：旧模块 + 新 Desktop 的日常组合
+            "nocap" => {
+                assert!(status.bridge_ready, "握手是好的，通道算可用");
+                assert!(!status.module_incompatible);
+                let error = service
+                    .list(&serial, None, LocalizedScope::All, false)
+                    .await
+                    .expect_err("模块没宣告 list 能力时必须显式失败，不能静默换成 pm 结果");
+                let text = error.to_string();
+                eprintln!("[ar10.5:nocap] 清单被拒: {text}");
+                assert!(
+                    text.contains("list") || text.contains("能力") || text.contains("capability"),
+                    "报错要指到缺的那条能力: {text}"
+                );
+            }
+            // 真模块被禁用（不注入假服务）：状态要说清"是禁用"，恢复动作是启用+重启
+            "disabled" => {
+                assert!(
+                    detail.contains("禁用"),
+                    "被禁用时不能只说未安装/未监听，那会把人支去重装: {detail}"
+                );
+                assert!(!status.module_incompatible, "禁用与版本不兼容是两件事");
+            }
+            // 模块 helper 失败时，`ERR helper_timeout` 这句话到底送不送得到调用方嘴里。
+            // errframe = v2.2 模块（错误装进帧）；errline = v2.1 及更早的写法（裸文本行）。
+            // 两种都必须报出 helper_timeout：v2.1 那条以前只会说"响应单帧超过大小上限"，
+            // 因为帧读取把 `ERR ` 这 4 个 ASCII 字节当成了 1.16 GB 的长度。
+            "errframe" | "errline" => {
+                // 这两种模式下握手与能力宣告都是**好的**，探测说"就绪"是真话；坏的是随后
+                // 那条命令。所以这里不断言 bridge_ready=false，而是要求命令失败时，
+                // 模块给的原因原话必须送到调用方嘴里。
+                let error = service
+                    .list(&serial, None, LocalizedScope::All, false)
+                    .await
+                    .expect_err("模块 helper 失败时清单必须显式失败");
+                let text = error.to_string();
+                eprintln!("[ar10.5:{fault}] 清单错误原文: {text}");
+                assert!(
+                    !text.contains("大小上限"),
+                    "不许再用\"帧太大\"盖掉模块给的真原因: {text}"
+                );
+                assert!(
+                    text.contains("helper_timeout"),
+                    "模块说的 helper_timeout 必须原样送到调用方: {text}"
+                );
+                if fault == "errframe" {
+                    assert!(
+                        !text.contains("未分帧"),
+                        "新模块按帧回错误，不该再提分帧不一致: {text}"
+                    );
+                } else {
+                    assert!(
+                        text.contains("未分帧"),
+                        "旧模块的回包要顺带说明该升级模块了: {text}"
+                    );
+                }
+            }
+            // 开机时就没带 helper.dex 的现场（真机跑过一次重启实验，这里把它做成
+            // 免重启的常驻腿：Agent 的 root 探测读的是磁盘文件，改名后下一次探测就看得见）
+            "helpermissing" => {
+                assert!(
+                    detail.contains("helper.dex 缺失"),
+                    "helper.dex 不在时必须说破，否则界面是一片绿而条条命令失败: {detail}"
+                );
+                assert!(
+                    detail.contains("重装模块 zip"),
+                    "要给出可执行的恢复动作: {detail}"
+                );
+                assert!(!status.module_incompatible, "缺文件与版本不兼容是两件事");
+            }
+            other => panic!("未知注入模式 {other}"),
+        }
+    }
+
     /// AR5.6 / D021 第三腿：模块装着、v2 bridge 在监听，但 **adb shell 被撤销 root 授权**
     /// （KernelSU 里把 Shell 设为不允许），于是 Agent 读不到令牌。
     ///
@@ -1819,11 +2070,14 @@ mod tests {
             sub_protocol_version: 1,
             probe_latency_ms: Some(6),
             module_handlers: Vec::new(),
+            module_incompatible: false,
             detail: Some("模块有新版本待重启加载".into()),
         };
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["lifecycle"], "installed_reboot_required");
         assert_eq!(value["bridgeReady"], true);
+        // 不兼容标记是"两个事实并存"的那一种：ready=true 同时 incompatible 也要能表达
+        assert_eq!(value["moduleIncompatible"], false);
         assert_eq!(value["agentConnected"], true);
         assert_eq!(value["subProtocolVersion"], 1);
     }
