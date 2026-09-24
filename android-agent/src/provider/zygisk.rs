@@ -291,7 +291,17 @@ struct ModuleFacts {
 struct RootFacts {
     pro: ModuleFacts,
     demo: ModuleFacts,
+    /// 已知的 Zygisk 实现**运行时目录**存在（`/data/adb/zygisksu` 等）。
+    /// 它只能证明"这台机器装过某种 Zygisk 实现"，**证明不了它现在开着**——
+    /// AR10.5 最后那一格就是把这个字段当结论，于是整机 Zygisk 被关掉时判成了 `loaded`。
     zygisk_impl: Option<String>,
+    /// Zygisk 实现本身通常也是一个模块（本机是 Zygisk Next 的 `zygisksu`）。
+    zygisk_impl_module: Option<String>,
+    /// 那个实现模块带着 `disable` 标记：整机 Zygisk 这一轮启动就没开。
+    zygisk_impl_disabled_module: Option<String>,
+    /// 实时证据：有没有 Zygisk 的守护/伴生进程。`None` = `ps` 没给出可判读的结果；
+    /// 未知不等于"没在跑"（这条纪律与桌面端的 `probe_pending` 同源）。
+    zygisk_daemon_running: Option<bool>,
 }
 
 /// 令牌是敏感物：只缓存在内存里，绝不进 Probe/日志/错误信息。
@@ -1904,6 +1914,16 @@ const ROOT_PROBE_SCRIPT: &str = concat!(
     " done;",
     "for d in /data/adb/zygisksu /data/adb/zygisk /data/adb/ap/zygisk /data/adb/kzygisk; do",
     " if [ -e \"$d\" ]; then echo \"ZYGIMPL=$(basename \"$d\")\"; fi; done;",
+    // Zygisk 实现自己也是个模块：它被禁用 == 整机 Zygisk 关着（等价于 KernelSU 里的总开关）。
+    // 只列已知的实现模块名；认不出来的实现交给下面"没有守护进程 + 端口无人监听"这条实时证据。
+    "for i in zygisksu zygisk-next zygisknext ZygiskNext; do",
+    " if [ -d \"/data/adb/modules/$i\" ]; then echo \"ZYGIMPLMOD $i\";",
+    "  if [ -f \"/data/adb/modules/$i/disable\" ]; then echo \"ZYGIMPL_OFF $i\"; fi; fi; done;",
+    // 实时证据：Zygisk Next 会有 zygiskd64 与每个模块各自的 zn-zygisk-companion 进程。
+    // ps 拿不到内容时**什么都不报**（未知），别把"看不见"写成"没在跑"。
+    "COMMS=$(ps -A -o COMM= 2>/dev/null);",
+    "if [ -n \"$COMMS\" ]; then case \"$COMMS\" in",
+    " *zygiskd*|*zn-zygisk*) echo ZYGRUN=1;; *) echo ZYGRUN=0;; esac; fi;",
     "echo PROBE_DONE=1",
 );
 
@@ -1975,6 +1995,21 @@ fn classify_root_output(text: &str) -> RootFacts {
                 {
                     facts.zygisk_impl = Some(value.to_owned());
                 }
+                for (prefix, field) in [
+                    ("ZYGIMPLMOD ", &mut facts.zygisk_impl_module),
+                    ("ZYGIMPL_OFF ", &mut facts.zygisk_impl_disabled_module),
+                ] {
+                    if let Some(value) = line.strip_prefix(prefix).filter(|v| !v.is_empty())
+                        && field.is_none()
+                    {
+                        *field = Some(value.to_owned());
+                    }
+                }
+                match line {
+                    "ZYGRUN=1" => facts.zygisk_daemon_running = Some(true),
+                    "ZYGRUN=0" => facts.zygisk_daemon_running = Some(false),
+                    _ => {}
+                }
             }
         }
     }
@@ -1988,6 +2023,29 @@ fn push_detail_hint(detail: &mut Option<String>, hint: &str) {
         Some(existing) => format!("{hint}；{existing}"),
         None => hint.to_owned(),
     });
+}
+
+impl RootFacts {
+    /// "整机 Zygisk 没在跑"的确凿证据。返回一句**带恢复动作**的话；证据不足时 None，
+    /// 让调用方退回原来的推断口径——绝不在没证据时说"被禁用"。
+    fn zygisk_impl_off_evidence(&self) -> Option<String> {
+        if let Some(name) = self.zygisk_impl_disabled_module.as_deref() {
+            return Some(format!(
+                "Zygisk 实现模块 {name} 当前被禁用：整机 Zygisk 没有运行，在 KernelSU/Magisk 里重新启用它（或打开 Zygisk 总开关）后重启才会生效，不需要重装 applistpro"
+            ));
+        }
+        // 只有**认得**这个实现时才敢用"看不见守护进程"这条负证据：Magisk/KernelSU 自带的
+        // Zygisk 本来就跑在 zygote 里、没有独立进程，那边 ZYGRUN=0 是正常的，
+        // 拿它说"整机 Zygisk 没开"就是一句假话。
+        if let Some(name) = self.zygisk_impl_module.as_deref()
+            && self.zygisk_daemon_running == Some(false)
+        {
+            return Some(format!(
+                "看不到 Zygisk 的守护进程（实现模块 {name} 装着）：整机 Zygisk 这一轮启动没开，在 KernelSU/Magisk 里启用 Zygisk 后重启，不需要重装 applistpro"
+            ));
+        }
+        None
+    }
 }
 
 /// 生命周期判定：先由「实际探测到的通道」决定，再用 root 事实细化原因。
@@ -2078,13 +2136,28 @@ fn classify_lifecycle(
                     Some("applistpro/applist 均未安装，需要推送并安装模块 ZIP".to_owned()),
                 );
             }
-            if facts.pro.disabled_marker
-                || facts.demo.disabled_marker
-                || facts.zygisk_impl.is_none()
-            {
+            // 整机 Zygisk 没跑（实现模块被禁用，或实现模块装着却看不到它的进程）。
+            // 这一档必须单独说：恢复动作是"启用 Zygisk 再重启"，不是"重装我们的模块"，
+            // 混成一句会让人白装一次 ZIP 还是连不上。（AR10.5 最后一格的真机现场）
+            if let Some(off) = facts.zygisk_impl_off_evidence() {
+                return (ZygiskLifecycle::ZygiskDisabled, Some(off));
+            }
+            if facts.pro.disabled_marker || facts.demo.disabled_marker {
                 return (
                     ZygiskLifecycle::ZygiskDisabled,
-                    Some("模块或 Zygisk 实现被禁用（检查 KernelSU/Magisk 的 Zygisk 开关与模块 enable）".to_owned()),
+                    Some(
+                        "模块被禁用：在 KernelSU/Magisk 里启用后重启才会生效（不需要重装）"
+                            .to_owned(),
+                    ),
+                );
+            }
+            if facts.zygisk_impl.is_none() {
+                return (
+                    ZygiskLifecycle::ZygiskDisabled,
+                    Some(
+                        "没探测到已知的 Zygisk 实现（可能被全局关闭，也可能是本工具还没认出的实现）：先确认 KernelSU/Magisk 的 Zygisk 开关"
+                            .to_owned(),
+                    ),
                 );
             }
             if facts.pro.pending_update || facts.demo.pending_update {
@@ -2376,6 +2449,54 @@ mod tests {
         assert_eq!(facts.demo.version.as_deref(), Some("v1.0"));
         assert_eq!(facts.demo.version_code, Some(1));
         assert_eq!(facts.zygisk_impl.as_deref(), Some("zygisksu"));
+    }
+
+    /// 整机 Zygisk 被关闭的现场（把提供 Zygisk 的模块禁用后重启）。fixture 用真机采集的
+    /// 探测输出原文，别手写"理想形状"——AR5 那条"目录探测只能证明装过"的偏差就是这么来的。
+    const ZYGISK_IMPL_OFF_SAMPLE: &str = concat!(
+        // 真机采集（module.prop 那两段与版本无关，这里省掉）
+        "ROOT=1\n",
+        "INSTALLED applistpro\n",
+        "INSTALLED applist\n",
+        "ZYGIMPL=zygisksu\n",
+        "ZYGIMPLMOD zygisksu\n",
+        "ZYGIMPL_OFF zygisksu\n",
+        "ZYGRUN=0\n",
+        "PROBE_DONE=1\n",
+    );
+
+    #[test]
+    fn whole_device_zygisk_off_says_so_instead_of_blaming_the_module() {
+        let facts = classify_root_output(ZYGISK_IMPL_OFF_SAMPLE);
+        let (lifecycle, detail) = classify_lifecycle(Variant::Absent, Some(&facts), false, None);
+        assert_eq!(lifecycle, ZygiskLifecycle::ZygiskDisabled);
+        let detail = detail.unwrap();
+        assert!(detail.contains("禁用"), "要说出是禁用: {detail}");
+        assert!(detail.contains("重启"), "恢复动作必须包含重启: {detail}");
+        assert!(
+            !detail.contains("推送并安装") && !detail.contains("重装模块 zip"),
+            "整机 Zygisk 关着时不该把人支去重装我们的模块: {detail}",
+        );
+
+        // 实现模块不在已知名单里，但有"没有守护进程"这条实时证据：仍然说得出"没在跑"
+        let mut daemon_only = facts.clone();
+        daemon_only.zygisk_impl_disabled_module = None;
+        let (lifecycle, detail) =
+            classify_lifecycle(Variant::Absent, Some(&daemon_only), false, None);
+        assert_eq!(lifecycle, ZygiskLifecycle::ZygiskDisabled);
+        assert!(detail.unwrap().contains("守护进程"));
+
+        // 反过来：证据不足时**不许**编出"被禁用"。目录装着、没有 disable 标记、
+        // ps 又读不到内容（未知）——只能老实说"模块已安装但 bridge 未监听"。
+        let mut unknown = facts.clone();
+        unknown.zygisk_impl_disabled_module = None;
+        unknown.zygisk_impl_module = None;
+        unknown.zygisk_daemon_running = None;
+        assert_eq!(
+            classify_lifecycle(Variant::Absent, Some(&unknown), false, None).0,
+            ZygiskLifecycle::Loaded,
+            "未知不等于没在跑"
+        );
     }
 
     #[test]

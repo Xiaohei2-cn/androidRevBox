@@ -216,7 +216,11 @@ adb reboot                                              # 唯一需要离手的 
      都跑过，界面上那句"当前被禁用…启用后重启才会生效（不需要重装）"就是这段现场。
   2. ✅ **已实机走过**：`adb shell su -c 'rm -rf /data/adb/modules/applistpro'` + 重启
      （或用管理器删除模块）。下次开机就没有这个模块，其它模块不受影响。
-  3. ⚠️ **未在本机验证**：万一某次改动真的让 zygote 起不来，KernelSU 的"安全模式"
+  3. ✅ **已实机走过**：连"整个 Zygisk 关掉"也回得来——把**提供 Zygisk 的那个模块**
+     （本机是 Zygisk Next，目录名 `zygisksu`）禁用后重启，系统照常开机，Agent 与全部
+     普通能力照常可用，只有 `zygisk.*` 与本地化清单显式不可用；删掉那个 `disable`
+     再重启，companion 全部回来（2026-09-24 走完一整个来回）。见第 8 节最后一档。
+  4. ⚠️ **未在本机验证**：万一某次改动真的让 zygote 起不来，KernelSU 的"安全模式"
      （开机时按音量下）会跳过模块注入，进系统后再把模块目录删掉。这条只按上游文档写在这里，
      我们**没有**制造过需要它的故障——本模块的开机路径不加载 dex、不注入 init 阶段，
      `preAppSpecialize` 里立刻 `DLCLOSE_MODULE_LIBRARY`，所以它坏起来影响不到启动。
@@ -249,6 +253,32 @@ adb shell su -c 'ksud module remove applistpro'    # 或 KernelSU 管理器里�
 `real_agent_zygisk_fault_modes_are_reported_honestly`（`AR105_FAULT=disabled`），
 恢复路径是 `rm disable` + 重启，重启后同一批常规腿全绿（这条也真跑过一遍）。
 
+**还有一档更容易被说错：整个 Zygisk 被关掉了**（AR10.5 清单里最后一格，2026-09-24 真机）。
+这时我们的模块**装着、也启用着**，坏的是它脚下那一层，所以"启用 applistpro"和"重装 ZIP"
+都是错的动作。判据不能只看目录——实测把 Zygisk Next 禁用重启之后
+`/data/adb/zygisksu` 这个目录**还在**，而 companion 进程与 11500/11501 监听一个都不剩：
+
+```
+ZYGIMPL=zygisksu          # 运行时目录还在：只信它就得出"实现还在"，于是判成 loaded
+ZYGIMPLMOD zygisksu       # 实现模块目录（只列认得出来的实现名）
+ZYGIMPL_OFF zygisksu      # 它带着 disable 标记 -> 整机 Zygisk 这一轮启动没开（确凿证据）
+ZYGRUN=0                  # 实时证据：一个 zygiskd / zn-zygisk-companion 进程都没有
+```
+
+界面上说的是（137 ms 返回，不挂不超时）：
+
+```
+Zygisk 实现模块 zygisksu 当前被禁用：整机 Zygisk 没有运行，在 KernelSU/Magisk 里
+重新启用它（或打开 Zygisk 总开关）后重启才会生效，不需要重装 applistpro
+```
+
+两条负证据的使用边界写死在代码里，因为**误判的代价是把人支到错的地方**：
+认不出来的实现不许用"看不见进程"下结论（Magisk / KernelSU 自带的 Zygisk 跑在 zygote
+里，本来就没有独立进程，那边 `ZYGRUN=0` 是正常现象）；`ps` 读不到内容时什么都不报，
+未知不等于没在跑。固定这句话的腿是同一批里的 `AR105_FAULT=impldisabled`，它同时钉住
+另外两件事：本地化清单**显式被拒**（不静默换成 pm 结果），而普通 `package.list` 照常
+354 项——"禁用 Zygisk 时 Agent 仍可用"这条完成条件就是在这两个断言上成立的。
+
 ## 9. 我们真踩过的坑（都在提交记录里有对应修复）
 
 - 判"文件/进程在不在"要问内核（`test -x`、`pm list packages` 精确等值），
@@ -266,6 +296,13 @@ adb shell su -c 'ksud module remove applistpro'    # 或 KernelSU 管理器里�
 - 断言"某个状态不可达"之前先想清楚它是不是**同时成立的两件事**：`bridge_ready` 与
   `module_incompatible` 可以都是真的（v2 不兼容、v1 还在服务），把它们塞进一个枚举值
   里就会造出一个永远进不去的死状态（`ZygiskLifecycle::Incompatible` 曾经就是这样）。
+- **"目录在"不等于"东西在跑"**：`/data/adb/zygisksu` 在 Zygisk Next 被禁用重启后仍然留着，
+  拿它当"Zygisk 可用"的证据，整机 Zygisk 关着时就会报 `loaded`（看起来像模块自己坏了）。
+  要判启用状态，得看那个实现模块的 `disable` 标记，以及它有没有进程。
+- 真机腿**必须串行跑**（`--test-threads=1`，回归脚本里已经这么写了）。两条腿同时拉起
+  Agent 时，后起的那个 `Address already in use` 直接退出，而客户端拿着新令牌去敲还活着的
+  旧进程，症状是 `agent authentication failed`——长得像鉴权回归，其实是自己踩自己。
+  现场要是被上一次跑崩的 Agent 占住了，`pkill -f app_reverse_tools_agent` 就清得干净。
 - 腿里给设备下发 root 命令时，命令串里**不要出现单引号**（`adb::su_wrap` 用单引号包裹，
   第一次跑 AR10.4 腿就是在收尾那句 `tr -s ' '` 上炸的，前面的断言全过了却记成失败）。
 
@@ -298,6 +335,11 @@ adb -s $S reboot                                                 # 真 companion
 | `errframe` | 命令错误按 v2.2 约定发帧 | "v2 模块返回 helper_timeout"——模块说什么我们传什么 |
 | `disabled` | 不注入：`touch disable` + 重启 | detail 第一句就是"当前被禁用…启用后重启才会生效（不需要重装）" |
 | `helpermissing` | 不注入：临时改名 `helper.dex`（需 `AR105_MUTATE_MODULE=yes`） | "helper.dex 缺失：握手与注册表正常，但清单/导出/按包查询都会失败，重装模块 zip 后重启即可恢复（不是刷机）" |
+| `impldisabled` | 不注入：`touch /data/adb/modules/zygisksu/disable` + 重启 = 整机 Zygisk 关闭 | `lifecycle=zygisk_disabled`；点名实现模块并明说"不需要重装 applistpro"；本地化清单被拒、普通包列表照常 |
+
+`disabled` 与 `impldisabled` 两档都要重启手机，动手前先确认有这段窗口；`impldisabled`
+会让这台机上**所有** Zygisk 模块一起停摆（本机还挂着 LSPosed / Shamiko / PlayIntegrityFix），
+验完记得 `rm disable` + 重启请回来。
 
 跑这批必须知道的三件事（都是踩出来的）：
 

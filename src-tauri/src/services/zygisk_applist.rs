@@ -1629,7 +1629,7 @@ mod tests {
     /// `incompatible`，但探测路径把握手失败一律当成"读不到令牌"，界面上永远显示
     /// "就绪"；用户手里的模块明明版本对不上，却被告知一切正常。
     #[tokio::test]
-    #[ignore = "需要真机 + 假模块注入；AR105_FAULT=proto3|garbage|close|slow|nocap|errframe|errline|disabled|helpermissing APPLIST_TEST_SERIAL=<serial> [AR105_MUTATE_MODULE=yes] cargo test -p app-reverse-tools real_agent_zygisk_fault -- --ignored --nocapture"]
+    #[ignore = "需要真机 + 假模块注入；AR105_FAULT=proto3|garbage|close|slow|nocap|errframe|errline|disabled|helpermissing|impldisabled APPLIST_TEST_SERIAL=<serial> [AR105_MUTATE_MODULE=yes] cargo test -p app-reverse-tools real_agent_zygisk_fault -- --ignored --nocapture"]
     async fn real_agent_zygisk_fault_modes_are_reported_honestly() {
         use crate::services::device_service::RealAdbRunner;
 
@@ -1858,6 +1858,64 @@ mod tests {
                     "要给出可执行的恢复动作: {detail}"
                 );
                 assert!(!status.module_incompatible, "缺文件与版本不兼容是两件事");
+            }
+            // 整机 Zygisk 被关闭（把提供 Zygisk 的那个模块禁用后重启）。与上面 `disabled`
+            // 的区别是恢复动作：那一档是"启用我们的模块"，这一档是"启用 Zygisk"，
+            // 说错一句，用户会去重装 ZIP 而问题一点没变。（AR10.5 清单里最后那一格）
+            "impldisabled" => {
+                if status.bridge_ready {
+                    eprintln!(
+                        "[跳过] 本机 Zygisk 通道还在，说明没进入「整机 Zygisk 关闭」现场；\
+                         先 su -c 'touch /data/adb/modules/zygisksu/disable' && reboot 再跑本腿"
+                    );
+                    return;
+                }
+                assert_eq!(
+                    status.lifecycle, "zygisk_disabled",
+                    "整机 Zygisk 没跑时必须落在 zygisk_disabled，别的档位都是误导: {:?}",
+                    status.lifecycle
+                );
+                assert!(
+                    !status.module_incompatible,
+                    "Zygisk 关着与版本不兼容是两件事"
+                );
+                assert!(
+                    detail.contains("Zygisk"),
+                    "要点名 Zygisk 这一层，而不是含糊说 bridge 没监听: {detail}"
+                );
+                assert!(
+                    detail.contains("禁用") || detail.contains("没在跑"),
+                    "要说清是「没开」而不是「没装」: {detail}"
+                );
+                assert!(detail.contains("重启"), "恢复动作必须包含重启: {detail}");
+                assert!(
+                    !detail.contains("重装模块 zip") && !detail.contains("推送并安装"),
+                    "整机 Zygisk 关着时把人支去重装模块是错的方向: {detail}"
+                );
+                // 完成条件第 2 句：Zygisk 专属 method 明确返回能力缺失
+                let error = service
+                    .list(&serial, None, LocalizedScope::All, false)
+                    .await
+                    .expect_err("Zygisk 关闭时本地化清单必须显式失败");
+                let message = error.to_string();
+                eprintln!("[ar10.5:impldisabled] 本地化清单被拒: {message}");
+                assert!(
+                    message.contains("Zygisk") || message.contains("禁用"),
+                    "报错要指到 Zygisk 没开: {message}"
+                );
+                // 完成条件第 1、3 句：同一个 Agent 的普通能力照常，Shell 可等价实现的按路由降级
+                let packages = service
+                    .plain_packages_for_test(&serial)
+                    .await
+                    .expect("package.list 不该依赖 Zygisk");
+                assert!(
+                    !packages.is_empty(),
+                    "Zygisk 关闭时普通包列表必须仍然可用（路由降级）"
+                );
+                eprintln!(
+                    "[ar10.5:impldisabled] 普通包列表 {} 项照常 ✓",
+                    packages.len()
+                );
             }
             other => panic!("未知注入模式 {other}"),
         }
