@@ -192,6 +192,7 @@ pub fn run() {
             commands::device::device_proc_ports,
             commands::device::device_proc_by_port,
             commands::device::device_pkg_lib_dir,
+            commands::device::device_proc_read,
             commands::device::device_frida_server_status,
             commands::device::device_frida_server_start,
             commands::device::device_frida_server_stop,

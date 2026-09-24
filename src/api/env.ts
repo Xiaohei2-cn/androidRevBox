@@ -41,6 +41,11 @@ export interface ProcPath {
   path: string;
   summary?: string | null;
   readable: boolean;
+  /**
+   * true = 这一项**我们没有读**（maps 属于别的用户的进程，Agent 以 shell 身份必然读不到）。
+   * 界面要给它一个箭头，点了才发一次按需读取；不能把它当"读过且失败"渲染成红色"不可读"。
+   */
+  readOnDemand: boolean;
 }
 
 export interface ForegroundApp {

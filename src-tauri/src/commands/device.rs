@@ -5,7 +5,7 @@
 use agent_protocol::{
     FilesystemPreviewResult, FilesystemStatResult, FridaServerStartResult, FridaServerStatusResult,
     FridaServerStopResult, HostedRunRecord, HostedStopResult, PackageUninstallResult,
-    PackageWriteResult, ReplaceNativeLibraryResult,
+    PackageWriteResult, ProcFile, ProcessProcReadResult, ReplaceNativeLibraryResult,
 };
 use serde::Deserialize;
 
@@ -413,6 +413,30 @@ pub async fn device_frida_server_status(
     serial: String,
 ) -> CoreResult<FridaServerStatusResult> {
     state.device.frida_server_status(&serial).await
+}
+
+/// 按需读取 `/proc/<pid>/<file>` 详情（设备信息页的箭头点了才会调）。
+/// `file` 只接受 maps|cmdline|status 三个值，路径由 Agent 侧拼接——这不是一个"读任意文件"
+/// 的入口（maps 需要提权，所以更不能让调用方给路径）。
+#[tauri::command]
+pub async fn device_proc_read(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    pid: u32,
+    file: String,
+    max_lines: Option<u32>,
+) -> CoreResult<ProcessProcReadResult> {
+    let file = match file.as_str() {
+        "maps" => ProcFile::Maps,
+        "cmdline" => ProcFile::Cmdline,
+        "status" => ProcFile::Status,
+        other => {
+            return Err(CoreError::Internal(format!(
+                "不支持的 /proc 文件 {other:?}（只认 maps/cmdline/status）"
+            )));
+        }
+    };
+    state.device.proc_read(&serial, pid, file, max_lines).await
 }
 
 /// 以 root 启动 frida-server：Agent 内跑写死的固定脚本，启动后复核「进程在 +

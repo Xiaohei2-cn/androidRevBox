@@ -9,17 +9,24 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use agent_protocol::method::{PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS};
+use agent_protocol::method::{PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS, PROCESS_PROC_READ};
 use agent_protocol::{
-    AgentError, ErrorCode, KillOutcome, KillSignal, ListeningPort, PortHoldingProcess,
+    AgentError, ErrorCode, KillOutcome, KillSignal, ListeningPort, PortHoldingProcess, ProcFile,
     ProcessByPortParams, ProcessByPortResult, ProcessKillParams, ProcessKillResult,
-    ProcessPortsParams, ProcessPortsResult, ProviderHealth, ProviderInfo, SocketFamily,
+    ProcessPortsParams, ProcessPortsResult, ProcessProcReadParams, ProcessProcReadResult,
+    ProviderHealth, ProviderInfo, SocketFamily,
 };
 use serde_json::Value;
 
+use super::privileged;
 use super::{Provider, ProviderFuture, RequestContext};
 
-const PROCESS_METHODS: &[&str] = &[PROCESS_PORTS, PROCESS_BY_PORT, PROCESS_KILL];
+const PROCESS_METHODS: &[&str] = &[
+    PROCESS_PORTS,
+    PROCESS_BY_PORT,
+    PROCESS_KILL,
+    PROCESS_PROC_READ,
+];
 /// 终止后的确认轮询：有界，不做无界等待（卡住的写操作比慢的更危险）。
 const KILL_VERIFY_TIMEOUT: Duration = Duration::from_millis(1_500);
 const KILL_VERIFY_POLL: Duration = Duration::from_millis(50);
@@ -28,6 +35,11 @@ const NET_FILES: [(&str, SocketFamily); 2] = [
     ("/proc/net/tcp6", SocketFamily::Ipv6),
 ];
 const PROC: &str = "/proc";
+/// 按需读取的默认/上限行数与字节数：宁可标 `truncated`，也不把一次界面点击变成
+/// 无界的大文件传输（maps 上万行很常见）。
+const DEFAULT_PROC_LINES: u32 = 400;
+const MAX_PROC_LINES: u32 = 5_000;
+const MAX_PROC_BYTES: u64 = 4 * 1024 * 1024;
 /// 行数与扫描进程数上限：极端设备上宁可标 truncated，也不无界扫描。
 const MAX_SOCKET_ROWS: usize = 200_000;
 const MAX_SCANNED_PIDS: usize = 4_000;
@@ -60,6 +72,7 @@ impl Provider for ProcessesProvider {
                 PROCESS_PORTS => self.ports(params).await,
                 PROCESS_BY_PORT => self.by_port(params).await,
                 PROCESS_KILL => self.kill(params).await,
+                PROCESS_PROC_READ => self.proc_read(params).await,
                 _ => Err(AgentError::new(
                     ErrorCode::UnsupportedMethod,
                     format!("unsupported process method: {method}"),
@@ -213,6 +226,69 @@ impl ProcessesProvider {
     ///
     /// 信号用 `libc::kill` 直发，不孵化 `sh -c "kill -9 x"`；errno 映射成结构化错误码。
     /// 发完信号后有界轮询 `/proc/<pid>` 确认，确认不到只说「未确认」，不谎报已死。
+    /// 按需读取 `/proc/<pid>/<file>` 的详情（设备信息页点箭头之后才会走到这里）。
+    ///
+    /// **先按 shell 身份试读，读不到才提权**：`cmdline`/`status` 以 shell 就读得到
+    /// （真机实测），没必要为它们弹一次 su；`maps` 属于另一个用户的进程，Android 14 上
+    /// shell 必然 `EACCES`，这时才走 `su`。结果里的 `read_via` 把这个选择如实带回去，
+    /// 因为"这次是靠提权看到的"本身就是要显示给用户的信息。
+    async fn proc_read(&self, params: Value) -> Result<Value, AgentError> {
+        let params: ProcessProcReadParams = parse_params(params)?;
+        let path = proc_path(params.pid, params.file)?;
+        let max_lines = params
+            .max_lines
+            .unwrap_or(DEFAULT_PROC_LINES)
+            .clamp(1, MAX_PROC_LINES);
+
+        match read_proc_head(&path, params.file, max_lines).await {
+            // `Readable` 直接用；`Empty` 只在 maps 上继续往上问（见 read_proc_head 的注释）
+            ShellRead::Readable(read) => {
+                return serialize(&ProcessProcReadResult {
+                    path,
+                    file: params.file,
+                    total_lines: read.total_lines,
+                    returned_lines: read.returned_lines,
+                    truncated: read.truncated,
+                    text: read.text,
+                    read_via: "shell".to_owned(),
+                });
+            }
+            ShellRead::Empty(read) if params.file != ProcFile::Maps => {
+                return serialize(&ProcessProcReadResult {
+                    path,
+                    file: params.file,
+                    total_lines: read.total_lines,
+                    returned_lines: read.returned_lines,
+                    truncated: read.truncated,
+                    text: read.text,
+                    read_via: "shell".to_owned(),
+                });
+            }
+            ShellRead::Empty(_) | ShellRead::Unreadable => {}
+        }
+        // shell 读不到才提权。脚本里没有一个是外部给的路径：pid 校验过是数字、
+        // 文件名来自协议枚举、行数是夹紧过的整数（D038）。
+        let script = privileged::proc_read_script(params.pid, params.file.as_str(), max_lines);
+        let output =
+            privileged::run_privileged("读取 /proc 详情", &script, privileged::PROC_READ_SENTINEL)
+                .await?;
+        let read = parse_proc_read_output(&output)?;
+        let truncated = read.total_lines > u64::from(max_lines) || read.body_truncated;
+        serialize(&ProcessProcReadResult {
+            path,
+            file: params.file,
+            total_lines: read.total_lines,
+            returned_lines: if read.body.is_empty() {
+                0
+            } else {
+                read.body.lines().count() as u32
+            },
+            truncated,
+            text: read.body,
+            read_via: "root".to_owned(),
+        })
+    }
+
     async fn kill(&self, params: Value) -> Result<Value, AgentError> {
         let params: ProcessKillParams = parse_params(params)?;
         // 先拒掉「一发信号打死一大片」的输入：pid=0 在 kill(2) 里是整进程组，
@@ -430,6 +506,173 @@ pub(crate) async fn confirm_dead(pid: u32) -> bool {
         }
         tokio::time::sleep(KILL_VERIFY_POLL).await;
     }
+}
+
+/// `/proc/<pid>/<file>` 只由**校验过的数字 + 协议枚举**拼出来：这条路径会进提权脚本，
+/// 所以不接受任何外部字符串。
+fn proc_path(pid: u32, file: ProcFile) -> Result<String, AgentError> {
+    if pid == 0 {
+        return Err(AgentError::new(
+            ErrorCode::InvalidRequest,
+            "pid 不能是 0（0 在 /proc 里是 swapper，没有可读的 maps）",
+        ));
+    }
+    Ok(format!("{PROC}/{pid}/{}", file.as_str()))
+}
+
+/// `cmdline` 是 NUL 分隔的一行；其余按文本读，非法字节替换而不是整条失败。
+fn decode_proc_bytes(file: ProcFile, raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    match file {
+        ProcFile::Cmdline => text.replace('\0', " ").trim().to_owned(),
+        ProcFile::Maps | ProcFile::Status => text.into_owned(),
+    }
+}
+
+fn take_lines(body: &str, max_lines: u32) -> (u64, String, bool) {
+    let total = body.lines().count() as u64;
+    let kept: Vec<&str> = body.lines().take(max_lines as usize).collect();
+    let truncated = total > kept.len() as u64;
+    (total, kept.join("\n"), truncated)
+}
+
+/// 以 shell 身份读 `/proc/<pid>/<file>` 的前若干行。
+///
+/// 返回 `None` = 读不到（`EACCES`/进程已退），调用方据此决定去提权；**不要**把它当成
+/// "文件是空的"。读取带字节上限：极端 maps 能到十几 MB，一次界面点击不该无界吃内存，
+/// 撞到上限时按已读部分给行数并如实标 `truncated`。
+/// shell 身份试读 `/proc/<pid>/<file>` 的三种结果，**必须分开**：
+/// `Readable` 正常返回；`Unreadable` 是"读不出"（EACCES、EISDIR…）；
+/// `Empty` 是"真的一个字节都没有"。
+///
+/// 为什么要三态：Android 14 上 `/proc/<pid>/maps` 属于别的用户，shell **能 open、
+/// 读的时候才失败**，有些 ROM/内核甚至直接给一个 EOF 当"读完了"。只看 `open` 或只看
+/// "读完不报错"，就会把"我们没权限"渲染成"这个进程有 0 条映射"——那是凭缺失的证据编一个
+/// 结论。maps 的正常值不可能是空（活的进程至少几十条），所以 maps 的 `Empty` 也当
+/// "没读到"处理，交给提权路径去确认真相。
+#[derive(Debug)]
+enum ShellRead {
+    Readable(ProcHeadRead),
+    Empty(ProcHeadRead),
+    Unreadable,
+}
+
+async fn read_proc_head(path: &str, file: ProcFile, max_lines: u32) -> ShellRead {
+    use tokio::io::AsyncReadExt;
+    let Ok(handle) = tokio::fs::File::open(path).await else {
+        return ShellRead::Unreadable;
+    };
+    let mut raw = Vec::new();
+    if handle
+        .take(MAX_PROC_BYTES + 1)
+        .read_to_end(&mut raw)
+        .await
+        .is_err()
+    {
+        return ShellRead::Unreadable;
+    }
+    let capped = raw.len() as u64 > MAX_PROC_BYTES;
+    raw.truncate(usize::try_from(MAX_PROC_BYTES).unwrap_or(usize::MAX));
+    let body = decode_proc_bytes(file, &raw);
+    let (total, text, truncated_by_lines) = take_lines(&body, max_lines);
+    let read = ProcHeadRead {
+        total_lines: total,
+        returned_lines: if text.is_empty() {
+            0
+        } else {
+            text.lines().count() as u32
+        },
+        truncated: truncated_by_lines || capped,
+        text,
+    };
+    if raw.is_empty() {
+        ShellRead::Empty(read)
+    } else {
+        ShellRead::Readable(read)
+    }
+}
+
+#[derive(Debug)]
+struct ProcHeadRead {
+    total_lines: u64,
+    returned_lines: u32,
+    truncated: bool,
+    text: String,
+}
+
+#[derive(Debug)]
+struct ProcReadOutput {
+    total_lines: u64,
+    body: String,
+    body_truncated: bool,
+}
+
+/// 解析 `proc_read_script` 的输出。形状错了要报出来，不能悄悄给个空内容当"没有映射"。
+fn parse_proc_read_output(output: &str) -> Result<ProcReadOutput, AgentError> {
+    let lines: Vec<&str> = output.lines().map(str::trim_end).collect();
+    let total_index = lines
+        .iter()
+        .position(|line| *line == "ARTPROC_TOTAL")
+        .ok_or_else(|| {
+            AgentError::new(
+                ErrorCode::Internal,
+                format!("提权读取的应答形状不对: {output}"),
+            )
+        })?;
+    // GONE/MISSING 都只看 TOTAL 后面那一个标记：正文里万一出现同名字符串也不会误判
+    match lines.get(total_index + 1).copied() {
+        Some("ARTPROC_GONE") => {
+            return Err(AgentError::new(
+                ErrorCode::NotFound,
+                "进程已经不在了（/proc 下没有这个 pid），请刷新后重试",
+            )
+            .with_details(serde_json::json!({ "reason": "proc_gone" })));
+        }
+        Some("ARTPROC_MISSING") => {
+            return Err(AgentError::new(
+                ErrorCode::NotFound,
+                "进程在，但 /proc 下没有这个文件（可能是该进程类型没有这项内容）",
+            )
+            .with_details(serde_json::json!({ "reason": "proc_file_missing" })));
+        }
+        _ => {}
+    }
+    let raw_total = lines.get(total_index + 1).copied().unwrap_or("").trim();
+    let total_lines: i64 = raw_total.parse().map_err(|error| {
+        AgentError::new(
+            ErrorCode::Internal,
+            format!("行数无法解析 {raw_total:?}: {error}"),
+        )
+    })?;
+    let body_index = lines
+        .iter()
+        .position(|line| *line == "ARTPROC_BODY")
+        .ok_or_else(|| AgentError::new(ErrorCode::Internal, "提权读取没有正文标记".to_owned()))?;
+    let end_index = lines
+        .iter()
+        .rposition(|line| *line == "ARTPROC_END")
+        .ok_or_else(|| {
+            AgentError::new(
+                ErrorCode::Internal,
+                "提权读取没有结束标记（可能被截断）".to_owned(),
+            )
+        })?;
+    if end_index < body_index {
+        return Err(AgentError::new(
+            ErrorCode::Internal,
+            "提权读取的标记顺序不对".to_owned(),
+        ));
+    }
+    // 脚本在正文后面多打了一个空行（`cmdline` 结尾没有换行，不补就会把 `ARTPROC_END`
+    // 顶到正文同一行，见 proc_read_script）；这里吃掉它，但不改 total 的判断。
+    let raw_body = lines[body_index + 1..end_index].join("\n");
+    let body = raw_body.trim_end_matches('\n').to_owned();
+    Ok(ProcReadOutput {
+        // awk 数不出来（读不到）时脚本给的是 -1：当成 0 行，但正文也一定是空的
+        total_lines: u64::try_from(total_lines).unwrap_or(0),
+        body_truncated: body.is_empty() && raw_body.len() != body.len(),
+        body,
+    })
 }
 
 fn effective_uid() -> Option<u32> {
@@ -664,6 +907,118 @@ fn serialize<T: serde::Serialize>(value: T) -> Result<Value, AgentError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(test)]
+    #[test]
+    fn proc_path_is_built_from_validated_parts_only() {
+        // 这条方法会走提权脚本，所以"能读哪个文件"必须由代码决定，不能由参数决定。
+        assert_eq!(proc_path(4321, ProcFile::Maps).unwrap(), "/proc/4321/maps");
+        assert_eq!(proc_path(1, ProcFile::Cmdline).unwrap(), "/proc/1/cmdline");
+        // pid=0 在 /proc 里是 swapper，没有 maps；放到脚本里就是一句让人找不着北的失败
+        assert!(proc_path(0, ProcFile::Maps).is_err());
+    }
+
+    #[test]
+    fn proc_read_script_shape_has_the_markers_the_parser_expects() {
+        let script = privileged::proc_read_script(4321, "maps", 400);
+        // 数字与白名单值拼出来的路径，脚本里不存在任何外部字符串
+        assert!(script.contains("/proc/4321/maps"), "{script}");
+        assert!(script.contains("sed -n '1,400p'"), "{script}");
+        assert!(script.contains("ARTPROC_TOTAL") && script.contains("ARTPROC_BODY"));
+        assert!(script.contains("ARTPROC_GONE") && script.contains("ARTPROC_MISSING"));
+        // 早退分支也必须以哨兵收尾，否则 run_privileged 会把"进程不在了"报成 Internal
+        assert_eq!(
+            script.matches(privileged::PROC_READ_SENTINEL).count(),
+            3,
+            "{script}"
+        );
+        assert!(script.contains(privileged::PROC_READ_SENTINEL));
+        // 行数统计用 awk 而不是 wc -l：cmdline 结尾没有换行，wc -l 会数成 0
+        assert!(
+            script.contains("END{{print NR}}") || script.contains("END{print NR}"),
+            "{script}"
+        );
+        assert!(
+            !script.contains("wc -l"),
+            "cmdline 用 wc -l 会得到 0 行: {script}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_read_separates_unreadable_empty_and_readable() {
+        // ① "能打开、读不出"：拿目录模拟（open 成功、read 直接 EISDIR）。
+        //    这类必须判成 Unreadable，否则界面会把"我们没权限"说成"这文件是空的"。
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_string_lossy().to_string();
+        assert!(matches!(
+            read_proc_head(&dir_path, ProcFile::Maps, 10).await,
+            ShellRead::Unreadable
+        ));
+        // ② 真·空文件：Maps 依然要交给提权去确认（活的进程不可能 0 条映射），
+        //    其他文件（如内核线程的 cmdline）就照实返回空。
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        let as_str = empty.to_string_lossy().to_string();
+        assert!(matches!(
+            read_proc_head(&as_str, ProcFile::Maps, 10).await,
+            ShellRead::Empty(_)
+        ));
+        assert!(matches!(
+            read_proc_head(&as_str, ProcFile::Cmdline, 10).await,
+            ShellRead::Empty(_)
+        ));
+        // ③ 有内容才叫 Readable
+        let full = dir.path().join("full");
+        std::fs::write(&full, b"12c00000 rw-p x\n32c00000 rw-p y\n").unwrap();
+        let read = read_proc_head(&full.to_string_lossy(), ProcFile::Maps, 10).await;
+        match read {
+            ShellRead::Readable(value) => {
+                assert_eq!(value.total_lines, 2);
+                assert!(!value.truncated);
+            }
+            other => panic!("应当读到内容: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proc_read_output_distinguishes_gone_missing_and_ok() {
+        let ok = parse_proc_read_output(
+            "ARTPROC_TOTAL\n2566\nARTPROC_BODY\nline1\nline2\n\nARTPROC_END",
+        )
+        .unwrap();
+        assert_eq!(ok.total_lines, 2566);
+        // 脚本为了不把 ARTPROC_END 顶到正文同一行会多打一个空行，解析时要吃掉
+        assert_eq!(ok.body, "line1\nline2");
+
+        // 与 proc_read_script 的真实输出一致：早退分支也要先打 TOTAL、并以哨兵收尾
+        let gone = parse_proc_read_output("ARTPROC_TOTAL\nARTPROC_GONE\nARTPROC_END");
+        assert_eq!(
+            gone.err().map(|error| error.code),
+            Some(ErrorCode::NotFound),
+            "进程已退要说成 NotFound，不能给一个空正文"
+        );
+        let missing = parse_proc_read_output("ARTPROC_TOTAL\nARTPROC_MISSING\nARTPROC_END");
+        assert_eq!(
+            missing.err().map(|error| error.code),
+            Some(ErrorCode::NotFound)
+        );
+        // 应答形状不对时必须报错：把它当"没有映射"就是又一次用空值伪装成功
+        let junk = parse_proc_read_output("something else");
+        assert!(junk.is_err(), "{junk:?}");
+    }
+
+    #[test]
+    fn cmdline_nuls_become_spaces_and_line_cap_marks_truncation() {
+        // cmdline 在 /proc 里是 NUL 分隔的一行；原样带出去界面就是一串方块
+        let raw = b"com.google.android.apps.nexuslauncher\0\0\0";
+        assert_eq!(
+            decode_proc_bytes(ProcFile::Cmdline, raw),
+            "com.google.android.apps.nexuslauncher"
+        );
+        let (total, text, truncated) = take_lines("a\nb\nc", 2);
+        assert_eq!((total, text.as_str(), truncated), (3, "a\nb", true));
+        assert!(!take_lines("a\nb", 5).2);
+    }
+
     use super::*;
 
     const TCP4_SAMPLE: &str = concat!(

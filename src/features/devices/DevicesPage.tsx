@@ -25,6 +25,7 @@ import { envApi } from "@/api/env";
 import { useAppNav } from "@/app/nav";
 import { useI18n } from "@/i18n";
 import { PathText } from "@/components/ui/PathText";
+import { ProcPaths } from "@/features/devices/ProcPaths";
 import { BrandIcon } from "@/components/ui/BrandIcon";
 import { cn } from "@/lib/utils";
 import { pickDirectory, pickFile } from "@/api/dialog";
@@ -604,25 +605,7 @@ function ForegroundAppSection({ serial }: { serial: string }) {
           <Field label={t("dashboard.foreground.nativeLib")} value={app.nativeLibDir} testid={`fg-libdir-${serial}`} mono />
           <div className="md:col-span-2">
             <p className="mb-1 text-muted-foreground">{t("dashboard.foreground.procPaths")}</p>
-            <ul className="space-y-1" data-testid={`fg-proc-paths-${serial}`}>
-              {app.procPaths.length === 0 && (
-                <li className="text-muted-foreground">{t("dashboard.foreground.noProc")}</li>
-              )}
-              {app.procPaths.map((p) => (
-                <li key={p.path} className="flex items-baseline gap-2 font-mono">
-                  <PathText value={p.path} className="shrink-0 text-foreground" />
-                  <span
-                    className={cn(
-                      "min-w-0 flex-1 break-all",
-                      p.readable ? "text-muted-foreground" : "text-amber-500",
-                    )}
-                    title={p.summary ?? undefined}
-                  >
-                    {p.readable ? p.summary || t("common.emptyValue") : t("dashboard.foreground.unreadable")}
-                  </span>
-                </li>
-              ))}
-            </ul>
+            <ProcPaths serial={serial} pid={app.pid} entries={app.procPaths} />
           </div>
         </div>
       )}

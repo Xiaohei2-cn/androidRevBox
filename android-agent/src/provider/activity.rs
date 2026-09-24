@@ -137,25 +137,29 @@ async fn proc_summary(pid: u32) -> Vec<ProcEntrySummary> {
     let cmdline_path = format!("/proc/{pid}/cmdline");
     let status_path = format!("/proc/{pid}/status");
 
-    let (maps, cmdline, status) = tokio::join!(
-        count_lines(&maps_path),
+    // maps **不在这里读**：它属于另一个用户的进程，Agent 以 shell 身份必然 EACCES
+    // （Android 14 真机实测；只有 root 读得到）。以前每次刷新设备信息都白跑一次注定
+    // 失败的读取，还在界面上留一句红色的"不可读"，看着像工具坏了。现在标记成
+    // read_on_demand，界面上给箭头，点了才走 `process.proc_read`（那里会按需提权）。
+    let (cmdline, status) = tokio::join!(
         read_to_string_lossy(&cmdline_path),
         read_head_lines(&status_path, STATUS_HEAD_LINES)
     );
 
     // 先取可读性再消费 Option，否则 map 之后就没法判断是否读到了
-    let (maps_readable, cmdline_readable, status_readable) =
-        (maps.is_some(), cmdline.is_some(), status.is_some());
+    let (cmdline_readable, status_readable) = (cmdline.is_some(), status.is_some());
     vec![
         ProcEntrySummary {
             name: "maps".into(),
             path: maps_path,
-            summary: maps.map(|lines| lines.to_string()),
-            readable: maps_readable,
+            summary: None,
+            readable: false,
+            read_on_demand: true,
         },
         ProcEntrySummary {
             name: "cmdline".into(),
             path: cmdline_path,
+            read_on_demand: false,
             summary: cmdline.map(|raw| {
                 let text: String = raw.replace('\0', " ").trim().chars().collect();
                 if text.chars().count() > MAX_CMDLINE_CHARS {
@@ -174,34 +178,9 @@ async fn proc_summary(pid: u32) -> Vec<ProcEntrySummary> {
             path: status_path,
             summary: status.map(|text| text.trim().to_owned()),
             readable: status_readable,
+            read_on_demand: false,
         },
     ]
-}
-
-async fn count_lines(path: &str) -> Option<u64> {
-    use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(path).await.ok()?;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    let mut lines = 0_u64;
-    let mut ended_with_newline = true;
-    loop {
-        let read = file.read(&mut buffer).await.ok()?;
-        if read == 0 {
-            break;
-        }
-        for byte in &buffer[..read] {
-            if *byte == b'\n' {
-                lines += 1;
-                ended_with_newline = true;
-            } else {
-                ended_with_newline = false;
-            }
-        }
-    }
-    if !ended_with_newline {
-        lines += 1;
-    }
-    Some(lines)
 }
 
 async fn read_to_string_lossy(path: &str) -> Option<String> {
@@ -726,6 +705,12 @@ mod tests {
         assert!(entries.iter().all(|entry| !entry.readable));
         assert!(entries.iter().all(|entry| entry.summary.is_none()));
         assert_eq!(entries[0].name, "maps");
+        // maps 是"没读"，不是"读了读不到"：这条断言钉住"不点不触发"这个产品口径
+        assert!(entries[0].read_on_demand, "maps 必须标成按需读");
+        assert!(
+            !entries[1].read_on_demand && !entries[2].read_on_demand,
+            "cmdline/status 以 shell 身份读得到，继续给摘要"
+        );
         assert_eq!(entries[1].name, "cmdline");
         assert_eq!(entries[2].path, "/proc/4000001/status");
     }
@@ -746,9 +731,7 @@ mod tests {
         .unwrap();
         std::fs::write(&without_newline, "a\0b\0c").unwrap();
 
-        assert_eq!(count_lines(&path_with).await, Some(3));
         // 末行没有换行符时也要算一行（`wc -l` 会少算，这里不能跟着错）
-        assert_eq!(count_lines(&path_without).await, Some(1));
         assert_eq!(
             read_head_lines(&path_with, 2).await.as_deref(),
             Some("Name:\tapp\nState:\tS (sleeping)")
@@ -756,11 +739,6 @@ mod tests {
         let raw = read_to_string_lossy(&path_without).await.unwrap();
         assert_eq!(raw.replace('\0', " ").trim(), "a b c");
         // 不存在的路径必须返回 None（readable=false），不能当 0 行
-        assert!(
-            count_lines(&dir.join("missing").to_string_lossy())
-                .await
-                .is_none()
-        );
         assert!(
             read_head_lines(&dir.join("missing").to_string_lossy(), 4)
                 .await

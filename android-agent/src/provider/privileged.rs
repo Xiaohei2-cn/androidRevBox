@@ -71,6 +71,41 @@ pub(crate) fn backup_script(target: &str, backup: &str) -> String {
     format!("cp -f {target} {backup}; chmod 644 {backup}; sync; echo BACKED_UP")
 }
 
+/// 读 `/proc/<pid>/<file>` 详情的脚本模板（AR10.6 的按需读取）。
+///
+/// 参数**没有一个是路径**：`pid` 只能是数字、`file` 只能来自协议枚举、`max_lines` 会被
+/// 夹紧成整数，路径是这里自己拼出来的。所以这条模板不构成"传任意路径就能提权读"的口子
+/// （对比 `validate_path`：那里必须卡前缀与后缀，因为路径本身是外部给的）。
+///
+/// 输出形状（解析端 `parse_proc_read_output` 逐字对齐）：
+/// ```text
+/// ARTPROC_TOTAL
+/// <总行数>
+/// ARTPROC_GONE          # 进程已经不在了（提前结束，不会有 TOTAL）
+/// ARTPROC_MISSING       # 进程在、但这个文件没有（如 32 位进程的 /proc/<pid>/map_files）
+/// ARTPROC_BODY
+/// <前 N 行>
+/// ARTPROC_END
+/// ```
+/// 用 `awk END{print NR}` 而不是 `wc -l` 数行：`cmdline` 结尾没有换行，`wc -l` 会数成 0
+/// （真机实测），而"0 行却有内容"会变成一个说不清的自相矛盾。
+pub(crate) fn proc_read_script(pid: u32, file: &str, max_lines: u32) -> String {
+    let path = format!("/proc/{pid}/{file}");
+    // 三个分支都必须以哨兵收尾：`run_privileged` 是拿哨兵判断"脚本走完了"，
+    // 早退时不带哨兵就会被当成"应答形状不对"，把一句本来说得清的"进程不在了"
+    // 变成 Internal（真机第一次跑这条腿就是这样）。
+    format!(
+        "if [ ! -d /proc/{pid} ]; then echo ARTPROC_TOTAL; echo ARTPROC_GONE; echo ARTPROC_END; exit 0; fi; \
+         if [ ! -e {path} ]; then echo ARTPROC_TOTAL; echo ARTPROC_MISSING; echo ARTPROC_END; exit 0; fi; \
+         echo ARTPROC_TOTAL; awk 'END{{print NR}}' {path} 2>/dev/null || echo -1; \
+         echo ARTPROC_BODY; sed -n '1,{max_lines}p' {path} 2>/dev/null; printf '\n'; \
+         echo ARTPROC_END"
+    )
+}
+
+/// 提权读 `/proc` 的哨兵：`run_privileged` 用它判断脚本走完了。
+pub(crate) const PROC_READ_SENTINEL: &str = "ARTPROC_END";
+
 /// 参数校验的公共部分：长度、前缀白名单、无 `..`、无 shell 元字符。
 fn check_shape(path: &str) -> Result<(), AgentError> {
     if path.is_empty() || path.len() > 512 {

@@ -19,8 +19,8 @@ use agent_protocol::{
     FilesystemRemoveResult, FilesystemRenameResult, FilesystemStatResult, FridaServerStartResult,
     FridaServerState, FridaServerStatusResult, FridaServerStopResult, HostedRunRecord,
     HostedRunState, HostedStopResult, KillOutcome, OperationStep, PackageUninstallResult,
-    PackageWriteAction, PackageWriteResult, PreviewEncoding, ReplaceNativeLibraryResult,
-    WriteOutcome,
+    PackageWriteAction, PackageWriteResult, PreviewEncoding, ProcFile, ProcessProcReadResult,
+    ReplaceNativeLibraryResult, WriteOutcome,
 };
 use serde_json::Value;
 
@@ -250,6 +250,22 @@ fn cases() -> Vec<(&'static str, Value, Vec<&'static str>)> {
             })
             .unwrap(),
             vec!["operation_id", "binary_name"],
+        ),
+        (
+            "ProcReadResult",
+            serde_json::to_value(ProcessProcReadResult {
+                path: "/proc/4321/maps".into(),
+                file: ProcFile::Maps,
+                total_lines: 2566,
+                returned_lines: 400,
+                truncated: true,
+                text: "line".into(),
+                read_via: "root".into(),
+            })
+            .unwrap(),
+            // 这三个键以前都漏过一次（文件页/ SO 页同类问题）：协议是 snake_case，
+            // 前端照 App 习惯写 camelCase 就会静默 undefined，只有界面上看得见
+            vec!["total_lines", "returned_lines", "read_via"],
         ),
         (
             "FridaServerStopResult",

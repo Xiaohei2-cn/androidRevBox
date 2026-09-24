@@ -850,27 +850,23 @@ impl EnvService {
         let cmdline_f = format!("{base}/cmdline");
         let status_f = format!("{base}/status");
 
-        let maps_cmd = format!("wc -l {maps_f}");
         let cmdline_cmd = format!("cat {cmdline_f}");
         let status_cmd = format!("head -4 {status_f}");
-        let (maps, cmdline, status) = tokio::join!(
-            self.shell(adb_path, serial, &maps_cmd),
+        // maps **不自动探**：shell 身份读别人的进程一定 EACCES，以前每次刷新都白跑一条
+        // `wc -l`，界面上还留一句红色的"不可读"。现在交给按需读取（点箭头，走 Agent 提权）。
+        let (cmdline, status) = tokio::join!(
             self.shell(adb_path, serial, &cmdline_cmd),
             self.shell(adb_path, serial, &status_cmd),
         );
-        let maps_readable = maps.is_ok();
         let cmdline_readable = cmdline.is_ok();
         let status_readable = status.is_ok();
         vec![
             ProcPath {
                 name: "maps".into(),
                 path: maps_f,
-                summary: maps.ok().map(|o| {
-                    let t = o.stdout.trim();
-                    // toybox wc 输出 "123 /proc/x/maps"，取行数段
-                    t.split_whitespace().next().unwrap_or(t).to_string()
-                }),
-                readable: maps_readable,
+                summary: None,
+                readable: false,
+                read_on_demand: true,
             },
             ProcPath {
                 name: "cmdline".into(),
@@ -885,12 +881,14 @@ impl EnvService {
                     }
                 }),
                 readable: cmdline_readable,
+                read_on_demand: false,
             },
             ProcPath {
                 name: "status".into(),
                 path: status_f,
                 summary: status.ok().map(|o| o.stdout.trim().to_string()),
                 readable: status_readable,
+                read_on_demand: false,
             },
         ]
     }
@@ -1085,6 +1083,7 @@ pub fn map_agent_foreground(serial: &str, result: ActivityForegroundResult) -> F
                 path: entry.path,
                 summary: entry.summary,
                 readable: entry.readable,
+                read_on_demand: entry.read_on_demand,
             })
             .collect(),
         hint: None,
@@ -1317,9 +1316,13 @@ pub struct ProcPath {
     /// maps | cmdline | status
     pub name: String,
     pub path: String,
-    /// 摘要（maps=行数、cmdline=命令行截断、status=头几行）；不可读为 None
+    /// 摘要（cmdline=命令行截断、status=头几行）；不自动读或读不到为 None
     pub summary: Option<String>,
     pub readable: bool,
+    /// **这一项没有读过，界面上只给箭头**（maps 就是这种：Agent 以 shell 身份读别人的
+    /// 进程必然 EACCES，白跑一次还在界面上留一句"不可读"）。与 `readable=false`
+    /// 的区别必须保住：后者是"试了，没权限"，前者是"根本没试，等你点"。
+    pub read_on_demand: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1587,7 +1590,7 @@ mod tests {
         mock.expect("dumpsys window", FIXTURE_WINDOW);
         mock.expect("pidof", "4321\n");
         mock.expect("legacyNativeLibraryDir", FIXTURE_LIB);
-        mock.expect("wc -l", "512 /proc/4321/maps\n");
+        // maps 不再自动探测：这里**故意不登记** `wc -l`，多发的 shell 会被 mock 记成意外
         mock.expect("cmdline", "com.target.app\0--flag\0");
         mock.expect("status", FIXTURE_STATUS);
         let svc = svc_with(mock.clone());
@@ -1606,9 +1609,10 @@ mod tests {
             Some("/data/app/~~x/com.target.app-y/lib/arm64")
         );
         assert_eq!(fg.proc_paths.len(), 3);
+        // maps 归"按需读"：这一栏一次 shell 都不发（以前每次刷新都白跑一条 wc -l）
         let maps = fg.proc_paths.iter().find(|p| p.name == "maps").unwrap();
-        assert_eq!(maps.summary.as_deref(), Some("512"));
-        assert!(maps.readable);
+        assert!(maps.read_on_demand, "Legacy 也要标成按需读");
+        assert!(maps.summary.is_none() && !maps.readable);
         let cmdline = fg.proc_paths.iter().find(|p| p.name == "cmdline").unwrap();
         assert_eq!(cmdline.summary.as_deref(), Some("com.target.app --flag"));
         assert!(fg.error.is_none());
@@ -1879,7 +1883,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(900)).await;
         }
 
-        let via_agent = svc.foreground_on(Some(serial.clone())).await;
+        // 等前台真的稳定下来再比：**不做成"起一次+睡 900 ms+读一次"**——刚软重启过
+        // （或机器正忙）时系统设置要多花几秒才拿到焦点窗口，读一次就断言会把时序抖动
+        // 报成"Agent 探测失败"。这里只把等待加进来，下面的对照断言一条都不放松。
+        let mut via_agent = svc.foreground_on(Some(serial.clone())).await;
+        for _ in 0..12 {
+            if via_agent.state == "ready" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            via_agent = svc.foreground_on(Some(serial.clone())).await;
+        }
         // 第二把路由从不连接 Agent，必然落到 Legacy 分支
         let offline_agent = Arc::new(AgentManager::new(
             runner.clone(),
@@ -1944,6 +1958,20 @@ mod tests {
                 .all(|entry| entry.readable == entry.summary.is_some()),
             "/proc 条目的 readable 必须与 summary 是否为空一致，不得用空串伪装可读"
         );
+        // maps 是"没读"而不是"读不到"：两条通道都必须标成按需读，且不带摘要
+        for (label, paths) in [
+            ("Agent", &via_agent.proc_paths),
+            ("Legacy", &via_legacy.proc_paths),
+        ] {
+            let maps = paths
+                .iter()
+                .find(|entry| entry.name == "maps")
+                .unwrap_or_else(|| panic!("{label} 应给出 maps 条目"));
+            assert!(
+                maps.read_on_demand && maps.summary.is_none() && !maps.readable,
+                "{label} 的 maps 必须标成按需读（不自动读、也不谎称读到了）: {maps:?}"
+            );
+        }
     }
 
     #[tokio::test]

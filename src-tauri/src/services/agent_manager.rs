@@ -3826,6 +3826,146 @@ mod tests {
 
     const REQUEST_TIMEOUT_DEV: Duration = Duration::from_secs(10);
 
+    /// 真机腿：`process.proc_read`（设备信息页点箭头之后）必须同时满足三件事——
+    /// ① `maps` 以 shell 身份读不到，要**自动提权**并把 `read_via=root` 如实带回来；
+    /// ② `cmdline` shell 就读得到，**不该为它惊动 su**（`read_via=shell`）；
+    /// ③ 进程不在了要说成 `NotFound`，不能给一个空正文当"这个进程没有映射"。
+    ///
+    /// 样本选 `system_server`：它一定是**别的用户的进程**（maps 只有 root 读得到），
+    /// 又不会像三方应用那样随时被杀或正在崩溃——第一次跑这条腿时挑到一个正在崩溃的
+    /// 三方包，shell 读到 0 字节，看着像工具的 bug，其实只是样本没了。判"读不到"和
+    /// "没读到"这件事，需要一个稳定的活进程。
+    #[tokio::test]
+    #[ignore = "需要真机；APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_proc_read -- --ignored --nocapture"]
+    async fn real_agent_proc_read_escalates_only_when_needed() {
+        use agent_protocol::method::PROCESS_PROC_READ;
+        use agent_protocol::{ErrorCode, ProcFile, ProcessProcReadParams, ProcessProcReadResult};
+
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        let adb_path = runner.environment().await.path.expect("本机应有 adb");
+        let pid_text = runner
+            .run(
+                &adb_path,
+                &adb::build_args(Some(&serial), &adb::cmd_shell("pidof system_server")),
+                Duration::from_secs(10),
+            )
+            .await
+            .unwrap_or_default();
+        let pid: u32 = pid_text
+            .stdout
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        if pid == 0 {
+            eprintln!("[跳过] 取不到 system_server 的 pid（设备没起来或 adb 不可用）");
+            manager.disconnect(&serial).await.unwrap();
+            return;
+        }
+        let read = |file: ProcFile, max_lines: Option<u32>, as_lines: u32| {
+            let client = client.clone();
+            async move {
+                client
+                    .request::<_, ProcessProcReadResult>(
+                        PROCESS_PROC_READ,
+                        &ProcessProcReadParams {
+                            pid,
+                            file,
+                            max_lines,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .inspect_err(|error| {
+                        eprintln!("[proc] {file:?} 读取失败: {error:?}");
+                    })
+                    .map(|result| {
+                        assert_eq!(
+                            result.returned_lines,
+                            as_lines.min(result.total_lines as u32),
+                            "returned_lines 与正文行数对不上: {result:?}"
+                        );
+                        result
+                    })
+            }
+        };
+
+        // ② cmdline：普通身份就该读到，不许为它弹 su
+        let cmdline = read(ProcFile::Cmdline, Some(10), 1)
+            .await
+            .expect("cmdline 应可读");
+        assert_eq!(cmdline.read_via, "shell", "cmdline 不该走提权: {cmdline:?}");
+        assert!(
+            !cmdline.text.contains('\0'),
+            "NUL 必须已换成空格: {cmdline:?}"
+        );
+        eprintln!(
+            "[proc] cmdline via={} 共 {} 行：{}",
+            cmdline.read_via,
+            cmdline.total_lines,
+            cmdline.text.chars().take(40).collect::<String>()
+        );
+
+        // ① maps：shell 读不到 → 自动提权，并且真拿到内容
+        let maps = read(ProcFile::Maps, Some(5), 5)
+            .await
+            .expect("maps 应能读到");
+        assert_eq!(
+            maps.read_via, "root",
+            "maps 以 shell 读不到，必须提权: {maps:?}"
+        );
+        assert!(maps.total_lines > 50, "maps 总行数不像话: {maps:?}");
+        assert_eq!(maps.returned_lines, 5, "max_lines 没生效: {maps:?}");
+        assert!(maps.truncated, "只回 5/{} 行却没标截断", maps.total_lines);
+        eprintln!(
+            "[proc] maps via={} 共 {} 行、回了 {} 行（截断={}）",
+            maps.read_via, maps.total_lines, maps.returned_lines, maps.truncated
+        );
+
+        // ③ 进程不在了 = NotFound（不是空正文）
+        let gone = client
+            .request::<_, ProcessProcReadResult>(
+                PROCESS_PROC_READ,
+                &ProcessProcReadParams {
+                    pid: 4_000_001,
+                    file: ProcFile::Maps,
+                    max_lines: None,
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("不存在的 pid 必须报错");
+        let code = match &gone {
+            AgentClientError::Remote(remote) => remote.code.clone(),
+            other => panic!("应当是设备侧结构化错误，实际 {other:?}"),
+        };
+        assert_eq!(code, ErrorCode::NotFound, "{gone:?}");
+        eprintln!("[proc] 进程已退：{gone:?}");
+
+        // ④ 枚举证：协议之外的文件名根本进不到 Agent（更进不到提权脚本）
+        let bogus = client
+            .request::<_, ProcessProcReadResult>(
+                PROCESS_PROC_READ,
+                &serde_json::json!({ "pid": pid, "file": "environ" }),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("只接受 maps/cmdline/status");
+        assert!(matches!(bogus, AgentClientError::Remote(_)), "{bogus:?}");
+        eprintln!("[proc] 边界：{bogus:?}");
+
+        manager.disconnect(&serial).await.unwrap();
+        eprintln!("[proc] 通过：maps 提权、cmdline 不惊动 su、进程消失说 NotFound");
+    }
+
     /// AR9.1 前置真机腿：root 探测改由 Agent 执行后，结论必须与 Legacy `su -c id`
     /// 一致，而且要把「su 可用」与「Agent 自身有 root」分开带回——UI 之前把这两件事
     /// 混成一个绿色徽章，正是 D026 那批 `root=true` 支路必须留在 Legacy 的原因。

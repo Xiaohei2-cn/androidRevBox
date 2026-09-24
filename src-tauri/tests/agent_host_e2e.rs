@@ -132,8 +132,9 @@ async fn host_agent_full_lifecycle() {
         assert_eq!(hello.protocol_version, 1);
         assert_eq!(hello.providers.len(), 9);
         // AR8.4 加 package.replace_native_library、AR9.1 加 frida.server.*、
-        // AR10.3 加 package.describe、AR7.4 加 filesystem 写侧四条：35 项能力。
-        assert_eq!(hello.capabilities.len(), 35);
+        // AR10.3 加 package.describe、AR7.4 加 filesystem 写侧四条、
+        // 本轮加 process.proc_read（设备信息页按需读 /proc 详情）：36 项能力。
+        assert_eq!(hello.capabilities.len(), 36);
         // 新增的 Zygisk 单点查询：能力必须登记，且不允许由 Legacy ADB 冒充
         let describe = hello
             .capabilities
@@ -159,6 +160,7 @@ async fn host_agent_full_lifecycle() {
             (agent_protocol::method::PROCESS_PORTS, "process"),
             (agent_protocol::method::PROCESS_BY_PORT, "process"),
             (agent_protocol::method::PROCESS_KILL, "process"),
+            (agent_protocol::method::PROCESS_PROC_READ, "process"),
             (agent_protocol::method::FILESYSTEM_LIST, "filesystem"),
             (agent_protocol::method::FILESYSTEM_STAT, "filesystem"),
             (agent_protocol::method::FILESYSTEM_PREVIEW, "filesystem"),

@@ -14,6 +14,8 @@ pub mod method {
     pub const PROCESS_PORTS: &str = "process.ports";
     pub const PROCESS_BY_PORT: &str = "process.by_port";
     pub const PROCESS_KILL: &str = "process.kill";
+    /// 读 `/proc/<pid>/maps|cmdline|status` 的**详情**：点开后才有的一次按需读取。
+    pub const PROCESS_PROC_READ: &str = "process.proc_read";
     pub const FILESYSTEM_LIST: &str = "filesystem.list";
     pub const FILESYSTEM_STAT: &str = "filesystem.stat";
     pub const FILESYSTEM_PREVIEW: &str = "filesystem.preview";
@@ -324,10 +326,20 @@ pub struct ProcEntrySummary {
     /// maps | cmdline | status
     pub name: String,
     pub path: String,
-    /// maps=行数、cmdline=命令行（截断）、status=头几行；不可读为 None
+    /// maps=行数、cmdline=命令行（截断）、status=头几行；不自动读或读不到为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub readable: bool,
+    /// **这一项不自动读，界面上给箭头，点了才走 `process.proc_read`。**
+    ///
+    /// 为什么需要这个标记而不是直接用 `readable=false`：`/proc/<pid>/maps` 属于另一个
+    /// 用户的进程，Agent 以 shell 身份读必然 `EACCES`（Android 14 实测；root 才读得到）。
+    /// 把它当"一次普通读取"放进摘要里，结果就是每次刷新设备信息都白跑一次注定失败的
+    /// 读取，并在界面上留下一句红色的"不可读"——看起来像工具坏了，其实是权限边界，
+    /// 而且用户要的根本不是那一个数字，是内容。所以这里显式区分三态：
+    /// 读到了 / 读不到 / **没读（等你点）**。
+    #[serde(default)]
+    pub read_on_demand: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,6 +361,55 @@ pub struct ActivityForegroundResult {
     /// 无前台时的原因提示，便于 UI 直接展示
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+}
+
+/// AR10.5 之后的按需读取：`/proc/<pid>/<file>` 的详情。
+///
+/// `file` 是**枚举**而不是路径字符串：这一条方法在需要时会经 `su` 提权执行（maps 以
+/// shell 身份读不到），所以绝不允许调用方传任意路径进来——白名单在 Agent 侧逐值拼接，
+/// 参数非法直接 `invalid_request`（与 D038"特权只走写死的固定脚本 + 校验过的参数"同一条）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcFile {
+    Maps,
+    Cmdline,
+    Status,
+}
+
+impl ProcFile {
+    /// 拼进脚本的那一段文件名：只有这三个值，别的都进不来。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Maps => "maps",
+            Self::Cmdline => "cmdline",
+            Self::Status => "status",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessProcReadParams {
+    pub pid: u32,
+    pub file: ProcFile,
+    /// 返回行数上限；省略=Agent 默认值，超出会被夹紧（不是报错）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lines: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessProcReadResult {
+    pub path: String,
+    pub file: ProcFile,
+    /// 文件总行数（截断与否都以它为准）
+    pub total_lines: u64,
+    /// 本次真的带回来多少行
+    pub returned_lines: u32,
+    pub truncated: bool,
+    /// 正文。`cmdline` 的 NUL 已经换成空格并截尾
+    pub text: String,
+    /// `shell` = 普通身份就读到了；`root` = 走了提权。界面要如实标出来，
+    /// 因为它同时告诉用户"这台机没授权时会看到什么"
+    pub read_via: String,
 }
 
 /// AR6.2：端口/进程互查。`/proc/net/*` 解析与 fd→inode 匹配全部在设备端完成，
@@ -1170,6 +1231,58 @@ pub struct PackageListLocalizedResult {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn proc_read_dto_is_snake_case_and_the_file_enum_is_closed() {
+        let params = ProcessProcReadParams {
+            pid: 4321,
+            file: ProcFile::Maps,
+            max_lines: Some(400),
+        };
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["file"], "maps");
+        assert_eq!(value["max_lines"], 400);
+        // 省略 max_lines 时不出现该字段（旧 Desktop 发的请求体形状不变）
+        let omitted = serde_json::to_value(ProcessProcReadParams {
+            pid: 1,
+            file: ProcFile::Cmdline,
+            max_lines: None,
+        })
+        .unwrap();
+        assert_eq!(omitted.get("max_lines"), None);
+        // 只认这三个值：想借这条方法读别的路径，反序列化阶段就该失败
+        assert!(serde_json::from_value::<ProcFile>(serde_json::json!("environ")).is_err());
+        assert!(serde_json::from_value::<ProcFile>(serde_json::json!("../cmdline")).is_err());
+
+        let result = ProcessProcReadResult {
+            path: "/proc/4321/maps".into(),
+            file: ProcFile::Maps,
+            total_lines: 2557,
+            returned_lines: 2,
+            truncated: true,
+            text: "a\nb".into(),
+            read_via: "root".into(),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["total_lines"], 2557);
+        assert_eq!(value["returned_lines"], 2);
+        assert_eq!(value["read_via"], "root");
+    }
+
+    #[test]
+    fn proc_summary_treats_missing_read_on_demand_as_eager_read() {
+        // 旧 Agent 不带这个字段：必须照旧当"已经读过的摘要"，不能凭空变成"等你点"
+        let legacy = serde_json::json!({
+            "name": "cmdline",
+            "path": "/proc/1/cmdline",
+            "summary": "init",
+            "readable": true
+        });
+        let parsed: ProcEntrySummary = serde_json::from_value(legacy).unwrap();
+        assert!(!parsed.read_on_demand);
+        assert_eq!(parsed.summary.as_deref(), Some("init"));
+    }
+
     use crate::{AgentError, ErrorCode};
     use serde_json::json;
 
@@ -1233,6 +1346,7 @@ mod tests {
                 path: "/proc/4321/maps".into(),
                 summary: Some("118".into()),
                 readable: true,
+                read_on_demand: false,
             }],
             hint: None,
         };

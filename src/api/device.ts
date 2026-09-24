@@ -66,6 +66,23 @@ export interface FileStat {
   readable: boolean;
 }
 
+/**
+ * `/proc/<pid>/<file>` 的按需读取结果（设备信息页点箭头之后）。
+ * ⚠️ 字段名与 Agent 协议 wire 一致（snake_case），由 ipc_dto_wire_shape 对账。
+ */
+export interface ProcReadResult {
+  path: string;
+  file: string;
+  /** 文件真实总行数 */
+  total_lines: number;
+  /** 本次带回来多少行（受 max_lines 限制） */
+  returned_lines: number;
+  truncated: boolean;
+  text: string;
+  /** shell = 普通身份就读到；root = 走了提权。界面要如实标出来 */
+  read_via: string;
+}
+
 /** 文件写操作的结果（AR7.4）。⚠️ 字段名与 Agent 协议 wire 一致（snake_case）。 */
 export interface FsMkdirResult {
   path: string;
@@ -323,6 +340,24 @@ export const deviceApi = {
    * 单路径元数据（AR7.1，Agent only）。`followSymlink=false` 是 lstat 语义（链接本身），
    * true 时取解析后的目标；路径含 `..` 或不在允许范围内会被设备端结构化拒绝。
    */
+  /**
+   * 按需读 `/proc/<pid>/<file>` 详情（AR10.6）。**只在用户点箭头时调用**——
+   * `maps` 以 shell 身份读不到，Agent 会先试普通身份、读不到才提权，
+   * 所以这条不并入设备信息的周期刷新。`file` 只接受 maps|cmdline|status。
+   */
+  procRead(
+    serial: string,
+    pid: number,
+    file: "maps" | "cmdline" | "status",
+    maxLines?: number,
+  ): Promise<ProcReadResult> {
+    return invokeCommand<ProcReadResult>("device_proc_read", {
+      serial,
+      pid,
+      file,
+      maxLines,
+    });
+  },
   fileStat(
     serial: string,
     path: string,

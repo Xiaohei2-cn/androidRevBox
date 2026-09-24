@@ -17,7 +17,7 @@ use agent_protocol::method::{
     FILESYSTEM_STAT, FRIDA_SERVER_START, FRIDA_SERVER_STATUS, FRIDA_SERVER_STOP, HOSTED_CHMOD,
     HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP, PACKAGE_LIST, PACKAGE_NATIVE_LIB_DIR,
     PACKAGE_REPLACE_NATIVE_LIBRARY, PACKAGE_UNINSTALL, PROCESS_BY_PORT, PROCESS_KILL,
-    PROCESS_PORTS,
+    PROCESS_PORTS, PROCESS_PROC_READ,
 };
 use agent_protocol::{
     ActivityForceStopParams, ActivityLaunchParams, DeviceInfoParams, DeviceInfoResult,
@@ -32,9 +32,10 @@ use agent_protocol::{
     HostedStatusResult, HostedStopParams, HostedStopResult, KillSignal, ListeningPort,
     PackageListParams, PackageListResult, PackageNativeLibDirParams, PackageNativeLibDirResult,
     PackageScope, PackageUninstallParams, PackageUninstallResult, PackageWriteResult,
-    PortHoldingProcess, PreviewEncoding, ProcessByPortParams, ProcessByPortResult,
+    PortHoldingProcess, PreviewEncoding, ProcFile, ProcessByPortParams, ProcessByPortResult,
     ProcessKillParams, ProcessKillResult, ProcessPortsParams, ProcessPortsResult,
-    ReplaceNativeLibraryParams, ReplaceNativeLibraryResult, SO_STAGED_ROOT, SocketFamily,
+    ProcessProcReadParams, ProcessProcReadResult, ReplaceNativeLibraryParams,
+    ReplaceNativeLibraryResult, SO_STAGED_ROOT, SocketFamily,
 };
 
 use async_trait::async_trait;
@@ -1917,6 +1918,36 @@ impl DeviceService {
     /// 所以这一项**不需要 root**；需要 root 的只有 start/stop。
     ///
     /// 没有 Legacy 对照（旧实现根本不看设备侧状态），所以 Agent 不在线就是明确错误。
+    /// 按需读取 `/proc/<pid>/<file>` 的详情（设备信息页点箭头之后）。
+    ///
+    /// **没有 ADB 回退腿**，这是有意的：这条读要在设备上提权（`maps` 以 shell 身份读不到），
+    /// 而"提权"在我们的架构里只有 Agent 的固定脚本一条路（D037/D038）。让桌面端自己拼
+    /// `adb shell su -c` 等于把同一件事做成第二个不可审计的入口，与 AR9.4 的调用点审计相反。
+    pub async fn proc_read(
+        &self,
+        serial: &str,
+        pid: u32,
+        file: ProcFile,
+        max_lines: Option<u32>,
+    ) -> CoreResult<ProcessProcReadResult> {
+        self.require_agent_route(serial, PROCESS_PROC_READ)?;
+        let params = ProcessProcReadParams {
+            pid,
+            file,
+            max_lines,
+        };
+        self.android
+            .agent()
+            .request::<_, ProcessProcReadResult>(
+                serial,
+                PROCESS_PROC_READ,
+                &params,
+                SHORT_CMD_TIMEOUT,
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))
+    }
+
     pub async fn frida_server_status(&self, serial: &str) -> CoreResult<FridaServerStatusResult> {
         self.require_agent_route(serial, FRIDA_SERVER_STATUS)?;
         let params = FridaServerStatusParams {};
