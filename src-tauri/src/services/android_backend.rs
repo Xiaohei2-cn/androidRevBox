@@ -164,7 +164,9 @@ pub struct AgentBackend {
 }
 
 impl AgentBackend {
-    fn new(manager: Arc<AgentManager>) -> Self {
+    // crate 内可见即可（不对外扩面）：AR10.4 的自动重连钩子就挂在这个 request() 上，
+    // 会话层的单测要能从 AgentManager 那一侧把它整条跑一遍。
+    pub(crate) fn new(manager: Arc<AgentManager>) -> Self {
         Self { manager }
     }
 
@@ -182,10 +184,33 @@ impl AgentBackend {
         let client = self.manager.client(serial).ok_or_else(|| {
             AgentBackendError::Unavailable("Agent session is not connected".into())
         })?;
-        client
-            .request(method, params, timeout)
-            .await
-            .map_err(|error| map_client_error(method, error))
+        match client.request(method, params, timeout).await {
+            Ok(value) => Ok(value),
+            Err(AgentClientError::TransportLost(reason)) => {
+                // 链路被打断（AR10.4 真机现场：framework 软重启常连带重启 adbd，转发规则
+                // 随它一起消失，而设备上的 Agent 与模块都还好好的）。这里把会话接回来，
+                // 但**这一次调用照实失败**——请求可能已经在设备上执行完了，只是应答丢在
+                // 半路；替用户重放就等于把同一次删除/改权限再做一遍。
+                self.recover_transport(serial, method, &reason).await
+            }
+            Err(error) => Err(map_client_error(method, error)),
+        }
+    }
+
+    async fn recover_transport<R>(
+        &self,
+        serial: &str,
+        method: &str,
+        reason: &str,
+    ) -> Result<R, AgentBackendError> {
+        match self.manager.reconnect_after_transport_loss(serial).await {
+            Ok(_) => Err(AgentBackendError::TransportLost(format!(
+                "与设备的连接被中断（{reason}）。已自动重连，这一步可以直接重试；{method} 这一次没有被重放（无法确认设备侧当时是否已执行）",
+            ))),
+            Err(error) => Err(AgentBackendError::TransportLost(format!(
+                "与设备的连接被中断（{reason}），自动重连也没成功：{error}。请在设备页重新连接 Agent",
+            ))),
+        }
     }
 
     fn availability_from_status(status: &AgentSessionStatus, method: &str) -> BackendAvailability {

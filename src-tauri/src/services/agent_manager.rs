@@ -45,11 +45,23 @@ pub enum AgentManagerError {
     },
 }
 
+/// 连上之后留着这两样，只为一件事：**传输被打断时能轻量重连**（AR10.4）。
+/// 令牌从头到尾只在内存里（不落盘、不进日志），产物版本号用来核对"重连后还是同一份 Agent"。
+#[derive(Debug, Clone)]
+struct SessionPlan {
+    auth_token: String,
+    expected_agent_version: String,
+}
+
 struct DeviceSession {
     operation: AsyncMutex<()>,
     status: RwLock<AgentSessionStatus>,
     client: Mutex<Option<AgentClient>>,
     forward: Mutex<Option<String>>,
+    /// 只有完整连接成功过一次才会有值；重连成功后会跟着新握手更新
+    plan: Mutex<Option<SessionPlan>>,
+    /// 自动重连次数：给诊断与回归断言用（"到底有没有不靠人再点一次"）
+    transport_recoveries: Mutex<usize>,
 }
 
 impl DeviceSession {
@@ -59,6 +71,8 @@ impl DeviceSession {
             status: RwLock::new(AgentSessionStatus::disconnected(serial)),
             client: Mutex::new(None),
             forward: Mutex::new(None),
+            plan: Mutex::new(None),
+            transport_recoveries: Mutex::new(0),
         }
     }
 
@@ -146,6 +160,9 @@ impl AgentManager {
         }
 
         *session.client.lock().expect("agent client lock poisoned") = None;
+        // 凭据跟着会话一起作废：下一次显式连接会重新起 Agent、重新生成令牌，
+        // 留着旧的只会让自动重连拿着过期钥匙去敲新门。
+        *session.plan.lock().expect("agent plan lock poisoned") = None;
         *session.status.write().expect("agent status lock poisoned") =
             AgentSessionStatus::disconnected(serial);
         if let Err(error) = self.bootstrap.ensure_online(serial).await {
@@ -239,8 +256,8 @@ impl AgentManager {
             .handshake(
                 serial,
                 local_port,
-                &launch,
-                &artifact.expected_agent_version,
+                launch.auth_token.as_str(),
+                artifact.expected_agent_version.as_str(),
                 &session,
             )
             .await;
@@ -277,6 +294,10 @@ impl AgentManager {
                 return Err(error);
             }
         }
+        *session.plan.lock().expect("agent plan lock poisoned") = Some(SessionPlan {
+            auth_token: launch.auth_token.clone(),
+            expected_agent_version: artifact.expected_agent_version.clone(),
+        });
         tracing::info!(
             serial,
             artifact_source = ?artifact.source,
@@ -285,6 +306,148 @@ impl AgentManager {
             "Agent artifact accepted"
         );
         Ok(status)
+    }
+
+    /// 自动重连过几次（诊断与回归断言用）。
+    pub fn transport_recovery_count(&self, serial: &str) -> usize {
+        self.sessions
+            .lock()
+            .expect("agent sessions lock poisoned")
+            .get(serial)
+            .map(|session| {
+                *session
+                    .transport_recoveries
+                    .lock()
+                    .expect("counter lock poisoned")
+            })
+            .unwrap_or(0)
+    }
+
+    /// **传输被打断后自动把会话接回来——只重连，绝不重放任何请求。**
+    ///
+    /// 现场（AR10.4 真机）：framework 软重启有概率连带重启 adbd，`adb forward` 的规则是
+    /// adbd 持有的，于是它一消失，桌面↔Agent 的链路就断了（报 `TransportLost`），而设备上的
+    /// Agent 与 Zygisk 模块**都还好好的**。以前这种情况下用户得自己去点一次"连接 Agent"。
+    ///
+    /// 三条刻意的设计：
+    /// ① **不重放**：请求可能已经在设备上执行完了，只是应答丢在断掉的链路上；重放等于把
+    ///    同一次删除/改权限/安装再做一遍（§3.6"写操作不自动回退"的同一条纪律，读操作也一律
+    ///    不猜）。所以这个方法只负责"把路接回来"，那一次失败的调用照实报错。
+    /// ② **只做轻量重连**：重建 forward + TCP + hello，用内存里那份令牌。不重装产物、
+    ///    不重启 Agent——重启会连带打掉托管进程（AR7.2/AR9.1 的账就不对了）。
+    /// ③ **单飞**：和 `connect_*` 抢同一把 `operation` 锁，并且进来先做一次健康检查，
+    ///    所以并发十个失败请求只会真的重连一次。
+    pub async fn reconnect_after_transport_loss(
+        &self,
+        serial: &str,
+    ) -> Result<AgentSessionStatus, AgentManagerError> {
+        validate_serial(serial)?;
+        let session = self.session_for(serial);
+        let _operation = session.operation.lock().await;
+
+        // 先把锁内的东西取成一个普通值再 await：`std::sync::MutexGuard` 不是 `Send`，
+        // 直接在 `if let` 的暂存里持有它跨过一次 await，整个命令的 future 就不再是 `Send`
+        // （Tauri 命令当场编译不过）。下面这两段都按这个写法来。
+        let existing_client = session
+            .client
+            .lock()
+            .expect("agent client lock poisoned")
+            .clone();
+        if let Some(client) = existing_client
+            && client.health(REUSE_HEALTH_TIMEOUT).await.is_ok()
+        {
+            // 已经有人接回来了（或者只是我们这边的读超时误判），什么都不用做
+            return Ok(session.status());
+        }
+        let stored_plan = session
+            .plan
+            .lock()
+            .expect("agent plan lock poisoned")
+            .clone();
+        let Some(plan) = stored_plan else {
+            let error = AgentManagerError::Client(AgentClientError::TransportLost(
+                "没有可复用的会话凭据（这个会话从没完整连上过）".into(),
+            ));
+            session.fail(AgentSessionState::Disconnected, error.to_string());
+            return Err(error);
+        };
+
+        *session.client.lock().expect("agent client lock poisoned") = None;
+        // 先 take 成普通值再 await（同上：别把 MutexGuard 带过 await）
+        let stale_forward = session
+            .forward
+            .lock()
+            .expect("agent forward lock poisoned")
+            .take();
+        if let Some(stale) = stale_forward {
+            // 规则多半已经随 adbd 一起没了，移除失败是常态，不当错误
+            let _ = self.bootstrap.remove_forward(serial, &stale).await;
+        }
+        self.wait_device_online(serial).await?;
+
+        session.transition(AgentSessionState::Starting);
+        let (forward, local_port) = match self.bootstrap.forward(serial).await {
+            Ok(value) => value,
+            Err(error) => {
+                session.fail(AgentSessionState::Disconnected, error.to_string());
+                return Err(error.into());
+            }
+        };
+        *session.forward.lock().expect("agent forward lock poisoned") = Some(forward);
+        let result = self
+            .handshake(
+                serial,
+                local_port,
+                plan.auth_token.as_str(),
+                plan.expected_agent_version.as_str(),
+                &session,
+            )
+            .await;
+        match result {
+            Ok(status) => {
+                *session
+                    .transport_recoveries
+                    .lock()
+                    .expect("counter lock poisoned") += 1;
+                tracing::warn!(
+                    serial,
+                    local_port,
+                    "Agent transport recovered without reinstall"
+                );
+                Ok(status)
+            }
+            Err(error) => {
+                // 接不回来就别装作连上了：交回原来的显式连接路径（那才会重装/重启 Agent）
+                let _ = session
+                    .forward
+                    .lock()
+                    .expect("agent forward lock poisoned")
+                    .take();
+                session.fail(AgentSessionState::Disconnected, error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    /// adbd 重启时设备会在 adb 服务器上消失一小会儿，这里给它一个有界的等待窗口。
+    /// 上限很短（默认 8 s）：软重启打掉的只是转发规则，Agent 进程一直在，等不到就该
+    /// 让人看见真问题，而不是把一次点击挂在那里几十秒。
+    async fn wait_device_online(&self, serial: &str) -> Result<(), AgentManagerError> {
+        const DEADLINE: Duration = Duration::from_secs(8);
+        const STEP: Duration = Duration::from_millis(400);
+        let started = Instant::now();
+        loop {
+            match self.bootstrap.ensure_online(serial).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if started.elapsed() >= DEADLINE {
+                        session_state_fail(&self.sessions, serial, &error.to_string());
+                        return Err(error.into());
+                    }
+                    tokio::time::sleep(STEP).await;
+                }
+            }
+        }
     }
 
     pub fn status(&self, serial: &str) -> AgentSessionStatus {
@@ -426,6 +589,8 @@ impl AgentManager {
                 tracing::debug!(serial, local, error = %error, "forward cleanup after device disconnect was not acknowledged");
             }
         }
+        // 设备都没了，凭据也就作废：下一次必须走显式连接（那才会重新起 Agent 换令牌）
+        *session.plan.lock().expect("agent plan lock poisoned") = None;
         session.fail(AgentSessionState::Disconnected, "ADB device disconnected");
     }
 
@@ -433,7 +598,7 @@ impl AgentManager {
         &self,
         serial: &str,
         local_port: u16,
-        launch: &AgentLaunch,
+        auth_token: &str,
         expected_agent_version: &str,
         session: &DeviceSession,
     ) -> Result<AgentSessionStatus, AgentManagerError> {
@@ -451,11 +616,7 @@ impl AgentManager {
                 .saturating_duration_since(Instant::now())
                 .min(HELLO_TIMEOUT);
             let hello = client
-                .hello(
-                    launch.auth_token.as_str(),
-                    env!("CARGO_PKG_VERSION"),
-                    hello_timeout,
-                )
+                .hello(auth_token, env!("CARGO_PKG_VERSION"), hello_timeout)
                 .await;
             match hello {
                 Ok(hello) => break (client, hello),
@@ -463,6 +624,11 @@ impl AgentManager {
                     tokio::time::sleep(CONNECT_RETRY_DELAY).await;
                 }
                 Err(error) => {
+                    let auth_failed = matches!(
+                        &error,
+                        AgentClientError::Remote(remote)
+                            if remote.code == ErrorCode::PermissionDenied
+                    );
                     let state = if matches!(
                         &error,
                         AgentClientError::Remote(remote)
@@ -472,7 +638,19 @@ impl AgentManager {
                     } else {
                         AgentSessionState::Disconnected
                     };
-                    session.fail(state, error.to_string());
+                    // 鉴权失败几乎不可能是"令牌打错"：令牌是这次连接现生成现推的。
+                    // 真正常见的原因是**应答来自上一个还活着的 Agent 实例**（它占着抽象
+                    // 套接字、手里是上一次的令牌），新起的实例因为端口被占根本没跑起来。
+                    // 连接前已经按 exe 路径扫过一遍（AgentBootstrap::stop），仍失败时就得
+                    // 把这个方向说出来，否则用户只能对着 "authentication failed" 猜。
+                    let reason = if auth_failed {
+                        format!(
+                            "{error}；多半是设备上还留着上一个 Agent 实例占着通信口                              （另一个会话窗口或上次没退净的连接）。关掉其它会话后重试，                             或拔插一次 USB"
+                        )
+                    } else {
+                        error.to_string()
+                    };
+                    session.fail(state, reason);
                     return Err(error.into());
                 }
             }
@@ -565,6 +743,20 @@ impl AgentManager {
             .entry(serial.to_owned())
             .or_insert_with(|| Arc::new(DeviceSession::new(serial)))
             .clone()
+    }
+}
+
+fn session_state_fail(
+    sessions: &Mutex<HashMap<String, Arc<DeviceSession>>>,
+    serial: &str,
+    reason: &str,
+) {
+    if let Some(session) = sessions
+        .lock()
+        .expect("agent sessions lock poisoned")
+        .get(serial)
+    {
+        session.fail(AgentSessionState::Disconnected, reason);
     }
 }
 
@@ -673,6 +865,8 @@ mod tests {
         AgentManager::new(Arc::new(MockAdbRunner::new(true)), artifacts)
     }
 
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
     const TEST_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
     #[derive(Clone, Copy)]
@@ -680,9 +874,25 @@ mod tests {
         Ready,
         Incompatible,
         CloseFirstThenReady,
+        /// 第一条连接：握手正常，但**第一个请求**在应答之前就被掐断——就是 AR10.4
+        /// 里 adbd 随 framework 一起重启、`adb forward` 规则消失的那个现场。
+        /// 第二条连接起完全正常，于是"只重连不重放"这件事可以被数出来。
+        DropFirstRequestThenReady,
     }
 
     async fn spawn_fake_agent(mode: FakeAgentMode) -> (u16, JoinHandle<()>) {
+        let (port, task, _served) = spawn_fake_agent_counting(mode).await;
+        (port, task)
+    }
+
+    /// 同一个假 Agent，额外把"真正被应答过的非握手请求数"暴露出来：
+    /// 自动重连如果偷偷重放了那一条，这个数就会涨——那是本阶段最不该发生的事。
+    async fn spawn_fake_agent_counting(
+        mode: FakeAgentMode,
+    ) -> (u16, JoinHandle<()>, Arc<AtomicUsize>) {
+        let served = Arc::new(AtomicUsize::new(0));
+        // 计数器的"拥有者"是测试，accept 循环里只拿副本
+        let served_by_task = served.clone();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let task = tokio::spawn(async move {
@@ -693,20 +903,28 @@ mod tests {
                 };
                 let current_index = connection_index;
                 connection_index += 1;
-                tokio::spawn(serve_fake_connection(stream, mode, current_index));
+                tokio::spawn(serve_fake_connection(
+                    stream,
+                    mode,
+                    current_index,
+                    served_by_task.clone(),
+                ));
             }
         });
-        (port, task)
+        (port, task, served)
     }
 
     async fn serve_fake_connection(
         mut stream: TcpStream,
         mode: FakeAgentMode,
         connection_index: usize,
+        served: Arc<AtomicUsize>,
     ) {
         if matches!(mode, FakeAgentMode::CloseFirstThenReady) && connection_index == 0 {
             return;
         }
+        let drop_first_request =
+            matches!(mode, FakeAgentMode::DropFirstRequestThenReady) && connection_index == 0;
         loop {
             let request = match read_request(&mut stream).await {
                 Some(request) => request,
@@ -735,6 +953,14 @@ mod tests {
                 ),
                 _ => continue,
             };
+            if request.method != agent_protocol::method::SYSTEM_HELLO {
+                if drop_first_request {
+                    // 应答之前就把连接断掉：调用方只知道自己"没收到回复"，
+                    // 无从判断设备端到底执行没执行——所以任何人都不能替它重放。
+                    return;
+                }
+                served.fetch_add(1, Ordering::SeqCst);
+            }
             if stream
                 .write_all(&encode_json(&response).unwrap())
                 .await
@@ -951,6 +1177,101 @@ mod tests {
         assert_eq!(status.state, AgentSessionState::Ready);
         manager.disconnect("serial-a").await.unwrap();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn transport_loss_reconnects_without_reinstall_or_replay() {
+        use crate::services::android_backend::AgentBackend;
+        use agent_protocol::method::SYSTEM_HEALTH;
+
+        let (port, server, served) =
+            spawn_fake_agent_counting(FakeAgentMode::DropFirstRequestThenReady).await;
+        let runner = Arc::new(SessionAdbRunner::new(
+            [("serial-a".into(), port)],
+            Duration::ZERO,
+        ));
+        let manager = Arc::new(manager_with_runner(runner.clone()));
+        let backend = AgentBackend::new(manager.clone());
+        let artifact = test_artifact();
+        manager
+            .connect("serial-a", &artifact.path().join("android-agent"))
+            .await
+            .unwrap();
+        let pushes = runner.count_command("push");
+        let starts = runner.count_command("nohup");
+        assert_eq!(pushes, 1, "前置：连接阶段应当推过一次产物");
+        assert_eq!(starts, 1, "前置：连接阶段应当起过一次 Agent");
+
+        // ① 链路在应答前被打断：这一条调用必须**照实失败**
+        let error = backend
+            .request::<_, HealthResult>(
+                "serial-a",
+                SYSTEM_HEALTH,
+                &serde_json::json!({}),
+                REQUEST_TIMEOUT,
+            )
+            .await
+            .expect_err("应答丢失时不能假装成功");
+        let text = error.to_string();
+        assert!(
+            text.contains("已自动重连") && text.contains("没有被重放"),
+            "要说清做了什么（重连）和没做什么（重放）: {text}"
+        );
+        assert!(
+            !text.contains("  "),
+            "文案里有连续空格，多半是拼接残渣: {text:?}"
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            0,
+            "断掉的那条请求被自动重放了——写操作这么干等于把同一刀砍两次"
+        );
+
+        // ② 但路已经接回来了：只重建 forward + 握手，不重装、不重启 Agent
+        assert_eq!(manager.transport_recovery_count("serial-a"), 1);
+        assert_eq!(runner.count_command("push"), pushes, "自动重连不该推产物");
+        assert_eq!(
+            runner.count_command("nohup"),
+            starts,
+            "自动重连不该重启 Agent"
+        );
+        assert_eq!(
+            manager.status("serial-a").state,
+            AgentSessionState::Ready,
+            "重连后会话该回到 Ready，而不是等用户再点一次"
+        );
+
+        // ③ 下一次调用直接可用（这就是"不用人工重连"的全部含义）
+        let ok = backend
+            .request::<_, HealthResult>(
+                "serial-a",
+                SYSTEM_HEALTH,
+                &serde_json::json!({}),
+                REQUEST_TIMEOUT,
+            )
+            .await
+            .expect("重连之后的调用应当正常成功");
+        assert_eq!(ok.status, HealthStatus::Ready);
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+
+        // ④ 并发失败只该重连一次（单飞）：两条链路同时断，各自报错，但计数只 +1
+        let empty = serde_json::json!({});
+        let left =
+            backend.request::<_, HealthResult>("serial-a", SYSTEM_HEALTH, &empty, REQUEST_TIMEOUT);
+        let right =
+            backend.request::<_, HealthResult>("serial-a", SYSTEM_HEALTH, &empty, REQUEST_TIMEOUT);
+        let (left, right) = (left.await, right.await);
+        assert!(
+            left.is_ok() && right.is_ok(),
+            "健康链路上的并发调用都该成功: {left:?} {right:?}"
+        );
+        assert_eq!(
+            manager.transport_recovery_count("serial-a"),
+            1,
+            "没断就不该再重连"
+        );
+        server.abort();
+        manager.disconnect("serial-a").await.unwrap();
     }
 
     #[tokio::test]
@@ -3117,14 +3438,16 @@ mod tests {
     /// ② **Desktop ↔ Agent 的 adb forward**：软重启有时会连带把 adbd 一起重启（实测两种
     ///    结果都出现过：一次 17 s 自愈、一次 forward 被打掉报 TransportLost）。这一层不是
     ///    Zygisk 生命周期，但会让人误以为"①没做到"，所以本腿把它显式量出来：需要几次
-    ///    重连才恢复。当前产品答案是"下一次连接动作（设备页→连接 Agent）恢复"，
-    ///    自动重连没做——这条差异记在 §10，不做到腿里冒充已验证。
+    ///    重连才恢复。这一层现在由 `AgentBackend::request` 上的**自动重连**接住
+    ///    （只重连、不重放），本腿不代劳、只把它的次数读出来；专门造那个现场的是
+    ///    `real_agent_auto_recovers_when_the_link_is_torn_down`。
     ///
     /// 因为会 kill system_server（手机会黑屏重启桌面约 10~30 秒），必须
     /// `AR104_KILL_SYSTEM_SERVER=yes` 显式授权才跑。
     #[tokio::test]
     #[ignore = "会 kill system_server（软重启）；APPLIST_TEST_SERIAL=<serial> AR104_KILL_SYSTEM_SERVER=yes cargo test -p app-reverse-tools real_agent_survives_framework_restart -- --ignored --nocapture"]
     async fn real_agent_survives_framework_restart() {
+        use crate::services::android_backend::AgentBackend;
         use agent_protocol::method::{PACKAGE_LIST_LOCALIZED, ZYGISK_STATUS};
         use agent_protocol::{
             PackageListLocalizedParams, PackageScope, ZygiskStatusParams, ZygiskStatusResult,
@@ -3170,18 +3493,19 @@ mod tests {
         let first_pid =
             |text: String| -> String { text.split_whitespace().next().unwrap_or("").to_string() };
 
-        // 每次都用 manager 里**当前**那个 client：软重启可能打掉 adb forward，
-        // 重连之后 client 会被换掉，抓住旧的不放就变成"自己在跟自己说话的假自愈"。
+        // 采样走**产品同一条入口**（AgentBackend::request，上面挂着自动重连的钩子），
+        // 而不是自己抓一个 client：自己重连再报"自愈成功"，验的就不是产品行为了。
+        let backend = Arc::new(AgentBackend::new(manager.clone()));
         let status_once = {
-            let manager = manager.clone();
+            let backend = backend.clone();
             let serial = serial.clone();
             move || {
-                let manager = manager.clone();
+                let backend = backend.clone();
                 let serial = serial.clone();
                 async move {
-                    let client = manager.client(&serial).expect("会话还在连接中");
-                    client
+                    backend
                         .request::<_, ZygiskStatusResult>(
+                            &serial,
                             ZYGISK_STATUS,
                             &ZygiskStatusParams {},
                             Duration::from_secs(10),
@@ -3191,15 +3515,15 @@ mod tests {
             }
         };
         let list_once = {
-            let manager = manager.clone();
+            let backend = backend.clone();
             let serial = serial.clone();
             move || {
-                let manager = manager.clone();
+                let backend = backend.clone();
                 let serial = serial.clone();
                 async move {
-                    let client = manager.client(&serial).expect("会话还在连接中");
-                    client
+                    backend
                         .request::<_, agent_protocol::PackageListLocalizedResult>(
+                            &serial,
                             PACKAGE_LIST_LOCALIZED,
                             &PackageListLocalizedParams {
                                 locale: None,
@@ -3240,7 +3564,7 @@ mod tests {
         eprintln!("[ar10.4] 已 kill system_server：{killed}");
 
         let started = std::time::Instant::now();
-        let mut reconnects = 0_u32;
+        let mut reconnects = 0_usize;
         let mut saw_outage = false;
         let mut honest_failure = String::new();
         let mut recovered = None;
@@ -3273,18 +3597,13 @@ mod tests {
                 Err(e) => format!("status=fail({e:?})"),
             };
             eprintln!("[ar10.4] +{el}s system_server={ss_now} {tag} {st_tag}");
-            // 第②层：会话的传输被软重启打掉时，做一次重连（等价于用户点一次
-            // "连接 Agent"），然后继续按①的判据观察。重连次数会被打进结论。
-            if format!("{st:?}").contains("TransportLost")
-                || format!("{list:?}").contains("TransportLost")
+            // 第②层：adbd 被一起重启时，桌面↔Agent 的转发动不动得看运气。这里**不代劳**，
+            // 只把产品的自动重连次数读出来——如果有人替它重连，这条腿就白验了。
+            if format!("{st:?}").contains("自动重连") || format!("{list:?}").contains("自动重连")
             {
-                eprintln!("[ar10.4] +{el}s 传输被打掉（adbd 随 framework 一起重启），做一次重连");
-                reconnects += 1;
-                manager
-                    .connect_resolved(&serial)
-                    .await
-                    .expect("软重启后重新连接 Agent 失败");
+                eprintln!("[ar10.4] +{el}s 传输被打断，交给自动重连（本腿不代劳）");
             }
+            reconnects = manager.transport_recovery_count(&serial);
             let fresh_framework = !ss_now.is_empty() && ss_now != ss_before;
             if fresh_framework
                 && let Ok(s) = &st
@@ -3330,6 +3649,182 @@ mod tests {
             "[ar10.4] 通过：Agent↔模块通道自愈（0 人工干预）；桌面↔Agent 传输层重连次数={reconnects}"
         );
     }
+
+    /// AR10.4 真机腿：**转发规则被打断后，工具自己把路接回来，用户不用再点一次连接**。
+    ///
+    /// 现场是软重启把 adbd 一起重启，`adb forward` 的规则随它消失，而设备上的 Agent 和
+    /// Zygisk 模块都还好好的。这里不重启手机，而是**直接把我们自己那条 forward 拆掉**
+    /// （拆不动就再退一步重启宿主 adb 服务器），效果同一条：桌面↔Agent 链路断、设备侧不动。
+    ///
+    /// 三件事必须同时成立，缺一不可：
+    /// ① 断链的那一次调用**照实报错**，并且说清楚"没有重放"（不能偷偷补一次）；
+    /// ② 报错之后会话已经是 Ready —— 紧接着的第二次调用不用任何人动手就能成；
+    /// ③ 恢复是"轻量重连"：Agent 进程 pid 不变（没重装、没重启，托管进程因此不受牵连）。
+    #[tokio::test]
+    #[ignore = "会拆掉本会话的 adb forward（必要时重启宿主 adb 服务器）；AR104_RECOVER_PROBE=yes APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_auto_recovers -- --ignored --nocapture"]
+    async fn real_agent_auto_recovers_when_the_link_is_torn_down() {
+        use crate::services::android_backend::AgentBackend;
+        use agent_protocol::method::SYSTEM_HEALTH;
+        use agent_protocol::{EmptyParams, HealthResult, HealthStatus};
+
+        if std::env::var("AR104_RECOVER_PROBE").unwrap_or_default() != "yes" {
+            eprintln!(
+                "[跳过] 本腿会拆掉本会话的 adb forward（必要时 kill-server），需要 AR104_RECOVER_PROBE=yes"
+            );
+            return;
+        }
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = Arc::new(AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        ));
+        // 走产品同一条入口：AgentBackend::request 里挂着自动重连的钩子
+        let backend = AgentBackend::new(manager.clone());
+        manager.connect_resolved(&serial).await.unwrap();
+        let adb_path = runner
+            .environment()
+            .await
+            .path
+            .expect("本机应有 adb")
+            .to_string();
+        let agent_pid = |runner: Arc<dyn AdbRunner>| {
+            let adb_path = adb_path.clone();
+            let serial = serial.clone();
+            async move {
+                // 不经 su：Agent 是 shell 起的，shell 就看得见它的 pid
+                let out = runner
+                    .run(
+                        &adb_path,
+                        &adb::build_args(
+                            Some(&serial),
+                            &adb::cmd_shell("pidof app_reverse_tools_agent"),
+                        ),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .unwrap_or_default();
+                out.stdout
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            }
+        };
+        let pid_before = agent_pid(runner.clone()).await;
+        assert!(!pid_before.is_empty(), "起点必须有一个在跑的 Agent");
+        let healthy = backend
+            .request::<_, HealthResult>(
+                &serial,
+                SYSTEM_HEALTH,
+                &EmptyParams {},
+                REQUEST_TIMEOUT_DEV,
+            )
+            .await
+            .expect("起点链路是通的");
+        assert_eq!(healthy.status, HealthStatus::Ready);
+        let recoveries_before = manager.transport_recovery_count(&serial);
+
+        // ── 打断链路：先拆自己那条 forward；若已建立的隧道还活着，再重启宿主 adb 服务器 ──
+        let local = manager
+            .status(&serial)
+            .local_port
+            .map(|port| format!("tcp:{port}"))
+            .unwrap_or_default();
+        let mut how = String::new();
+        if !local.is_empty() {
+            let _ = runner
+                .run(
+                    &adb_path,
+                    &adb::build_args(Some(&serial), &adb::cmd_forward_remove(Some(&local))),
+                    Duration::from_secs(10),
+                )
+                .await;
+            how = format!("forward --remove {local}");
+            if backend
+                .request::<_, HealthResult>(
+                    &serial,
+                    SYSTEM_HEALTH,
+                    &EmptyParams {},
+                    REQUEST_TIMEOUT_DEV,
+                )
+                .await
+                .is_ok()
+            {
+                // adb 服务器可能还留着已经建好的隧道，那就把它重启一次（等价于 adbd 换了人）
+                let _ = runner
+                    .run(
+                        &adb_path,
+                        &adb::build_args(None, &["kill-server".to_string()]),
+                        Duration::from_secs(20),
+                    )
+                    .await;
+                how = "adb kill-server".to_string();
+            }
+        }
+        eprintln!("[ar10.4] 已用「{how}」打断桌面↔Agent 链路");
+
+        // ① 第一次调用必须照实失败，并说明没重放
+        let first = backend
+            .request::<_, HealthResult>(
+                &serial,
+                SYSTEM_HEALTH,
+                &EmptyParams {},
+                REQUEST_TIMEOUT_DEV,
+            )
+            .await;
+        match &first {
+            Ok(_) => {
+                eprintln!("[跳过] 用「{how}」没能打断已建立的链路，本腿的判据无从验证");
+                manager.disconnect(&serial).await.unwrap();
+                return;
+            }
+            Err(error) => {
+                let text = error.to_string();
+                eprintln!("[ar10.4] 断链后的第一次调用如实失败：{text}");
+                assert!(
+                    text.contains("自动重连"),
+                    "要告诉用户我们做了什么、没做什么: {text}"
+                );
+                assert!(
+                    !text.contains("  "),
+                    "文案里有连续空格，多半是拼接残渣: {text:?}"
+                );
+                // 这句话是直接给用户看的：别把字符串续行的空白残渣一起端上去
+                assert!(!text.contains("  "), "报错文案里有连续空格: {text:?}");
+            }
+        }
+
+        // ② 紧接着的第二次调用不需要任何人动手
+        let second = backend
+            .request::<_, HealthResult>(
+                &serial,
+                SYSTEM_HEALTH,
+                &EmptyParams {},
+                REQUEST_TIMEOUT_DEV,
+            )
+            .await
+            .expect("自动重连之后调用必须直接可用，不该再等用户点\"连接 Agent\"");
+        assert_eq!(second.status, HealthStatus::Ready);
+        assert_eq!(
+            manager.transport_recovery_count(&serial),
+            recoveries_before + 1,
+            "重连应当恰好发生一次"
+        );
+
+        // ③ 轻量重连：Agent 没被重启过
+        let pid_after = agent_pid(runner.clone()).await;
+        eprintln!("[ar10.4] Agent pid {pid_before} -> {pid_after}（不该变）；自动重连一次");
+        assert_eq!(
+            pid_after, pid_before,
+            "恢复过程重启了 Agent：说明走了重装/重启的重路径，托管进程会被牵连"
+        );
+        manager.disconnect(&serial).await.unwrap();
+        eprintln!("[ar10.4] 通过：链路被打断后自动恢复，且断掉那一次没有被重放");
+    }
+
+    const REQUEST_TIMEOUT_DEV: Duration = Duration::from_secs(10);
 
     /// AR9.1 前置真机腿：root 探测改由 Agent 执行后，结论必须与 Legacy `su -c id`
     /// 一致，而且要把「su 可用」与「Agent 自身有 root」分开带回——UI 之前把这两件事

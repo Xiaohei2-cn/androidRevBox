@@ -83,6 +83,14 @@ pub struct AgentBootstrap {
     runner: Arc<dyn AdbRunner>,
 }
 
+/// 停 Agent 的固定脚本（抽成自由函数是为了能被单测钉住形状——见 tests::
+/// stop_agent_also_sweeps_by_exe_path_not_only_the_pid_file）。
+fn stop_agent_script() -> String {
+    format!(
+        "if [ -f {AGENT_REMOTE_PID} ]; then pid=$(cat {AGENT_REMOTE_PID}); case \"$pid\" in ''|*[!0-9]*) ;; *) kill \"$pid\" 2>/dev/null || true; attempt=0; while kill -0 \"$pid\" 2>/dev/null && [ \"$attempt\" -lt 20 ]; do sleep 0.05; attempt=$((attempt + 1)); done; if kill -0 \"$pid\" 2>/dev/null; then kill -9 \"$pid\" 2>/dev/null || true; sleep 0.05; fi ;; esac; fi;              for p in $(pidof app_reverse_tools_agent 2>/dev/null); do if [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = \"{AGENT_REMOTE_BINARY}\" ]; then kill \"$p\" 2>/dev/null || true; fi; done;              attempt=0; while true; do left=; for p in $(pidof app_reverse_tools_agent 2>/dev/null); do if [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = \"{AGENT_REMOTE_BINARY}\" ]; then left=\"$left $p\"; fi; done; [ -z \"$left\" ] && break; [ \"$attempt\" -ge 20 ] && break; sleep 0.05; attempt=$((attempt + 1)); done;              for p in $(pidof app_reverse_tools_agent 2>/dev/null); do if [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = \"{AGENT_REMOTE_BINARY}\" ]; then kill -9 \"$p\" 2>/dev/null || true; fi; done; sleep 0.05; rm -f {AGENT_REMOTE_PID}"
+    )
+}
+
 impl AgentBootstrap {
     pub fn new(runner: Arc<dyn AdbRunner>) -> Self {
         Self { runner }
@@ -329,13 +337,19 @@ impl AgentBootstrap {
         Ok(())
     }
 
+    /// 停掉设备上**我们自己的** Agent。
+    ///
+    /// 先按 pid 文件停（常规路径），再按"可执行文件就是我们那个二进制"兜一遍：
+    /// pid 文件丢过一次（手工清 `/data/local/tmp`、上一次跑半途被杀），旧 Agent 就会
+    /// 赖在抽象套接字 `app_reverse_tools_agent_v1` 上不走；下一次 `start` 起的新实例
+    /// 绑不上端口直接退出，而桌面端握手的应答其实来自那个**拿着旧令牌**的老实例——
+    /// 现场表现为一句莫名其妙的 "agent authentication failed"（AR10.4 加自动重连腿时
+    /// 撞上的，见阶段文档）。所以这里必须按 exe 路径核对，不能只看 pid 文件。
+    /// 只匹配 `/data/local/tmp/app_reverse_tools_agent` 这一个路径，别的进程一概不碰。
     pub async fn stop(&self, serial: &str) -> Result<(), AgentBootstrapError> {
-        let command = format!(
-            "if [ -f {AGENT_REMOTE_PID} ]; then pid=$(cat {AGENT_REMOTE_PID}); case \"$pid\" in ''|*[!0-9]*) ;; *) kill \"$pid\" 2>/dev/null || true; attempt=0; while kill -0 \"$pid\" 2>/dev/null && [ \"$attempt\" -lt 20 ]; do sleep 0.05; attempt=$((attempt + 1)); done; if kill -0 \"$pid\" 2>/dev/null; then kill -9 \"$pid\" 2>/dev/null || true; sleep 0.05; fi ;; esac; fi; rm -f {AGENT_REMOTE_PID}"
-        );
         self.run_checked(
             serial,
-            &adb::cmd_shell(&command),
+            &adb::cmd_shell(&stop_agent_script()),
             SHORT_TIMEOUT,
             "stop_agent",
         )
@@ -517,6 +531,30 @@ impl Drop for LocalTokenFile {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stop_agent_sweeps_by_exe_path_not_only_the_pid_file() {
+        // pid 文件丢了或过期时，只按它停就会留下一个还占着抽象套接字的旧 Agent：
+        // 下一次 start 起的新实例绑不上端口直接退出，而桌面端握手的应答其实来自那个
+        // **拿着旧令牌**的老实例，现场只剩一句看不懂的 "agent authentication failed"
+        // （AR10.4 加自动重连腿时撞上）。所以"按 exe 路径兜一遍"不能丢。
+        let script = stop_agent_script();
+        assert!(script.contains("pidof app_reverse_tools_agent"), "{script}");
+        assert!(
+            script.contains("/proc/$p/exe"),
+            "必须核对可执行文件路径，光看进程名会误伤: {script}"
+        );
+        assert!(
+            script.contains("/data/local/tmp/app_reverse_tools_agent\""),
+            "只允许停我们自己那个路径下的二进制: {script}"
+        );
+        assert!(
+            !script.contains("pkill") && !script.contains("killall"),
+            "按名字批量杀不在我们的边界内: {script}"
+        );
+        // 停完要把 pid 文件清掉，但别把二进制本身删了（回滚还要用）
+        assert!(script.contains("rm -f /data/local/tmp/app_reverse_tools_agent.pid"));
+    }
     use std::sync::Mutex;
 
     use async_trait::async_trait;
