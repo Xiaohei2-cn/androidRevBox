@@ -59,8 +59,10 @@ DTO 留在 `android-agent`/模块两侧，**不要**把它塞进 `agent-protocol
 一句"v2 响应单帧超过大小上限"——模块其实说的是 `helper_timeout`/`helper_failed`，
 真原因和"该怎么办"全被这句话吃掉。v2.2 把模块侧改对（`send_err_for`），Agent 侧同时
 加了容错：长度大得离谱且头 4 字节全是可打印字符时，按文本行读出来照实报，并补一句
-"模块回了未分帧的文本行……升级模块后按帧返回"。两个方向都要活：新模块+旧 Agent 本来就
-能解析（Agent 一直在等帧里的 `ERR`），旧模块+新 Agent 靠容错路径也不说假话。
+"模块回了未分帧的文本行……升级模块后按帧返回"。两个方向都要活：旧模块+新 Agent 靠容错
+路径也不说假话（**这一向有真机腿 `errline`**）；新模块+旧 Agent 这一向只有**代码级依据**
+——帧循环里的 `parse_pro_error` 从 AR5.6 起就在等帧内的 `ERR`（本轮一字未动），
+对旧端来说 v2.2 才是"终于对上了"；这一向**没有拿旧 Agent 实测过**，别当成已验证结论。
 
 能力位常量：`CAP_LIST="list"`、`CAP_MANIFEST="manifest"`、`CAP_EXPORT="export"`、
 `CAP_DESCRIBE="describe"`、`CAP_HANDLERS="handlers"`
