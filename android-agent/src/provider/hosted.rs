@@ -12,7 +12,7 @@
 //!   不再是自己的子进程，只报存活状态，绝不假装知道退出码；
 //! - 参数数组直接 exec，文件名与参数都不进任何 shell 解析上下文。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt as _;
@@ -163,10 +163,23 @@ impl HostedProvider {
             })?;
         let mut table = self.lock();
         let runs = refresh(&mut table);
+        let runs: Vec<HostedRunRecord> = runs.into_iter().map(|(_, record)| record).collect();
+        let ours: std::collections::HashSet<u32> = runs
+            .iter()
+            .filter(|r| r.state == HostedRunState::Running)
+            .map(|r| r.pid)
+            .collect();
+        // 设备上有同名进程在跑、但不是我们启动的：工具比目标进程晚启动时必然出现这种
+        // "它在跑，可我这边显示未运行"。把 pid 一起带回去，界面才说得出"其实已经在跑"。
+        let external = running_processes_by_comm();
+        let mut binaries = scan.binaries;
+        for info in &mut binaries {
+            info.external_pids = external_pids_for(&info.name, &external, &ours);
+        }
         serialize(HostedListResult {
             dir: HOSTED_DIR.to_owned(),
-            binaries: scan.binaries,
-            runs: runs.into_iter().map(|(_, record)| record).collect(),
+            binaries,
+            runs,
             truncated: scan.truncated,
             unreadable: scan.unreadable,
         })
@@ -746,10 +759,66 @@ fn scan_binaries() -> BinaryScan {
             has_exec: mode & 0o100 != 0,
             uid: metadata.uid(),
             mtime_unix: metadata.mtime().max(0) as u64,
+            // 这里先留空：外部同名进程要扫一遍 /proc，整份清单一次扫完再回填（见 list）
+            external_pids: Vec::new(),
         });
     }
     scan.binaries.sort_by(|a, b| a.name.cmp(&b.name));
     scan
+}
+
+/// 扫一遍 `/proc/<pid>/comm`，得到"进程名 → 正在跑的 pid"。
+///
+/// 用 comm 而不是 cmdline：cmdline 属于别的 uid 时 shell 读不到（真机实测），
+/// 而 comm 可读。注意内核把 comm 截到 15 字符，所以匹配时按截断后的名字比，
+/// 长名字会一起命中——这比"显示成未运行"更接近事实，误命中的代价由界面上
+/// "确认再执行"这一步兜住（不会静默替用户做决定）。
+fn running_processes_by_comm() -> HashMap<String, Vec<u32>> {
+    let mut map: HashMap<String, Vec<u32>> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return map;
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_string_lossy().parse::<u32>().ok() else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            continue;
+        };
+        let comm = comm.trim();
+        if comm.is_empty() {
+            continue;
+        }
+        map.entry(comm.to_owned()).or_default().push(pid);
+    }
+    map
+}
+
+/// 某个托管文件当前有没有"别人启动的同名进程"在跑：按 comm 匹配，并剔掉我们自己
+/// 托管表里已在跑的 pid（那些有句柄、界面本来就显示成运行中，不该再报"外部"）。
+fn external_pids_for(
+    name: &str,
+    by_comm: &HashMap<String, Vec<u32>>,
+    ours: &HashSet<u32>,
+) -> Vec<u32> {
+    let mut found: Vec<u32> = by_comm
+        .iter()
+        .filter(|(comm, _)| comm_matches(name, comm))
+        .flat_map(|(_, pids)| pids.iter().copied())
+        .filter(|pid| !ours.contains(pid))
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// 托管文件名与 comm 的对应：完全相等，或名字长到被内核截断后相等。
+fn comm_matches(name: &str, comm: &str) -> bool {
+    name == comm || (name.len() > 15 && name.starts_with(comm) && comm.len() == 15)
 }
 
 /// 确认死亡时顺手回收自己持有的子进程，把真实退出码/信号留在记录里。
@@ -863,6 +932,35 @@ fn serialize<T: serde::Serialize>(value: T) -> Result<Value, AgentError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn comm_matching_survives_the_kernels_15_char_truncation() {
+        assert!(comm_matches("auth-server", "auth-server"));
+        // 内核把 comm 截到 15 字符：长名字必须还能认出来，否则又会显示成"没在跑"
+        // TASK_COMM_LEN=16 → 内核只留 15 个字符
+        assert_eq!("my-very-long-dumper-name".chars().count().min(15), 15);
+        assert!(comm_matches("my-very-long-dumper-name", "my-very-long-du"));
+        // 短名字不能被前缀误伤（comm 必须一字不差）
+        assert!(!comm_matches("frida-server", "frida"));
+        assert!(!comm_matches("server", "auth-server"));
+    }
+
+    #[test]
+    fn external_pids_exclude_what_we_started_ourselves() {
+        let mut by_comm = HashMap::new();
+        by_comm.insert("auth-server".to_string(), vec![9727_u32, 9728]);
+        let ours: HashSet<u32> = [9727].into_iter().collect();
+        // 9727 是我们自己起的（有句柄、界面已显示运行中），只有 9728 才算"外部在跑"
+        assert_eq!(
+            external_pids_for("auth-server", &by_comm, &ours),
+            vec![9728]
+        );
+        assert_eq!(
+            external_pids_for("frida-server", &by_comm, &ours),
+            Vec::<u32>::new()
+        );
+    }
+
     use super::*;
 
     fn record(handle: &str, pid: u32, ticks: u64) -> HostedRunRecord {

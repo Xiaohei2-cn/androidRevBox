@@ -24,6 +24,15 @@ pub enum CoreError {
     #[error("设备上没有这个文件或目录：{0}")]
     NotFound(String),
 
+    /// 设备当前的状态与这次操作冲突（端口已被占用、同名进程已在跑…）。
+    ///
+    /// 单独立一个变体，理由与 `NotFound` 一模一样：这类话以前挤在「内部错误」里，
+    /// 用户看到 `内部错误: auth-server 启动后立即退出：… bind failed` 第一反应是
+    /// 程序坏了去翻日志，而真相是"已经有一个 auth-server 在跑、端口是它的"——
+    /// 该做的是先停掉那个进程或换个端口，跟故障没关系。
+    #[error("与设备当前状态冲突：{0}")]
+    Conflict(String),
+
     #[error("Agent 不可用: {0}")]
     AgentUnavailable(String),
 
@@ -45,6 +54,7 @@ impl CoreError {
             CoreError::Database(_) => "DATABASE",
             CoreError::Internal(_) => "INTERNAL",
             CoreError::NotFound(_) => "NOT_FOUND",
+            CoreError::Conflict(_) => "CONFLICT",
             CoreError::AgentUnavailable(_) => "AGENT_UNAVAILABLE",
             CoreError::AgentIncompatible(_) => "AGENT_INCOMPATIBLE",
             CoreError::AgentTransportLost(_) => "AGENT_TRANSPORT_LOST",

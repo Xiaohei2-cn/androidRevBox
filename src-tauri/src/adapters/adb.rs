@@ -269,6 +269,10 @@ pub struct HostedBinary {
     pub perms: String,
     /// owner 有执行位 → 绿色；否则红色（可 chmod 赋予）
     pub has_exec: bool,
+    /// 设备上正在跑的**同名进程 pid，但不是本工具启动的**（因此没有句柄、这里停不了）。
+    /// 只有 Agent 通道给得出：Legacy 的 `ls -l` + `file` 只看文件，看不见进程。
+    #[serde(default)]
+    pub external_pids: Vec<u32>,
 }
 
 /// 校验托管文件名：仅允许安全字符（防 shell 注入 / 路径逃逸）。
@@ -339,6 +343,8 @@ pub fn hosted_binaries(ls_stdout: &str, file_stdout: &str) -> Vec<HostedBinary> 
             size: fe.size,
             has_exec: perms_has_exec(&fe.perms),
             perms: fe.perms,
+            // Legacy 的 `ls -l` + `file` 只看文件，看不见进程：外部同名进程只有 Agent 报得出
+            external_pids: Vec::new(),
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));

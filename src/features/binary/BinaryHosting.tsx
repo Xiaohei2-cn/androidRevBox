@@ -57,6 +57,12 @@ export function BinaryHosting() {
   const { t } = useI18n();
   const [deviceSerial, setDeviceSerial] = useState<string | null>(null);
   const [hosted, setHosted] = useState<HostedRow[]>([]);
+  /**
+   * 「设备上已有同名进程在跑，仍要再启一个？」的待确认行名。
+   * 需要这一步是因为工具后启动时看不见别人的进程：列表说"未运行"，点执行就是
+   * 一个注定失败的实例（端口被占 → 秒退）。不静默替用户决定，也不拦着他启动。
+   */
+  const [confirmExternal, setConfirmExternal] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [root, setRoot] = useState(false);
   const [probing, setProbing] = useState(false);
@@ -347,6 +353,15 @@ export function BinaryHosting() {
                   >
                     {b.name}
                   </span>
+                  {(b.externalPids?.length ?? 0) > 0 && (
+                    <span
+                      className="shrink-0 rounded bg-amber-500/10 px-1.5 py-0.5 text-10px text-amber-500"
+                      title={t("adb.binary.externalRunningTip")}
+                      data-testid={`external-${b.name}`}
+                    >
+                      {t("adb.binary.externalRunning", { pids: b.externalPids.join(", ") })}
+                    </span>
+                  )}
                   {/* 权限/大小/操作固定列宽：无按钮行同位占格，右缘垂直对齐 */}
                   <span className="w-[78px] shrink-0 text-right font-mono text-muted-foreground">
                     {b.perms}
@@ -424,8 +439,18 @@ export function BinaryHosting() {
                           size="sm"
                           variant="outline"
                           className="h-6 shrink-0 gap-1 px-2"
+                          data-testid={`run-${row.name}`}
                           disabled={row.running || bin?.hasExec === false}
-                          onClick={() => void run(row)}
+                          onClick={() => {
+                            const outsiders = bin?.externalPids ?? [];
+                            if (outsiders.length > 0 && confirmExternal !== row.name) {
+                              // 第一次点击只把后果说清楚，不真的启动
+                              setConfirmExternal(row.name);
+                              return;
+                            }
+                            setConfirmExternal(null);
+                            void run(row);
+                          }}
                         >
                           {row.running ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />}
                           {row.running ? t("adb.binary.starting") : t("adb.binary.execute")}
@@ -454,6 +479,28 @@ export function BinaryHosting() {
                         <Trash2 className="h-3 w-3" />
                       </Button>
                     </div>
+                    {(bin?.externalPids?.length ?? 0) > 0 && (
+                      <div
+                        className="mt-1.5 flex items-center gap-2 text-10px"
+                        data-testid={`external-confirm-${row.name}`}
+                      >
+                        <span className="min-w-0 flex-1 text-amber-500">
+                          {t("adb.binary.externalRunning", { pids: (bin?.externalPids ?? []).join(", ") })}
+                          {" · "}
+                          <span className="text-muted-foreground">{t("adb.binary.externalRunningTip")}</span>
+                        </span>
+                        {confirmExternal === row.name && (
+                          <>
+                            <Button size="sm" variant="outline" data-testid={`confirm-run-${row.name}`} className="h-6 shrink-0 px-2" onClick={() => { setConfirmExternal(null); void run(row); }}>
+                              {t("adb.binary.confirmRun")}
+                            </Button>
+                            <Button size="sm" variant="ghost" className="h-6 shrink-0 px-2" onClick={() => setConfirmExternal(null)}>
+                              {t("adb.binary.confirmCancel")}
+                            </Button>
+                          </>
+                        )}
+                      </div>
+                    )}
                     <div className="mt-1.5 flex items-center gap-1.5">
                       <input
                         aria-label={t("adb.binary.noteLabel", { name: row.name })}

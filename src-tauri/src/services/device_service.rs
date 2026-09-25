@@ -1205,11 +1205,55 @@ impl DeviceService {
                 .exit_code
                 .map(|code| format!("（退出码 {code}）"))
                 .unwrap_or_default();
+            // 先分一类：这个进程起不来最常见的原因不是"程序坏了"，而是它要绑的端口
+            // 已被一个我们没启动过的实例占着（工具比目标进程晚开时必然遇到）。以前这种
+            // 一律抛 Internal，用户看到的就是那句「内部错误: … bind failed」——会去翻代码，
+            // 而真该做的是停掉那个实例或换个端口。
+            if let Some(reason) = classify_start_failure(&cause) {
+                let holders = self.external_pids_for(serial, name).await;
+                let who = match holders.as_slice() {
+                    [] => "若确认没有别的实例在跑，就换一个端口/参数再试".to_owned(),
+                    pids => format!(
+                        "设备上已有一个不是本工具启动的同名进程在跑（pid {}）——本工具对它没有句柄，停不掉：先停掉它，或换一个端口再执行",
+                        pids.iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
+                return Err(CoreError::Conflict(format!(
+                    "{name} 没能起来：{reason}。{who}（日志末行：{detail}{exit}）"
+                )));
+            }
             return Err(CoreError::Internal(format!(
                 "{name} 启动后立即退出：{detail}{exit}"
             )));
         }
         Ok(status.record.pid)
+    }
+
+    /// 查这个托管文件在设备上有没有"别人启动的同名进程"——工具晚启动时，这是唯一能看到
+    /// 它的地方（我们的运行表里根本没有这一条）。只在失败路径上跑，不是常态开销；
+    /// 查不到就什么都不补，绝不编一个 pid 出来。
+    async fn external_pids_for(&self, serial: &str, name: &str) -> Vec<u32> {
+        let params = HostedListParams {};
+        match self
+            .android
+            .agent()
+            .request::<_, HostedListResult>(serial, HOSTED_LIST, &params, SHORT_CMD_TIMEOUT)
+            .await
+        {
+            Ok(list) => list
+                .binaries
+                .into_iter()
+                .find(|binary| binary.name == name)
+                .map(|binary| binary.external_pids)
+                .unwrap_or_default(),
+            Err(error) => {
+                tracing::warn!(serial, name, error = %error, "查询外部同名进程失败");
+                Vec::new()
+            }
+        }
     }
 
     /// 按句柄停止托管进程（AR7.3，写操作）。
@@ -2557,6 +2601,25 @@ enum InstallInputs {
 }
 
 /// 判定输入形态。规则要能被单测钉住，因为"混选"必须当场拒，不能悄悄挑一个装。
+/// 从启动日志里判"这次起不来的原因是不是端口/地址冲突"。
+///
+/// 只认这几条明确字样（`bind failed` / `address already in use` / `EADDRINUSE` /
+/// 绑定时 permission denied）。**认不准就宁可回到原来的 Internal**：把一次真崩溃
+/// 说成"端口被占"会让人往错的方向查，那比含糊更糟。
+pub(crate) fn classify_start_failure(log: &str) -> Option<String> {
+    let lowered = log.to_ascii_lowercase();
+    if lowered.contains("bind failed")
+        || lowered.contains("address already in use")
+        || lowered.contains("eaddrinuse")
+    {
+        return Some("日志显示绑定端口失败，通常是端口已被占用".to_owned());
+    }
+    if lowered.contains("permission denied") && lowered.contains("bind") {
+        return Some("绑定端口被拒：1024 以下需要 root，请开 Root 或换端口".to_owned());
+    }
+    None
+}
+
 fn plan_install_inputs(apks: &[String]) -> Result<InstallInputs, String> {
     let bundles: Vec<&String> = apks
         .iter()
@@ -2932,6 +2995,7 @@ fn map_agent_hosted_binaries(binaries: &[HostedBinaryInfo]) -> Vec<adb::HostedBi
             size: i64::try_from(item.size).unwrap_or(i64::MAX),
             perms: item.mode_text.clone(),
             has_exec: item.has_exec,
+            external_pids: item.external_pids.clone(),
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -3246,6 +3310,26 @@ fn log_device_info_shadow_diff(serial: &str, agent: &DeviceInfo, legacy: &Device
 mod tests {
 
     #[test]
+    fn port_conflict_is_not_reported_as_an_internal_error() {
+        // 真机实况：auth-server 已被一个外部实例占着 8080，第二个实例必然 bind failed
+        let log = "服务器初始化完成\n注册用户数: 6\nbind failed\n";
+        let reason = classify_start_failure(log).expect("bind failed 要判成端口冲突");
+        assert!(reason.contains("端口"), "{reason}");
+        // 缺依赖库、段错误是真故障，不许被归成"端口被占"
+        assert!(
+            classify_start_failure(
+                "CANNOT LINK EXECUTABLE \"./x\": library \"liblog.so\" not found\n"
+            )
+            .is_none()
+        );
+        assert!(classify_start_failure("segmentation fault\n").is_none());
+        assert!(
+            classify_start_failure("bind: permission denied\n").is_some(),
+            "绑特权端口被拒是可行动的"
+        );
+    }
+
+    #[test]
     fn install_inputs_separate_container_from_loose_apks() {
         // 散装：1 件走 install -r，多件走 install-multiple -r（AR8.2 的既有口径）
         assert_eq!(
@@ -3320,6 +3404,7 @@ mod tests {
             has_exec: mode & 0o100 != 0,
             uid: 2000,
             mtime_unix: 1_760_000_000,
+            external_pids: Vec::new(),
         };
         let agent = map_agent_hosted_binaries(&[
             info("zz-tool", 0o755, 4096),

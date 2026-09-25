@@ -749,6 +749,13 @@ pub struct HostedBinaryInfo {
     pub has_exec: bool,
     pub uid: u32,
     pub mtime_unix: u64,
+    /// 设备上**正在跑的同名进程 pid，但不是本工具启动的**（所以没有句柄、这里停不了它）。
+    ///
+    /// 为什么要单独带这个数：工具后启动时，先跑起来的实例不在运行表里，界面就显示
+    /// "未运行"，点执行等于再启一个 —— 端口被占，秒退，然后报一句看不懂的失败。
+    /// 有这个字段，界面才能提前说"它其实已经在跑了（pid N）"。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_pids: Vec<u32>,
 }
 
 /// 一次托管运行的状态。`unknown` 只用于「Agent 重启后连 `/proc` 都读不到」，
@@ -1459,6 +1466,8 @@ mod tests {
                 has_exec: true,
                 uid: 2000,
                 mtime_unix: 1_760_000_000,
+                // 外部同名进程：这条 fixture 顺带钉住它参与"只省略空集合"的线格式约定
+                external_pids: vec![9727],
             }],
             runs: vec![HostedRunRecord {
                 state: HostedRunState::Exited,
@@ -1472,6 +1481,20 @@ mod tests {
         assert_eq!(value["binaries"][0]["mode"], json!(493));
         assert_eq!(value["binaries"][0]["mode_text"], "-rwxr-xr-x");
         assert_eq!(value["runs"][0]["exit_code"], json!(137));
+        // 外部同名进程：有值才上 wire（snake_case），空数组整个键省略
+        assert_eq!(value["binaries"][0]["external_pids"], json!([9727]));
+        let empty = HostedListResult {
+            binaries: vec![HostedBinaryInfo {
+                external_pids: Vec::new(),
+                ..listed.binaries[0].clone()
+            }],
+            ..listed.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(empty).unwrap()["binaries"][0].get("external_pids"),
+            None,
+            "没有外部进程时不该在报文里占一个空数组"
+        );
         assert_eq!(value.get("truncated"), None);
         assert_eq!(value.get("unreadable"), None);
     }

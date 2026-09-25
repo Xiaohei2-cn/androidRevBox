@@ -191,6 +191,12 @@ export interface HostedBinary {
   size: number;
   perms: string;
   hasExec: boolean;
+  /**
+   * 设备上正在跑的同名进程 pid，且**不是本工具启动的**（所以没有句柄，这里停不掉它）。
+   * 工具比目标进程晚开时就是这个情况：列表显示"未运行"，点执行等于再启一个，
+   * 端口被占 → 秒退。只有 Agent 通道给得出这个数（Legacy 的 ls -l 看不见进程）。
+   */
+  externalPids: number[];
 }
 
 /** 端口→PID 反查的持有进程行 */

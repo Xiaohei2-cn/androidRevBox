@@ -134,6 +134,8 @@ beforeEach(() => {
       size: 53_539_200,
       perms: "-rwxr-xr-x",
       hasExec: true,
+      // 外部在跑的实例（不是本工具启动的）：工具比目标进程晚开时就是这个形状
+      externalPids: [31337],
     },
     {
       name: "helper.dex",
@@ -141,6 +143,7 @@ beforeEach(() => {
       size: 12_345,
       perms: "-rw-r--r--",
       hasExec: false,
+      externalPids: [],
     },
   ]);
   device.procPorts.mockResolvedValue([
@@ -260,6 +263,30 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     // 按 handle + start time 停止那段真实链路在 AR7.3 真机腿里验
     // （real_agent_hosted_lifecycle_handles_identity_and_reaping），
     // 页面测试不重复假装覆盖了它。
+  });
+
+  it("外部同名实例要被标出来，点执行先说后果再问一次", async () => {
+    // 这是"软件后启动"的真实现场：进程在跑但我们没有句柄，列表会说"未运行"。
+    // 直接再启一个只会因端口被占秒退 —— 所以界面必须先说清，并且不静默替用户决定。
+    // 这一条要的是"我们没启动过它"的现场：清掉运行表，界面才会给执行按钮而不是终止
+    device.hostedRuns.mockResolvedValue([]);
+    renderPage(<BinaryHosting />);
+    const chip = await screen.findByTestId("external-frida-server");
+    expect(chip.textContent ?? "").toContain("31337");
+    // 双击把文件加入下区托管
+    const row = await screen.findByTestId("bin-frida-server");
+    fireEvent.doubleClick(row.querySelector("button") ?? row);
+    const hosted = await screen.findByTestId("hosted-frida-server");
+    expect(hosted.textContent ?? "").toContain("外部在跑 pid 31337");
+    // 第一次点执行：不启动，只把确认条亮出来
+    device.binaryRun.mockClear();
+    fireEvent.click(screen.getByTestId("run-frida-server"));
+    expect(device.binaryRun).not.toHaveBeenCalled();
+    const confirm = await screen.findByTestId("external-confirm-frida-server");
+    expect(confirm.textContent ?? "").toContain("端口已被占用");
+    // 「仍然执行」才真的执行（用户明确要起第二个实例时不该拦死）
+    fireEvent.click(screen.getByTestId("confirm-run-frida-server"));
+    await waitFor(() => expect(device.binaryRun).toHaveBeenCalledTimes(1));
   });
 
   it("进程端口两个方向都能渲染（PID→端口、端口→PID）", async () => {

@@ -3966,6 +3966,265 @@ mod tests {
         eprintln!("[proc] 通过：maps 提权、cmdline 不惊动 su、进程消失说 NotFound");
     }
 
+    /// 真机腿：**别人先启动的同名进程必须被认出来**（"软件后启动"就是这种情况）。
+    ///
+    /// 用户现场的形状是：auth-server 早在跑，工具后来才打开——我们的运行表里没有它，
+    /// 于是列表显示"未运行"，点执行就是再起一个，端口被占 → 秒退 → 看到一句看不懂的失败。
+    /// 这条腿钉住两件事：① 外部实例的 pid 要出现在 `external_pids` 里；
+    /// ② **我们自己起的那个不能算外部**（它有句柄、界面本来就显示"运行中"，
+    /// 再报一次"外部在跑"就是自相矛盾的假警报）。
+    #[tokio::test]
+    #[ignore = "需要真机；AR104_EXTERNAL_PROBE=yes APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_hosted_notices -- --ignored --nocapture"]
+    async fn real_agent_hosted_notices_externally_started_process() {
+        use agent_protocol::method::{HOSTED_LIST, HOSTED_START, HOSTED_STOP};
+        use agent_protocol::{
+            HostedListParams, HostedListResult, HostedStartParams, HostedStartResult,
+            HostedStopParams, HostedStopResult, KillSignal,
+        };
+        if std::env::var("AR104_EXTERNAL_PROBE").unwrap_or_default() != "yes" {
+            eprintln!("[跳过] 本腿会在设备上真起两个探针进程，需要 AR104_EXTERNAL_PROBE=yes");
+            return;
+        }
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        if !prepare_toybox_probe(&serial).await {
+            return;
+        }
+
+        async fn adb_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        async fn list(client: &AgentClient) -> agent_protocol::HostedBinaryInfo {
+            let listed = client
+                .request::<_, HostedListResult>(
+                    HOSTED_LIST,
+                    &HostedListParams {},
+                    Duration::from_secs(20),
+                )
+                .await
+                .expect("hosted.list 应当可用");
+            listed
+                .binaries
+                .into_iter()
+                .find(|binary| binary.name == "toybox")
+                .expect("探针 toybox 应在托管目录里")
+        }
+
+        // ① 外部先起一个（完全绕开本工具：adb shell 里 nohup 一个 toybox sleep）
+        let external_started = adb_shell(
+            &serial,
+            "nohup /data/local/tmp/toybox sleep 120 </dev/null >/dev/null 2>&1 & echo OUTSIDE_STARTED",
+        )
+        .await;
+        assert!(
+            external_started.contains("OUTSIDE_STARTED"),
+            "{external_started}"
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let outside = list(&client).await;
+        assert!(
+            !outside.external_pids.is_empty(),
+            "别人启动的 toybox 必须出现在 external_pids 里，否则界面还是会说它没在跑"
+        );
+        eprintln!("[hosted] 外部实例 pid={:?}", outside.external_pids);
+
+        // ② 我们自己再起一个：它的 pid 不能被算成"外部"
+        let started = client
+            .request::<_, HostedStartResult>(
+                HOSTED_START,
+                &HostedStartParams {
+                    name: "toybox".into(),
+                    args: vec!["sleep".into(), "120".into()],
+                    root: false,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("hosted.start 应当成功")
+            .record;
+        let ours = started.pid;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let after = list(&client).await;
+        assert!(
+            !after.external_pids.contains(&ours),
+            "自己启动的 pid {ours} 不该出现在 external_pids 里（它有句柄、界面已显示运行中）：{:?}",
+            after.external_pids
+        );
+        assert!(
+            after
+                .external_pids
+                .iter()
+                .any(|pid| outside.external_pids.contains(pid)),
+            "外部那个必须还在：{:?}",
+            after.external_pids
+        );
+        eprintln!(
+            "[hosted] 我们起的 pid={ours} 被正确排除，external_pids={:?}",
+            after.external_pids
+        );
+
+        // ③ 收尾：句柄停自己的，外部那个按 pid 收掉
+        let stopped = client
+            .request::<_, HostedStopResult>(
+                HOSTED_STOP,
+                &HostedStopParams {
+                    handle: started.handle,
+                    expected_pid: Some(ours),
+                    signal: KillSignal::Term,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("hosted.stop 应当成功");
+        let _ = stopped;
+        for pid in &outside.external_pids {
+            adb_shell(&serial, &format!("kill {pid} 2>/dev/null; echo KILLED")).await;
+        }
+        let cleaned = list(&client).await;
+        assert!(
+            !cleaned.external_pids.contains(&ours),
+            "停止后也不该把我们的 pid 留在外部列表里"
+        );
+        manager.disconnect(&serial).await.unwrap();
+        eprintln!("[hosted] 通过：外部实例看得见，自己起的不算外部");
+    }
+
+    /// 真机腿：端口被占时**第二个实例的真实死因要能被认出来**，不能落在"内部错误"里。
+    ///
+    /// 与上面那条 `real_agent_hosted_notices_externally_started_process` 是一对：
+    /// 那条管"点之前就该看见别人在跑"，这条管"已经点了、秒退之后说什么"。
+    /// 日志取的是设备上真跑出来的字节（`toybox nc -l -p` 撞端口），不是手写的样例。
+    #[tokio::test]
+    #[ignore = "需要真机；AR104_CONFLICT_PROBE=yes APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_second_instance -- --ignored --nocapture"]
+    async fn real_agent_second_instance_on_a_busy_port_is_diagnosed_not_internal() {
+        use crate::services::device_service::classify_start_failure;
+        use agent_protocol::method::{HOSTED_START, HOSTED_STATUS, HOSTED_STOP};
+        use agent_protocol::{
+            HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams,
+            HostedStatusResult, HostedStopParams, KillSignal,
+        };
+        if std::env::var("AR104_CONFLICT_PROBE").unwrap_or_default() != "yes" {
+            eprintln!("[跳过] 本腿会真起两个探针进程占端口，需要 AR104_CONFLICT_PROBE=yes");
+            return;
+        }
+        const PORT: u16 = 24579;
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        if !prepare_toybox_probe(&serial).await {
+            return;
+        }
+        async fn adb_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        // ① 先让端口被一个"别人"占住（绕开本工具）
+        let holder = format!(
+            "nohup /data/local/tmp/toybox nc -l -p {PORT} -s 127.0.0.1 </dev/null >/dev/null 2>&1 & echo HELD"
+        );
+        assert!(
+            adb_shell(&serial, &holder).await.contains("HELD"),
+            "探针端口没被占住，这条腿没有意义"
+        );
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        // ② 我们用同一个端口再起一个：设备会把它拉起来，但它一定秒退
+        let started = client
+            .request::<_, HostedStartResult>(
+                HOSTED_START,
+                &HostedStartParams {
+                    name: "toybox".into(),
+                    args: vec![
+                        "nc".into(),
+                        "-l".into(),
+                        "-p".into(),
+                        PORT.to_string(),
+                        "-s".into(),
+                        "127.0.0.1".into(),
+                    ],
+                    root: false,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("spawn 本身应当成功")
+            .record;
+        let mut state = HostedRunState::Running;
+        let mut log_path = started.log_path.clone();
+        for _ in 0..12 {
+            let status = client
+                .request::<_, HostedStatusResult>(
+                    HOSTED_STATUS,
+                    &HostedStatusParams {
+                        handle: started.handle.clone(),
+                    },
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect("hosted.status 应当可用");
+            state = status.record.state;
+            log_path = status.record.log_path.clone();
+            if state != HostedRunState::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        assert_ne!(
+            state,
+            HostedRunState::Running,
+            "端口被占时第二个实例不该活着；这条腿的前提变了"
+        );
+
+        // ③ 真日志必须能被认成"端口冲突"，而不是落进内部错误
+        let log = adb_shell(&serial, &format!("cat {log_path} 2>/dev/null")).await;
+        eprintln!("[conflict] 设备真实日志: {}", log.trim());
+        let reason = classify_start_failure(&log).expect("端口被占要能被认出来");
+        assert!(reason.contains("端口"), "{reason}");
+
+        // ④ 收尾：停掉句柄、放掉探针端口
+        let _ = client
+            .request::<_, agent_protocol::HostedStopResult>(
+                HOSTED_STOP,
+                &HostedStopParams {
+                    handle: started.handle,
+                    expected_pid: None,
+                    signal: KillSignal::Term,
+                },
+                Duration::from_secs(10),
+            )
+            .await;
+        adb_shell(
+            &serial,
+            &format!("pkill -f 'nc -l -p {PORT}' 2>/dev/null; echo CLEANED"),
+        )
+        .await;
+        manager.disconnect(&serial).await.unwrap();
+        eprintln!("[conflict] 通过：秒退真因被认成端口冲突，不是内部错误");
+    }
+
     /// AR9.1 前置真机腿：root 探测改由 Agent 执行后，结论必须与 Legacy `su -c id`
     /// 一致，而且要把「su 可用」与「Agent 自身有 root」分开带回——UI 之前把这两件事
     /// 混成一个绿色徽章，正是 D026 那批 `root=true` 支路必须留在 Legacy 的原因。
