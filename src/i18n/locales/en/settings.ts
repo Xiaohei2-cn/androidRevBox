@@ -17,7 +17,7 @@ export default {
 
   "settings.clickThrough.label": "Click through transparent areas",
   "settings.clickThrough.hint":
-    "When on, only the transparent parts of the left tab rail (its gutter, the gaps between teeth and the translucent teeth themselves) hand clicks to the app behind. Tab icons keep a hit area, the active tab and the whole content area always keep the clicks, and the window edges stay grabbable so you can still resize it. The live readout below shows the current state.",
+    "When on, only two spots in the left tab rail hand clicks to the app behind: the transparent gutter left of the tabs, and the translucent body of an inactive tab. The gaps between tabs, the icon hit areas, the active tab and the whole content area keep the clicks. The outer 12px on every window edge stays a resize grip, so you can always resize. The live readout below shows the current state.",
 
   "settings.clickThrough.status.solid": "Now: pointer is over real content, this tool keeps the clicks",
   "settings.clickThrough.status.passing": "Now: pointer is over a transparent spot, clicks go to the app behind",

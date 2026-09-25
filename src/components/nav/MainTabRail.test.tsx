@@ -46,26 +46,38 @@ describe("MainTabRail", () => {
     );
   });
 
-  it("未选中齿块本体让出点击、图标热区留住（透明区穿透的粒度就钉在这儿）", () => {
-    // 用户报"透明部分透传没生效"的根因：整条 rail 曾被钉成实体，rail 宽 128px 而齿块只有
-    // 36px，左边那一整条纯透明留白跟着一起被挡住了。现在 rail 不标实体，
-    // 未选中齿块本体标 pass（只有半透明着色），图标 pad 标 solid（否则切不了页）。
+  it("穿透只给齿块左边的留白与未选中齿块本体：tab 之间的小空隙必须接住", () => {
+    // 用户第二轮收窄要求：第一版整条栏标 pass，把齿块之间那 6px 缝（gap-1.5）也一起送了出去。
+    // 现在留白是**按行**声明的（滚动、选中态变宽都不会错位），而缝属于行与行之间的 nav，
+    // nav 自己没有标记 → 默认接住。
     renderRail();
+    const nav = screen.getByRole("navigation");
+    expect(nav.getAttribute("data-click-through")).toBeNull();
+
     const teeth = screen.getAllByRole("button");
     const inactive = teeth.filter((t) => t.getAttribute("aria-current") !== "true");
     const active = teeth.filter((t) => t.getAttribute("aria-current") === "true");
-    expect(inactive.length).toBeGreaterThan(0);
-    expect(active.length).toBe(1);
+    expect(active).toHaveLength(1);
     for (const tooth of inactive) {
-      expect(tooth.getAttribute("data-click-through")).toBe("pass");
-      const pad = tooth.querySelector('[data-click-through="solid"]');
-      expect(pad).toBeTruthy();
+      expect(tooth.getAttribute("data-click-through")).toBe("pass"); // 半透明本体让出
+      expect(tooth.querySelector('[data-click-through="solid"]')).toBeTruthy(); // 图标热区接住
     }
-    // 选中态是实心 bg-primary，本来就是实体：必须显式标 solid，
-    // 否则会被 nav 的 pass 一路穿透掉，当前页的 tab 就成了点不动的空壳
+    // 选中态是实心 bg-primary + 中文标签，本来就是实体，必须显式 solid
     expect(active[0].getAttribute("data-click-through")).toBe("solid");
-    // rail 是全项目唯一声明"可以让出点击"的区域，而且绝不能反过来钉成实体
-    expect(screen.getByRole("navigation").getAttribute("data-click-through")).toBe("pass");
+
+    // 每一行只有一个留白带 + 顶部带，且它们都不是按钮；行容器本身不许带标记
+    const rows = nav.querySelectorAll(":scope > div");
+    expect(rows).toHaveLength(13);
+    for (const row of rows) {
+      expect(row.getAttribute("data-click-through")).toBeNull();
+      // 行里"让出点击"的非按钮元素只有一个：齿块左边那条留白带
+      // （未选中齿块本体也标了 pass，但它是 button，另一段断言在管）
+      expect(row.querySelectorAll('span[data-click-through="pass"]')).toHaveLength(1);
+      expect(row.querySelector("button")).toBeTruthy();
+    }
+    // 顶部那 56px 是 nav 自己的 padding → 不标任何穿透声明（接住点击）
+    expect(nav.querySelectorAll(":scope > span[data-click-through=\"pass\"]")).toHaveLength(0);
+    expect(nav.className).toContain("pt-14");
   });
 
   it("当前激活 tab 标记 aria-current", () => {

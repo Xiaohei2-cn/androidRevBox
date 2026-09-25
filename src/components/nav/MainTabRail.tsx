@@ -63,20 +63,29 @@ export function MainTabRail() {
   return (
     <nav
       aria-label={t("nav.aria")}
-      // 全项目**唯一**声明"可以让出点击"的区域：rail 宽 128px 而齿块只占右边 36px，
-      // 左边那一条透明留白与齿块之间的缝隙就是用户要点穿到后面 App 的地方。
-      // 判定默认是"接住"，所以别的界面不标也不会被误穿；这里显式标 pass 才让出去。
-      data-click-through="pass"
-      className="flex w-32 shrink-0 flex-col items-end gap-1.5 overflow-y-auto pt-14"
+      // nav 自己**不带**任何穿透标记：默认就是"接住点击"。
+      // 之前整条栏标 pass，把齿块之间那 6px 缝（gap-1.5）也一起送了出去 —— 用户要的
+      // 只是"透传 tab 底图"，缝隙属于栏的 chrome，该接住。
+      // 顶部那 56px 仍然用 nav 自己的 padding 撑：它属于 nav、没有声明 → 接住点击。
+      // （不写成一条 flex 子元素是有原因的：nav 的 gap 会在它与第一个 tab 之间多塞 6px，
+      //  整条栏被往下推，与内容区顶边错位。）
+      className="flex w-32 shrink-0 flex-col gap-1.5 overflow-y-auto pt-14"
     >
       {MAIN_TABS.map((item) => (
-        <MainTabButton
-          key={item.id}
-          tab={item}
-          label={t(item.labelKey)}
-          active={item.id === tab}
-          onClick={() => setTab(item.id)}
-        />
+        <div key={item.id} className="flex w-full items-stretch justify-end">
+          {/*
+            本行齿块左边的透明留白：全项目唯一"让出点击"的容器之一（另一处是未选中
+            齿块本体，见 MainTabButton）。按行声明，所以滚动与选中态变宽都不会错位；
+            行容器自己不标记 → 齿块之间那 6px 缝落在 nav/行之间，默认接住。
+          */}
+          <span aria-hidden data-click-through="pass" className="min-w-0 flex-1" />
+          <MainTabButton
+            tab={item}
+            label={t(item.labelKey)}
+            active={item.id === tab}
+            onClick={() => setTab(item.id)}
+          />
+        </div>
       ))}
     </nav>
   );
@@ -117,7 +126,7 @@ function MainTabButton({
       data-click-through={active ? "solid" : "pass"}
       onClick={onClick}
       className={cn(
-        "app-surface group relative flex h-10 shrink-0 select-none items-center justify-center rounded-l-xl border border-r-0 border-border/60",
+        "app-surface group relative flex h-10 shrink-0 select-none items-center justify-center self-end rounded-l-xl border border-r-0 border-border/60",
         active
           ? "max-w-28 bg-primary px-3 text-primary-foreground"
           : "w-9 text-muted-foreground hover:bg-accent hover:text-foreground",

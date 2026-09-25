@@ -17,7 +17,7 @@ export default {
 
   "settings.clickThrough.label": "透明区点击穿透",
   "settings.clickThrough.hint":
-    "打开后只有左侧 tab 栏的透明部分（留白、齿块之间的缝隙、未选中齿块那层半透明底）会把点击让给后面的 App；图标有热区、当前 tab 与所有内容区一律照常接住，窗口四边也留着拉伸抓住区，所以界面永远调得动。当前状态见下方实时读数。",
+    "打开后只有左侧 tab 栏的这两处把点击让给后面的 App：齿块左边的透明留白、未选中齿块那层半透明底。齿块之间的缝隙、tab 图标热区、当前 tab、以及所有内容区一律照常接住；窗口四边各 12px 永远是拉伸抓住区，界面随时调得动。当前状态见下方实时读数。",
 
   "settings.clickThrough.status.solid": "当前：光标在实体上，本工具接点击",
   "settings.clickThrough.status.passing": "当前：光标在透明处，点击交给后面的 App",
