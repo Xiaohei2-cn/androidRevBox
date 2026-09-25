@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Copy, RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck, Cpu, Save, FolderPlus, Pencil, KeyRound, Trash2 } from "lucide-react";
+import { Copy, RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck, Cpu, Save, FolderPlus, Pencil, KeyRound, Trash2, Eye, EyeOff, Search, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -1083,7 +1083,10 @@ export function AppsView({ serial }: { serial: string | null }) {
   const [context, setContext] = useState<{ x: number; y: number; app: ZygiskAppItem } | null>(null);
   const [exporting, setExporting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [scope, setScope] = useState<ZygiskScope>("all");
+  // 默认只看三方应用：一屏系统包对逆向没用，反而把要找的应用冲掉。
+  // "要不要把系统应用一起显示"用一个眼睛按钮切换（一个按钮，不是三个选项）。
+  const [scope, setScope] = useState<ZygiskScope>('user');
+  const [query, setQuery] = useState('');
   const [includeDisabled, setIncludeDisabled] = useState(false);
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["zygisk", "applist", serial, scope, includeDisabled],
@@ -1129,6 +1132,22 @@ export function AppsView({ serial }: { serial: string | null }) {
 
   const apps = data?.items ?? [];
   const warnings = data?.warnings ?? [];
+  /*
+   * 搜索是**纯本地过滤**：清单一次就几百条，边打字边发请求既没意义也会把 Zygisk
+   * 通道当搜索框使（每次都是一趟 su + Framework 枚举）。匹配 label 与包名，忽略大小写。
+   */
+  const showAllApps = scope !== 'user';
+  const eyeLabel = showAllApps ? t('apps.hideSystem') : t('apps.showSystem');
+  const needle = query.trim().toLowerCase();
+  // 直接过滤，不套 useMemo：清单几百条、比较的是短字符串，一次渲染几微秒；
+  // 而这段代码位于若干 early-return 之后，套 hook 会违反调用顺序规则（lint 已报）。
+  const visibleApps = needle
+    ? apps.filter(
+        (app) =>
+          (app.label || '').toLowerCase().includes(needle) ||
+          app.packageName.toLowerCase().includes(needle),
+      )
+    : apps;
 
   const runWrite = async (
     fn: () => Promise<PackageWriteResult | PackageUninstallResult>,
@@ -1213,7 +1232,11 @@ export function AppsView({ serial }: { serial: string | null }) {
       <div className="flex min-h-0 w-80 shrink-0 flex-col gap-2">
         <div className="flex shrink-0 items-center gap-2">
           <span className="text-xs font-medium">{t("apps.zygiskList")}</span>
-          <span className="text-11px text-muted-foreground">{t("apps.count", { count: apps.length })}</span>
+          <span className="text-11px text-muted-foreground" data-testid="apps-count">
+            {needle
+              ? t('apps.countFiltered', { matched: visibleApps.length, total: apps.length })
+              : t('apps.count', { count: apps.length })}
+          </span>
           {data && data.channel === "zygisk_v2" && (
             <span className="shrink-0"><StatusBadge tone="info" className="px-1.5 py-0">v2</StatusBadge></span>
           )}
@@ -1232,22 +1255,50 @@ export function AppsView({ serial }: { serial: string | null }) {
           </Button>
         </div>
         <div className="flex shrink-0 items-center gap-1">
-          {(["all", "user", "system"] as const).map((value) => (
-            <button
-              key={value}
-              type="button"
-              onClick={(event) => {
-                event.stopPropagation();
-                setScope(value);
-              }}
-              className={cn(
-                "rounded-full border px-2 py-0.5 text-11px hover:bg-accent",
-                scope === value ? "border-primary text-foreground" : "text-muted-foreground",
-              )}
-            >
-              {value === "all" ? t("apps.scopeAll") : value === "user" ? t("apps.scopeUser") : t("apps.scopeSystem")}
-            </button>
-          ))}
+          <div className="relative min-w-0 flex-1">
+            <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <input
+              type="search"
+              data-testid="apps-search"
+              aria-label={t('apps.searchPlaceholder')}
+              placeholder={t('apps.searchPlaceholder')}
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              className="h-6 w-full rounded-md border border-input bg-transparent pl-7 pr-6 text-11px focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            />
+            {query !== '' && (
+              <button
+                type="button"
+                aria-label={t('apps.searchClear')}
+                data-testid="apps-search-clear"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setQuery('');
+                }}
+                className="absolute right-1 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:bg-accent"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            )}
+          </div>
+          {/* 一个眼睛按钮：灭=只给三方，开=把系统应用一起显示。
+              以前这里是三枚胶囊（全部/三方/系统），三选一里其实只有两态有用。 */}
+          <Button
+            size="sm"
+            variant="ghost"
+            type="button"
+            aria-pressed={showAllApps}
+            aria-label={eyeLabel}
+            title={eyeLabel}
+            data-testid="apps-toggle-system"
+            className="h-6 shrink-0 gap-1 px-1.5 text-11px"
+            onClick={(event) => {
+              event.stopPropagation();
+              setScope(showAllApps ? 'user' : 'all');
+            }}
+          >
+            {showAllApps ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+          </Button>
         </div>
         <button
           type="button"
@@ -1279,9 +1330,21 @@ export function AppsView({ serial }: { serial: string | null }) {
           </p>
         )}
         <div className="min-h-0 flex-1 overflow-auto rounded-xl border border-border/70 bg-card shadow-card">
-          {apps.length === 0 && <Empty text={t("apps.empty")} />}
+          {visibleApps.length === 0 &&
+            (needle ? (
+              <div className="px-3 py-4 text-center text-xs">
+                <p className="text-muted-foreground">{t('apps.searchNoMatch')}</p>
+                {/* 三方范围内搜不到，多半是系统应用被藏起来了——把话说清，
+                    别让人以为设备上真没这个应用（这与 /proc 那栏「没读 ≠ 读不到」同一条原则） */}
+                {scope !== 'all' && (
+                  <p className="mt-1 text-11px text-muted-foreground">{t('apps.searchNoMatchSystemHint')}</p>
+                )}
+              </div>
+            ) : (
+              <Empty text={t('apps.empty')} />
+            ))}
           <ul className="text-xs">
-            {apps.map((app) => (
+            {visibleApps.map((app) => (
             <li
               key={app.packageName}
               onContextMenu={(event) => {

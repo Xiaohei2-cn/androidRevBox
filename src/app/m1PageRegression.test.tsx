@@ -264,3 +264,120 @@ describe("Frida 工作台 · 设备侧服务（AR9.1）", () => {
     expect(document.body.textContent).toContain("2000");
   });
 });
+
+describe("应用页 · 默认三方 + 一个眼睛开关 + 本地搜索", () => {
+  /**
+   * 这一组断言盯的是三件容易做歪的事：
+   * ① 默认必须只请求三方清单（scope=user），别一上来就把几百个系统包倒进列表；
+   * ② "要不要含系统应用"只有一个按钮（眼睛），它切的是**请求范围**；
+   * ③ 搜索是本地过滤——边打字边打设备是假的"搜索功能"，
+   *    所以这里反向断言 `zygisk.list` 的调用次数不随输入增长。
+   */
+  const userItem = {
+    packageName: "com.amazon.mShop.android.shopping",
+    label: "亚马逊购物",
+    versionName: "32.17.0.100",
+    versionCode: 1,
+    labelSource: "framework",
+    requestedLocale: "zh-CN",
+    resolvedLocale: "zh-CN",
+    fallbackReason: null,
+    uid: 10214,
+    isSystem: false,
+    enabled: true,
+  };
+  const systemItem = {
+    packageName: "com.android.settings",
+    label: "设置",
+    versionName: "14",
+    versionCode: 34,
+    labelSource: "framework",
+    requestedLocale: "zh-CN",
+    resolvedLocale: "zh-CN",
+    fallbackReason: null,
+    uid: 1000,
+    isSystem: true,
+    enabled: true,
+  };
+
+  beforeEach(() => {
+    // mock 按 scope 返回不同范围：照实模拟设备端行为，而不是把所有包一股脑给出去
+    api.zygiskList.mockImplementation((_serial: string, scope: string) =>
+      Promise.resolve({
+        items: scope === "user" ? [userItem] : [userItem, systemItem],
+        successCount: scope === "user" ? 1 : 2,
+        fallbackCount: 0,
+        warnings: [],
+        deviceLocale: "zh-CN",
+        channel: "zygisk_v2",
+      }),
+    );
+    api.zygiskStatus.mockResolvedValue({
+      lifecycle: "bridge_ready",
+      bridge_ready: true,
+      root_available: true,
+      sub_protocol_version: 2,
+      module_id: "applistpro",
+      detail: null,
+    });
+  });
+
+  it("默认只请求三方清单，系统应用不在列表里", async () => {
+    renderWith(<AppsView serial="SERIAL-1" />);
+    await waitFor(() => expect(screen.getByText("亚马逊购物")).toBeTruthy());
+    expect(api.zygiskList).toHaveBeenCalledWith("SERIAL-1", "user", expect.anything());
+    expect(screen.queryByText("设置")).toBeNull();
+  });
+
+  it("眼睛按钮切换的是请求范围：点开才把系统应用一起取回", async () => {
+    renderWith(<AppsView serial="SERIAL-1" />);
+    await waitFor(() => expect(screen.getByText("亚马逊购物")).toBeTruthy());
+    const calls = api.zygiskList.mock.calls.length;
+    fireEvent.click(screen.getByTestId("apps-toggle-system"));
+    await waitFor(() => expect(screen.getByText("设置")).toBeTruthy());
+    expect(api.zygiskList).toHaveBeenLastCalledWith("SERIAL-1", "all", expect.anything());
+    // 一个按钮来回切，不该多出第三个入口
+    fireEvent.click(screen.getByTestId("apps-toggle-system"));
+    await waitFor(() => expect(screen.queryByText("设置")).toBeNull());
+    expect(api.zygiskList).toHaveBeenLastCalledWith("SERIAL-1", "user", expect.anything());
+    expect(api.zygiskList.mock.calls.length).toBe(calls + 2);
+  });
+
+  it("搜索是本地过滤：打字不发请求，只收窄列表", async () => {
+    renderWith(<AppsView serial="SERIAL-1" />);
+    // 工具条是清单到位之后才渲染的，先等它出现再点（否则这条测试是在测加载顺序）
+    await waitFor(() => expect(screen.getByTestId("apps-toggle-system")).toBeTruthy());
+    fireEvent.click(screen.getByTestId("apps-toggle-system"));
+    await waitFor(() => expect(screen.getByText("设置")).toBeTruthy());
+    const calls = api.zygiskList.mock.calls.length;
+
+    fireEvent.change(screen.getByTestId("apps-search"), { target: { value: "设置" } });
+    expect(screen.getByText("设置")).toBeTruthy();
+    expect(screen.queryByText("亚马逊购物")).toBeNull();
+    expect(api.zygiskList.mock.calls.length).toBe(calls);
+    expect(screen.getByTestId("apps-count").textContent).toContain("1");
+
+    // 包名也能搜
+    fireEvent.change(screen.getByTestId("apps-search"), {
+      target: { value: "mShop" },
+    });
+    expect(screen.getByText("亚马逊购物")).toBeTruthy();
+    expect(screen.queryByText("设置")).toBeNull();
+    expect(api.zygiskList.mock.calls.length).toBe(calls);
+
+    fireEvent.click(screen.getByTestId("apps-search-clear"));
+    expect(screen.getByText("设置")).toBeTruthy();
+    expect(screen.getByText("亚马逊购物")).toBeTruthy();
+  });
+
+  it("三方范围里搜不到的东西要说明可能被藏起来了，而不是空列表了事", async () => {
+    renderWith(<AppsView serial="SERIAL-1" />);
+    await waitFor(() => expect(screen.getByText("亚马逊购物")).toBeTruthy());
+    fireEvent.change(screen.getByTestId("apps-search"), { target: { value: "settings" } });
+    expect(screen.getByText("没有匹配的应用")).toBeTruthy();
+    // 关键：提示要说清"可能是范围问题"，给用户下一步动作
+    expect(screen.getByText(/眼睛/)).toBeTruthy();
+    fireEvent.click(screen.getByTestId("apps-toggle-system"));
+    await waitFor(() => expect(screen.getByText("设置")).toBeTruthy());
+  });
+});
