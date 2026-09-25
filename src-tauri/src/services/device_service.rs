@@ -3310,6 +3310,30 @@ fn log_device_info_shadow_diff(serial: &str, agent: &DeviceInfo, legacy: &Device
 mod tests {
 
     #[test]
+    fn external_pids_survive_the_agent_to_ui_mapping() {
+        // Agent 报得出来、界面却什么都看不见 —— 断点就在这层映射上，所以单独钉一条
+        let mapped = map_agent_hosted_binaries(&[HostedBinaryInfo {
+            name: "auth-server".into(),
+            path: "/data/local/tmp/auth-server".into(),
+            size: 3_543_112,
+            mode: 0o755,
+            mode_text: "-rwxr-xr-x".into(),
+            has_exec: true,
+            uid: 0,
+            mtime_unix: 1_760_000_000,
+            external_pids: vec![9727, 11049],
+        }]);
+        assert_eq!(mapped[0].external_pids, vec![9727, 11049]);
+        // Legacy 那侧永远给不出进程信息：必须是空数组，而不是"看起来没有外部实例"
+        let legacy = adb::hosted_binaries(
+            "-rwxr-xr-x 1 root root 3543112 2025-06-28 16:08 auth-server\n",
+            "/data/local/tmp/auth-server: ELF 64-bit\n",
+        );
+        assert_eq!(legacy.len(), 1, "fixture 本身要能解析出一个条目");
+        assert!(legacy[0].external_pids.is_empty(), "{:?}", legacy[0]);
+    }
+
+    #[test]
     fn port_conflict_is_not_reported_as_an_internal_error() {
         // 真机实况：auth-server 已被一个外部实例占着 8080，第二个实例必然 bind failed
         let log = "服务器初始化完成\n注册用户数: 6\nbind failed\n";

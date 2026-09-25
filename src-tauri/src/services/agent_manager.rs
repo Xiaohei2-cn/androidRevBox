@@ -4022,10 +4022,12 @@ mod tests {
                 .expect("探针 toybox 应在托管目录里")
         }
 
-        // ① 外部先起一个（完全绕开本工具：adb shell 里 nohup 一个 toybox sleep）
+        // ① 外部先起一个（完全绕开本工具）。**按 root 身份起**：用户的真实现场就是
+        // `su -c` 起的 auth-server，而我们的检测靠读 `/proc/<pid>/comm`——shell 能不能
+        // 读到 root 进程的 comm 是这条链成立的前提，不能只测 shell 自己起的进程就当成立。
         let external_started = adb_shell(
             &serial,
-            "nohup /data/local/tmp/toybox sleep 120 </dev/null >/dev/null 2>&1 & echo OUTSIDE_STARTED",
+            "su -c 'nohup /data/local/tmp/toybox sleep 120 </dev/null >/dev/null 2>&1 & echo OUTSIDE_STARTED'",
         )
         .await;
         assert!(
@@ -4036,7 +4038,7 @@ mod tests {
         let outside = list(&client).await;
         assert!(
             !outside.external_pids.is_empty(),
-            "别人启动的 toybox 必须出现在 external_pids 里，否则界面还是会说它没在跑"
+            "root 身份启动的 toybox 必须出现在 external_pids 里，否则界面还是会说它没在跑"
         );
         eprintln!("[hosted] 外部实例 pid={:?}", outside.external_pids);
 
@@ -4090,7 +4092,12 @@ mod tests {
             .expect("hosted.stop 应当成功");
         let _ = stopped;
         for pid in &outside.external_pids {
-            adb_shell(&serial, &format!("kill {pid} 2>/dev/null; echo KILLED")).await;
+            // 它是 root 起的，普通 shell kill 不掉——收尾也要按真实身份来
+            adb_shell(
+                &serial,
+                &format!("su -c 'kill {pid} 2>/dev/null; echo KILLED'"),
+            )
+            .await;
         }
         let cleaned = list(&client).await;
         assert!(
