@@ -4036,6 +4036,18 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(600)).await;
         let outside = list(&client).await;
+        // 僵尸也有 pid 与 comm，但它是"等着被回收的尸体"，不是"在跑"。
+        // 判据按设备真实状态核，而不是信我们的过滤代码：真机上就同时存在
+        // 一个活着的 auth-server(S) 和一个僵尸(Z)，后者早年被算进过"外部在跑"。
+        for pid in &outside.external_pids {
+            let state = adb_shell(
+                &serial,
+                &format!("su -c 'cut -d \" \" -f3 /proc/{pid}/stat'"),
+            )
+            .await;
+            let state = state.trim();
+            assert_ne!(state, "Z", "pid {pid} 是僵尸，不该出现在 external_pids 里");
+        }
         assert!(
             !outside.external_pids.is_empty(),
             "root 身份启动的 toybox 必须出现在 external_pids 里，否则界面还是会说它没在跑"
@@ -4230,6 +4242,83 @@ mod tests {
         .await;
         manager.disconnect(&serial).await.unwrap();
         eprintln!("[conflict] 通过：秒退真因被认成端口冲突，不是内部错误");
+    }
+
+    /// 真机腿（只读）：**僵尸进程不许被算成"外部在跑"**。
+    ///
+    /// 判据来自用户手机上的真实形状：`auth-server` 同时存在一个在跑的（state=S）
+    /// 和一个僵尸（state=Z，ps 里显示成 `[auth-server]`）。僵尸既有 pid 也有 comm，
+    /// 早版本的按 comm 匹配会把它一起报成"外部在跑"，于是界面给出一个停不掉的
+    /// "运行中"，而它其实早就死了。这条腿不启动任何东西，随时可跑。
+    #[tokio::test]
+    #[ignore = "需要真机；APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_hosted_excludes_zombies -- --ignored --nocapture"]
+    async fn real_agent_hosted_excludes_zombie_processes() {
+        use agent_protocol::method::HOSTED_LIST;
+        use agent_protocol::{HostedListParams, HostedListResult};
+
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        let listed = client
+            .request::<_, HostedListResult>(
+                HOSTED_LIST,
+                &HostedListParams {},
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("hosted.list 应当可用");
+        async fn state_of(
+            runner: Arc<dyn AdbRunner>,
+            adb_path: String,
+            serial: String,
+            pid: u32,
+        ) -> String {
+            let out = runner
+                .run(
+                    &adb_path,
+                    &adb::build_args(
+                        Some(&serial),
+                        // 不用 awk（设备上 toybox 版本差异会吞输出），按空格切第三段
+                        &adb::cmd_shell(&format!("su -c 'cut -d \" \" -f3 /proc/{pid}/stat'")),
+                    ),
+                    Duration::from_secs(10),
+                )
+                .await
+                .unwrap_or_default();
+            out.stdout.trim().to_string()
+        }
+        let adb_path = runner
+            .environment()
+            .await
+            .path
+            .expect("本机应有 adb")
+            .to_string();
+
+        let mut checked = 0_usize;
+        for binary in listed.binaries {
+            for pid in binary.external_pids {
+                let state = state_of(runner.clone(), adb_path.clone(), serial.clone(), pid).await;
+                eprintln!("[zombie] {} pid={pid} state={state:?}", binary.name);
+                assert_ne!(
+                    state, "Z",
+                    "{} 的 pid {pid} 是僵尸，不该出现在 external_pids",
+                    binary.name
+                );
+                checked += 1;
+            }
+        }
+        manager.disconnect(&serial).await.unwrap();
+        if checked == 0 {
+            eprintln!("[提示] 这台机上当前没有外部同名进程可核（跳过断言，不是失败）");
+        } else {
+            eprintln!("[zombie] 通过：{checked} 个外部 pid 逐个核过状态，都不是僵尸");
+        }
     }
 
     /// AR9.1 前置真机腿：root 探测改由 Agent 执行后，结论必须与 Legacy `su -c id`

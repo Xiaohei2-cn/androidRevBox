@@ -786,16 +786,38 @@ fn running_processes_by_comm() -> HashMap<String, Vec<u32>> {
         if pid == me {
             continue;
         }
-        let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+        // 一次读 stat 就够：comm 与状态都在里面（stat 里同样被截到 15 字符，与
+        // /proc/<pid>/comm 一致）。**僵尸必须剔掉**：它既有 pid 也还有 comm，按 comm
+        // 匹配就会把"等着被回收的尸体"报成"外部在跑"——那又是拿缺失的证据编一个结论。
+        // 真机上就是这个形状：auth-server 活着是 9727(S)，11049 是 Z。
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             continue;
         };
-        let comm = comm.trim();
-        if comm.is_empty() {
+        let Some((comm, state)) = parse_comm_and_state(&stat) else {
+            continue;
+        };
+        if matches!(state, 'Z' | 'X' | 'x') || comm.is_empty() {
             continue;
         }
         map.entry(comm.to_owned()).or_default().push(pid);
     }
     map
+}
+
+/// 从 `/proc/<pid>/stat` 取 (comm, 状态)。
+///
+/// 只能从**最后一个** `)` 之后切：comm 自己可以含括号（内核线程名常是 `(devw` 这类，
+/// 应用也会改进程名），从第一个 `)` 切会把状态读成名字中间的一个字符。
+/// 同一口径在本模块 `parse_start_time_ticks` 已经用过，别再各写一份。
+fn parse_comm_and_state(stat: &str) -> Option<(String, char)> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    if close < open {
+        return None;
+    }
+    let comm = stat[open + 1..close].to_owned();
+    let state = stat[close + 1..].trim_start().chars().next()?;
+    Some((comm, state))
 }
 
 /// 某个托管文件当前有没有"别人启动的同名进程"在跑：按 comm 匹配，并剔掉我们自己
@@ -932,6 +954,19 @@ fn serialize<T: serde::Serialize>(value: T) -> Result<Value, AgentError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn zombies_are_not_reported_as_running_elsewhere() {
+        // 真机原样：9727 在跑（S），11049 是僵尸（Z）
+        let (comm, state) = parse_comm_and_state("9727 (auth-server) S 1 9727 0 0\n").unwrap();
+        assert_eq!((comm.as_str(), state), ("auth-server", 'S'));
+        let (_, state) = parse_comm_and_state("11049 (auth-server) Z 1 11049 0 0\n").unwrap();
+        assert_eq!(state, 'Z', "僵尸要能被认出来，否则又变成「它在跑」的假警报");
+        // comm 内含括号时必须从最后一个 ) 切
+        let (comm, state) = parse_comm_and_state("7 ((weird (x)) name) S 1 7\n").unwrap();
+        assert_eq!((comm.as_str(), state), ("(weird (x)) name", 'S'));
+        assert!(parse_comm_and_state("garbage without parens").is_none());
+    }
 
     #[test]
     fn comm_matching_survives_the_kernels_15_char_truncation() {
