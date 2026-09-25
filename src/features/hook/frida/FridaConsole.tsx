@@ -296,7 +296,9 @@ function FilterBar({ filter, onChange }: { filter: FridaFilter; onChange: (f: Fr
 
 // ===== 事件流：虚拟列表 + 钉底跟随（§5.3-M1） =====
 
-function EventStream({
+// 导出给测试：这一层的价值全在"行高量得准"，不导出来就只能测单行渲染（上一版就是这样，
+// 于是"从不测量"这个缺陷一直没被测到）
+export function EventStream({
   events,
   rawMode,
   origin,
@@ -315,12 +317,26 @@ function EventStream({
   const [newCount, setNewCount] = useState(0);
   const lastLen = useRef(0);
 
+  /**
+   * 虚拟列表必须**量过真实高度**，不然就是"挤占"：以前只给 estimateSize=22 却从不测量，
+   * 于是任何一条折行的消息（hexdump 一行 438 字符，屏宽下是 3–4 行）实际高 60–90px，
+   * 下一行却仍按 22px 的偏移量绝对定位 —— 文本互相压在彼此上面。
+   *
+   * getItemKey 用事件 id 而不是 index：超过 MAX_EVENTS 会从头裁剪，index 一移位
+   * 测量缓存就张冠李戴（表现同样是行高错乱，且只在流跑久了之后出现，最难复现）。
+   */
   const rowVirtualizer = useVirtualizer({
     count: events.length,
     getScrollElement: () => parentRef.current,
+    getItemKey: (index) => events[index]?.id ?? index,
     estimateSize: () => 22,
     overscan: 12,
   });
+
+  // 只渲染视口内（含 overscan）的行；上下留白把没渲染的部分垫出来
+  const items = rowVirtualizer.getVirtualItems();
+  const firstItem = items[0];
+  const lastItem = items[items.length - 1];
 
   // 钉底跟随：新行到达且在底部 → 滚到底；用户上滚 → 暂停并计数
   useEffect(() => {
@@ -362,12 +378,37 @@ function EventStream({
         {events.length === 0 ? (
           <span className={cn("text-muted-foreground", running && "animate-pulse")}>{emptyText}</span>
         ) : (
-          <div style={{ height: rowVirtualizer.getTotalSize(), position: "relative" }}>
-            {rowVirtualizer.getVirtualItems().map((vi) => {
+          /*
+           * 占位块 + 普通流，而不是"每行绝对定位"。
+           *
+           * 绝对定位那一版把 overlap 做成了可达状态：行高全靠 estimateSize，一旦某条消息
+           * 折行成多行（hexdump 一行 438 字符，屏宽下 3–4 行）而测量又没生效，下一条就
+           * 直接印在它身上 —— 用户看到的就是"文本互相挤占"。
+           * 现在可见行按文档流排：量不准最多只影响滚动条长度与占位，**永远不可能压到别的行**。
+           */
+          <div
+            data-testid="frida-rows"
+            style={{
+              // 上下留白顶出"没渲染的那部分"高度。故意**不**写死容器高度：
+              // 写死了以后，真实行高与估算不一致时内容会溢出去，滚动条长度反而更离谱。
+              paddingTop: firstItem?.start ?? 0,
+              paddingBottom: lastItem
+                ? Math.max(0, rowVirtualizer.getTotalSize() - lastItem.end)
+                : 0,
+              width: "100%",
+            }}
+          >
+            {items.map((vi) => {
               const e = events[vi.index];
               if (!e) return null;
               return (
-                <div key={e.id} style={{ position: "absolute", top: 0, left: 0, right: 0, transform: `translateY(${vi.start}px)` }}>
+                <div
+                  key={vi.key}
+                  // data-index 是 measureElement 找行的依据；少了它就永远退回估算值
+                  data-index={vi.index}
+                  data-testid="frida-row"
+                  ref={rowVirtualizer.measureElement}
+                >
                   <EventRow e={e} raw={rawMode} origin={origin} />
                 </div>
               );
@@ -413,7 +454,12 @@ export function EventRow({ e, raw, origin }: { e: ConsoleEvent; raw: boolean; or
               : "text-zinc-500";
   const time = renderTime(e.ts, origin);
   return (
-    <div className={cn("group flex items-start gap-2 whitespace-pre-wrap break-all rounded px-1", raw ? "text-zinc-400" : color)}>
+    <div
+      className={cn(
+        "group flex items-start gap-2 whitespace-pre-wrap [overflow-wrap:anywhere] rounded px-1",
+        raw ? "text-zinc-400" : color,
+      )}
+    >
       <span className="shrink-0 select-none text-10px text-zinc-600">{time}</span>
       {raw ? (
         <span className="path-selectable min-w-0 flex-1">{e.line}</span>
