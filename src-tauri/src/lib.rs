@@ -157,6 +157,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::system::system_ping,
+            commands::window::window_pointer_state,
+            commands::window::window_set_click_through,
             commands::agent::agent_status,
             commands::agent::agent_statuses,
             commands::agent::agent_install,

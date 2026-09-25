@@ -1,5 +1,6 @@
 import { useMemo, type CSSProperties } from "react";
 import { useSettings } from "@/app/providers";
+import { useClickThrough } from "@/hooks/useClickThrough";
 import { AppNavProvider, useAppNav } from "@/app/nav";
 import { MainTabRail } from "@/components/nav/MainTabRail";
 import { TitleBar } from "@/components/window/TitleBar";
@@ -34,7 +35,9 @@ export function AppShell() {
 
 function ShellBody() {
   const { tab } = useAppNav();
-  const { effectiveTheme, opacity } = useSettings();
+  const { effectiveTheme, opacity, clickThrough } = useSettings();
+  // 透明区点击穿透（第五十四轮）：只有鼠标底下没有实体时让点击出去
+  useClickThrough(clickThrough);
 
   // CSS 变量供 .app-surface（主体 + 锯齿齿块）共用：同色、同透明度。
   // ⚠️ 不要给 .app-surface 加回 backdrop-filter/transform：WKWebView 合成层

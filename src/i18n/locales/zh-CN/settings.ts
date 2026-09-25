@@ -13,8 +13,11 @@ export default {
 
   "settings.opacity.label": "背景不透明度",
   "settings.opacity.hint":
-    "调节窗口背景透明度，并叠加毛玻璃效果（macOS Vibrancy / Windows Acrylic；Linux 无合成器时自动降级为纯透明度）。最低 20%，保证内容可读。",
+    "调节窗口背景的不透明度。只是半透明着色，不会模糊背后的内容（WebKit 在透明窗口里模糊不到窗口外的东西，那条实现已删）。最低 20%，保证内容可读。",
 
+  "settings.clickThrough.label": "透明区点击穿透",
+  "settings.clickThrough.hint":
+    "打开后，界面上真正透明的地方（卡片之间的间隙、留白、圆角外）点击会直接落到后面的 App；卡片、按钮、输入框与文字区仍归本工具接。标题栏与左侧 tab 栏永远可点，任何时候都能回到这里关掉它。",
   "settings.language.label": "界面语言",
   "settings.language.hint": "切换后立即生效并持久化，重启自动恢复。",
   "settings.language.restartHint": "部分系统提示语（如 adb/进程错误）重启后完全生效。",

@@ -8,4 +8,5 @@ pub mod hook;
 pub mod plugins;
 pub mod system;
 pub mod task;
+pub mod window;
 pub mod zygisk;

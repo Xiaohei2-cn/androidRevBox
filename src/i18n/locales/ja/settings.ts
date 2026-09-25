@@ -13,8 +13,11 @@ export default {
 
   "settings.opacity.label": "背景の不透明度",
   "settings.opacity.hint":
-    "すりガラス効果を伴うウィンドウ背景の透明度を調整します（macOS Vibrancy / Windows Acrylic、合成器のない Linux では単なる透明度）。最小 20% で可読性を確保します。",
+    "ウィンドウ背景の不透明度を設定します。半透明の塗りだけなので、背後の内容はぼけません（WebKit は透明ウィンドウの外側をぼかせず、その実装は削除済み）。内容の可読性のため最低 20%。",
 
+  "settings.clickThrough.label": "透明部分をクリック透過",
+  "settings.clickThrough.hint":
+    "オンにすると、本当に透明な部分（カードの隙間、余白、角丸の外側）でのクリックが後ろのアプリに渡ります。カード・ボタン・入力欄・テキストは本ツールが受け取ります。タイトルバーと左のタブバーは常にクリック可能なので、いつでもここに戻してオフにできます。",
   "settings.language.label": "表示言語",
   "settings.language.hint": "即時反映され、再起動後も保持されます。",
   "settings.language.restartHint":

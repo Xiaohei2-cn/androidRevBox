@@ -63,6 +63,8 @@ export function MainTabRail() {
   return (
     <nav
       aria-label={t("nav.aria")}
+      // 同标题栏：tab 栏永远算实体，保证任何时候都能切页、能点回设置关掉穿透
+      data-click-through="solid"
       className="flex w-32 shrink-0 flex-col items-end gap-1.5 overflow-y-auto pt-14"
     >
       {MAIN_TABS.map((item) => (

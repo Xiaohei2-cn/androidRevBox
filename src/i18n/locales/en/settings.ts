@@ -13,8 +13,11 @@ export default {
 
   "settings.opacity.label": "Background opacity",
   "settings.opacity.hint":
-    "Adjusts window background transparency with a frosted-glass overlay (macOS Vibrancy / Windows Acrylic; falls back to plain transparency on Linux without a compositor). Minimum 20% keeps content readable.",
+    "Sets how opaque the window background is. It is a translucent fill only — nothing behind the window gets blurred (WebKit cannot blur outside a transparent window, and that implementation was removed). Minimum 20% so content stays readable.",
 
+  "settings.clickThrough.label": "Click through transparent areas",
+  "settings.clickThrough.hint":
+    "When on, clicks in genuinely transparent spots (gaps between cards, padding, outside the rounded corners) go to the app behind this window. Cards, buttons, inputs and text still belong to this tool. The title bar and the tab rail always stay clickable, so you can always come back here and switch it off.",
   "settings.language.label": "Language",
   "settings.language.hint": "Applies immediately and persists across restarts.",
   "settings.language.restartHint":

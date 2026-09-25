@@ -13,8 +13,11 @@ export default {
 
   "settings.opacity.label": "Opacidade do fundo",
   "settings.opacity.hint":
-    "Ajusta a transparência do fundo da janela com efeito de vidro fosco (macOS Vibrancy / Windows Acrylic; no Linux sem compositor, apenas transparência). O mínimo de 20% mantém o conteúdo legível.",
+    "Define a opacidade do fundo da janela. É apenas um preenchimento translúcido — nada atrás da janela fica desfocado (o WebKit não desboca fora de uma janela transparente e essa implementação foi removida). Mínimo 20% para manter o conteúdo legível.",
 
+  "settings.clickThrough.label": "Clicar através das áreas transparentes",
+  "settings.clickThrough.hint":
+    "Quando ativo, cliques em pontos realmente transparentes (vãos entre cartões, margens, fora dos cantos arredondados) vão para o app atrás desta janela. Cartões, botões, campos e texto continuam pertencendo a esta ferramenta. A barra de título e a barra de abas ficam sempre clicáveis, então dá para voltar aqui e desligar.",
   "settings.language.label": "Idioma da interface",
   "settings.language.hint": "Aplica imediatamente e persiste entre reinícios.",
   "settings.language.restartHint":

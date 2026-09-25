@@ -10,13 +10,14 @@ vi.mock("@tauri-apps/api/core", () => ({
 import { AppProviders, useSettings } from "@/app/providers";
 
 function Probe() {
-  const { theme, opacity, logLevel, hydrated } = useSettings();
+  const { theme, opacity, logLevel, clickThrough, hydrated } = useSettings();
   return (
     <div
       data-testid="probe"
       data-theme={theme}
       data-opacity={opacity}
       data-log-level={logLevel}
+      data-click-through={String(clickThrough)}
       data-hydrated={String(hydrated)}
     />
   );
@@ -32,6 +33,38 @@ describe("SettingsProvider（Tauri 环境：SQLite 持久化 + P0 迁移）", ()
   afterEach(() => {
     localStorage.clear();
     delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  });
+
+  it("透明区点击穿透：DB 明确写 true 才开，脏值与缺键都算关", async () => {
+    // 这个设置会改变"点下去归谁"，默认必须是关：拿猜出来的值去开穿透是危险的
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "config_snapshot") {
+        return [{ key: "app.settings.click_through", value: "maybe" }];
+      }
+      return null;
+    });
+    const dirty = render(
+      <AppProviders>
+        <Probe />
+      </AppProviders>,
+    );
+    await waitFor(() => expect(dirty.getByTestId("probe").dataset.hydrated).toBe("true"));
+    expect(dirty.getByTestId("probe").dataset.clickThrough).toBe("false");
+    dirty.unmount();
+
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "config_snapshot") {
+        return [{ key: "app.settings.click_through", value: "true" }];
+      }
+      return null;
+    });
+    const ok = render(
+      <AppProviders>
+        <Probe />
+      </AppProviders>,
+    );
+    await waitFor(() => expect(ok.getByTestId("probe").dataset.clickThrough).toBe("true"));
+    ok.unmount();
   });
 
   it("DB 值覆盖 localStorage 缓存（SQLite 为事实源）", async () => {

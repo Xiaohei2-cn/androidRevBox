@@ -111,7 +111,7 @@ export function SettingsPage() {
 
 /** 显示：主题 + 背景不透明度 */
 function DisplayTab() {
-  const { theme, setTheme, opacity, setOpacity } = useSettings();
+  const { theme, setTheme, opacity, setOpacity, clickThrough, setClickThrough } = useSettings();
   const { t } = useI18n();
 
   return (
@@ -171,6 +171,26 @@ function DisplayTab() {
             onValueChange={(values) => setOpacity(values[0])}
           />
           <p className="text-xs text-muted-foreground">{t("settings.opacity.hint")}</p>
+          {/*
+            透明区点击穿透（第五十四轮）：透明度调低之后，那些"看得透"的留白仍然会把点击
+            吃掉——macOS 不看像素 alpha，DOM 也不看 opacity。这个开关让判定跟着鼠标走：
+            底下是实体就接，底下只有半透明底色就把点击交给后面的 App。
+          */}
+          <label className="flex items-start gap-2 pt-1 text-sm">
+            <input
+              type="checkbox"
+              data-testid="click-through-toggle"
+              className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary"
+              checked={clickThrough}
+              onChange={(e) => setClickThrough(e.target.checked)}
+            />
+            <span className="min-w-0">
+              <span className="font-medium">{t("settings.clickThrough.label")}</span>
+              <span className="mt-0.5 block text-xs text-muted-foreground">
+                {t("settings.clickThrough.hint")}
+              </span>
+            </span>
+          </label>
         </CardContent>
       </Card>
     </div>

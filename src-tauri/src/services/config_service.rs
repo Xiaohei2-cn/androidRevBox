@@ -9,6 +9,8 @@ use crate::db::{Db, config_repo};
 pub const KEY_THEME: &str = "app.settings.theme";
 pub const KEY_OPACITY: &str = "app.settings.opacity";
 pub const KEY_LOG_LEVEL: &str = "app.settings.log_level";
+/// 透明区点击穿透开关（第五十四轮）：开着它，界面上纯透明的留白处点击会落到后面的 App
+pub const KEY_CLICK_THROUGH: &str = "app.settings.click_through";
 /// 手动指定的 adb 路径（P3）；空 = 走环境变量自动探测
 pub const KEY_ADB_PATH: &str = "app.adb.path";
 /// Android Agent binary 显式路径；空 = 环境变量/resource/workspace 自动发现
@@ -48,6 +50,11 @@ fn is_valid_opacity(v: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 布尔型设置：只认 "true"/"false" 两个字面量（跟前端 JSON 序列化口径一致）。
+fn is_valid_bool(v: &str) -> bool {
+    matches!(v, "true" | "false")
+}
+
 fn is_valid_log_level(v: &str) -> bool {
     matches!(v, "trace" | "debug" | "info" | "warn" | "error")
 }
@@ -83,6 +90,7 @@ const ALLOWED_KEYS: &[(&str, ValueValidator)] = &[
     (KEY_THEME, is_valid_theme),
     (KEY_OPACITY, is_valid_opacity),
     (KEY_LOG_LEVEL, is_valid_log_level),
+    (KEY_CLICK_THROUGH, is_valid_bool),
     (KEY_ADB_PATH, is_valid_path),
     (KEY_AGENT_PATH, is_valid_path),
     (KEY_PLUGIN_CALL_TIMEOUT_MS, is_valid_timeout_ms),

@@ -19,6 +19,8 @@ export function TitleBar() {
   return (
     <header
       data-tauri-drag-region
+      // 穿透模式下标题栏永远算实体：不然窗口拖不动、也关不掉，等于把自己锁死
+      data-click-through="solid"
       className="flex h-10 shrink-0 items-center gap-3 border-b border-border/60"
     >
       {/* macOS：控制按钮在左（对齐系统习惯，红黄绿顺序）；拖拽区在其右 */}

@@ -74,6 +74,30 @@ describe("SettingsPage", () => {
     expect(screen.getByText("100%")).toBeInTheDocument();
   });
 
+  it("「透明区点击穿透」勾选后写回配置键，且界面立刻是选中态", async () => {
+    // 写回 SQLite 只在 Tauri 环境发生（浏览器里退回 localStorage），这里得把环境装上；
+    // 另外必须等水合完成——水合期间故意不写回，免得把缓存值当成用户的新设置覆盖上去
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    render(
+      <AppProviders>
+        <SettingsPage />
+      </AppProviders>,
+    );
+    const box = (await screen.findByTestId("click-through-toggle")) as HTMLInputElement;
+    await waitFor(() => expect(configMocks.snapshot).toHaveBeenCalled());
+    expect(box.checked).toBe(false); // 默认必须关：它会改变"点下去归谁"
+    await userEvent.click(box);
+    expect(box.checked).toBe(true);
+    await waitFor(() =>
+      expect(configMocks.set).toHaveBeenCalledWith("app.settings.click_through", "true"),
+    );
+    await userEvent.click(box);
+    await waitFor(() =>
+      expect(configMocks.set).toHaveBeenLastCalledWith("app.settings.click_through", "false"),
+    );
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  });
+
   it("关于小节显示应用版本/Tauri 版本/运行平台（自仪表盘迁入，P7）", async () => {
     render(
       <AppProviders>

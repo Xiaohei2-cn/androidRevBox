@@ -22,6 +22,8 @@ export type LogLevel = "trace" | "debug" | "info" | "warn" | "error";
 export const KEY_THEME = "app.settings.theme";
 export const KEY_OPACITY = "app.settings.opacity";
 export const KEY_LOG_LEVEL = "app.settings.log_level";
+/** 透明区点击穿透（第五十四轮）：开则界面上纯透明的留白处点击落到后面的 App */
+export const KEY_CLICK_THROUGH = "app.settings.click_through";
 
 const THEME_VALUES: readonly string[] = ["light", "dark", "system"];
 const LOG_LEVELS: readonly LogLevel[] = ["trace", "debug", "info", "warn", "error"];
@@ -38,6 +40,12 @@ interface SettingsContextValue {
   setOpacity: (value: number) => void;
   logLevel: LogLevel;
   setLogLevel: (level: LogLevel) => void;
+  /**
+   * 透明区点击穿透。默认关：它会改变"点下去归谁"这件事，属于要用户主动要的行为。
+   * 关掉之后 Rust 侧立刻恢复可点击，不留中间态。
+   */
+  clickThrough: boolean;
+  setClickThrough: (value: boolean) => void;
   /** 后端配置是否已从 SQLite 完成水合（P0 localStorage 用户在迁移完成前看到缓存值） */
   hydrated: boolean;
 }
@@ -74,6 +82,15 @@ function readStoredOpacity(): number {
   return DEFAULT_OPACITY;
 }
 
+function readStoredClickThrough(): boolean {
+  try {
+    return localStorage.getItem(KEY_CLICK_THROUGH) === "true";
+  } catch {
+    // localStorage 不可用时按"关"处理：默认值不该依赖存储
+  }
+  return false;
+}
+
 function readStoredLogLevel(): LogLevel {
   try {
     const raw = localStorage.getItem(KEY_LOG_LEVEL);
@@ -101,6 +118,7 @@ function SettingsProvider({ children }: { children: ReactNode }) {
   const [theme, setThemeState] = useState<ThemePref>(readStoredTheme);
   const [opacity, setOpacityState] = useState<number>(readStoredOpacity);
   const [logLevel, setLogLevelState] = useState<LogLevel>(readStoredLogLevel);
+  const [clickThrough, setClickThroughState] = useState<boolean>(readStoredClickThrough);
   const [hydrated, setHydrated] = useState(false);
   const [systemDark, setSystemDark] = useState<boolean>(
     () => window.matchMedia("(prefers-color-scheme: dark)").matches,
@@ -146,6 +164,7 @@ function SettingsProvider({ children }: { children: ReactNode }) {
         await migrateUp(KEY_THEME, theme);
         await migrateUp(KEY_OPACITY, String(opacity));
         await migrateUp(KEY_LOG_LEVEL, logLevel);
+        await migrateUp(KEY_CLICK_THROUGH, String(clickThrough));
         if (cancelled) return;
 
         const dbTheme = db.get(KEY_THEME);
@@ -158,6 +177,11 @@ function SettingsProvider({ children }: { children: ReactNode }) {
           const clamped = Math.min(100, Math.max(MIN_OPACITY, dbOpacity));
           setOpacityState(clamped);
           persistCache(KEY_OPACITY, String(clamped));
+        }
+        // 只认 "true"：脏值/缺键一律落回"关"，不拿猜出来的值去改点击归属
+        if (db.get(KEY_CLICK_THROUGH) === "true") {
+          setClickThroughState(true);
+          persistCache(KEY_CLICK_THROUGH, "true");
         }
         const dbLevel = db.get(KEY_LOG_LEVEL);
         if (dbLevel && isValidLogLevel(dbLevel)) {
@@ -218,6 +242,14 @@ function SettingsProvider({ children }: { children: ReactNode }) {
     [writeThrough],
   );
 
+  const setClickThrough = useCallback(
+    (next: boolean) => {
+      setClickThroughState(next);
+      writeThrough(KEY_CLICK_THROUGH, String(next));
+    },
+    [writeThrough],
+  );
+
   const setLogLevel = useCallback(
     (next: LogLevel) => {
       setLogLevelState(next);
@@ -235,9 +267,22 @@ function SettingsProvider({ children }: { children: ReactNode }) {
       setOpacity,
       logLevel,
       setLogLevel,
+      clickThrough,
+      setClickThrough,
       hydrated,
     }),
-    [theme, setTheme, effectiveTheme, opacity, setOpacity, logLevel, setLogLevel, hydrated],
+    [
+      theme,
+      setTheme,
+      effectiveTheme,
+      opacity,
+      setOpacity,
+      logLevel,
+      setLogLevel,
+      clickThrough,
+      setClickThrough,
+      hydrated,
+    ],
   );
 
   return (
