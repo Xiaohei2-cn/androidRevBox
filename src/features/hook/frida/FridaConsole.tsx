@@ -7,6 +7,8 @@ import { parseFridaLine, summarizeEventData, type FridaEvent } from "@/api/hook"
 import { useAppNav } from "@/app/nav";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
+import { stripAnsi } from "@/lib/ansi";
+import { AnsiText } from "@/components/ui/AnsiText";
 import type { ConsoleEvent, FridaFilter, SessionInfo, TaskState } from "./types";
 import { DEFAULT_FILTER, filterMatch, filterStorageKey, loadFilter, saveFilter } from "./types";
 
@@ -417,11 +419,15 @@ export function EventRow({ e, raw, origin }: { e: ConsoleEvent; raw: boolean; or
         <span className="path-selectable min-w-0 flex-1">{e.line}</span>
       ) : (
         <span className="path-selectable min-w-0 flex-1">
-          {rawlessBody(e.evt, t)}
+          {/* 脚本自己会打 ANSI 颜色（hexdump 的地址绿、零字节黄）：
+              当文字渲染就是一行乱码，翻成样式才是它本来的样子 */}
+          <AnsiText text={rawlessBody(e.evt, t)} />
           {e.evt.kind === "error" && e.evt.stack && (
             <details className="mt-0.5 text-10px text-red-400/80">
               <summary className="cursor-pointer select-none">{t("hook.frida.stack")}</summary>
-              <pre className="whitespace-pre-wrap">{e.evt.stack}</pre>
+              <pre className="whitespace-pre-wrap">
+                <AnsiText text={e.evt.stack} />
+              </pre>
             </details>
           )}
         </span>
@@ -431,7 +437,9 @@ export function EventRow({ e, raw, origin }: { e: ConsoleEvent; raw: boolean; or
         className="shrink-0 text-zinc-600 opacity-0 hover:text-zinc-300 group-hover:opacity-100"
         title={t("common.copy")}
         onClick={() => {
-          void copyText(e.line).then(() => {
+          // 复制"看见的东西"：普通模式复制去色后的正文，原始模式复制那行 NDJSON 原文。
+          // 以前一律复制 wire 行，粘出去是一串 \u001b[0;32m，hexdump 没法直接用。
+          void copyText(raw ? e.line : stripAnsi(rawlessBody(e.evt, t))).then(() => {
             setCopied(true);
             setTimeout(() => setCopied(false), 1000);
           });

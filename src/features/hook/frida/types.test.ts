@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { FridaEvent } from "@/api/hook";
-import { DEFAULT_FILTER, filterMatch, filterStorageKey, loadFilter, saveFilter, remoteSpec, type ConsoleEvent, fridaSessionLabel } from "./types";
+import {
+  DEFAULT_FILTER,
+  filterMatch,
+  filterStorageKey,
+  loadFilter,
+  saveFilter,
+  remoteSpec,
+  fridaSessionLabel,
+  type ConsoleEvent,
+  type FridaFilter,
+} from "./types";
 
 function evt(over: Partial<ConsoleEvent>): ConsoleEvent {
   const e: Partial<ConsoleEvent> = { id: 1, ts: 0, stream: "stdout", line: "", ...over };
@@ -71,5 +81,24 @@ describe("fridaSessionLabel（attach 空目标 = 自动前台）", () => {
   it("填了目标就用目标；spawn 的包名原样带出", () => {
     expect(fridaSessionLabel("attach", " com.x.y ", "a.js")).toBe("attach com.x.y · a.js");
     expect(fridaSessionLabel("spawn", "com.x.y", "a.js")).toBe("spawn com.x.y · a.js");
+  });
+});
+
+describe("filterMatch 按看得见的文字过滤", () => {
+  const evt = (line: string): ConsoleEvent => ({
+    id: 1,
+    ts: 0,
+    stream: "stdout",
+    line,
+    evt: { kind: "log", lvl: "log", msg: line },
+  });
+  const f = (kw: string): FridaFilter => ({ ...DEFAULT_FILTER, kw });
+
+  it("带 ANSI 颜色的 hexdump 也能按内容搜到（以前搜 00000000 是空的）", () => {
+    const line = "\u001b[0;32m00000000\u001b[0m  \u001b[0;33m00\u001b[0m";
+    expect(filterMatch(evt(line), f("00000000"))).toBe(true);
+    expect(filterMatch(evt(line), f("0000ffff"))).toBe(false);
+    // 正则模式同理：转义不该插进匹配串中间
+    expect(filterMatch(evt(line), { ...f("0000.*00$"), regex: true })).toBe(true);
   });
 });

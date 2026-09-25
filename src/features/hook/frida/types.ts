@@ -1,3 +1,4 @@
+import { stripAnsi } from "@/lib/ansi";
 import type { FridaEvent } from "@/api/hook";
 
 /** A 区会话设置（启动时快照进会话，§3） */
@@ -79,7 +80,8 @@ export function filterMatch(e: ConsoleEvent, f: FridaFilter): boolean {
   if ((k === "raw" || k === "exit" || k === "ready") && !f.raw) return false;
   const kw = f.kw.trim();
   if (!kw) return true;
-  const text = e.line;
+  // 过滤与高亮都按"看得见的文字"来：转义序列吃在中间，搜 00000000 就搜不到了
+  const text = stripAnsi(e.line);
   if (f.regex) {
     try {
       return new RegExp(kw, "i").test(text);
