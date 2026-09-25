@@ -17,7 +17,7 @@ export default {
 
   "settings.clickThrough.label": "Clicar através das áreas transparentes",
   "settings.clickThrough.hint":
-    "Quando ativo, cliques em pontos realmente transparentes (a faixa translúcida e os blocos da barra de abas, vãos entre cartões, margens, fora dos cantos arredondados) vão para o app atrás desta janela. Cartões, botões, campos e texto continuam com esta ferramenta. Cada aba mantém uma área de clique sobre o ícone e a barra de título continua sólida, então dá para voltar aqui e desligar.",
+    "Quando ativo, só as partes transparentes da barra de abas à esquerda (a faixa, os vãos entre os blocos e os próprios blocos translúcidos) entregam os cliques ao app de trás. Os ícones mantêm área de clique, a aba ativa e toda a área de conteúdo continuam recebendo os cliques, e as bordas da janela seguem utilizáveis para redimensionar. O estado atual aparece logo abaixo.",
 
   "settings.clickThrough.status.solid": "Agora: o cursor está sobre conteúdo real, esta ferramenta mantém os cliques",
   "settings.clickThrough.status.passing": "Agora: o cursor está numa área transparente, os cliques vão para o app de trás",

@@ -17,7 +17,7 @@ export default {
 
   "settings.clickThrough.label": "Click through transparent areas",
   "settings.clickThrough.hint":
-    "When on, clicks in genuinely transparent spots (the see-through gutter and teeth of the tab rail, gaps between cards, padding, outside the rounded corners) go to the app behind this window. Cards, buttons, inputs and text still belong to this tool. Each tab keeps a hit area over its icon and the title bar stays solid, so you can always come back here and switch it off.",
+    "When on, only the transparent parts of the left tab rail (its gutter, the gaps between teeth and the translucent teeth themselves) hand clicks to the app behind. Tab icons keep a hit area, the active tab and the whole content area always keep the clicks, and the window edges stay grabbable so you can still resize it. The live readout below shows the current state.",
 
   "settings.clickThrough.status.solid": "Now: pointer is over real content, this tool keeps the clicks",
   "settings.clickThrough.status.passing": "Now: pointer is over a transparent spot, clicks go to the app behind",

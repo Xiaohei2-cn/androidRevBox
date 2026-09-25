@@ -1,117 +1,76 @@
 /**
- * 透明区点击穿透的判定层（第五十四轮）。
+ * 透明区点击穿透的判定层。
  *
- * 一句话规则：**鼠标底下那一点有没有"实体"**。有实体（卡片、按钮、输入框、可选中的文字、
- * 窗口 chrome）就接点击；只有半透明底色（留白、卡片之间的间隙、圆角外）就把点击让给后面的 App。
+ * 规则是**反过来**的：默认所有地方都算实体、都接点击；只有被显式标成 `data-click-through="pass"`
+ * 的区域（左侧 tab 栏的透明留白与齿块本体）才把点击让给后面的 App。
  *
- * 为什么判定必须在这儿而不是 CSS 里：整窗穿透是 macOS 的窗口级开关，一旦开了，
- * webview 就收不到鼠标事件了 —— 所以不能靠 :hover/pointer-events 反应，只能拿
- * Rust 读到的全局光标位置，反过来问 DOM「这一点是什么」。`elementFromPoint` 不需要
- * 窗口拿到事件，问得动。
+ * 为什么不做"看谁透明"的启发式（我第一版就是这么写的，被用户当场指出两个后果）：
+ * ① 内容区里卡片之间的间隙、3% 的极浅着色会被判成"透明"，于是**点自己的界面点到了后面**；
+ * ② 无边框窗口的拉伸热区正好压在边缘那几个透明像素上，穿透一开**整窗就拖不动了**。
+ * 猜错了的代价是"自己的界面失灵"，所以宁可少穿、不可乱穿。
  */
 
-/** 全局底色/布局层：它们"看着透明"正是因为不代表任何可点内容，所以不算实体 */
-export const TINT_LAYERS = ".app-surface,.page-canvas";
+/** 显式声明"这里可以让出去" */
+export const PASS_ATTR = "pass";
+/** 显式声明"这里必须接住"（优先级高于 pass，用于 pass 区域里的控件热区） */
+export const SOLID_ATTR = "solid";
 
 /**
- * 算"实体"的原生可交互元素。
- * React 的 onClick 在 DOM 上查不到（事件挂在根节点），所以能靠的只有语义标签、
- * ARIA role，以及我们自己标的 data-* —— 这也是标题栏/tab 栏要显式标记的原因。
+ * 窗口边缘抓住区（CSS px）：`decorations:false` 的窗口只能靠边缘热区拉伸，
+ * 这几像素永远算实体，否则"透明处穿透"会把调整窗口大小一起废掉。
  */
-export const INTERACTIVE_SELECTOR = [
-  "button",
-  "a[href]",
-  "input",
-  "select",
-  "textarea",
-  "summary",
-  "label",
-  "[role]",
-  "[contenteditable='true']",
-  "[data-clickable]",
-].join(",");
+export const EDGE_GRIP_PX = 12;
 
-/**
- * 背景 alpha 低于它就当作"这块地方本来也是透的"。
- * 0.15 这条线画在：卡片/输入框（实色）算实体，而 3% 那一层极浅着色不算。
- */
-export const PAINT_ALPHA = 0.15;
+export interface Viewport {
+  width: number;
+  height: number;
+}
 
-/** 判定一个元素栈需要的三种知识；注入进来是为了能在没有布局引擎的环境里逐条钉住 */
-export interface StackJudges {
-  isTint: (el: Element) => boolean;
-  isInteractive: (el: Element) => boolean;
-  isPainted: (el: Element) => boolean;
+/** 是不是压在窗口边缘的拉伸热区上 */
+export function isOnEdgeGrip(x: number, y: number, viewport: Viewport): boolean {
+  return (
+    x <= EDGE_GRIP_PX ||
+    y <= EDGE_GRIP_PX ||
+    x >= viewport.width - EDGE_GRIP_PX ||
+    y >= viewport.height - EDGE_GRIP_PX
+  );
 }
 
 /**
- * 从上往下找第一个"说得清这一点是实体"的元素（纯函数）。
- *
- * 栈里越靠前越是压在上面的元素；一路都是底色层/无边框的布局容器，才算透明。
- * 显式标记优先于任何启发式：`data-click-through="solid"` 钉住（窗口 chrome 用），
- * `="pass"` 钉透（以后要挖洞也给这条路，不用再改判定逻辑）。
+ * 从上往下找第一个带声明的元素：`solid` 接住、`pass` 让出；一路都没声明 → **接住**。
+ * 纯函数，不需要布局引擎，也不需要读 computed style（那种读法正是上一版误判的来源）。
  */
-export function isSolidStack(elements: readonly Element[], judges: StackJudges): boolean {
+export function isSolidStack(
+  elements: readonly Element[],
+  viewport: Viewport = { width: 0, height: 0 },
+  point = { x: -1, y: -1 },
+): boolean {
+  // 拉伸优先于任何让渡声明：贴着边缘时哪怕在 pass 区域里也绝不能把点击送出去
+  if (isOnEdgeGrip(point.x, point.y, viewport)) return true;
   for (const el of elements) {
-    const forced = el.getAttribute("data-click-through");
-    if (forced === "solid") return true;
-    if (forced === "pass") return false;
-    /*
-     * 顺序很重要：**控件先于底色层**。tab 齿块这类元素同时挂着 `.app-surface`（共用窗口
-     * 底色，保证颜色一致）和"它就是个按钮"这两件事；先判底色会把选中齿块那种
-     * 实心不透明的块也算成"透明可穿"，等于把当前页的 tab 点丢了。
-     */
-    if (judges.isInteractive(el)) return true;
-    if (judges.isTint(el)) continue;
-    if (judges.isPainted(el)) return true;
+    const mark = el.getAttribute("data-click-through");
+    if (mark === SOLID_ATTR) return true;
+    if (mark === PASS_ATTR) return false;
   }
-  return false;
-}
-
-/** `rgb(24 24 27 / 0.6)`、`rgba(0,0,0,.6)`、`hsl(0 0% 0% / 60%)`、`transparent` → alpha */
-export function alphaOf(color: string): number {
-  const value = (color ?? "").trim().toLowerCase();
-  if (!value || value === "none" || value === "transparent") return 0;
-  // 先摘掉收尾的 ")"：`hsl(0 0% 0% / 35%)` 的 alpha 段是 "35%"，带着括号就认不出百分号了
-  const body = value.replace(/\)\s*$/, "");
-  const slash = body.lastIndexOf("/");
-  if (slash > 0) {
-    const token = body.slice(slash + 1).trim();
-    const percent = token.endsWith("%");
-    const raw = Number.parseFloat(percent ? token.slice(0, -1) : token);
-    if (!Number.isFinite(raw)) return 1;
-    return percent ? raw / 100 : raw;
-  }
-  // 老式逗号写法：第四个分量才是 alpha；只有三个分量就是全不透明
-  const nums = value.match(/-?\d*\.?\d+/g);
-  if (!nums || nums.length < 4) return 1;
-  const raw = Number.parseFloat(nums[3]);
-  return Number.isFinite(raw) ? raw : 1;
-}
-
-/** 浏览器实现：`matches` + computed style */
-export function domJudges(): StackJudges {
-  return {
-    isTint: (el) => el.matches(TINT_LAYERS),
-    isInteractive: (el) => el.matches(INTERACTIVE_SELECTOR),
-    isPainted: (el) => {
-      const style = getComputedStyle(el as HTMLElement);
-      if (alphaOf(style.backgroundColor) >= PAINT_ALPHA) return true;
-      if (style.backgroundImage && style.backgroundImage !== "none") return true;
-      // 图片/canvas 本身就是实体，哪怕没有背景色
-      return el instanceof HTMLImageElement || el instanceof HTMLCanvasElement;
-    },
-  };
+  return true;
 }
 
 /**
  * 这一点该不该接点击。
  *
- * 拿不到元素栈（无布局引擎、坐标在视口外、jsdom 未实现 `elementFromPoint`）时
- * **一律算实体**：宁可"透传没生效"，也不能把用户自己的界面点不到。
+ * 拿不到元素栈（坐标在视口外、无布局环境）时也按"接住"处理：宁可这次没穿透，
+ * 也不能出现"看着界面在眼前、点下去却打到后面那个 App"。
  */
-export function isSolidAt(x: number, y: number, doc: Document = document): boolean {
+export function isSolidAt(
+  x: number,
+  y: number,
+  doc: Document = document,
+  viewport: Viewport = {
+    width: doc.defaultView?.innerWidth ?? 0,
+    height: doc.defaultView?.innerHeight ?? 0,
+  },
+): boolean {
   const stack = typeof doc.elementsFromPoint === "function" ? doc.elementsFromPoint(x, y) : [];
   if (!stack || stack.length === 0) return true;
-  return isSolidStack(stack, domJudges());
+  return isSolidStack(stack, viewport, { x, y });
 }

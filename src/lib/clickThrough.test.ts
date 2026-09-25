@@ -1,102 +1,57 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  PAINT_ALPHA,
-  alphaOf,
-  domJudges,
+  EDGE_GRIP_PX,
+  isOnEdgeGrip,
   isSolidAt,
   isSolidStack,
 } from "./clickThrough";
 
-/** 造一个元素栈：jsdom 没有布局引擎，`elementsFromPoint` 用不了，所以直接喂栈 */
-function el(opts: {
-  className?: string;
-  tag?: string;
-  bg?: string;
-  clickThrough?: "solid" | "pass";
-  role?: string;
-}): Element {
-  const node = document.createElement(opts.tag ?? "div");
-  if (opts.className) node.className = opts.className;
-  if (opts.bg) node.style.backgroundColor = opts.bg;
-  if (opts.clickThrough) node.setAttribute("data-click-through", opts.clickThrough);
-  if (opts.role) node.setAttribute("role", opts.role);
+function el(mark?: "solid" | "pass", className = ""): HTMLElement {
+  const node = document.createElement(className === "button" ? "button" : "div");
+  if (mark) node.setAttribute("data-click-through", mark);
   return node;
 }
 
-const solid = (stack: Element[]) => isSolidStack(stack, domJudges());
+const VIEWPORT = { width: 1200, height: 800 };
+const CENTER = { x: 600, y: 400 };
 
-describe("透明区点击穿透的判定", () => {
-  it("只有半透明底色与布局容器 → 透明，让点击出去", () => {
-    expect(
-      solid([
-        el({ className: "absolute inset-0 p-5" }),
-        el({ className: "app-surface", bg: "rgba(24, 24, 27, 0.55)" }),
-        el({ className: "page-canvas", bg: "rgba(17, 24, 39, 0.03)" }),
-      ]),
-    ).toBe(false);
+describe("点击穿透的判定（默认接住，只有显式声明才让出）", () => {
+  it("什么都不标 → 接住点击", () => {
+    // 用户报的第一条：内容区卡片之间的间隙、3% 极浅着色被上一版猜成"透明"，
+    // 结果点自己的界面打到了后面的 App。默认必须反过来。
+    expect(isSolidStack([el(), el(), document.createElement("html")], VIEWPORT, CENTER)).toBe(true);
   });
 
-  it("压在底色上面的卡片算实体", () => {
-    expect(
-      solid([
-        el({ className: "rounded-xl bg-card", bg: "rgb(255 255 255 / 1)" }),
-        el({ className: "app-surface", bg: "rgba(24, 24, 27, 0.55)" }),
-      ]),
-    ).toBe(true);
+  it("显式 pass 才让出点击", () => {
+    expect(isSolidStack([el(), el("pass")], VIEWPORT, CENTER)).toBe(false);
   });
 
-  it("极浅着色（低于阈值）不算实体，别把 3% 的层次当成卡片", () => {
-    expect(solid([el({ bg: "rgba(255 255 255 / 0.04)" })])).toBe(false);
-    expect(solid([el({ bg: `rgba(255 255 255 / ${PAINT_ALPHA})` })])).toBe(true);
+  it("pass 区域里的控件热区仍然算实体（tab 图标就是这一类）", () => {
+    // 栈是从上往下的：图标 pad(solid) 压在齿块(pass) 与 rail(pass) 上面
+    expect(isSolidStack([el("solid"), el("pass"), el("pass")], VIEWPORT, CENTER)).toBe(true);
+    // 而热区之外就是让出去
+    expect(isSolidStack([el(), el("pass"), el("pass")], VIEWPORT, CENTER)).toBe(false);
   });
 
-  it("原生控件与带 role 的东西一律算实体，哪怕它没画背景", () => {
-    expect(solid([el({ tag: "button" })])).toBe(true);
-    expect(solid([el({ tag: "input" })])).toBe(true);
-    expect(solid([el({ role: "tab" })])).toBe(true);
+  it("拿不到元素栈时算实体：宁可没穿透，不能把界面点失灵", () => {
+    expect(isSolidAt(10, 10, { elementsFromPoint: undefined, defaultView: null } as unknown as Document)).toBe(true);
+    expect(isSolidAt(10, 10, { elementsFromPoint: () => [], defaultView: null } as unknown as Document)).toBe(true);
+  });
+});
+
+describe("窗口边缘的拉伸热区", () => {
+  it("四条边各 EDGE_GRIP_PX 内都算抓住区", () => {
+    expect(isOnEdgeGrip(2, 400, VIEWPORT)).toBe(true);
+    expect(isOnEdgeGrip(600, 1, VIEWPORT)).toBe(true);
+    expect(isOnEdgeGrip(VIEWPORT.width - 3, 400, VIEWPORT)).toBe(true);
+    expect(isOnEdgeGrip(600, VIEWPORT.height - 3, VIEWPORT)).toBe(true);
+    expect(isOnEdgeGrip(600, 400, VIEWPORT)).toBe(false);
+    expect(EDGE_GRIP_PX).toBeGreaterThan(0);
   });
 
-  it("控件优先于底色层：齿块带着 .app-surface 也仍是实体（选中态点得动）", () => {
-    // 这是本轮返工的根因之一：`.app-surface` 同时挂在窗口底色与 tab 齿块上，
-    // 先判底色会把实心不透明的选中齿块也当成"可穿透"，当前页的 tab 就点丢了。
-    const selectedTooth = el({ tag: "button", className: "app-surface bg-primary" });
-    expect(solid([selectedTooth])).toBe(true);
-  });
-
-  it("显式 pass 的透明齿块让出点击，但图标热区在上面就先算实体", () => {
-    const tooth = el({ tag: "button", className: "app-surface", clickThrough: "pass" });
-    // 齿块本体（只有半透明着色）→ 穿透，这正是用户要的那块
-    expect(solid([tooth, el({ className: "app-surface" })])).toBe(false);
-    // 图标热区压在齿块上面 → 仍然切得了页
-    const pad = el({ clickThrough: "solid" });
-    expect(solid([pad, tooth, el({ className: "app-surface" })])).toBe(true);
-  });
-
-  it("窗口 chrome 显式钉成实体：标题栏永远点得回来", () => {
-    expect(solid([el({ clickThrough: "solid", className: "app-surface" })])).toBe(true);
-    // 反过来也必须成立：显式声明穿透的层优先于任何启发式
-    expect(solid([el({ clickThrough: "pass", bg: "rgb(0 0 0 / 1)" })])).toBe(false);
-  });
-
-  it("越靠前越上面：先碰到实体就停，不去看下面的底色", () => {
-    expect(
-      solid([el({ clickThrough: "solid" }), el({ clickThrough: "pass" })]),
-    ).toBe(true);
-  });
-
-  it("alphaOf 覆盖现代/老式两种写法与关键字", () => {
-    expect(alphaOf("rgba(24, 24, 27, 0.6)")).toBeCloseTo(0.6);
-    expect(alphaOf("rgb(255 255 255 / 0.25)")).toBeCloseTo(0.25);
-    expect(alphaOf("hsl(0 0% 0% / 35%)")).toBeCloseTo(0.35);
-    expect(alphaOf("rgb(17 24 39)")).toBe(1);
-    expect(alphaOf("transparent")).toBe(0);
-    expect(alphaOf("")).toBe(0);
-    // 认不出来时按不透明处理：宁可这次没穿透，也不能把界面点不动
-    expect(alphaOf("not-a-color")).toBe(1);
-  });
-
-  it("拿不到元素栈时算实体（无布局环境/坐标越界都不能把界面点不动）", () => {
-    expect(isSolidAt(10, 10)).toBe(true);
+  it("边缘优先于 pass 声明：不然无边框窗口一开穿透就拖不动、也拉伸不了", () => {
+    // 用户报的第二条，正是这个形状：点击被透传到下面的 App，界面尺寸调不了
+    expect(isSolidStack([el("pass")], VIEWPORT, { x: 3, y: 400 })).toBe(true);
   });
 });

@@ -61,10 +61,11 @@ describe("MainTabRail", () => {
       const pad = tooth.querySelector('[data-click-through="solid"]');
       expect(pad).toBeTruthy();
     }
-    // 选中态是实心 bg-primary，属于实体：不能标 pass，否则当前页的 tab 点不动
-    expect(active[0].getAttribute("data-click-through")).toBeNull();
-    // rail 本体绝不能是实体（它就是用户要穿透的那块）
-    expect(screen.getByRole("navigation").getAttribute("data-click-through")).toBeNull();
+    // 选中态是实心 bg-primary，本来就是实体：必须显式标 solid，
+    // 否则会被 nav 的 pass 一路穿透掉，当前页的 tab 就成了点不动的空壳
+    expect(active[0].getAttribute("data-click-through")).toBe("solid");
+    // rail 是全项目唯一声明"可以让出点击"的区域，而且绝不能反过来钉成实体
+    expect(screen.getByRole("navigation").getAttribute("data-click-through")).toBe("pass");
   });
 
   it("当前激活 tab 标记 aria-current", () => {

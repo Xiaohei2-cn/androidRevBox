@@ -63,9 +63,10 @@ export function MainTabRail() {
   return (
     <nav
       aria-label={t("nav.aria")}
-      // 这里**不**钉实体：rail 宽 128px，齿块只占右边 36px，左边那一条与齿块之间的缝隙
-      // 本来就是纯透明——用户要的正是"这些透明处能点到后面的 App"（第五十四轮的返工点）。
-      // 切页与回到设置关掉穿透，靠每个齿块上的图标热区（下面 pad）。
+      // 全项目**唯一**声明"可以让出点击"的区域：rail 宽 128px 而齿块只占右边 36px，
+      // 左边那一条透明留白与齿块之间的缝隙就是用户要点穿到后面 App 的地方。
+      // 判定默认是"接住"，所以别的界面不标也不会被误穿；这里显式标 pass 才让出去。
+      data-click-through="pass"
       className="flex w-32 shrink-0 flex-col items-end gap-1.5 overflow-y-auto pt-14"
     >
       {MAIN_TABS.map((item) => (
@@ -110,9 +111,10 @@ function MainTabButton({
       type="button"
       aria-label={label}
       aria-current={active ? "true" : undefined}
-      // 未选中齿块只是一层半透明着色 → 本体让出去，图标热区留着（否则切不了页）；
-      // 选中态有实心 bg-primary，属于实体，不标 pass。
-      data-click-through={active ? undefined : "pass"}
+      // 未选中齿块本体只有那层半透明着色 → 让出去；图标热区标回 solid（否则切不了页）。
+      // 选中态是实心 bg-primary + 中文标签，本来就是实体：**必须显式标 solid**，
+      // 不然会被 nav 的 pass 一路穿透掉，当前页的 tab 就成了点不动的空壳。
+      data-click-through={active ? "solid" : "pass"}
       onClick={onClick}
       className={cn(
         "app-surface group relative flex h-10 shrink-0 select-none items-center justify-center rounded-l-xl border border-r-0 border-border/60",
