@@ -28,6 +28,7 @@ pub mod method {
     pub const HOSTED_START: &str = "hosted.start";
     pub const HOSTED_STATUS: &str = "hosted.status";
     pub const HOSTED_STOP: &str = "hosted.stop";
+    pub const HOSTED_ADOPT: &str = "hosted.adopt";
     pub const PACKAGE_EXPORT_APK: &str = "package.export_apk";
     pub const PACKAGE_EXPORT_CLEAN: &str = "package.export_clean";
     pub const PACKAGE_DESCRIBE: &str = "package.describe";
@@ -847,6 +848,33 @@ pub struct HostedStartResult {
     pub record: HostedRunRecord,
 }
 
+/// AR7.7：把「桌面侧代跑的、Agent 运行表里没有记录」的进程**认领**进表。
+///
+/// 为什么需要：Agent 以 shell 身份运行，`hosted.start{root:true}` 显式 `PermissionDenied`，
+/// 所以勾了 Root 的启动走的是 Legacy `su -c "cd D; nohup ./x >log 2>&1 & echo $!"` ——
+/// **那条路从来没写过运行表**，界面上的 pid 只是前端本地记忆。软件重启或换设备后就没有任何
+/// 凭据证明"那是本工具起的"，进程于是显示成"表外"。这个方法是把那条缺失的登记补上：
+/// 桌面把启动命令回读到的 pid 交给 Agent，Agent **在设备上核验之后**才写记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedAdoptParams {
+    pub name: String,
+    /// 启动命令回读的 pid（Legacy 的 `$!`）
+    pub pid: u32,
+    /// 调用方声称的启动身份。**Agent 不采信**：属主按 `/proc/<pid>/status` 实测
+    #[serde(default)]
+    pub root: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedAdoptResult {
+    pub record: HostedRunRecord,
+    /// 认领依据，逐条是可核对的事实（`comm=` / `argv0=` / `exe=` / `uid=`）；
+    /// 读不到的证据写成 `exe_unreadable`，**不写成"已核对"**
+    pub verified_by: Vec<String>,
+    /// true = 表里本来就有这条活着的记录（重复登记幂等，不新建第二条）
+    pub already: bool,
+}
+
 /// AR7.3：停止托管进程。用 `handle` 而不是裸 PID 寻址，并在发信号前用落盘的
 /// start time 再核一次身份——PID 复用窗口里，按数字杀进程可能杀到别人。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1661,6 +1689,38 @@ mod tests {
         assert!(
             serde_json::from_value::<ActivityLaunchParams>(json!({ "package": "com.x" })).is_err()
         );
+    }
+
+    #[test]
+    fn hosted_adopt_dto_wire_shape_is_snake_case() {
+        // AR7.7：认领的入参与结果都要过线，字段拼错会静默放宽守卫（同 D029 那类坑）
+        let params: HostedAdoptParams =
+            serde_json::from_value(json!({ "name": "auth-server", "pid": 3571 })).unwrap();
+        assert_eq!(params.pid, 3571);
+        assert!(
+            !params.root,
+            "root 缺省必须是 false：默认值写成 true 等于默认允许提权声称"
+        );
+        let camel: HostedAdoptParams =
+            serde_json::from_value(json!({ "name": "x", "pid": 1, "rootClaim": true })).unwrap();
+        assert!(!camel.root, "驼峰写法不被识别：会静默丢掉调用方的声称");
+
+        let result = HostedAdoptResult {
+            record: running_record(),
+            verified_by: vec!["comm=auth-server".into(), "exe_unreadable(跨 uid)".into()],
+            already: false,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["verified_by"][0], "comm=auth-server");
+        assert_eq!(value["already"], json!(false));
+        assert_eq!(
+            value["record"]["start_time_ticks"],
+            result.record.start_time_ticks
+        );
+
+        // 缺 name/pid 必须直接报错，不能靠默认值凑出一个"pid 0 的记录"
+        assert!(serde_json::from_value::<HostedAdoptParams>(json!({ "name": "x" })).is_err());
+        assert!(serde_json::from_value::<HostedAdoptParams>(json!({ "pid": 1 })).is_err());
     }
 
     #[test]

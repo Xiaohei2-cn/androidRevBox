@@ -53,6 +53,12 @@ interface HostedRow {
   error: string | null;
   /** 启动时所用的 root 上下文：kill/后续操作必须同身份 */
   root: boolean;
+  /**
+   * 这个 pid 有没有设备侧运行表背书（AR7.7）。
+   * 后端 `tracked:false` 时界面**不写 pid**：那只是桌面知道的一个数字，
+   * 设备上没有凭据，刷新后就没人认得它 —— 摆在那儿冒充"本工具在管"就是假话。
+   */
+  tracked: boolean;
   ports: ListenPort[];
   /** 端口查询进行中标记 */
   portsLoading: boolean;
@@ -124,7 +130,7 @@ export function BinaryHosting() {
    * Agent 侧托管运行表（AR7.2）：pid 与状态来自设备端 `pid + start time` 对账，
    * 不是前端本地记忆，所以 Desktop 重启、页面刷新后也能恢复「谁真的在跑」。
    */
-  const { data: runs = [] } = useQuery({
+  const { data: runs = [], refetch: refetchRuns, status: runsStatus } = useQuery({
     queryKey: ["adb", "hosted-runs", deviceSerial],
     queryFn: () => deviceApi.hostedRuns(deviceSerial!),
     enabled: !!deviceSerial,
@@ -139,9 +145,14 @@ export function BinaryHosting() {
     setRoot(false);
   }, [deviceSerial]);
 
-  // 用运行表校正/补齐托管行：设备端说在跑就是在跑，说退了就把状态收回去
+  /**
+   * 用运行表校正/补齐托管行：设备端说在跑就是在跑，说退了就把状态收回去。
+   *
+   * `runsStatus !== "success"` 时**什么都不做**：拿不到表是"不知道"，不是"没在跑"，
+   * 拿它去清 pid 会把一只真在跑的进程显示成未运行（本项目反复栽过的同一类错）。
+   */
   useEffect(() => {
-    if (runs.length === 0) return;
+    if (runsStatus !== "success") return;
     setHosted((rows) => {
       const next = rows.map((row) => {
         const mine = runs
@@ -155,7 +166,17 @@ export function BinaryHosting() {
             pid: live.pid,
             running: true,
             root: live.root,
+            tracked: true,
           };
+        }
+        if (!live && row.pid !== null && !row.tracked && !row.running) {
+          /*
+           * 这个 pid 只是桌面手里的一个数（Legacy 支路当场读到的 $!），而设备表里查不到
+           * 对应的活记录 —— 它要么已经退了，要么压根没登记上。继续摆着就成了
+           * "界面说在跑、设备说没这回事"。收回来之后，如果它其实还在跑，
+           * 「表外同名进程」那条会接手显示，界面上仍然有能用的停止入口。
+           */
+          return { ...row, pid: null, tracked: false, ports: [] };
         }
         const last = mine[0];
         if (last && last.state === "exited" && row.running) {
@@ -170,6 +191,8 @@ export function BinaryHosting() {
           name: run.name,
           handle: run.handle,
           pid: run.pid,
+          // 从设备运行表补进来的行：这条当然是设备认得的
+          tracked: true,
           running: true,
           error: null,
           root: run.root,
@@ -181,7 +204,7 @@ export function BinaryHosting() {
       }
       return next;
     });
-  }, [runs, deviceSerial]);
+  }, [runs, runsStatus, deviceSerial]);
 
   const patchRow = (name: string, p: Partial<HostedRow>) =>
     setHosted((hs) => hs.map((h) => (h.name === name ? { ...h, ...p } : h)));
@@ -197,6 +220,7 @@ export function BinaryHosting() {
               name: b.name,
               handle: null,
               pid: null,
+              tracked: false,
               running: false,
               error: null,
               root: false,
@@ -274,7 +298,22 @@ export function BinaryHosting() {
         return;
       }
       const pid = result.pid;
-      patchRow(row.name, { pid, running: false, ports: [], error: null });
+      /*
+       * pid 照写，但它有没有"设备侧凭据"由 `tracked` 决定（AR7.7）：
+       * 登记进运行表的显示成普通 pid chip；没登记上的（Agent 未在线、认领被拒）
+       * 显示成「已在运行（未登记）」——写「未运行」是假的，按"本工具在管着它"来显示也是假的。
+       */
+      patchRow(row.name, {
+        pid,
+        tracked: result.tracked,
+        running: false,
+        ports: [],
+        error: null,
+      });
+      // 成功也可能带话要交代（登记失败的原因）：不能只在失败时才让用户看见
+      if (result.detail) setNotice(result.detail);
+      // 立刻回查设备表：pid/状态以设备为准，不等 5s 轮询
+      void refetchRuns();
       // 端口可能在 listen() 前几十毫秒才绑定：立即拉一次，3s 后再补一次
       void loadPorts(row.name, pid, asRoot);
       window.setTimeout(() => void loadPorts(row.name, pid, asRoot), 3000);
@@ -302,6 +341,7 @@ export function BinaryHosting() {
       await deviceApi.binaryKill(deviceSerial, pid, true, name);
       setNotice(t("adb.binary.stoppedExternal", { pid }));
       void refetch();
+      void refetchRuns();
     } catch (e) {
       setNotice(`${t("adb.binary.stopFailed")}: ${String((e as Error)?.message ?? e)}`);
     } finally {
@@ -335,13 +375,28 @@ export function BinaryHosting() {
       } else {
         await deviceApi.binaryKill(deviceSerial, row.pid, row.root, row.name);
       }
+      /*
+       * root 行的终止走提权通道，Agent 那边只剩一条它够不着的记录（进程已被杀掉，
+       * 但表里还写着 running）。不顺手放掉的话，下一次轮询会把这一行又点亮成"在跑"，
+       * 用户看到的就是"我明明停了它"。Agent 侧对已消失的进程是幂等成功 + 删记录，
+       * 所以这里只清账，失败也不改变"进程已经停了"这个事实。
+       */
+      if (row.handle && row.root && row.pid !== null) {
+        try {
+          await deviceApi.hostedStop(deviceSerial, row.handle, row.pid);
+        } catch {
+          /* 记录留着也会在下一次对账时自己变 exited，不因此报失败 */
+        }
+      }
       patchRow(row.name, {
         handle: null,
         pid: null,
         running: false,
         ports: [],
+        tracked: false,
         error: t("adb.binary.killed", { pid: row.pid }),
       });
+      void refetchRuns();
     } catch (e) {
       patchRow(row.name, { running: false, error: String((e as Error)?.message ?? e) });
     }
@@ -469,12 +524,25 @@ export function BinaryHosting() {
                         title={t("adb.binary.copyCmd", { name: row.name })}
                         testid={`cmd-${row.name}`}
                       />
-                      {row.pid !== null ? (
+                      {row.pid !== null && row.tracked ? (
                         <InfoChip
                           label={`pid ${row.pid}${row.root ? " · root" : ""}`}
                           title={t("adb.binary.copyPid")}
                           testid={`pid-${row.name}`}
                         />
+                      ) : row.pid !== null && !row.tracked ? (
+                        /*
+                         * 起来了，但没能登记进设备侧运行表（AR7.7）：写「未运行」是假的，
+                         * 写成普通 pid chip 也是假的——那个数只是桌面的记忆，
+                         * 软件重启后没人认得它。照实标「已在运行（未登记）」。
+                         */
+                        <span
+                          className="shrink-0 text-amber-500"
+                          title={t("adb.binary.runningUntrackedTip")}
+                          data-testid={`running-untracked-${row.name}`}
+                        >
+                          {t("adb.binary.runningUntracked")}
+                        </span>
                       ) : firstOutsider ? (
                         /*
                          * 表外有同名进程在跑：这里不能写「未运行」。它只说明"我们

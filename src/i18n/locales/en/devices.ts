@@ -129,6 +129,8 @@ export default {
   "adb.binary.hostEmpty": "Empty: double-click an executable above to add",
   "adb.binary.idle": "Not running",
   "adb.binary.runningOutside": "Running (outside our table)",
+  "adb.binary.runningUntracked": "Running (not registered)",
+  "adb.binary.runningUntrackedTip": "The process really did start, but it could not be registered in this tool's run table (see the reason shown above): this pid is only desktop-side memory, and nothing will recognise it after a restart.",
   "adb.binary.externalRunning": "running externally: {pids}",
   "adb.binary.externalRunningTip": "It is not in this tool's run table: either you did not start it, or the process you started forked into a daemon (the parent exited, init adopted the child) and the table only knows the old pid. Either way it can be stopped: \"Stop process\" checks the program name before signalling.",
   "adb.binary.confirmCancel": "Cancel",

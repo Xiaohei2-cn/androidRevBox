@@ -14,10 +14,10 @@ use std::time::Duration;
 use agent_protocol::method::{
     ACTIVITY_FORCE_STOP, ACTIVITY_LAUNCH, DEVICE_INFO, DEVICE_ROOT_CHECK, FILESYSTEM_CHMOD,
     FILESYSTEM_LIST, FILESYSTEM_MKDIR, FILESYSTEM_PREVIEW, FILESYSTEM_REMOVE, FILESYSTEM_RENAME,
-    FILESYSTEM_STAT, FRIDA_SERVER_START, FRIDA_SERVER_STATUS, FRIDA_SERVER_STOP, HOSTED_CHMOD,
-    HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP, PACKAGE_LIST, PACKAGE_NATIVE_LIB_DIR,
-    PACKAGE_REPLACE_NATIVE_LIBRARY, PACKAGE_UNINSTALL, PROCESS_BY_PORT, PROCESS_KILL,
-    PROCESS_PORTS, PROCESS_PROC_READ,
+    FILESYSTEM_STAT, FRIDA_SERVER_START, FRIDA_SERVER_STATUS, FRIDA_SERVER_STOP, HOSTED_ADOPT,
+    HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP, PACKAGE_LIST,
+    PACKAGE_NATIVE_LIB_DIR, PACKAGE_REPLACE_NATIVE_LIBRARY, PACKAGE_UNINSTALL, PROCESS_BY_PORT,
+    PROCESS_KILL, PROCESS_PORTS, PROCESS_PROC_READ,
 };
 use agent_protocol::{
     ActivityForceStopParams, ActivityLaunchParams, DeviceInfoParams, DeviceInfoResult,
@@ -27,14 +27,14 @@ use agent_protocol::{
     FilesystemRemoveParams, FilesystemRemoveResult, FilesystemRenameParams, FilesystemRenameResult,
     FilesystemStatParams, FilesystemStatResult, FridaServerStartParams, FridaServerStartResult,
     FridaServerStatusParams, FridaServerStatusResult, FridaServerStopParams, FridaServerStopResult,
-    HostedBinaryInfo, HostedChmodParams, HostedChmodResult, HostedListParams, HostedListResult,
-    HostedRunRecord, HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams,
-    HostedStatusResult, HostedStopParams, HostedStopResult, KillSignal, ListeningPort,
-    PackageListParams, PackageListResult, PackageNativeLibDirParams, PackageNativeLibDirResult,
-    PackageScope, PackageUninstallParams, PackageUninstallResult, PackageWriteResult,
-    PortHoldingProcess, PreviewEncoding, ProcFile, ProcessByPortParams, ProcessByPortResult,
-    ProcessKillParams, ProcessKillResult, ProcessPortsParams, ProcessPortsResult,
-    ProcessProcReadParams, ProcessProcReadResult, ReplaceNativeLibraryParams,
+    HostedAdoptParams, HostedAdoptResult, HostedBinaryInfo, HostedChmodParams, HostedChmodResult,
+    HostedListParams, HostedListResult, HostedRunRecord, HostedRunState, HostedStartParams,
+    HostedStartResult, HostedStatusParams, HostedStatusResult, HostedStopParams, HostedStopResult,
+    KillSignal, ListeningPort, PackageListParams, PackageListResult, PackageNativeLibDirParams,
+    PackageNativeLibDirResult, PackageScope, PackageUninstallParams, PackageUninstallResult,
+    PackageWriteResult, PortHoldingProcess, PreviewEncoding, ProcFile, ProcessByPortParams,
+    ProcessByPortResult, ProcessKillParams, ProcessKillResult, ProcessPortsParams,
+    ProcessPortsResult, ProcessProcReadParams, ProcessProcReadResult, ReplaceNativeLibraryParams,
     ReplaceNativeLibraryResult, SO_STAGED_ROOT, SocketFamily,
 };
 
@@ -456,6 +456,11 @@ pub struct HostedRunView {
     /// 界面对象：真正在跑的那个 pid（我们起的，或者本来就在跑的）
     pub pid: u32,
     pub started: bool,
+    /// AR7.7：这条运行**登记进设备侧托管运行表**了没有。
+    /// `false` 意味着桌面上那个 pid 只是本地记忆：软件重启或切设备之后就没有凭据说
+    /// "这是本工具起的"，进程会显示成表外。root 支路靠 `hosted.adopt` 补登记，
+    /// 补不上（Agent 未在线、进程名对不上、已过认领窗口）时如实报 false，不装作在管。
+    pub tracked: bool,
     pub detail: Option<String>,
 }
 
@@ -1280,6 +1285,8 @@ impl DeviceService {
         Ok(HostedRunView {
             pid: status.record.pid,
             started: true,
+            // Agent 亲自启动的：记录本来就在设备表里，重启也认得
+            tracked: true,
             detail: None,
         })
     }
@@ -1338,6 +1345,7 @@ impl DeviceService {
             HostedRunView {
                 pid,
                 started: false,
+                tracked: false,
                 detail: Some(format!(
                     "{name} 已经在跑（{}），不在本工具的托管表里",
                     externals
@@ -1351,6 +1359,7 @@ impl DeviceService {
             HostedRunView {
                 pid,
                 started: false,
+                tracked: true,
                 detail: Some(format!(
                     "{name} 已由本工具启动（pid {pid}），要换参数请先终止它"
                 )),
@@ -1470,11 +1479,78 @@ impl DeviceService {
                 "{name} 启动后立即退出：{detail}"
             )));
         }
+        // AR7.7：root 支路的启动不经过 Agent，运行表里没有这条记录——不补登记的话，
+        // 软件重启/切设备之后没人能证明"这是本工具起的"，它就只能显示成表外进程。
+        let (tracked, detail) = match self.hosted_adopt(serial, name, pid, root).await {
+            None => (true, None),
+            Some(reason) => (
+                false,
+                // 一行的字符串常量：换行续行会被 rustfmt 吃掉转义，把一串空格塞进界面文案里
+                Some(format!(
+                    "已启动 pid {pid}，但没能登记进托管表：{reason}。它确实起来了，只是本工具没有凭据认领它，刷新后会显示成表外进程"
+                )),
+            ),
+        };
         Ok(HostedRunView {
             pid,
             started: true,
-            detail: None,
+            tracked,
+            detail,
         })
+    }
+
+    /// AR7.7：把 Legacy 支路（尤其 `su -c nohup`）起的进程**认领**进 Agent 运行表。
+    ///
+    /// 返回 `None` = 登记成功；`Some(原因)` = 没登记上。后者**不能**推翻"已经启动成功"
+    /// 这个事实（进程确实在跑），所以调用方只把它写进 detail，不报成失败。
+    /// 认领成不成立由设备侧按 `/proc` 实证判（comm/argv0/属主/启动时刻），桌面说了不算。
+    async fn hosted_adopt(&self, serial: &str, name: &str, pid: u32, root: bool) -> Option<String> {
+        let params = HostedAdoptParams {
+            name: name.to_owned(),
+            pid,
+            root,
+        };
+        match self.require_agent_write_route(serial, HOSTED_ADOPT) {
+            Ok(()) => {}
+            Err(error) => return Some(error.to_string()),
+        }
+        match self
+            .android
+            .agent()
+            .request::<_, HostedAdoptResult>(serial, HOSTED_ADOPT, &params, SHORT_CMD_TIMEOUT)
+            .await
+        {
+            Ok(result) => {
+                tracing::info!(
+                    serial,
+                    name,
+                    handle = %result.record.handle,
+                    pid,
+                    already = result.already,
+                    verified_by = ?result.verified_by,
+                    "托管进程已登记进运行表"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(serial, name, pid, error = %error, "托管进程登记进运行表失败");
+                // Agent 侧的 reason 码要带出来：拒绝认领的原因（进程名对不上 / 已过认领窗口）
+                // 直接决定用户下一步该做什么，只留一句"business error"等于没说
+                let reason = match &error {
+                    crate::services::android_backend::AgentBackendError::Business(business) => {
+                        business
+                            .details
+                            .as_ref()
+                            .and_then(|value| value.get("reason"))
+                            .and_then(|value| value.as_str())
+                            .map(|code| format!("{}（{code}）", business.message))
+                            .unwrap_or_else(|| business.message.clone())
+                    }
+                    other => other.to_string(),
+                };
+                Some(reason)
+            }
+        }
     }
 
     /// 读托管启动日志尾部（截 2KB 防日志爆炸）。

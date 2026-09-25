@@ -4131,6 +4131,224 @@ mod tests {
         eprintln!("[hosted] 通过：外部实例看得见，自己起的不算外部");
     }
 
+    /// 真机腿（AR7.7）：**root 支路起的进程能被认领进运行表**，且认领只认设备上的实证。
+    ///
+    /// 这条腿钉的是用户那句"这进程明明是我启动的，怎么说不是我启动的"的根治：
+    /// `device_binary_run(root=true)` 走的是 `su -c "nohup ./x & echo $!"`，Agent 全程没参与，
+    /// 运行表里从来没这条记录 —— 所以桌面一重启就没人认得它了。现在改成起完之后
+    /// `hosted.adopt` 补登记，而**登记成不成立由设备侧 `/proc` 说了算**：
+    /// ① 名字/命令行/属主/启动时刻都对得上 → 写记录，且不再算"表外"；
+    /// ② 对不上（这里拿 init 顶包）→ `precondition_failed`，一条记录都不许写；
+    /// ③ 重复登记幂等（不能给同一个 pid 发第二个句柄）。
+    #[tokio::test]
+    #[ignore = "需要真机；AR77_ADOPT_PROBE=yes APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_hosted_adopt -- --ignored --nocapture"]
+    async fn real_agent_hosted_adopt_claims_root_launched_process() {
+        use agent_protocol::method::{HOSTED_ADOPT, HOSTED_LIST};
+        use agent_protocol::{
+            HostedAdoptParams, HostedAdoptResult, HostedListParams, HostedListResult,
+            HostedRunState,
+        };
+        if std::env::var("AR77_ADOPT_PROBE").unwrap_or_default() != "yes" {
+            eprintln!("[跳过] 本腿会在设备上以 root 起一只探针进程，需要 AR77_ADOPT_PROBE=yes");
+            return;
+        }
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        if !prepare_toybox_probe(&serial).await {
+            return;
+        }
+        async fn adb_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        async fn list(client: &AgentClient) -> agent_protocol::HostedBinaryInfo {
+            client
+                .request::<_, HostedListResult>(
+                    HOSTED_LIST,
+                    &HostedListParams {},
+                    Duration::from_secs(20),
+                )
+                .await
+                .expect("hosted.list 应当可用")
+                .binaries
+                .into_iter()
+                .find(|binary| binary.name == "toybox")
+                .expect("探针 toybox 应在托管目录里")
+        }
+
+        // ① 复刻真实支路：**root 身份、脱离启动它的 shell**（父 shell 一退就被 init 收养）
+        let launched = adb_shell(
+            &serial,
+            "su -c 'cd /data/local/tmp; nohup ./toybox sleep 120 </dev/null >/dev/null 2>&1 & echo $!'",
+        )
+        .await;
+        let pid: u32 = launched
+            .trim()
+            .lines()
+            .last()
+            .and_then(|line| line.trim().parse().ok())
+            .unwrap_or_else(|| panic!("拿不到探针 pid，输出：{launched:?}"));
+        eprintln!("[adopt] root 支路起的探针 pid={pid}");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        // 认领之前：它就是"表外同名进程"
+        let before = list(&client).await;
+        assert!(
+            before.external_procs.iter().any(|proc| proc.pid == pid),
+            "认领前应当算表外：{:?}",
+            before.external_procs
+        );
+
+        // ② 认领：证据齐 → 写记录
+        let adopted = client
+            .request::<_, HostedAdoptResult>(
+                HOSTED_ADOPT,
+                &HostedAdoptParams {
+                    name: "toybox".into(),
+                    pid,
+                    root: true,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("证据齐全时 hosted.adopt 应当成功");
+        assert_eq!(adopted.record.pid, pid);
+        assert_eq!(adopted.record.state, HostedRunState::Running);
+        assert!(
+            adopted.record.root,
+            "属主按实测 uid 记：root 起的必须记成 root（决定走哪条终止链路）"
+        );
+        assert!(
+            adopted
+                .verified_by
+                .iter()
+                .any(|proof| proof.starts_with("comm=toybox")),
+            "认领依据要能核对：{:?}",
+            adopted.verified_by
+        );
+        assert!(!adopted.already, "第一次登记不该被说成已在表里");
+        eprintln!("[adopt] 依据 = {:?}", adopted.verified_by);
+
+        // ③ 认领之后：不再是表外进程，且带句柄
+        let after = list(&client).await;
+        assert!(
+            !after.external_procs.iter().any(|proc| proc.pid == pid),
+            "已经认领进表的进程不能再算表外：{:?}",
+            after.external_procs
+        );
+        let listed = client
+            .request::<_, HostedListResult>(
+                HOSTED_LIST,
+                &HostedListParams {},
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .runs
+                .iter()
+                .any(|run| run.pid == pid && run.state == HostedRunState::Running),
+            "运行表里必须能查到这条认领记录"
+        );
+
+        // ④ 幂等：同一只进程重复登记只能有那一个句柄
+        let again = client
+            .request::<_, HostedAdoptResult>(
+                HOSTED_ADOPT,
+                &HostedAdoptParams {
+                    name: "toybox".into(),
+                    pid,
+                    root: true,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("重复登记应当幂等成功");
+        assert!(again.already, "第二次必须被认成同一条记录");
+        assert_eq!(
+            again.record.handle, adopted.record.handle,
+            "同一个 pid 不能发两个句柄"
+        );
+
+        // ⑤ 反例：拿 init 顶包。名字对不上就一条都不许写
+        let bogus = client
+            .request::<_, HostedAdoptResult>(
+                HOSTED_ADOPT,
+                &HostedAdoptParams {
+                    name: "toybox".into(),
+                    pid: 1,
+                    root: true,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect_err("pid 1 是 init，绝不能被认领成托管进程");
+        let bogus = match bogus {
+            crate::services::agent_client::AgentClientError::Remote(remote) => {
+                assert_eq!(
+                    remote.code,
+                    agent_protocol::ErrorCode::PreconditionFailed,
+                    "{}",
+                    remote.message
+                );
+                remote
+            }
+            other => panic!("认领被拒应当是设备侧的业务错误，实际 {other:?}"),
+        };
+        let reason = bogus
+            .details
+            .as_ref()
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(
+            matches!(
+                reason,
+                "comm_mismatch" | "argv0_unreadable" | "argv0_mismatch"
+            ),
+            "拒绝原因应当是身份不符，实际 {reason}：{}",
+            bogus.message
+        );
+        eprintln!("[adopt] init 顶包被拒：{reason}");
+
+        // ⑥ 收尾：探针是 root 起的，普通 shell 杀不动，按同一身份收掉；
+        //    收掉之后记录必须自己变成"不在了"，而不是赖在 running 里
+        adb_shell(
+            &serial,
+            &format!("su -c 'kill {pid} 2>/dev/null; echo KILLED'"),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let settled = client
+            .request::<_, HostedListResult>(
+                HOSTED_LIST,
+                &HostedListParams {},
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !settled
+                .runs
+                .iter()
+                .any(|run| run.pid == pid && run.state == HostedRunState::Running),
+            "探针已经停了，认领来的记录还显示 running 就是在骗界面"
+        );
+        manager.disconnect(&serial).await.unwrap();
+        eprintln!("[adopt] 通过：root 支路起的进程能认领、能幂等、顶包被拒、停完不留假 running");
+    }
+
     /// 真机腿：端口被占时**第二个实例的真实死因要能被认出来**，不能落在"内部错误"里。
     ///
     /// 与上面那条 `real_agent_hosted_notices_externally_started_process` 是一对：

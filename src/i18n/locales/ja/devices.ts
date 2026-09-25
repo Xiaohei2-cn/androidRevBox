@@ -129,6 +129,8 @@ export default {
   "adb.binary.hostEmpty": "空です：上の緑のファイルをダブルクリックで追加",
   "adb.binary.idle": "未実行",
   "adb.binary.runningOutside": "稼働中（管理表外）",
+  "adb.binary.runningUntracked": "稼働中（未登録）",
+  "adb.binary.runningUntrackedTip": "プロセスは起動しましたが、本ツールの管理表に登録できませんでした（理由は上のお知らせに表示）。この pid はデスクトップ側の記憶のみで、再起動後は誰も認識できません。",
   "adb.binary.externalRunning": "外部で稼働中: {pids}",
   "adb.binary.externalRunningTip": "本ツールの実行テーブルにありません：自分で起動していないか、起動したプロセスがデーモン化（親が終了し子プロセスを init が引き継ぐ）して旧 pid だけが残っているかのどちらかです。どちらも停止できます：停止前にプロセス名を照合します。",
   "adb.binary.confirmCancel": "キャンセル",

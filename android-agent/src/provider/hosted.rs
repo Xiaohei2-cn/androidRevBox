@@ -19,13 +19,15 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use agent_protocol::method::{HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP};
+use agent_protocol::method::{
+    HOSTED_ADOPT, HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP,
+};
 use agent_protocol::{
-    AgentError, ErrorCode, ExternalProc, FileKind, HostedBinaryInfo, HostedChmodParams,
-    HostedChmodResult, HostedListParams, HostedListResult, HostedRunRecord, HostedRunState,
-    HostedStartParams, HostedStartResult, HostedStatusParams, HostedStatusResult, HostedStopParams,
-    HostedStopResult, KillOutcome, KillSignal, PERMISSION_BITS, ProviderHealth, ProviderInfo,
-    render_mode_text,
+    AgentError, ErrorCode, ExternalProc, FileKind, HostedAdoptParams, HostedAdoptResult,
+    HostedBinaryInfo, HostedChmodParams, HostedChmodResult, HostedListParams, HostedListResult,
+    HostedRunRecord, HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams,
+    HostedStatusResult, HostedStopParams, HostedStopResult, KillOutcome, KillSignal,
+    PERMISSION_BITS, ProviderHealth, ProviderInfo, render_mode_text,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,6 +37,7 @@ use super::{Provider, ProviderFuture, RequestContext};
 
 const HOSTED_METHODS: &[&str] = &[
     HOSTED_LIST,
+    HOSTED_ADOPT,
     HOSTED_CHMOD,
     HOSTED_START,
     HOSTED_STATUS,
@@ -76,6 +79,8 @@ enum RunSource {
     Spawned,
     /// 从磁盘对账恢复（已不是自己的子进程）
     Reconciled,
+    /// AR7.7：桌面侧（Legacy/root 支路）起的进程事后认领进来，同样没有子进程句柄
+    Adopted,
 }
 
 /// 落盘格式：记录本体 + 来源标记。
@@ -135,6 +140,7 @@ impl Provider for HostedProvider {
         Box::pin(async move {
             match method {
                 HOSTED_LIST => self.list(params).await,
+                HOSTED_ADOPT => self.adopt(params),
                 HOSTED_CHMOD => self.chmod(params),
                 HOSTED_START => self.start(params),
                 HOSTED_STATUS => self.status(params),
@@ -321,6 +327,146 @@ impl HostedProvider {
         serialize(HostedStartResult { record })
     }
 
+    /// AR7.7：把「桌面侧代跑、我们没句柄」的进程认领进运行表。
+    ///
+    /// 存在的理由不是"让界面好看"，而是**root 支路的启动从来不经 Agent**：
+    /// `hosted.start{root:true}` 在设备侧是 `PermissionDenied`（Agent 跑 shell 身份），
+    /// 于是 `device_binary_run(root=true)` 走 Legacy `su -c "cd D; nohup ./x >log 2>&1 & echo $!"`。
+    /// 那条路不进运行表 ⇒ 软件重启/刷新页面之后，设备上没有任何凭据说"这是本工具起的"，
+    /// 进程就显示成表外（用户的原话：明明是我启动的，怎么说不是我启动的）。
+    ///
+    /// 认领必须**拿设备上的实证**换，不能拿桌面的声明换：这条记录之后就是「终止」按钮的
+    /// 依据，认错一个 pid 等于拿别人的进程当自己的杀。四道证据缺一不可（见 `adopt_refusal`）：
+    /// 活着不是僵尸、`comm` 与托管文件名相符、`cmdline` 的 argv0 相符、进程启动时刻在窗口内。
+    /// `exe` 能读就读（同 uid 可读，读得到就是最强证据）；跨 uid 读不到时**如实记为读不到**。
+    fn adopt(&self, params: Value) -> Result<Value, AgentError> {
+        let params: HostedAdoptParams = parse_params(params)?;
+        self.ensure_loaded()?;
+        let path = hosted_path(&params.name)?;
+        let pid = params.pid;
+        if pid == 0 {
+            return Err(invalid("pid_zero", "pid 为 0 不能认领为运行记录"));
+        }
+        // 先把"托管目录里真的有这个文件"钉住：认领不能凭空调出一个不存在的二进制
+        let metadata = std::fs::metadata(&path).map_err(|error| io_error("stat", &path, error))?;
+        if !metadata.is_file() {
+            return Err(invalid(
+                "not_a_regular_file",
+                format!("托管目标不是普通文件: {}", display(&path)),
+            ));
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|error| {
+            AgentError::new(
+                ErrorCode::PreconditionFailed,
+                format!("pid={pid} 读不到 /proc/{pid}/stat，拒绝认领: {error}"),
+            )
+            .with_details(serde_json::json!({ "reason": "stat_unreadable", "pid": pid }))
+        })?;
+        let Some((comm, _ppid, state)) = parse_comm_ppid_state(&stat) else {
+            return Err(AgentError::new(
+                ErrorCode::PreconditionFailed,
+                format!("/proc/{pid}/stat 解析不出 comm/state，拒绝认领"),
+            )
+            .with_details(serde_json::json!({ "reason": "stat_unparsable", "pid": pid })));
+        };
+        let Some(ticks) = parse_start_time_ticks(&stat) else {
+            return Err(AgentError::new(
+                ErrorCode::PreconditionFailed,
+                format!("/proc/{pid}/stat 读不到启动时刻，拒绝认领"),
+            )
+            .with_details(serde_json::json!({ "reason": "start_time_unreadable", "pid": pid })));
+        };
+        let argv0 = cmdline_argv0(pid);
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|value| value.to_string_lossy().into_owned());
+        let uid = real_uid(pid);
+        let started_unix = process_start_unix(ticks);
+        if let Some((reason, message)) = adopt_refusal(
+            &params.name,
+            &path,
+            &comm,
+            state,
+            argv0.as_deref(),
+            exe.as_deref(),
+            uid,
+            started_unix,
+            unix_now(),
+        ) {
+            return Err(AgentError::new(ErrorCode::PreconditionFailed, message)
+                .with_details(serde_json::json!({ "reason": reason, "pid": pid })));
+        }
+        // 属主以实测为准（不采信调用方声称的 root）：界面要靠它决定走哪条终止链路
+        let root = uid == Some(0);
+        let mut proofs = vec![
+            format!("comm={comm}"),
+            format!("argv0={}", argv0.clone().unwrap_or_default()),
+            match uid {
+                Some(value) => format!("uid={value}"),
+                None => "uid_unreadable".to_string(),
+            },
+            match &exe {
+                Some(value) => format!("exe={value}"),
+                None => "exe_unreadable(跨 uid)".to_string(),
+            },
+            match (started_unix, uid) {
+                (Some(at), _) => format!("started_at={at}"),
+                (None, _) => "start_time_unreadable".to_string(),
+            },
+        ];
+        if params.root != root {
+            proofs.push(format!(
+                "root_claim_discrepant(claimed={},measured={root})",
+                params.root
+            ));
+        }
+        let mut table = self.lock();
+        // 幂等：同一个 pid 已经活着记在表里就回原来那条，不能发第二个句柄
+        if let Some(existing) = table
+            .runs
+            .values()
+            .find(|run| run.record.pid == pid && run.record.state == HostedRunState::Running)
+        {
+            let record = existing.record.clone();
+            return serialize(HostedAdoptResult {
+                record,
+                verified_by: proofs,
+                already: true,
+            });
+        }
+        let handle = random_handle()?;
+        let record = HostedRunRecord {
+            handle: handle.clone(),
+            name: params.name.clone(),
+            pid,
+            start_time_ticks: ticks,
+            started_at_unix: started_unix.unwrap_or_else(unix_now),
+            log_path: format!("{HOSTED_DIR}/.{}.run.log", params.name),
+            root,
+            state: HostedRunState::Running,
+            exit_code: None,
+            detail: Some("adopted".to_string()),
+        };
+        self.persist(&record);
+        table.runs.insert(
+            handle.clone(),
+            ManagedRun {
+                record: record.clone(),
+                child: None,
+                source: RunSource::Adopted,
+            },
+        );
+        eprintln!(
+            "audit method={HOSTED_ADOPT} handle={handle} name={} pid={} root={root} claimed_root={} proofs={:?}",
+            params.name, pid, params.root, proofs
+        );
+        serialize(HostedAdoptResult {
+            record,
+            verified_by: proofs,
+            already: false,
+        })
+    }
+
     /// 单条运行记录：能回收的子进程顺手回收，拿到真实退出码。
     fn status(&self, params: Value) -> Result<Value, AgentError> {
         let params: HostedStatusParams = parse_params(params)?;
@@ -338,7 +484,7 @@ impl HostedProvider {
             .with_details(serde_json::json!({ "reason": "unknown_handle" })));
         };
         serialize(HostedStatusResult {
-            reconciled: source == RunSource::Reconciled,
+            reconciled: !matches!(source, RunSource::Spawned),
             record,
         })
     }
@@ -848,6 +994,120 @@ fn external_procs_for(
     found
 }
 
+/// 认领窗口（秒）：只接受"刚刚起起来的"进程。
+///
+/// 为什么要有窗口而不是只看进程名：光凭 `comm`/`argv0` 相符就认领，等于承认
+/// "这台机上任何一只叫 auth-server 的进程都是我们起的"——那正是"拿缺失的证据编结论"。
+/// 加了时间窗，认领才真的意味着"这是刚才那次启动的产物"。
+const ADOPT_WINDOW_SECS: u64 = 120;
+
+/// `/proc/<pid>/stat` 第 22 字段的单位：Android userland 固定 100（`getconf CLK_TCK` 实测）。
+const USER_HZ: u64 = 100;
+
+/// 认领的否决判断（纯函数：每条守卫都能单独钉一条断言，不依赖设备上的 /proc）。
+/// 返回 `Some((reason, message))` 就是拒绝；`None` 才是"可以写进运行表"。
+#[allow(clippy::too_many_arguments)]
+fn adopt_refusal(
+    name: &str,
+    path: &Path,
+    comm: &str,
+    state: char,
+    argv0: Option<&str>,
+    exe: Option<&str>,
+    uid: Option<u32>,
+    started_unix: Option<u64>,
+    now: u64,
+) -> Option<(&'static str, String)> {
+    if matches!(state, 'Z' | 'X' | 'x') {
+        return Some((
+            "zombie",
+            format!("pid 的进程状态是 {state}（已死待回收），不能认领成在跑"),
+        ));
+    }
+    if !comm_matches(name, comm) {
+        return Some((
+            "comm_mismatch",
+            format!("设备上的进程名是 {comm}，与托管文件 {name} 对不上，拒绝认领"),
+        ));
+    }
+    let target = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    match argv0 {
+        None => {
+            return Some((
+                "argv0_unreadable",
+                format!("读不到 pid 的 cmdline，无法确认它跑的是 {name}，拒绝认领"),
+            ));
+        }
+        Some(value) => {
+            let base = value.rsplit('/').next().unwrap_or("");
+            if base != target && value != path.to_string_lossy().as_ref() {
+                return Some((
+                    "argv0_mismatch",
+                    format!("启动命令行是 {value}，不是托管文件 {name}，拒绝认领"),
+                ));
+            }
+        }
+    }
+    if let Some(value) = exe {
+        // 文件被覆盖时内核会在链接后面加 " (deleted)"：路径仍然指向我们托管的那个 inode
+        let trimmed = value.strip_suffix(" (deleted)").unwrap_or(value);
+        if trimmed != path.to_string_lossy().as_ref() {
+            return Some((
+                "exe_mismatch",
+                format!("pid 实际运行的可执行文件是 {value}，不是 {name}，拒绝认领"),
+            ));
+        }
+    }
+    if uid.is_none() {
+        return Some((
+            "uid_unreadable",
+            "读不到进程属主，界面上就定不了该走哪条终止链路，拒绝认领".to_string(),
+        ));
+    }
+    match started_unix {
+        None => Some((
+            "start_time_unreadable",
+            "算不出进程的启动时刻，无法判断它是不是刚才那次启动，拒绝认领".to_string(),
+        )),
+        Some(at) if at > now.saturating_add(5) => Some((
+            "start_time_in_future",
+            format!("进程启动时刻 {at} 晚于当前时间 {now}，设备时钟不可信，拒绝认领"),
+        )),
+        Some(at) if now.saturating_sub(at) > ADOPT_WINDOW_SECS => Some((
+            "out_of_window",
+            format!(
+                "这个进程已经跑了 {}s，超过认领窗口 {ADOPT_WINDOW_SECS}s，不能算成本次启动的产物",
+                now.saturating_sub(at)
+            ),
+        )),
+        _ => None,
+    }
+}
+
+/// `cmdline` 的第一个非空项（argv0）。空 cmdline 一般是内核线程，返回 `None`。
+fn cmdline_argv0(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    raw.split(|byte| *byte == 0)
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .find(|part| !part.is_empty())
+}
+
+/// 进程启动的墙上时间：`/proc/stat` 的 `btime` + `starttime_ticks / USER_HZ`。
+/// 任何一环读不到都返回 `None`——宁可不认领，也不拿一个猜出来的时刻去过时间窗。
+fn process_start_unix(ticks: u64) -> Option<u64> {
+    let btime = boot_time_unix()?;
+    btime.checked_add(ticks.checked_div(USER_HZ)?)
+}
+
+fn boot_time_unix() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = stat.lines().find(|line| line.starts_with("btime "))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// 真实 uid（`/proc/<pid>/status` 的 `Uid:` 第一段）。读不到返回 `None`——
 /// 用 `u32::MAX` 占位是"不知道"，不会像 0 那样被误读成"root 起的"。
 fn real_uid(pid: u32) -> Option<u32> {
@@ -972,6 +1232,226 @@ fn serialize<T: serde::Serialize>(value: T) -> Result<Value, AgentError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn adopt_refusal_demands_every_piece_of_evidence() {
+        use std::path::Path;
+        let hosted = Path::new("/data/local/tmp/auth-server");
+        let ok = |argv0: Option<&str>, exe: Option<&str>| {
+            adopt_refusal(
+                "auth-server",
+                hosted,
+                "auth-server",
+                'S',
+                argv0,
+                exe,
+                Some(0),
+                Some(1_760_000_000),
+                1_760_000_030,
+            )
+        };
+        // 齐全的证据：放行
+        assert_eq!(ok(Some("./auth-server"), None), None);
+        assert_eq!(
+            ok(
+                Some("/data/local/tmp/auth-server"),
+                Some("/data/local/tmp/auth-server")
+            ),
+            None
+        );
+        // 证据齐全的这一支本身必须走通，否则后面每一条反向断言都是空的
+        assert_eq!(ok(Some("./auth-server"), None), None);
+        assert_eq!(
+            adopt_refusal(
+                "auth-server",
+                hosted,
+                "other-daemon",
+                'S',
+                Some("./other-daemon"),
+                None,
+                Some(0),
+                Some(1_760_000_000),
+                1_760_000_030,
+            )
+            .map(|pair| pair.0),
+            Some("comm_mismatch")
+        );
+        // 僵尸：有 pid 也没在跑
+        assert_eq!(
+            adopt_refusal(
+                "auth-server",
+                hosted,
+                "auth-server",
+                'Z',
+                Some("./auth-server"),
+                None,
+                Some(0),
+                Some(1_760_000_000),
+                1_760_000_030,
+            )
+            .map(|pair| pair.0),
+            Some("zombie")
+        );
+        // argv0 读不到 = 没法确认它跑的是哪个文件
+        assert_eq!(
+            adopt_refusal(
+                "auth-server",
+                hosted,
+                "auth-server",
+                'S',
+                None,
+                None,
+                Some(0),
+                Some(1_760_000_000),
+                1_760_000_030,
+            )
+            .map(|pair| pair.0),
+            Some("argv0_unreadable")
+        );
+        assert_eq!(
+            adopt_refusal(
+                "auth-server",
+                hosted,
+                "auth-server",
+                'S',
+                Some("/system/bin/sh"),
+                None,
+                Some(0),
+                Some(1_760_000_000),
+                1_760_000_030,
+            )
+            .map(|pair| pair.0),
+            Some("argv0_mismatch")
+        );
+        // exe 读得到却不指向托管文件：最强证据反了，必须拒
+        assert_eq!(
+            adopt_refusal(
+                "auth-server",
+                hosted,
+                "auth-server",
+                'S',
+                Some("./auth-server"),
+                Some("/data/local/tmp/other"),
+                Some(0),
+                Some(1_760_000_000),
+                1_760_000_030,
+            )
+            .map(|pair| pair.0),
+            Some("exe_mismatch")
+        );
+        // 文件被覆盖过：内核在链接后加 " (deleted)"，路径仍指向我们托管的那个 inode → 放行
+        assert_eq!(
+            adopt_refusal(
+                "auth-server",
+                hosted,
+                "auth-server",
+                'S',
+                Some("./auth-server"),
+                Some("/data/local/tmp/auth-server (deleted)"),
+                Some(0),
+                Some(1_760_000_000),
+                1_760_000_030,
+            ),
+            None
+        );
+        // 属主读不到：界面定不了该走哪条终止链路
+        assert_eq!(
+            adopt_refusal(
+                "auth-server",
+                hosted,
+                "auth-server",
+                'S',
+                Some("./auth-server"),
+                None,
+                None,
+                Some(1_760_000_000),
+                1_760_000_030,
+            )
+            .map(|pair| pair.0),
+            Some("uid_unreadable")
+        );
+        // 启动时刻算不出来 → 不能拿猜出来的时间去判"是不是刚才那次启动"
+        assert_eq!(
+            adopt_refusal(
+                "auth-server",
+                hosted,
+                "auth-server",
+                'S',
+                Some("./auth-server"),
+                None,
+                Some(0),
+                None,
+                1_760_000_030,
+            )
+            .map(|pair| pair.0),
+            Some("start_time_unreadable")
+        );
+        // 跑了很久：那是别人的实例（或上一次会话起的），不能算本次启动的产物
+        assert_eq!(
+            adopt_refusal(
+                "auth-server",
+                hosted,
+                "auth-server",
+                'S',
+                Some("./auth-server"),
+                None,
+                Some(0),
+                Some(1_760_000_000),
+                1_760_000_000 + 121,
+            )
+            .map(|pair| pair.0),
+            Some("out_of_window")
+        );
+        // 窗口边界内仍放行（120s）
+        assert_eq!(
+            adopt_refusal(
+                "auth-server",
+                hosted,
+                "auth-server",
+                'S',
+                Some("./auth-server"),
+                None,
+                Some(0),
+                Some(1_760_000_000),
+                1_760_000_120,
+            ),
+            None
+        );
+        // 设备时钟不可信（启动时刻在未来）
+        assert_eq!(
+            adopt_refusal(
+                "auth-server",
+                hosted,
+                "auth-server",
+                'S',
+                Some("./auth-server"),
+                None,
+                Some(0),
+                Some(1_760_000_100),
+                1_760_000_000,
+            )
+            .map(|pair| pair.0),
+            Some("start_time_in_future")
+        );
+    }
+
+    #[test]
+    fn adopted_records_have_no_child_handle_so_status_must_not_claim_exit_code() {
+        // 认领来的记录没有子进程句柄：`reconciled` 必须为 true，否则界面会以为拿得到退出码
+        assert!(!matches!(RunSource::Adopted, RunSource::Spawned));
+        assert!(!matches!(RunSource::Reconciled, RunSource::Spawned));
+        assert!(matches!(RunSource::Spawned, RunSource::Spawned));
+    }
+
+    #[test]
+    fn process_start_unix_adds_ticks_to_boot_time() {
+        // USER_HZ=100：20000 ticks = 200s
+        let Some(btime) = boot_time_unix() else {
+            // 非 Android/无 /proc/stat 的构建环境（CI 之外）跳过，但在这台机上不该发生
+            return;
+        };
+        assert_eq!(process_start_unix(20_000), Some(btime + 200));
+        assert_eq!(process_start_unix(0), Some(btime));
+    }
 
     #[test]
     fn zombies_are_not_reported_as_running_elsewhere() {
@@ -1206,7 +1686,7 @@ mod tests {
         let provider = HostedProvider::new();
         assert_eq!(provider.info().name, "hosted");
         assert_eq!(provider.methods(), HOSTED_METHODS);
-        assert_eq!(HOSTED_METHODS.len(), 5);
+        assert_eq!(HOSTED_METHODS.len(), 6);
     }
 
     #[test]
@@ -1325,10 +1805,39 @@ mod tests {
     }
 
     #[test]
-    fn hosted_provider_declares_all_five_hosted_methods() {
+    fn hosted_provider_declares_all_six_hosted_methods() {
         let provider = HostedProvider::new();
-        assert_eq!(provider.methods().len(), 5);
+        assert_eq!(provider.methods().len(), 6);
         assert!(provider.methods().contains(&HOSTED_STOP));
+        // AR7.7 新增：认领方法必须被宣告出来，否则 Desktop 的路由看不到它
+        assert!(provider.methods().contains(&HOSTED_ADOPT));
+    }
+
+    #[test]
+    fn adopt_refuses_before_touching_proc_when_the_file_is_not_hosted() {
+        let provider = HostedProvider::new();
+        // 非法名：白名单先挡下（不信任 Desktop，§3.7）
+        let error = provider
+            .adopt(serde_json::json!({ "name": "../escape", "pid": 1 }))
+            .expect_err("非法名必须拒");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert_eq!(error.details.unwrap()["reason"], "invalid_name");
+        // 合法名但托管目录里没有这个文件：不能凭空调出一个不存在的二进制
+        let error = provider
+            .adopt(serde_json::json!({ "name": "definitely-absent-bin", "pid": 1 }))
+            .expect_err("缺文件必须报错");
+        assert_eq!(
+            error.code,
+            ErrorCode::NotFound,
+            "文件不在托管目录：{:?} {}",
+            error.code,
+            error.message
+        );
+        // pid=0 连认领对象都没有
+        let error = provider
+            .adopt(serde_json::json!({ "name": "toybox", "pid": 0 }))
+            .expect_err("pid 0 必须拒");
+        assert_eq!(error.details.unwrap()["reason"], "pid_zero");
     }
 
     #[test]

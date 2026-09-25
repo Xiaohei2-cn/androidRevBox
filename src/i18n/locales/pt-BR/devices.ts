@@ -129,6 +129,8 @@ export default {
   "adb.binary.hostEmpty": "Vazio: duplo clique num executável acima",
   "adb.binary.idle": "Não executando",
   "adb.binary.runningOutside": "Em execução (fora da tabela)",
+  "adb.binary.runningUntracked": "Em execução (não registrado)",
+  "adb.binary.runningUntrackedTip": "O processo de fato subiu, mas não foi registrado na tabela de execução desta ferramenta (veja o motivo no aviso acima): esse pid é só uma memória do lado do desktop.",
   "adb.binary.externalRunning": "rodando por fora: {pids}",
   "adb.binary.externalRunningTip": "Ele não está na tabela desta ferramenta: ou você não o iniciou, ou o processo que você iniciou fez fork para daemon (o pai morreu, o init adotou o filho) e a tabela só conhece o pid antigo. Nos dois casos dá para parar: o nome é conferido antes do sinal.",
   "adb.binary.confirmCancel": "Cancelar",

@@ -189,6 +189,13 @@ export interface HostedRunView {
   pid: number;
   /** false = 本次没有启动任何东西，因为它已经在跑 */
   started: boolean;
+  /**
+   * 这条运行**有没有登记进设备侧的托管运行表**（AR7.7）。
+   * true = 表里有记录，pid 与状态由设备按 `pid + 启动时刻` 对账，软件重启也认得；
+   * false = 只是桌面侧知道这个数字（登记失败，例如 Agent 未在线、进程名对不上）。
+   * 界面必须区别对待：没登记的那条一旦刷新就没有凭据了，不能装作"本工具在管着它"。
+   */
+  tracked: boolean;
   detail?: string | null;
 }
 

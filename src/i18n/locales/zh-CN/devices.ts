@@ -129,6 +129,8 @@ export default {
   "adb.binary.hostEmpty": "托管区为空：从上方双击可执行文件加入",
   "adb.binary.idle": "未运行",
   "adb.binary.runningOutside": "已在运行（表外）",
+  "adb.binary.runningUntracked": "已在运行（未登记）",
+  "adb.binary.runningUntrackedTip": "进程确实起来了，但没能登记进本工具的托管运行表（见上方提示里的原因）：这个 pid 只是桌面侧的记忆，软件重启后就没人认得它。",
   "adb.binary.externalRunning": "外部在跑 {pids}",
   "adb.binary.externalRunningTip": "它不在本工具的托管表里：可能不是你起的，也可能是你起的进程自己 fork 出去了（父进程退出、子进程被 init 收养），运行表只认得原来那个 pid。两种情况都能停：「停止进程」会先核进程名再发信号。",
   "adb.binary.confirmCancel": "取消",

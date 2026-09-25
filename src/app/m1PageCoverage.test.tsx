@@ -344,6 +344,69 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     expect(document.body.textContent ?? "").not.toContain("启动失败");
   });
 
+  it("登记进托管表的 root 进程：pid 由设备侧凭据支撑，按钮走「终止」", async () => {
+    // AR7.7：勾 Root 的启动以前只在桌面本地记一个 pid；现在 Agent 认领后会写进运行表。
+    // tracked:true 的这条，界面显示的就是设备认得的进程，终止也按句柄/身份来。
+    device.hostedRuns.mockResolvedValue([]);
+    device.binaryPorts.mockResolvedValue([]);
+    device.binaries.mockResolvedValue([
+      {
+        name: "frida-server",
+        path: "/data/local/tmp/frida-server",
+        size: 53_539_200,
+        perms: "-rwxr-xr-x",
+        hasExec: true,
+        externalProcs: [],
+      },
+    ]);
+    device.binaryRun.mockResolvedValue({ pid: 4321, started: true, tracked: true, detail: null });
+    renderPage(<BinaryHosting />);
+    const entry = await screen.findByTestId("bin-frida-server");
+    fireEvent.doubleClick((entry.querySelector("button") ?? entry) as Element);
+    await screen.findByTestId("hosted-frida-server");
+    fireEvent.click(screen.getByTestId("run-frida-server"));
+    expect((await screen.findByTestId("pid-frida-server")).textContent ?? "").toContain("4321");
+    // 登记上了就不该出现「未登记」标记，也不该出现「停止进程」（那是给表外进程用的）
+    expect(screen.queryByTestId("running-untracked-frida-server")).toBeNull();
+    expect(screen.queryByTestId("stop-external-frida-server")).toBeNull();
+  });
+
+  it("没登记进托管表：标成「已在运行（未登记）」，不拿桌面记忆冒充设备状态", async () => {
+    // Agent 未在线 / 进程名对不上时 adopt 会失败。进程确实起来了，所以不能写「未运行」；
+    // 但我们手里只剩一个数字，所以也不能按"本工具在管着它"来显示。
+    // Agent 拿不到 = "不知道"，不是"没在跑"：这条只能显示成未登记，不能显示成未运行
+    device.hostedRuns.mockRejectedValue(new Error("Agent 未在线"));
+    device.binaryPorts.mockResolvedValue([]);
+    device.binaries.mockResolvedValue([
+      {
+        name: "frida-server",
+        path: "/data/local/tmp/frida-server",
+        size: 53_539_200,
+        perms: "-rwxr-xr-x",
+        hasExec: true,
+        externalProcs: [],
+      },
+    ]);
+    device.binaryRun.mockResolvedValue({
+      pid: 4321,
+      started: true,
+      tracked: false,
+      detail: "已启动 pid 4321，但没能登记进托管表：Agent 未在线",
+    });
+    renderPage(<BinaryHosting />);
+    const entry = await screen.findByTestId("bin-frida-server");
+    fireEvent.doubleClick((entry.querySelector("button") ?? entry) as Element);
+    await screen.findByTestId("hosted-frida-server");
+    fireEvent.click(screen.getByTestId("run-frida-server"));
+    expect(await screen.findByText(/没能登记进托管表/)).toBeTruthy();
+    const chip = await screen.findByTestId("running-untracked-frida-server");
+    expect(chip.textContent ?? "").toContain("未登记");
+    // 反向断言：这条没有设备侧凭据，不能显示成普通的运行中 pid chip
+    expect(screen.queryByTestId("pid-frida-server")).toBeNull();
+    // 也不能被写成"未运行"——它真的起来了
+    expect(screen.queryByText("未运行")).toBeNull();
+  });
+
   it("进程端口两个方向都能渲染（PID→端口、端口→PID）", async () => {
     renderPage(<ProcPorts />);
     // 两个 section 各有一个「查询」，DOM 顺序是「端口 → 进程」在前、「进程 → 端口」在后；
