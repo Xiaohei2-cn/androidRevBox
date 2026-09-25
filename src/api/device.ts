@@ -189,8 +189,6 @@ export interface HostedRunView {
   pid: number;
   /** false = 本次没有启动任何东西，因为它已经在跑 */
   started: boolean;
-  /** 不是本工具启动的同名进程 pid（没有句柄，只能按身份核验后终止） */
-  externalPids: number[];
   detail?: string | null;
 }
 
@@ -202,11 +200,26 @@ export interface HostedBinary {
   perms: string;
   hasExec: boolean;
   /**
-   * 设备上正在跑的同名进程 pid，且**不是本工具启动的**（所以没有句柄，这里停不掉它）。
-   * 工具比目标进程晚开时就是这个情况：列表显示"未运行"，点执行等于再启一个，
-   * 端口被占 → 秒退。只有 Agent 通道给得出这个数（Legacy 的 ls -l 看不见进程）。
+   * 设备上正在跑、却不在本工具托管表里的同名进程（带 ppid/uid，界面上说得出是谁）。
+   * 两种来源都可能落在这里：① 别人（或用户自己 `su -c`）起的；② 本工具起的那个进程
+   * 自己 fork 成守护进程，父进程一退，运行表按"已退出"清掉了记录（ppid=1 就是这形状）。
+   * 不管哪种，点执行都等于再起一个 → 端口被占 → 秒退，所以启动前要先看见它。
+   * 只有 Agent 通道给得出这些数（Legacy 的 ls -l 看不见进程）。
    */
-  externalPids: number[];
+  externalProcs: ExternalProc[];
+}
+
+/**
+ * 一个"在跑、但不在托管表里"的同名进程。
+ * 为什么要 ppid/uid：光一个 pid 分不出两种情况——① 别人（或用户 su -c）起的；
+ * ② 本工具起的那个进程自己 fork 成了守护进程，父进程一退，运行表按"已退出"清掉记录，
+ * 活着的子进程就成了表外进程（`ppid=1` 就是这个形状）。界面据此说实话，
+ * 不替用户断言"这不是你起的"。
+ */
+export interface ExternalProc {
+  pid: number;
+  ppid: number;
+  uid: number;
 }
 
 /** 端口→PID 反查的持有进程行 */

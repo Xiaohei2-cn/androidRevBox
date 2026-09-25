@@ -3974,7 +3974,7 @@ mod tests {
     ///
     /// 用户现场的形状是：auth-server 早在跑，工具后来才打开——我们的运行表里没有它，
     /// 于是列表显示"未运行"，点执行就是再起一个，端口被占 → 秒退 → 看到一句看不懂的失败。
-    /// 这条腿钉住两件事：① 外部实例的 pid 要出现在 `external_pids` 里；
+    /// 这条腿钉住两件事：① 外部实例的 pid 要出现在 `external_procs` 里（带 ppid/uid）；
     /// ② **我们自己起的那个不能算外部**（它有句柄、界面本来就显示"运行中"，
     /// 再报一次"外部在跑"就是自相矛盾的假警报）。
     #[tokio::test]
@@ -4043,20 +4043,29 @@ mod tests {
         // 僵尸也有 pid 与 comm，但它是"等着被回收的尸体"，不是"在跑"。
         // 判据按设备真实状态核，而不是信我们的过滤代码：真机上就同时存在
         // 一个活着的 auth-server(S) 和一个僵尸(Z)，后者早年被算进过"外部在跑"。
-        for pid in &outside.external_pids {
+        for proc in &outside.external_procs {
+            let pid = proc.pid;
             let state = adb_shell(
                 &serial,
                 &format!("su -c 'cut -d \" \" -f3 /proc/{pid}/stat'"),
             )
             .await;
             let state = state.trim();
-            assert_ne!(state, "Z", "pid {pid} 是僵尸，不该出现在 external_pids 里");
+            assert_ne!(state, "Z", "pid {pid} 是僵尸，不该出现在表外列表里");
         }
         assert!(
-            !outside.external_pids.is_empty(),
-            "root 身份启动的 toybox 必须出现在 external_pids 里，否则界面还是会说它没在跑"
+            !outside.external_procs.is_empty(),
+            "root 身份启动的 toybox 必须出现在 external_procs 里，否则界面还是会说它没在跑"
         );
-        eprintln!("[hosted] 外部实例 pid={:?}", outside.external_pids);
+        eprintln!(
+            "[hosted] 表外实例 = {:?}",
+            outside
+                .external_procs
+                .iter()
+                .map(|proc| format!("pid {} ppid {} uid {}", proc.pid, proc.ppid, proc.uid))
+                .collect::<Vec<_>>()
+                .join("；")
+        );
 
         // ② 我们自己再起一个：它的 pid 不能被算成"外部"
         let started = client
@@ -4076,23 +4085,20 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(600)).await;
         let after = list(&client).await;
         assert!(
-            !after.external_pids.contains(&ours),
-            "自己启动的 pid {ours} 不该出现在 external_pids 里（它有句柄、界面已显示运行中）：{:?}",
-            after.external_pids
+            !after.external_procs.iter().any(|proc| proc.pid == ours),
+            "自己启动的 pid {ours} 不该出现在表外列表里（它有句柄、界面本来就显示运行中）：{:?}",
+            after.external_procs
         );
+        let before_pids: Vec<u32> = outside.external_procs.iter().map(|proc| proc.pid).collect();
+        let after_pids: Vec<u32> = after.external_procs.iter().map(|proc| proc.pid).collect();
         assert!(
-            after
-                .external_pids
-                .iter()
-                .any(|pid| outside.external_pids.contains(pid)),
-            "外部那个必须还在：{:?}",
-            after.external_pids
+            after_pids.iter().any(|pid| before_pids.contains(pid)),
+            "表外那条必须还在：{before_pids:?} -> {after_pids:?}"
         );
         eprintln!(
-            "[hosted] 我们起的 pid={ours} 被正确排除，external_pids={:?}",
-            after.external_pids
+            "[hosted] 我们起的 pid={ours} 被正确排除，表外={:?}",
+            after_pids
         );
-
         // ③ 收尾：句柄停自己的，外部那个按 pid 收掉
         let stopped = client
             .request::<_, HostedStopResult>(
@@ -4107,7 +4113,8 @@ mod tests {
             .await
             .expect("hosted.stop 应当成功");
         let _ = stopped;
-        for pid in &outside.external_pids {
+        for proc in &outside.external_procs {
+            let pid = proc.pid;
             // 它是 root 起的，普通 shell kill 不掉——收尾也要按真实身份来
             adb_shell(
                 &serial,
@@ -4117,7 +4124,7 @@ mod tests {
         }
         let cleaned = list(&client).await;
         assert!(
-            !cleaned.external_pids.contains(&ours),
+            !cleaned.external_procs.iter().any(|proc| proc.pid == ours),
             "停止后也不该把我们的 pid 留在外部列表里"
         );
         manager.disconnect(&serial).await.unwrap();
@@ -4306,12 +4313,13 @@ mod tests {
 
         let mut checked = 0_usize;
         for binary in listed.binaries {
-            for pid in binary.external_pids {
+            for proc in binary.external_procs {
+                let pid = proc.pid;
                 let state = state_of(runner.clone(), adb_path.clone(), serial.clone(), pid).await;
                 eprintln!("[zombie] {} pid={pid} state={state:?}", binary.name);
                 assert_ne!(
                     state, "Z",
-                    "{} 的 pid {pid} 是僵尸，不该出现在 external_pids",
+                    "{} 的 pid {pid} 是僵尸，不该出现在 external_procs",
                     binary.name
                 );
                 checked += 1;
@@ -4403,6 +4411,22 @@ mod tests {
                 .await
                 .contains("ALIVE"),
             "名字不符却把进程杀了——身份核验没生效"
+        );
+        /*
+         * ppid 必须是 1：nohup 的父 shell 一退出就这样，正是"我们手上没有句柄"那一类进程
+         * （用户自己起的守护进程、或我们起的那个又 fork 出去，都长这个形状）。界面那句
+         * "没有句柄，这里停不掉它"就是被这类进程证伪的——所以断言钉住形状，
+         * 不只钉"最后能杀掉"。
+         */
+        let ppid = adb_shell(
+            &serial,
+            &format!("su -c 'cut -d \" \" -f4 /proc/{pid}/stat'"),
+        )
+        .await;
+        assert_eq!(
+            ppid.trim(),
+            "1",
+            "探针应已被 init 收养，否则测不到无句柄那类进程: {ppid}"
         );
         eprintln!("[kill] 身份不符已拒止，pid {pid} 仍然活着");
 

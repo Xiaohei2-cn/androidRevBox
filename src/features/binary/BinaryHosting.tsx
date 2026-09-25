@@ -3,7 +3,13 @@ import { useQuery } from "@tanstack/react-query";
 import { CircleStop, Play, RefreshCw, ShieldCheck, Square, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AdbNotReadyState } from "@/components/ui/adb-gate";
-import { deviceApi, type HostedBinary, type HostedRunRecord, type ListenPort } from "@/api/device";
+import {
+  deviceApi,
+  type ExternalProc,
+  type HostedBinary,
+  type HostedRunRecord,
+  type ListenPort,
+} from "@/api/device";
 import { DeviceBar } from "@/components/ui/device-bar";
 import { InfoChip } from "@/components/ui/info-chip";
 import { useI18n } from "@/i18n";
@@ -25,6 +31,19 @@ import { cn } from "@/lib/utils";
  * 所有 adb 调用后端 -s 绑定设备。
  */
 
+/** 一句人话：pid + 谁收养的 + 是不是 root。ppid=1 意味着它爹已退出（fork 成守护进程的形状） */
+function describeProcs(procs: ExternalProc[]): string {
+  return procs
+    .map((p) =>
+      [
+        `pid ${p.pid}`,
+        p.ppid === 1 ? "父进程已退出" : `父进程 ${p.ppid}`,
+        p.uid === 0 ? "root" : `uid ${p.uid}`,
+      ].join(" · "),
+    )
+    .join("；");
+}
+
 interface HostedRow {
   name: string;
   /** Agent 运行表里的稳定句柄；有它才能按 handle + start time 停止（AR7.3） */
@@ -44,6 +63,9 @@ interface HostedRow {
 /** 常驻快捷备注选项（值为写入备注的文本本身，跨语言固定） */
 const NOTE_PRESETS = ["frida server", "ida远程调试server", "dumper"] as const;
 
+/** 待停止的那个表外实例：进程身份 + 它属于哪个托管文件（确认框要显示名字） */
+type PendingStop = ExternalProc & { name: string };
+
 /** 备注持久化键：设备 serial + 文件名维度，跨重启/重托管保留 */
 const noteKey = (serial: string, name: string) => `adb.binary.note.${serial}.${name}`;
 const loadNote = (serial: string | null, name: string) =>
@@ -61,7 +83,7 @@ export function BinaryHosting() {
    * 待停止的外部实例（`{name, pid}`）：点「停止进程」先亮一次确认，
    * 因为杀进程不可逆，而我们停的又是"别人启动的"进程——没有回头路可给。
    */
-  const [pendingStop, setPendingStop] = useState<{ name: string; pid: number } | null>(null);
+  const [pendingStop, setPendingStop] = useState<PendingStop | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [root, setRoot] = useState(false);
   const [probing, setProbing] = useState(false);
@@ -382,13 +404,13 @@ export function BinaryHosting() {
                   >
                     {b.name}
                   </span>
-                  {(b.externalPids?.length ?? 0) > 0 && (
+                  {(b.externalProcs?.length ?? 0) > 0 && (
                     <span
                       className="shrink-0 rounded bg-amber-500/10 px-1.5 py-0.5 text-10px text-amber-500"
                       title={t("adb.binary.externalRunningTip")}
                       data-testid={`external-${b.name}`}
                     >
-                      {t("adb.binary.externalRunning", { pids: b.externalPids.join(", ") })}
+                      {t("adb.binary.externalRunning", { pids: describeProcs(b.externalProcs) })}
                     </span>
                   )}
                   {/* 权限/大小/操作固定列宽：无按钮行同位占格，右缘垂直对齐 */}
@@ -436,8 +458,8 @@ export function BinaryHosting() {
                 const bin = binaries.find((b) => b.name === row.name);
                 // "已经在跑"有两种：我们起的（有句柄，用既有「终止」）与别人起的（无句柄，
                 // 用下面的「停止进程」）。这一行的按钮只能有一个，否则用户不知道该点哪个。
-                const outsiders = bin?.externalPids ?? [];
-                const stopPid = outsiders[0] ?? null;
+                const outsiders = bin?.externalProcs ?? [];
+                const firstOutsider = outsiders[0] ?? null;
                 return (
                   <li key={row.name} className="px-3 py-2" data-testid={`hosted-${row.name}`}>
                     <div className="flex items-center gap-3">
@@ -453,6 +475,17 @@ export function BinaryHosting() {
                           title={t("adb.binary.copyPid")}
                           testid={`pid-${row.name}`}
                         />
+                      ) : firstOutsider ? (
+                        /*
+                         * 表外有同名进程在跑：这里不能写「未运行」。它只说明"我们
+                         * 托管表里没有它的记录"，而设备上的确实在跑 —— 写未运行就是撒谎。
+                         */
+                        <span
+                          className="shrink-0 text-amber-500"
+                          data-testid={`running-outside-${row.name}`}
+                        >
+                          {t("adb.binary.runningOutside")}
+                        </span>
                       ) : (
                         <span className="shrink-0 text-muted-foreground">{t("adb.binary.idle")}</span>
                       )}
@@ -467,7 +500,7 @@ export function BinaryHosting() {
                           <Square className="h-3 w-3" />
                           {t("adb.binary.kill")}
                         </Button>
-                      ) : stopPid !== null ? (
+                      ) : firstOutsider !== null ? (
                         /*
                          * 已经有实例在跑 —— 这里不给「执行」：点了只会起一个秒退的进程。
                          * 换成一个「停止进程」按钮（一次确认），停完按钮自己变回「执行」。
@@ -480,7 +513,9 @@ export function BinaryHosting() {
                           disabled={probing}
                           onClick={(event) => {
                             event.stopPropagation();
-                            setPendingStop({ name: row.name, pid: stopPid });
+                            if (firstOutsider) {
+                              setPendingStop({ ...firstOutsider, name: row.name });
+                            }
                           }}
                         >
                           <CircleStop className="h-3 w-3" />
@@ -531,7 +566,7 @@ export function BinaryHosting() {
                         data-testid={`external-note-${row.name}`}
                       >
                         <span className="min-w-0 flex-1 text-amber-500">
-                          {t("adb.binary.alreadyRunning", { pids: outsiders.join(", ") })}
+                          {t("adb.binary.alreadyRunning", { pids: describeProcs(outsiders) })}
                           {" · "}
                           <span className="text-muted-foreground">{t("adb.binary.externalRunningTip")}</span>
                         </span>

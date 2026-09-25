@@ -751,13 +751,25 @@ pub struct HostedBinaryInfo {
     pub has_exec: bool,
     pub uid: u32,
     pub mtime_unix: u64,
-    /// 设备上**正在跑的同名进程 pid，但不是本工具启动的**（所以没有句柄、这里停不了它）。
+    /// 设备上**正在跑、但不在本工具托管表里**的同名进程。
     ///
-    /// 为什么要单独带这个数：工具后启动时，先跑起来的实例不在运行表里，界面就显示
-    /// "未运行"，点执行等于再启一个 —— 端口被占，秒退，然后报一句看不懂的失败。
-    /// 有这个字段，界面才能提前说"它其实已经在跑了（pid N）"。
+    /// 为什么不止带 pid、还要带 ppid 与 uid：光一个 pid 分不出两种完全不同的情况 —
+    /// ① 别人（或用户自己 `su -c`）起的；② 本工具起的那个进程**自己 fork 成了守护进程**，
+    /// 父进程一退，运行表按"我起的那个已退出"清掉记录，活着的子进程就成了"表外进程"
+    /// （用户现场的 `auth-server` 正是这种：`ppid=1`、`uid=0`）。`ppid=1` 是②的形状，
+    /// 带出来界面才能说实话，而不是替用户断言"这不是你起的"。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub external_pids: Vec<u32>,
+    pub external_procs: Vec<ExternalProc>,
+}
+
+/// 一个"在跑但不在托管表里"的同名进程。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalProc {
+    pub pid: u32,
+    /// 父进程 pid。`1` = 父进程已退出、被 init 收养（守护进程与 fork 子进程的共同形状）
+    pub ppid: u32,
+    /// 真实 uid（`0` = root 起的；Agent 以 shell 身份发不动信号，只能走提权通道）
+    pub uid: u32,
 }
 
 /// 一次托管运行的状态。`unknown` 只用于「Agent 重启后连 `/proc` 都读不到」，
@@ -1468,8 +1480,12 @@ mod tests {
                 has_exec: true,
                 uid: 2000,
                 mtime_unix: 1_760_000_000,
-                // 外部同名进程：这条 fixture 顺带钉住它参与"只省略空集合"的线格式约定
-                external_pids: vec![9727],
+                // 表外同名进程：真机形状（auth-server 活着的那个 ppid=1、uid=0）
+                external_procs: vec![ExternalProc {
+                    pid: 9727,
+                    ppid: 1,
+                    uid: 0,
+                }],
             }],
             runs: vec![HostedRunRecord {
                 state: HostedRunState::Exited,
@@ -1484,16 +1500,27 @@ mod tests {
         assert_eq!(value["binaries"][0]["mode_text"], "-rwxr-xr-x");
         assert_eq!(value["runs"][0]["exit_code"], json!(137));
         // 外部同名进程：有值才上 wire（snake_case），空数组整个键省略
-        assert_eq!(value["binaries"][0]["external_pids"], json!([9727]));
+        let ext = &value["binaries"][0]["external_procs"][0];
+        assert_eq!(ext["pid"], json!(9727));
+        assert_eq!(
+            ext["ppid"],
+            json!(1),
+            "ppid 要上 wire，界面靠它区分\"被 init 收养\""
+        );
+        assert_eq!(
+            ext["uid"],
+            json!(0),
+            "uid 要上 wire：root 起的进程 shell 发不动信号"
+        );
         let empty = HostedListResult {
             binaries: vec![HostedBinaryInfo {
-                external_pids: Vec::new(),
+                external_procs: Vec::new(),
                 ..listed.binaries[0].clone()
             }],
             ..listed.clone()
         };
         assert_eq!(
-            serde_json::to_value(empty).unwrap()["binaries"][0].get("external_pids"),
+            serde_json::to_value(empty).unwrap()["binaries"][0].get("external_procs"),
             None,
             "没有外部进程时不该在报文里占一个空数组"
         );

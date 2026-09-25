@@ -21,10 +21,11 @@ use std::sync::Mutex;
 
 use agent_protocol::method::{HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP};
 use agent_protocol::{
-    AgentError, ErrorCode, FileKind, HostedBinaryInfo, HostedChmodParams, HostedChmodResult,
-    HostedListParams, HostedListResult, HostedRunRecord, HostedRunState, HostedStartParams,
-    HostedStartResult, HostedStatusParams, HostedStatusResult, HostedStopParams, HostedStopResult,
-    KillOutcome, KillSignal, PERMISSION_BITS, ProviderHealth, ProviderInfo, render_mode_text,
+    AgentError, ErrorCode, ExternalProc, FileKind, HostedBinaryInfo, HostedChmodParams,
+    HostedChmodResult, HostedListParams, HostedListResult, HostedRunRecord, HostedRunState,
+    HostedStartParams, HostedStartResult, HostedStatusParams, HostedStatusResult, HostedStopParams,
+    HostedStopResult, KillOutcome, KillSignal, PERMISSION_BITS, ProviderHealth, ProviderInfo,
+    render_mode_text,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -174,7 +175,7 @@ impl HostedProvider {
         let external = running_processes_by_comm();
         let mut binaries = scan.binaries;
         for info in &mut binaries {
-            info.external_pids = external_pids_for(&info.name, &external, &ours);
+            info.external_procs = external_procs_for(&info.name, &external, &ours);
         }
         serialize(HostedListResult {
             dir: HOSTED_DIR.to_owned(),
@@ -760,7 +761,7 @@ fn scan_binaries() -> BinaryScan {
             uid: metadata.uid(),
             mtime_unix: metadata.mtime().max(0) as u64,
             // 这里先留空：外部同名进程要扫一遍 /proc，整份清单一次扫完再回填（见 list）
-            external_pids: Vec::new(),
+            external_procs: Vec::new(),
         });
     }
     scan.binaries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -773,8 +774,8 @@ fn scan_binaries() -> BinaryScan {
 /// 而 comm 可读。注意内核把 comm 截到 15 字符，所以匹配时按截断后的名字比，
 /// 长名字会一起命中——这比"显示成未运行"更接近事实，误命中的代价由界面上
 /// "确认再执行"这一步兜住（不会静默替用户做决定）。
-fn running_processes_by_comm() -> HashMap<String, Vec<u32>> {
-    let mut map: HashMap<String, Vec<u32>> = HashMap::new();
+fn running_processes_by_comm() -> HashMap<String, Vec<(u32, u32)>> {
+    let mut map: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return map;
     };
@@ -793,49 +794,66 @@ fn running_processes_by_comm() -> HashMap<String, Vec<u32>> {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             continue;
         };
-        let Some((comm, state)) = parse_comm_and_state(&stat) else {
+        let Some((comm, ppid, state)) = parse_comm_ppid_state(&stat) else {
             continue;
         };
         if matches!(state, 'Z' | 'X' | 'x') || comm.is_empty() {
             continue;
         }
-        map.entry(comm.to_owned()).or_default().push(pid);
+        map.entry(comm.to_owned()).or_default().push((pid, ppid));
     }
     map
 }
 
-/// 从 `/proc/<pid>/stat` 取 (comm, 状态)。
+/// 一次拿 (comm, ppid, state)。
 ///
 /// 只能从**最后一个** `)` 之后切：comm 自己可以含括号（内核线程名常是 `(devw` 这类，
 /// 应用也会改进程名），从第一个 `)` 切会把状态读成名字中间的一个字符。
-/// 同一口径在本模块 `parse_start_time_ticks` 已经用过，别再各写一份。
-fn parse_comm_and_state(stat: &str) -> Option<(String, char)> {
+/// ppid 同理取最后一个 `)` 之后的第二段。同一口径在本模块 `parse_start_time_ticks`
+/// 已经用过，别再各写一份。
+fn parse_comm_ppid_state(stat: &str) -> Option<(String, u32, char)> {
     let open = stat.find('(')?;
     let close = stat.rfind(')')?;
     if close < open {
         return None;
     }
     let comm = stat[open + 1..close].to_owned();
-    let state = stat[close + 1..].trim_start().chars().next()?;
-    Some((comm, state))
+    let mut fields = stat[close + 1..].split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let ppid = fields.next()?.parse().unwrap_or(0);
+    Some((comm, ppid, state))
 }
 
 /// 某个托管文件当前有没有"别人启动的同名进程"在跑：按 comm 匹配，并剔掉我们自己
 /// 托管表里已在跑的 pid（那些有句柄、界面本来就显示成运行中，不该再报"外部"）。
-fn external_pids_for(
+fn external_procs_for(
     name: &str,
-    by_comm: &HashMap<String, Vec<u32>>,
+    by_comm: &HashMap<String, Vec<(u32, u32)>>,
     ours: &HashSet<u32>,
-) -> Vec<u32> {
-    let mut found: Vec<u32> = by_comm
+) -> Vec<ExternalProc> {
+    let mut found: Vec<ExternalProc> = by_comm
         .iter()
         .filter(|(comm, _)| comm_matches(name, comm))
         .flat_map(|(_, pids)| pids.iter().copied())
-        .filter(|pid| !ours.contains(pid))
+        .filter(|(pid, _)| !ours.contains(pid))
+        .map(|(pid, ppid)| ExternalProc {
+            pid,
+            ppid,
+            // uid 只对少数候选读，别为 /proc 下几百个 pid 都开一次文件
+            uid: real_uid(pid).unwrap_or(u32::MAX),
+        })
         .collect();
-    found.sort_unstable();
+    found.sort_unstable_by_key(|proc| proc.pid);
     found.dedup();
     found
+}
+
+/// 真实 uid（`/proc/<pid>/status` 的 `Uid:` 第一段）。读不到返回 `None`——
+/// 用 `u32::MAX` 占位是"不知道"，不会像 0 那样被误读成"root 起的"。
+fn real_uid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let line = status.lines().find(|line| line.starts_with("Uid:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// 托管文件名与 comm 的对应：完全相等，或名字长到被内核截断后相等。
@@ -958,14 +976,20 @@ mod tests {
     #[test]
     fn zombies_are_not_reported_as_running_elsewhere() {
         // 真机原样：9727 在跑（S），11049 是僵尸（Z）
-        let (comm, state) = parse_comm_and_state("9727 (auth-server) S 1 9727 0 0\n").unwrap();
+        let (comm, _, state) = parse_comm_ppid_state("9727 (auth-server) S 1 9727 0 0\n").unwrap();
+        // 真机形状：ppid=1（父进程已退出）
+        let (_, ppid, _) = parse_comm_ppid_state("3571 (auth-server) S 1 3568 3568\n").unwrap();
+        assert_eq!(ppid, 1);
+        // comm 里有空格时也不能错位：整行 split 会把 ppid 读成 comm 中间那个词
+        let (_, ppid, _) = parse_comm_ppid_state("42 (top - 12:00) S 41 42 42\n").unwrap();
+        assert_eq!(ppid, 41, "comm 含空格时 ppid 必须从最后一个 ) 之后数");
         assert_eq!((comm.as_str(), state), ("auth-server", 'S'));
-        let (_, state) = parse_comm_and_state("11049 (auth-server) Z 1 11049 0 0\n").unwrap();
+        let (_, _, state) = parse_comm_ppid_state("11049 (auth-server) Z 1 11049 0 0\n").unwrap();
         assert_eq!(state, 'Z', "僵尸要能被认出来，否则又变成「它在跑」的假警报");
         // comm 内含括号时必须从最后一个 ) 切
-        let (comm, state) = parse_comm_and_state("7 ((weird (x)) name) S 1 7\n").unwrap();
+        let (comm, _, state) = parse_comm_ppid_state("7 ((weird (x)) name) S 1 7\n").unwrap();
         assert_eq!((comm.as_str(), state), ("(weird (x)) name", 'S'));
-        assert!(parse_comm_and_state("garbage without parens").is_none());
+        assert!(parse_comm_ppid_state("garbage without parens").is_none());
     }
 
     #[test]
@@ -981,19 +1005,33 @@ mod tests {
     }
 
     #[test]
-    fn external_pids_exclude_what_we_started_ourselves() {
+    fn externals_exclude_what_we_started_and_carry_the_shape() {
         let mut by_comm = HashMap::new();
-        by_comm.insert("auth-server".to_string(), vec![9727_u32, 9728]);
-        let ours: HashSet<u32> = [9727].into_iter().collect();
-        // 9727 是我们自己起的（有句柄、界面已显示运行中），只有 9728 才算"外部在跑"
-        assert_eq!(
-            external_pids_for("auth-server", &by_comm, &ours),
-            vec![9728]
+        // (pid, ppid)：9727 是自己 fork 出去后被 init 收养的子进程；9728 是我们仍在管的
+        // 那个进程本身（在运行表里，界面已经显示"运行中"，不该再算"表外"）
+        by_comm.insert(
+            "auth-server".to_string(),
+            vec![(9727_u32, 1u32), (9728, 4321)],
         );
+        let ours: HashSet<u32> = [9728].into_iter().collect();
+        let found = external_procs_for("auth-server", &by_comm, &ours);
+        assert_eq!(found.len(), 1, "只该留下表外那条: {found:?}");
+        assert_eq!(found[0].pid, 9727);
         assert_eq!(
-            external_pids_for("frida-server", &by_comm, &ours),
-            Vec::<u32>::new()
+            found[0].ppid, 1,
+            "ppid 必须带出来，界面靠它说\"父进程已退出\""
         );
+        assert!(external_procs_for("frida-server", &by_comm, &ours).is_empty());
+    }
+
+    #[test]
+    fn ppid_is_parsed_after_the_last_paren_not_by_splitting_the_line() {
+        // comm 里可以有空格（`top - 12:00` 这类），整行 split 会把 ppid 读成 comm 中间一个词
+        let stat = "42 (top - 12:00) S 41 42 42 0";
+        let (_, ppid, _) = parse_comm_ppid_state(stat).unwrap();
+        assert_eq!(ppid, 41, "ppid 必须从最后一个 ) 之后数");
+        // uid 读不到时返回 None：界面宁可不写，也不要填个 0 假装"是 root 起的"
+        assert_eq!(real_uid(0), None);
     }
 
     use super::*;

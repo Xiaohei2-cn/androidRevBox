@@ -42,7 +42,9 @@ use async_trait::async_trait;
 use serde::Serialize;
 use tauri::Emitter;
 
-use crate::adapters::adb::{self, AdbVersionInfo, DeviceEntry, DeviceInfo, FileEntry};
+use crate::adapters::adb::{
+    self, AdbVersionInfo, DeviceEntry, DeviceInfo, ExternalProcView, FileEntry,
+};
 use crate::core::error::{CoreError, CoreResult};
 use crate::core::ipc::{AppEvent, event_names};
 use crate::db::Db;
@@ -454,8 +456,6 @@ pub struct HostedRunView {
     /// 界面对象：真正在跑的那个 pid（我们起的，或者本来就在跑的）
     pub pid: u32,
     pub started: bool,
-    /// 不是本工具启动的同名进程（没有句柄，只能按身份核验后终止）
-    pub external_pids: Vec<u32>,
     pub detail: Option<String>,
 }
 
@@ -463,9 +463,12 @@ pub struct HostedRunView {
 ///
 /// 优先报外部实例：那才是"软件后启动"的现场，界面要给的按钮是「停止进程」；
 /// 我们自己起的那条有句柄，走既有的「终止」。两边都没有才返回 `None`（可以启动）。
-fn pick_already_running(externals: &[u32], our_running_pid: Option<u32>) -> Option<(u32, bool)> {
-    if let Some(pid) = externals.first() {
-        return Some((*pid, true));
+fn pick_already_running(
+    externals: &[crate::adapters::adb::ExternalProcView],
+    our_running_pid: Option<u32>,
+) -> Option<(u32, bool)> {
+    if let Some(first) = externals.first() {
+        return Some((first.pid, true));
     }
     our_running_pid.map(|pid| (pid, false))
 }
@@ -1250,19 +1253,20 @@ impl DeviceService {
                 .map(|code| format!("（退出码 {code}）"))
                 .unwrap_or_default();
             // 先分一类：这个进程起不来最常见的原因不是"程序坏了"，而是它要绑的端口
-            // 已被一个我们没启动过的实例占着（工具比目标进程晚开时必然遇到）。以前这种
+            // 已被另一个同名实例占着（工具比目标进程晚开时必然遇到）。以前这种
             // 一律抛 Internal，用户看到的就是那句「内部错误: … bind failed」——会去翻代码，
             // 而真该做的是停掉那个实例或换个端口。
             if let Some(reason) = classify_start_failure(&cause) {
-                let holders = self.external_pids_for(serial, name).await;
+                let holders = self.hosted_externals(serial, name).await;
                 let who = match holders.as_slice() {
                     [] => "若确认没有别的实例在跑，就换一个端口/参数再试".to_owned(),
-                    pids => format!(
-                        "设备上已有一个不是本工具启动的同名进程在跑（pid {}）——本工具对它没有句柄，停不掉：先停掉它，或换一个端口再执行",
-                        pids.iter()
-                            .map(u32::to_string)
+                    procs => format!(
+                        "设备上已经有一个同名进程在跑（{}），它不在本工具的托管表里——可能是别人起的，也可能是本工具起的那个进程自己 fork 成了守护进程（父进程退出后表里那条就没的了）。用界面上的「停止进程」停掉它，或换一个端口再执行",
+                        procs
+                            .iter()
+                            .map(ExternalProcView::describe)
                             .collect::<Vec<_>>()
-                            .join(", ")
+                            .join("；")
                     ),
                 };
                 return Err(CoreError::Conflict(format!(
@@ -1276,51 +1280,50 @@ impl DeviceService {
         Ok(HostedRunView {
             pid: status.record.pid,
             started: true,
-            external_pids: Vec::new(),
             detail: None,
         })
     }
 
-    /// 查这个托管文件在设备上有没有"别人启动的同名进程"——工具晚启动时，这是唯一能看到
-    /// 它的地方（我们的运行表里根本没有这一条）。只在失败路径上跑，不是常态开销；
-    /// 查不到就什么都不补，绝不编一个 pid 出来。
-    async fn external_pids_for(&self, serial: &str, name: &str) -> Vec<u32> {
+    /// 这个托管文件在设备上有没有"在跑但不在我们托管表里"的同名进程。
+    /// 工具比目标进程晚启动时，这是唯一能看到它的地方——我们的运行表里根本没有这一条。
+    /// 只有 Agent 通道给得出（Legacy 的 `ls -l` + `file` 看不见进程），查不到就返回空：
+    /// **不知道不等于没有**，所以调用方拿空值时会照常往下走，不编一句假冲突。
+    async fn hosted_externals(&self, serial: &str, name: &str) -> Vec<ExternalProcView> {
         let params = HostedListParams {};
         match self
             .android
             .agent()
-            .request::<_, HostedListResult>(serial, HOSTED_LIST, &params, SHORT_CMD_TIMEOUT)
+            .request::<_, HostedListResult>(serial, HOSTED_LIST, &params, LIST_TIMEOUT)
             .await
         {
             Ok(list) => list
                 .binaries
                 .into_iter()
                 .find(|binary| binary.name == name)
-                .map(|binary| binary.external_pids)
+                .map(|binary| {
+                    binary
+                        .external_procs
+                        .into_iter()
+                        .map(|proc| ExternalProcView {
+                            pid: proc.pid,
+                            ppid: proc.ppid,
+                            uid: proc.uid,
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
             Err(error) => {
-                tracing::warn!(serial, name, error = %error, "查询外部同名进程失败");
+                tracing::warn!(serial, name, error = %error, "查询表外同名进程失败");
                 Vec::new()
             }
         }
     }
 
     /// 启动前的"是不是已经在跑"检查。两条来源都要看，缺一不可：
-    /// ① 设备上的**同名外部进程**（别人起的，我们没句柄）；
-    /// ② 我们自己的运行表里还活着的那条（有句柄，界面的「终止」本来就能停它）。
-    /// 查不到就当没在跑（Legacy 通道看不见进程时也是这样）——宁可让后面的启动流程
-    /// 照旧走一遍，也不拿"我没看见"当成"它不存在"去报一句假冲突。
+    /// ① 表外的同名进程（别人起的，或我们起的那个又 fork 出去了）；
+    /// ② 我们自己运行表里还活着的那条（有句柄，界面本来就该显示运行中）。
     async fn hosted_already_running(&self, serial: &str, name: &str) -> Option<HostedRunView> {
-        let externals = self
-            .hosted_binaries(serial)
-            .await
-            .ok()
-            .and_then(|list| {
-                list.into_iter()
-                    .find(|binary| binary.name == name)
-                    .map(|binary| binary.external_pids)
-            })
-            .unwrap_or_default();
+        let externals = self.hosted_externals(serial, name).await;
         let ours = self
             .hosted_runs(serial)
             .await
@@ -1335,21 +1338,19 @@ impl DeviceService {
             HostedRunView {
                 pid,
                 started: false,
-                external_pids: externals.clone(),
                 detail: Some(format!(
-                    "{name} 已经在跑（pid {}），不是本工具启动的",
+                    "{name} 已经在跑（{}），不在本工具的托管表里",
                     externals
                         .iter()
-                        .map(u32::to_string)
+                        .map(ExternalProcView::describe)
                         .collect::<Vec<_>>()
-                        .join(", ")
+                        .join("；")
                 )),
             }
         } else {
             HostedRunView {
                 pid,
                 started: false,
-                external_pids: Vec::new(),
                 detail: Some(format!(
                     "{name} 已由本工具启动（pid {pid}），要换参数请先终止它"
                 )),
@@ -1472,7 +1473,6 @@ impl DeviceService {
         Ok(HostedRunView {
             pid,
             started: true,
-            external_pids: Vec::new(),
             detail: None,
         })
     }
@@ -3080,7 +3080,15 @@ fn map_agent_hosted_binaries(binaries: &[HostedBinaryInfo]) -> Vec<adb::HostedBi
             size: i64::try_from(item.size).unwrap_or(i64::MAX),
             perms: item.mode_text.clone(),
             has_exec: item.has_exec,
-            external_pids: item.external_pids.clone(),
+            external_procs: item
+                .external_procs
+                .iter()
+                .map(|proc| crate::adapters::adb::ExternalProcView {
+                    pid: proc.pid,
+                    ppid: proc.ppid,
+                    uid: proc.uid,
+                })
+                .collect(),
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -3393,12 +3401,17 @@ fn log_device_info_shadow_diff(serial: &str, agent: &DeviceInfo, legacy: &Device
 
 #[cfg(test)]
 mod tests {
+    use crate::adapters::adb::ExternalProcView;
+
+    fn ext(pid: u32, ppid: u32, uid: u32) -> ExternalProcView {
+        ExternalProcView { pid, ppid, uid }
+    }
 
     #[test]
     fn preflight_prefers_the_external_instance_and_starts_only_when_both_are_empty() {
         // 外部在跑 → 报外部（界面给「停止进程」），哪怕我们自己也有一条在跑
         assert_eq!(
-            pick_already_running(&[9727], Some(1234)),
+            pick_already_running(&[ext(9727, 1, 0)], Some(1234)),
             Some((9727, true)),
             "软件后启动的现场必须先报外部实例"
         );
@@ -3407,10 +3420,15 @@ mod tests {
         let nothing: Option<(u32, bool)> = None;
         // 两边都没有才允许启动
         assert_eq!(pick_already_running(&[], None), nothing);
+        // 多个表外实例：报第一个，其余由界面列出来
+        assert_eq!(
+            pick_already_running(&[ext(40, 1, 0), ext(30, 25, 2000)], None),
+            Some((40, true))
+        );
     }
 
     #[test]
-    fn external_pids_survive_the_agent_to_ui_mapping() {
+    fn external_procs_survive_the_agent_to_ui_mapping() {
         // Agent 报得出来、界面却什么都看不见 —— 断点就在这层映射上，所以单独钉一条
         let mapped = map_agent_hosted_binaries(&[HostedBinaryInfo {
             name: "auth-server".into(),
@@ -3421,16 +3439,28 @@ mod tests {
             has_exec: true,
             uid: 0,
             mtime_unix: 1_760_000_000,
-            external_pids: vec![9727, 11049],
+            external_procs: vec![
+                agent_protocol::ExternalProc {
+                    pid: 9727,
+                    ppid: 1,
+                    uid: 0,
+                },
+                agent_protocol::ExternalProc {
+                    pid: 11049,
+                    ppid: 9727,
+                    uid: 0,
+                },
+            ],
         }]);
-        assert_eq!(mapped[0].external_pids, vec![9727, 11049]);
+        assert_eq!(mapped[0].external_procs.len(), 2);
+        assert_eq!(mapped[0].external_procs[0].ppid, 1, "ppid 要一路带到界面");
         // Legacy 那侧永远给不出进程信息：必须是空数组，而不是"看起来没有外部实例"
         let legacy = adb::hosted_binaries(
             "-rwxr-xr-x 1 root root 3543112 2025-06-28 16:08 auth-server\n",
             "/data/local/tmp/auth-server: ELF 64-bit\n",
         );
         assert_eq!(legacy.len(), 1, "fixture 本身要能解析出一个条目");
-        assert!(legacy[0].external_pids.is_empty(), "{:?}", legacy[0]);
+        assert!(legacy[0].external_procs.is_empty(), "{:?}", legacy[0]);
     }
 
     #[test]
@@ -3528,7 +3558,7 @@ mod tests {
             has_exec: mode & 0o100 != 0,
             uid: 2000,
             mtime_unix: 1_760_000_000,
-            external_pids: Vec::new(),
+            external_procs: Vec::new(),
         };
         let agent = map_agent_hosted_binaries(&[
             info("zz-tool", 0o755, 4096),

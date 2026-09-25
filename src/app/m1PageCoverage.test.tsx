@@ -134,8 +134,8 @@ beforeEach(() => {
       size: 53_539_200,
       perms: "-rwxr-xr-x",
       hasExec: true,
-      // 外部在跑的实例（不是本工具启动的）：工具比目标进程晚开时就是这个形状
-      externalPids: [31337],
+      // 表外同名进程：ppid=1 = 父进程已退出（守护化形状），界面据此说实话
+      externalProcs: [{ pid: 31337, ppid: 1, uid: 0 }],
     },
     {
       name: "helper.dex",
@@ -143,7 +143,7 @@ beforeEach(() => {
       size: 12_345,
       perms: "-rw-r--r--",
       hasExec: false,
-      externalPids: [],
+      externalProcs: [],
     },
   ]);
   device.procPorts.mockResolvedValue([
@@ -272,8 +272,7 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     device.binaryRun.mockResolvedValue({
       pid: 31337,
       started: false,
-      externalPids: [31337],
-      detail: "frida-server 已经在跑（pid 31337），不是本工具启动的",
+      detail: "frida-server 已经在跑（pid 31337 · 父进程已退出 · root），不在本工具的托管表里",
     });
     device.binaryKill.mockResolvedValue(undefined);
     renderPage(<BinaryHosting />);
@@ -294,7 +293,7 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
         size: 53_539_200,
         perms: "-rwxr-xr-x",
         hasExec: true,
-        externalPids: [],
+        externalProcs: [],
       },
     ]);
     fireEvent.click(screen.getByTestId("stop-external-frida-server"));
@@ -302,6 +301,8 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     expect(device.binaryKill).not.toHaveBeenCalled();
     const note = await screen.findByTestId("external-note-frida-server");
     expect(note.textContent ?? "").toContain("31337");
+    // 文案不能撒谎：无句柄 ≠ 停不掉（停止按钮走的就是按身份核验的终止通道）
+    expect(note.textContent ?? "").not.toContain("停不掉");
     fireEvent.click(screen.getByTestId("confirm-stop-frida-server"));
     // root=true：目标可能是 su 起的（shell 杀不动）；带上名字，设备端先核身份再发信号
     await waitFor(() =>
@@ -323,14 +324,13 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
         size: 53_539_200,
         perms: "-rwxr-xr-x",
         hasExec: true,
-        externalPids: [],
+        externalProcs: [],
       },
     ]);
     device.binaryRun.mockResolvedValue({
       pid: 4242,
       started: false,
-      externalPids: [4242],
-      detail: "frida-server 已经在跑（pid 4242），不是本工具启动的",
+      detail: "frida-server 已经在跑（pid 4242 · 父进程 3900 · uid 2000），不在本工具的托管表里",
     });
     renderPage(<BinaryHosting />);
     // 清单是异步来的，先等它出现（上一条测试是"先等到有外部实例"才动的，这里同理）

@@ -258,6 +258,27 @@ pub fn join_remote_path(dir: &str, name: &str) -> String {
 /// 托管目录固定路径（用户指定默认）。
 pub const HOSTED_DIR: &str = "/data/local/tmp";
 
+/// 表外同名进程的界面视图（camelCase，前端直接用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ExternalProcView {
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+}
+
+impl ExternalProcView {
+    /// 一句人话：ppid=1 说明它爹已经退出（守护进程/fork 子进程的形状），uid=0 说明是 root 起的。
+    pub fn describe(&self) -> String {
+        let parent = if self.ppid == 1 {
+            "父进程已退出"
+        } else {
+            &format!("父进程 {}", self.ppid)
+        };
+        let owner = if self.uid == 0 { "root" } else { "非 root" };
+        format!("pid {} · {parent} · {owner}", self.pid)
+    }
+}
+
 /// 一个被托管的二进制（tmp 目录下的 ELF 文件）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -269,10 +290,10 @@ pub struct HostedBinary {
     pub perms: String,
     /// owner 有执行位 → 绿色；否则红色（可 chmod 赋予）
     pub has_exec: bool,
-    /// 设备上正在跑的**同名进程 pid，但不是本工具启动的**（因此没有句柄、这里停不了）。
+    /// 在跑但不在本工具托管表里的同名进程（带 ppid/uid，理由见 `ExternalProcView`）。
     /// 只有 Agent 通道给得出：Legacy 的 `ls -l` + `file` 只看文件，看不见进程。
     #[serde(default)]
-    pub external_pids: Vec<u32>,
+    pub external_procs: Vec<ExternalProcView>,
 }
 
 /// 校验托管文件名：仅允许安全字符（防 shell 注入 / 路径逃逸）。
@@ -343,8 +364,8 @@ pub fn hosted_binaries(ls_stdout: &str, file_stdout: &str) -> Vec<HostedBinary> 
             size: fe.size,
             has_exec: perms_has_exec(&fe.perms),
             perms: fe.perms,
-            // Legacy 的 `ls -l` + `file` 只看文件，看不见进程：外部同名进程只有 Agent 报得出
-            external_pids: Vec::new(),
+            // Legacy 的 `ls -l` + `file` 只看文件，看不见进程：表外同名进程只有 Agent 报得出
+            external_procs: Vec::new(),
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
