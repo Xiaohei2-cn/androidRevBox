@@ -17,8 +17,12 @@ export default {
 
   "settings.clickThrough.label": "Click through transparent areas",
   "settings.clickThrough.hint":
-    "When on, clicks in genuinely transparent spots (gaps between cards, padding, outside the rounded corners) go to the app behind this window. Cards, buttons, inputs and text still belong to this tool. The title bar and the tab rail always stay clickable, so you can always come back here and switch it off.",
-  "settings.language.label": "Language",
+    "When on, clicks in genuinely transparent spots (the see-through gutter and teeth of the tab rail, gaps between cards, padding, outside the rounded corners) go to the app behind this window. Cards, buttons, inputs and text still belong to this tool. Each tab keeps a hit area over its icon and the title bar stays solid, so you can always come back here and switch it off.",
+
+  "settings.clickThrough.status.solid": "Now: pointer is over real content, this tool keeps the clicks",
+  "settings.clickThrough.status.passing": "Now: pointer is over a transparent spot, clicks go to the app behind",
+  "settings.clickThrough.status.outside": "Now: the pointer is outside this window",
+  "settings.clickThrough.status.error": "Now: pointer position unavailable, kept the window clickable",  "settings.language.label": "Language",
   "settings.language.hint": "Applies immediately and persists across restarts.",
   "settings.language.restartHint":
     "Some system messages (e.g. adb/process errors) fully apply after a restart.",

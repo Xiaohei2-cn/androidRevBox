@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { windowApi } from "@/api/window";
 import { isSolidAt } from "@/lib/clickThrough";
+import { setClickThroughStatus } from "@/lib/clickThroughStatus";
 
 /**
  * 指针轮询间隔。80ms 够"鼠标移上去就能点"，又不至于白烧 CPU：
@@ -21,8 +22,12 @@ const POLL_MS = 80;
  */
 export function useClickThrough(enabled: boolean): void {
   useEffect(() => {
+    if (!enabled) {
+      setClickThroughStatus("off");
+      return;
+    }
     // 浏览器里（vitest / vite 预览）没有窗口层，直接不启
-    if (!enabled || !("__TAURI_INTERNALS__" in window)) return;
+    if (!("__TAURI_INTERNALS__" in window)) return;
     let ignore = false;
     let cancelled = false;
 
@@ -37,17 +42,25 @@ export function useClickThrough(enabled: boolean): void {
       try {
         if (document.hidden) {
           restore();
+          setClickThroughStatus("off");
           return;
         }
         const state = await windowApi.pointerState();
-        if (cancelled || !state.inside) return;
+        if (cancelled) return;
+        if (!state.inside) {
+          // 光标在别处：不改状态（来回开关会让状态抖），但读数要能说清"现在没在穿"
+          setClickThroughStatus(ignore ? "passing" : "outside");
+          return;
+        }
         const next = !isSolidAt(state.x, state.y);
+        setClickThroughStatus(next ? "passing" : "solid");
         if (next === ignore) return;
         await windowApi.setClickThrough(next);
         ignore = next;
       } catch {
         // 问不到指针就当"可点击"：宁可这次没穿透，也不能把自己界面锁死
         restore();
+        setClickThroughStatus("error");
       }
     };
 
@@ -57,6 +70,7 @@ export function useClickThrough(enabled: boolean): void {
       cancelled = true;
       window.clearInterval(timer);
       restore();
+      setClickThroughStatus("off");
     };
   }, [enabled]);
 }

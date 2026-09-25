@@ -46,6 +46,27 @@ describe("MainTabRail", () => {
     );
   });
 
+  it("未选中齿块本体让出点击、图标热区留住（透明区穿透的粒度就钉在这儿）", () => {
+    // 用户报"透明部分透传没生效"的根因：整条 rail 曾被钉成实体，rail 宽 128px 而齿块只有
+    // 36px，左边那一整条纯透明留白跟着一起被挡住了。现在 rail 不标实体，
+    // 未选中齿块本体标 pass（只有半透明着色），图标 pad 标 solid（否则切不了页）。
+    renderRail();
+    const teeth = screen.getAllByRole("button");
+    const inactive = teeth.filter((t) => t.getAttribute("aria-current") !== "true");
+    const active = teeth.filter((t) => t.getAttribute("aria-current") === "true");
+    expect(inactive.length).toBeGreaterThan(0);
+    expect(active.length).toBe(1);
+    for (const tooth of inactive) {
+      expect(tooth.getAttribute("data-click-through")).toBe("pass");
+      const pad = tooth.querySelector('[data-click-through="solid"]');
+      expect(pad).toBeTruthy();
+    }
+    // 选中态是实心 bg-primary，属于实体：不能标 pass，否则当前页的 tab 点不动
+    expect(active[0].getAttribute("data-click-through")).toBeNull();
+    // rail 本体绝不能是实体（它就是用户要穿透的那块）
+    expect(screen.getByRole("navigation").getAttribute("data-click-through")).toBeNull();
+  });
+
   it("当前激活 tab 标记 aria-current", () => {
     renderRail();
     const dashboard = screen.getByRole("button", { name: "仪表盘" });

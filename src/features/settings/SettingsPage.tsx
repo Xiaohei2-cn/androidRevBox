@@ -1,7 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { FolderOpen } from "lucide-react";
 import { Label } from "@/components/ui/label";
+import {
+  getClickThroughStatus,
+  subscribeClickThroughStatus,
+} from "@/lib/clickThroughStatus";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -112,6 +116,12 @@ export function SettingsPage() {
 /** 显示：主题 + 背景不透明度 */
 function DisplayTab() {
   const { theme, setTheme, opacity, setOpacity, clickThrough, setClickThrough } = useSettings();
+  // 穿透状态的实时读数（开关在 AppShell 里驱动轮询，这里只订阅显示）
+  const status = useSyncExternalStore(
+    subscribeClickThroughStatus,
+    getClickThroughStatus,
+    getClickThroughStatus,
+  );
   const { t } = useI18n();
 
   return (
@@ -189,6 +199,26 @@ function DisplayTab() {
               <span className="mt-0.5 block text-xs text-muted-foreground">
                 {t("settings.clickThrough.hint")}
               </span>
+              {/*
+                实时读数：开关打开后，"没生效"、"循环没跑"、"判定认为那儿是实体"
+                这三种故障在界面上原本长得一模一样，有这条才分得开。
+              */}
+              {clickThrough && status !== "off" && (
+                <span
+                  data-testid="click-through-status"
+                  className={cn(
+                    "mt-1 block text-xs",
+                    status === "passing" ? "text-emerald-500" : "text-muted-foreground",
+                  )}
+                >
+                  {{
+                    solid: t("settings.clickThrough.status.solid"),
+                    passing: t("settings.clickThrough.status.passing"),
+                    outside: t("settings.clickThrough.status.outside"),
+                    error: t("settings.clickThrough.status.error"),
+                  }[status]}
+                </span>
+              )}
             </span>
           </label>
         </CardContent>

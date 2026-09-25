@@ -17,8 +17,12 @@ export default {
 
   "settings.clickThrough.label": "Clicar através das áreas transparentes",
   "settings.clickThrough.hint":
-    "Quando ativo, cliques em pontos realmente transparentes (vãos entre cartões, margens, fora dos cantos arredondados) vão para o app atrás desta janela. Cartões, botões, campos e texto continuam pertencendo a esta ferramenta. A barra de título e a barra de abas ficam sempre clicáveis, então dá para voltar aqui e desligar.",
-  "settings.language.label": "Idioma da interface",
+    "Quando ativo, cliques em pontos realmente transparentes (a faixa translúcida e os blocos da barra de abas, vãos entre cartões, margens, fora dos cantos arredondados) vão para o app atrás desta janela. Cartões, botões, campos e texto continuam com esta ferramenta. Cada aba mantém uma área de clique sobre o ícone e a barra de título continua sólida, então dá para voltar aqui e desligar.",
+
+  "settings.clickThrough.status.solid": "Agora: o cursor está sobre conteúdo real, esta ferramenta mantém os cliques",
+  "settings.clickThrough.status.passing": "Agora: o cursor está numa área transparente, os cliques vão para o app de trás",
+  "settings.clickThrough.status.outside": "Agora: o cursor está fora desta janela",
+  "settings.clickThrough.status.error": "Agora: sem posição do cursor, a janela continua clicável",  "settings.language.label": "Idioma da interface",
   "settings.language.hint": "Aplica imediatamente e persiste entre reinícios.",
   "settings.language.restartHint":
     "Algumas mensagens do sistema (ex.: erros de adb/processo) só se aplicam por completo após reiniciar.",

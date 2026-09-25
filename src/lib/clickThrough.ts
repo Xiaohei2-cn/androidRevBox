@@ -56,8 +56,13 @@ export function isSolidStack(elements: readonly Element[], judges: StackJudges):
     const forced = el.getAttribute("data-click-through");
     if (forced === "solid") return true;
     if (forced === "pass") return false;
-    if (judges.isTint(el)) continue;
+    /*
+     * 顺序很重要：**控件先于底色层**。tab 齿块这类元素同时挂着 `.app-surface`（共用窗口
+     * 底色，保证颜色一致）和"它就是个按钮"这两件事；先判底色会把选中齿块那种
+     * 实心不透明的块也算成"透明可穿"，等于把当前页的 tab 点丢了。
+     */
     if (judges.isInteractive(el)) return true;
+    if (judges.isTint(el)) continue;
     if (judges.isPainted(el)) return true;
   }
   return false;

@@ -17,8 +17,12 @@ export default {
 
   "settings.clickThrough.label": "透明区点击穿透",
   "settings.clickThrough.hint":
-    "打开后，界面上真正透明的地方（卡片之间的间隙、留白、圆角外）点击会直接落到后面的 App；卡片、按钮、输入框与文字区仍归本工具接。标题栏与左侧 tab 栏永远可点，任何时候都能回到这里关掉它。",
-  "settings.language.label": "界面语言",
+    "打开后，界面上真正透明的地方（左侧 tab 栏的透明留白与齿块本体、卡片之间的间隙、圆角外）点击会直接落到后面的 App；卡片、按钮、输入框与文字区仍归本工具接。每个 tab 的图标留着热区、标题栏整条仍算实体，所以随时能回到这里关掉它。",
+
+  "settings.clickThrough.status.solid": "当前：光标在实体上，本工具接点击",
+  "settings.clickThrough.status.passing": "当前：光标在透明处，点击交给后面的 App",
+  "settings.clickThrough.status.outside": "当前：光标不在本窗口内",
+  "settings.clickThrough.status.error": "当前：取不到指针位置，已按可点击处理",  "settings.language.label": "界面语言",
   "settings.language.hint": "切换后立即生效并持久化，重启自动恢复。",
   "settings.language.restartHint": "部分系统提示语（如 adb/进程错误）重启后完全生效。",
 

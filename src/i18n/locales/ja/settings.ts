@@ -17,8 +17,12 @@ export default {
 
   "settings.clickThrough.label": "透明部分をクリック透過",
   "settings.clickThrough.hint":
-    "オンにすると、本当に透明な部分（カードの隙間、余白、角丸の外側）でのクリックが後ろのアプリに渡ります。カード・ボタン・入力欄・テキストは本ツールが受け取ります。タイトルバーと左のタブバーは常にクリック可能なので、いつでもここに戻してオフにできます。",
-  "settings.language.label": "表示言語",
+    "オンにすると、本当に透明な部分（左タブバーの透明な余白とタブ本体、カード間の隙間、角丸の外側）でのクリックが後ろのアプリに渡ります。カード・ボタン・入力欄・テキストは本ツールが受け取ります。各タブはアイコン上のヒット領域を残し、タイトルバーは常に実体なので、いつでもここに戻してオフにできます。",
+
+  "settings.clickThrough.status.solid": "現在：ポインターは実体上、本ツールがクリックを受け取ります",
+  "settings.clickThrough.status.passing": "現在：ポインターは透明部分上、クリックは後ろのアプリへ渡ります",
+  "settings.clickThrough.status.outside": "現在：ポインターはこのウィンドウ外です",
+  "settings.clickThrough.status.error": "現在：ポインター位置を取得できないため、クリック可能のままにしています",  "settings.language.label": "表示言語",
   "settings.language.hint": "即時反映され、再起動後も保持されます。",
   "settings.language.restartHint":
     "一部のシステムメッセージ（adb／プロセスのエラーなど）は再起動後に完全に反映されます。",

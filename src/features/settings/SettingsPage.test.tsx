@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { AppProviders } from "@/app/providers";
 import { SettingsPage } from "./SettingsPage";
+import { setClickThroughStatus } from "@/lib/clickThroughStatus";
 
 const systemMocks = vi.hoisted(() => ({ ping: vi.fn() }));
 const configMocks = vi.hoisted(() => ({ snapshot: vi.fn(), set: vi.fn() }));
@@ -96,6 +97,25 @@ describe("SettingsPage", () => {
       expect(configMocks.set).toHaveBeenLastCalledWith("app.settings.click_through", "false"),
     );
     delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  });
+
+  it("开关打开后给出实时读数：能分清「没生效」与「那儿本来就是实体」", async () => {
+    // 用户报"透传没生效"时，开关没跑、循环卡住、判定认为那儿是实体这三种情况在界面上
+    // 长得一模一样。这条读数就是用来把它们分开的，所以必须钉住它真的会跟着状态变。
+    render(
+      <AppProviders>
+        <SettingsPage />
+      </AppProviders>,
+    );
+    const box = await screen.findByTestId("click-through-toggle");
+    expect(screen.queryByTestId("click-through-status")).toBeNull(); // 关着不显示
+    await userEvent.click(box);
+    setClickThroughStatus("solid");
+    const reading = await screen.findByTestId("click-through-status");
+    expect(reading.textContent ?? "").toContain("实体");
+    setClickThroughStatus("passing");
+    const passing2 = await screen.findByTestId("click-through-status");
+    expect(passing2.textContent ?? "").toContain("后面的 App");
   });
 
   it("关于小节显示应用版本/Tauri 版本/运行平台（自仪表盘迁入，P7）", async () => {

@@ -57,7 +57,23 @@ describe("透明区点击穿透的判定", () => {
     expect(solid([el({ role: "tab" })])).toBe(true);
   });
 
-  it("窗口 chrome 显式钉成实体：标题栏与 tab 栏永远点得回来", () => {
+  it("控件优先于底色层：齿块带着 .app-surface 也仍是实体（选中态点得动）", () => {
+    // 这是本轮返工的根因之一：`.app-surface` 同时挂在窗口底色与 tab 齿块上，
+    // 先判底色会把实心不透明的选中齿块也当成"可穿透"，当前页的 tab 就点丢了。
+    const selectedTooth = el({ tag: "button", className: "app-surface bg-primary" });
+    expect(solid([selectedTooth])).toBe(true);
+  });
+
+  it("显式 pass 的透明齿块让出点击，但图标热区在上面就先算实体", () => {
+    const tooth = el({ tag: "button", className: "app-surface", clickThrough: "pass" });
+    // 齿块本体（只有半透明着色）→ 穿透，这正是用户要的那块
+    expect(solid([tooth, el({ className: "app-surface" })])).toBe(false);
+    // 图标热区压在齿块上面 → 仍然切得了页
+    const pad = el({ clickThrough: "solid" });
+    expect(solid([pad, tooth, el({ className: "app-surface" })])).toBe(true);
+  });
+
+  it("窗口 chrome 显式钉成实体：标题栏永远点得回来", () => {
     expect(solid([el({ clickThrough: "solid", className: "app-surface" })])).toBe(true);
     // 反过来也必须成立：显式声明穿透的层优先于任何启发式
     expect(solid([el({ clickThrough: "pass", bg: "rgb(0 0 0 / 1)" })])).toBe(false);

@@ -63,8 +63,9 @@ export function MainTabRail() {
   return (
     <nav
       aria-label={t("nav.aria")}
-      // 同标题栏：tab 栏永远算实体，保证任何时候都能切页、能点回设置关掉穿透
-      data-click-through="solid"
+      // 这里**不**钉实体：rail 宽 128px，齿块只占右边 36px，左边那一条与齿块之间的缝隙
+      // 本来就是纯透明——用户要的正是"这些透明处能点到后面的 App"（第五十四轮的返工点）。
+      // 切页与回到设置关掉穿透，靠每个齿块上的图标热区（下面 pad）。
       className="flex w-32 shrink-0 flex-col items-end gap-1.5 overflow-y-auto pt-14"
     >
       {MAIN_TABS.map((item) => (
@@ -109,6 +110,9 @@ function MainTabButton({
       type="button"
       aria-label={label}
       aria-current={active ? "true" : undefined}
+      // 未选中齿块只是一层半透明着色 → 本体让出去，图标热区留着（否则切不了页）；
+      // 选中态有实心 bg-primary，属于实体，不标 pass。
+      data-click-through={active ? undefined : "pass"}
       onClick={onClick}
       className={cn(
         "app-surface group relative flex h-10 shrink-0 select-none items-center justify-center rounded-l-xl border border-r-0 border-border/60",
@@ -122,7 +126,13 @@ function MainTabButton({
           {label}
         </span>
       ) : (
-        <Icon className="h-4 w-4" />
+        /*
+         * 图标外面这块 pad 是齿块上唯一的实体热区：24×24 居中，占 36×40 齿块的大部分，
+         * 剩下那一圈透明边才让给后面的 App。热区大小想调就改这里（h-6/w-6）。
+         */
+        <span data-click-through="solid" className="grid h-6 w-6 shrink-0 place-items-center">
+          <Icon className="h-4 w-4" />
+        </span>
       )}
     </button>
   );
