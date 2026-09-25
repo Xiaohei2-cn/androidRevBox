@@ -75,6 +75,33 @@ pub fn validate_attach_target(target: &str) -> CoreResult<()> {
     )))
 }
 
+/// 通道握手探活脚本：用**工具配置的那个解释器**连设备上的 frida-server，问一件最小的事。
+///
+/// 为什么问"能不能枚举进程"而不是 connect 一下 TCP：端口活着 ≠ 能用。版本不匹配时
+/// frida 直接回 `unable to communicate with remote frida-server`，而 TCP 探活照样是绿的
+/// —— 真机上就出现过"三项全绿、会话起不来"。argv 只收模式与目标，不拼字符串。
+pub const CHANNEL_PROBE_SCRIPT: &str = r#"
+import sys
+mode = sys.argv[1]
+target = sys.argv[2]
+try:
+    import frida
+except Exception as e:
+    print("ERR", type(e).__name__, str(e)[:200])
+    raise SystemExit(0)
+try:
+    if mode == "remote":
+        dev = frida.get_device_manager().add_remote_device(target)
+        where = "远程 " + target
+    else:
+        dev = frida.get_device(target, timeout=8)
+        where = "USB " + target
+    n = len(dev.enumerate_processes())
+    print("OK", n, where)
+except Exception as e:
+    print("ERR", type(e).__name__, " ".join(str(e).split())[:200])
+"#;
+
 /// frida 的注入目标（对应 CLI 的三种写法，分开表达、不靠"空字符串"表达意思）。
 ///
 /// `Frontmost` 就是 `frida -UF` 里那个 `-F`：**附加设备当前前台应用，调用方不需要知道

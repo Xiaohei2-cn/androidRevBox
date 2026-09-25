@@ -67,8 +67,10 @@ export function SettingsPanel({
 
   const remote = remoteSpec(settings);
   const { data: preflight } = useQuery({
-    queryKey: ["hook", "preflight", remote ?? "usb"],
-    queryFn: () => hookApi.preflight(remote),
+    // 换设备必须重新探：不然绿的是上一台机的 frida-server
+    queryKey: ["hook", "preflight", remote ?? "usb", settings.deviceSerial ?? "none"],
+    queryFn: () =>
+      hookApi.preflight(remote, settings.connMode === "usb" ? (settings.deviceSerial ?? undefined) : undefined),
     refetchInterval: hookActive ? 15_000 : false,
     staleTime: 5_000,
   });
@@ -366,7 +368,8 @@ export function FridaServerControl({
   );
 }
 
-function PreflightList({
+/** 导出给测试：三态（没探 / 探失败 / 探通）的渲染差异是这里最容易写错的地方 */
+export function PreflightList({
   preflight,
   remoteMode,
   t,
@@ -390,6 +393,15 @@ function PreflightList({
     { ok: preflight.fridaOk, label: `frida${preflight.fridaVersion ? " " + preflight.fridaVersion : ""}`, hint: preflight.fridaHint, fix: "frida" },
     { ok: preflight.runnerOk, label: t("hook.frida.runner"), hint: preflight.runnerHint, fix: "runner" },
   ];
+  // 握手探活只在"探过"的时候出现：没 Python 时画一条红字只是噪音，画绿勾又是撒谎
+  if (preflight.channelOk !== null && preflight.channelOk !== undefined) {
+    items.push({
+      ok: preflight.channelOk === true,
+      label: t("hook.frida.channel"),
+      hint: preflight.channelHint,
+      fix: "frida-server",
+    });
+  }
   if (remoteMode) {
     items.push({
       ok: preflight.remoteOk === true,

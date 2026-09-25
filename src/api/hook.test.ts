@@ -1,5 +1,9 @@
-import { describe, expect, it } from "vitest";
-import { parseFridaLine, summarizeEventData } from "@/api/hook";
+import { describe, expect, it, vi } from "vitest";
+
+const invokeMock = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+
+import { hookApi, parseFridaLine, summarizeEventData } from "@/api/hook";
 
 describe("parseFridaLine（runner NDJSON 协议，§5.2）", () => {
   it("ready 控制行", () => {
@@ -55,5 +59,25 @@ describe("summarizeEventData", () => {
     expect(summarizeEventData(42)).toBe("42");
     expect(summarizeEventData(null)).toBe("null");
     expect(summarizeEventData({ a: 1 })).toBe('{"a":1}');
+  });
+});
+
+describe("hook_preflight 的入参", () => {
+  it("USB 模式必须把 serial 一起送出去（否则探的是上一台机的 frida-server）", async () => {
+    invokeMock.mockReset().mockResolvedValue({});
+    await hookApi.preflight(undefined, "18271FDF600FL4");
+    expect(invokeMock).toHaveBeenCalledWith("hook_preflight", {
+      remote: null,
+      serial: "18271FDF600FL4",
+    });
+  });
+
+  it("远程模式给 endpoint，serial 留空", async () => {
+    invokeMock.mockReset().mockResolvedValue({});
+    await hookApi.preflight("127.0.0.1:27042");
+    expect(invokeMock).toHaveBeenCalledWith("hook_preflight", {
+      remote: "127.0.0.1:27042",
+      serial: null,
+    });
   });
 });

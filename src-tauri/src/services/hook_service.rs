@@ -23,6 +23,8 @@ use crate::services::task_service::TaskService;
 const JS_LIST_CAP: usize = 500;
 /// 远程 frida-server 端口探活超时
 const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// frida 握手要 spawn python 并在设备上找 server，比 TCP 探活慢一个量级
+const CHANNEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// runner 随包资源名（tauri.conf bundle.resources 落点）
 const RUNNER_RESOURCE: &str = "scripts/frida_runner.py";
 
@@ -59,6 +61,62 @@ pub struct PreflightDto {
     /// runner 脚本是否随包可达
     pub runner_ok: bool,
     pub runner_hint: Option<String>,
+    /// 与设备 frida-server 的真实握手结果。`None` = 这一项没探（Python 未就绪），
+    /// 三态是必需的：把"没探"画成绿色对勾就是骗人，画成红色又是噪音。
+    #[serde(default)]
+    pub channel_ok: Option<bool>,
+    #[serde(default)]
+    pub channel_hint: Option<String>,
+}
+
+/// 握手探活结果（checked=false 表示连试都没试）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelProbe {
+    pub checked: bool,
+    pub ok: bool,
+    pub hint: Option<String>,
+}
+
+impl ChannelProbe {
+    fn skipped() -> Self {
+        Self {
+            checked: false,
+            ok: false,
+            hint: None,
+        }
+    }
+}
+
+/// 解析探活脚本的输出。只认 `OK ...` / `ERR <类型> <消息>` 两种形状；
+/// 别的（空输出、python 自己崩了）一律算"没探成"，不猜成功。
+pub fn parse_channel_probe(stdout: &str, host_frida: Option<&str>) -> (bool, Option<String>) {
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let mut words = line.split_whitespace();
+    match words.next() {
+        Some("OK") => (true, None),
+        Some("ERR") => {
+            let kind = words.next().unwrap_or("Error");
+            let msg: String = line.splitn(3, ' ').nth(2).unwrap_or("").to_string();
+            let tail = match host_frida {
+                Some(v) => format!("（工具用的 frida 是 {v}，两端主版本必须一致）"),
+                None => String::new(),
+            };
+            (
+                false,
+                Some(format!(
+                    "连不上设备上的 frida-server：{kind} {msg}{tail}。常见原因是 server 没起、                     或它的主版本与工具用的 frida 不同"
+                )),
+            )
+        }
+        _ => (
+            false,
+            Some("握手探测没有任何输出（python 起不来或 frida 未装？）".to_string()),
+        ),
+    }
 }
 
 /// hook_session_start 入参（命令层薄校验后传入）
@@ -128,8 +186,13 @@ impl HookService {
 
     /// 聚合探测 adb/python/frida（§10 剪枝由 EnvService 承担：Python 未配置
     /// 不发 frida 探测子进程）。remote 非空时追加 TCP 探活。
-    pub async fn preflight(&self, remote: Option<&str>) -> PreflightDto {
+    pub async fn preflight(&self, remote: Option<&str>, serial: Option<&str>) -> PreflightDto {
         let (adb, (python, frida_env)) = tokio::join!(self.env.adb(), self.env.python_and_frida());
+        // 握手探活放在版本探测之后：hint 里要带上"工具用的 frida 是哪一版"，
+        // 用户看一眼就知道是不是两端版本不一致，而不是自己去猜
+        let channel = self
+            .probe_channel(serial, remote, frida_env.frida_version.as_deref())
+            .await;
         let (remote_ok, remote_hint) = match remote {
             Some(endpoint) => {
                 let (ok, hint) = self.probe_remote(endpoint).await;
@@ -153,6 +216,8 @@ impl HookService {
             frida_hint: frida_env.hint.clone(),
             remote_ok,
             remote_hint,
+            channel_ok: channel.checked.then_some(channel.ok),
+            channel_hint: channel.hint,
             runner_ok: runner.is_some(),
             runner_hint: if runner.is_some() {
                 None
@@ -161,6 +226,61 @@ impl HookService {
                     "未找到随包 runner（{RUNNER_RESOURCE}）：开发环境请确认 workspace scripts/ 目录"
                 ))
             },
+        }
+    }
+
+    /// frida 通道握手探活：**用工具配置的那个解释器**去连设备上的 frida-server，
+    /// 成功标准是"真问得出一件事"（枚举进程），不是 TCP 端口活着。
+    ///
+    /// 为什么必须有这条：端口活着但版本不匹配 / server 没起 / 起的是 shell 身份够不着别的进程，
+    /// 这三种情况在旧的 preflight 里全绿，用户只能对着"连不上"猜。
+    /// 而且必须用 runner 同一个解释器探——版本结论只有对同一个 python 才成立
+    /// （踩过：拿登录 shell 的 python 量出 17.x，工具用的 venv 其实是 16.5.7）。
+    pub async fn probe_channel(
+        &self,
+        serial: Option<&str>,
+        remote: Option<&str>,
+        host_frida: Option<&str>,
+    ) -> ChannelProbe {
+        let python = self.env.python().await;
+        if !python.ready {
+            // Python 都没配好，握手谈不上：不显示这一项（而不是报一句红字噪音）
+            return ChannelProbe::skipped();
+        }
+        let target = match (remote, serial) {
+            (Some(ep), _) => ("remote".to_string(), ep.to_string()),
+            (None, Some(sn)) if !sn.trim().is_empty() => ("usb".to_string(), sn.trim().to_string()),
+            _ => ("none".to_string(), String::new()),
+        };
+        if target.0 == "none" {
+            return ChannelProbe {
+                checked: true,
+                ok: false,
+                hint: Some("还没选设备：USB 模式要在设备列表里选一台".to_string()),
+            };
+        }
+        let script = frida::CHANNEL_PROBE_SCRIPT;
+        let out = match crate::services::env_service::run_probe_with_timeout(
+            &python.path.unwrap_or_default(),
+            &["-c", script, &target.0, &target.1],
+            CHANNEL_PROBE_TIMEOUT,
+        )
+        .await
+        {
+            Ok(out) => out,
+            Err(error) => {
+                return ChannelProbe {
+                    checked: true,
+                    ok: false,
+                    hint: Some(format!("握手探测没跑起来：{error}")),
+                };
+            }
+        };
+        let (ok, hint) = parse_channel_probe(&out.stdout, host_frida);
+        ChannelProbe {
+            checked: true,
+            ok,
+            hint,
         }
     }
 
@@ -401,5 +521,45 @@ mod tests {
         }
         let files = scan_js_dir(tmp.path()).unwrap();
         assert_eq!(files.len(), JS_LIST_CAP);
+    }
+    #[test]
+    fn channel_probe_only_trusts_its_own_output_shapes() {
+        // 成功：脚本问出了进程数
+        let (ok, hint) = parse_channel_probe("OK 128 USB 18271FDF\n", Some("16.5.7"));
+        assert!(ok);
+        assert_eq!(hint, None);
+        // 失败：把 frida 的原话与"工具用的版本"一起带出来，用户不必自己猜不匹配
+        let (ok, hint) = parse_channel_probe(
+            "ERR ProtocolError unable to communicate with remote frida-server\n",
+            Some("16.5.7"),
+        );
+        assert!(!ok);
+        let hint = hint.expect("失败必须给原因");
+        assert!(hint.contains("unable to communicate"), "{hint}");
+        assert!(hint.contains("16.5.7"), "要带出工具用的 frida 版本：{hint}");
+        // 没探成（空输出/ python 崩了）不算成功，也不算"端口没开"
+        let (ok, hint) = parse_channel_probe("", None);
+        assert!(!ok);
+        let hint = hint.expect("探不出结果也要说清为什么");
+        assert!(hint.contains("任何输出"), "{hint}");
+        // 乱码输出同样落回"没探成"，绝不猜成成功
+        let (ok, _) = parse_channel_probe("Traceback (most recent call last):", None);
+        assert!(!ok);
+    }
+
+    #[test]
+    fn channel_probe_is_skipped_rather_than_faked_when_python_is_not_ready() {
+        // checked=false → DTO 里是 None → 界面上根本不出现这一项
+        let skipped = ChannelProbe::skipped();
+        assert!(!skipped.checked);
+        let as_dto: Option<bool> = skipped.checked.then_some(skipped.ok);
+        assert_eq!(as_dto, None);
+        // 探过但失败 → Some(false)（画红），与"没探"分得开
+        let probed = ChannelProbe {
+            checked: true,
+            ok: false,
+            hint: Some("x".into()),
+        };
+        assert_eq!(probed.checked.then_some(probed.ok), Some(false));
     }
 }

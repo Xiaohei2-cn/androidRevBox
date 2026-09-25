@@ -29,11 +29,18 @@ pub async fn hook_js_list(
 pub async fn hook_preflight(
     state: tauri::State<'_, AppState>,
     remote: Option<String>,
+    serial: Option<String>,
 ) -> CoreResult<PreflightDto> {
     let remote = remote
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty());
-    Ok(state.hook.preflight(remote.as_deref()).await)
+    let serial = serial
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Ok(state
+        .hook
+        .preflight(remote.as_deref(), serial.as_deref())
+        .await)
 }
 
 /// 组 CommandSpec 起 frida runner 任务，返回 taskId（kind="frida"）。

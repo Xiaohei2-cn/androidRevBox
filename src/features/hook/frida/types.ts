@@ -92,6 +92,30 @@ export function filterMatch(e: ConsoleEvent, f: FridaFilter): boolean {
   return text.toLowerCase().includes(kw.toLowerCase());
 }
 
+/**
+ * 「自动换行」开关的持久化键（全局偏好，不按设备分：这是读法偏好，不是上下文）。
+ * 关掉换行是为了看宽 hexdump 的列对齐 —— 折行会把一张表切成上下两截。
+ */
+export const WRAP_STORAGE_KEY = "app.frida.wrap";
+
+export function loadWrap(defaultValue = true): boolean {
+  try {
+    const raw = localStorage.getItem(WRAP_STORAGE_KEY);
+    return raw === null ? defaultValue : raw === "1";
+  } catch {
+    // localStorage 不可用就不换行偏好，按默认走
+    return defaultValue;
+  }
+}
+
+export function saveWrap(wrap: boolean): void {
+  try {
+    localStorage.setItem(WRAP_STORAGE_KEY, wrap ? "1" : "0");
+  } catch {
+    // 写不进去只是下次回到默认，不影响本次阅读
+  }
+}
+
 export function filterStorageKey(settings: Pick<FridaSettings, "deviceSerial" | "target">): string {
   return `hook.frida.filter:${settings.deviceSerial ?? "-"}:${settings.target.trim() || "-"}`;
 }

@@ -24,6 +24,9 @@ export interface PreflightDto {
   remoteHint?: string | null;
   runnerOk: boolean;
   runnerHint?: string | null;
+  /** 与设备 frida-server 的真实握手；null/undefined = 没探（Python 未就绪），界面上不出现这一项 */
+  channelOk?: boolean | null;
+  channelHint?: string | null;
 }
 
 export interface HookSessionStartArgs {
@@ -47,9 +50,15 @@ export const hookApi = {
   jsList(dir?: string): Promise<JsFileDto[]> {
     return invokeCommand<JsFileDto[]>("hook_js_list", { dir: dir ?? null });
   },
-  /** 前置检查链聚合（adb/python/frida/runner/远程 TCP） */
-  preflight(remote?: string): Promise<PreflightDto> {
-    return invokeCommand<PreflightDto>("hook_preflight", { remote: remote ?? null });
+  /**
+   * 前置检查链聚合（adb/python/frida/runner/远程 TCP/frida 通道握手）。
+   * serial 只在 USB 模式下给：握手必须连**要用的那台设备**，不然探的是别机的 server。
+   */
+  preflight(remote?: string, serial?: string): Promise<PreflightDto> {
+    return invokeCommand<PreflightDto>("hook_preflight", {
+      remote: remote ?? null,
+      serial: serial ?? null,
+    });
   },
   /** 起 frida runner 会话任务，返回 taskId；停止=task_cancel，输出=task://output */
   sessionStart(args: HookSessionStartArgs): Promise<string> {

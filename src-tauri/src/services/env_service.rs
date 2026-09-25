@@ -916,7 +916,20 @@ impl EnvService {
 // ===== 探测工具 =====
 
 /// 运行外部探测命令（capture，短超时）。Windows 防 CREATE_NO_WINDOW 闪窗（仅预留）。
-async fn run_probe(program: &str, args: &[&str]) -> Result<ProbeOutput, String> {
+/// 起一个宿主子进程取 stdout（带超时与 kill_on_drop）。
+/// `pub(crate)` 给 hook_service 复用：frida 的版本/握手探测必须用**工具配置的那个解释器**，
+/// 拿登录 shell 的 python 量出来的版本不算数（真错过一次：本机 pyenv 是 17.x，
+/// 而工具用的 venv 是 16.5.7，据此得出的"版本不匹配"结论整个是假的）。
+pub(crate) async fn run_probe(program: &str, args: &[&str]) -> Result<ProbeOutput, String> {
+    run_probe_with_timeout(program, args, PROBE_TIMEOUT).await
+}
+
+/// 同上，但允许更长的超时：frida 握手要在设备上找 server，5s 会把它掐成"超时"假失败。
+pub(crate) async fn run_probe_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<ProbeOutput, String> {
     let mut cmd = Command::new(program);
     cmd.args(args);
     #[cfg(windows)]
@@ -930,9 +943,9 @@ async fn run_probe(program: &str, args: &[&str]) -> Result<ProbeOutput, String> 
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .output();
-    let out = tokio::time::timeout(PROBE_TIMEOUT, fut)
+    let out = tokio::time::timeout(timeout, fut)
         .await
-        .map_err(|_| format!("超时（{PROBE_TIMEOUT:?}）"))?
+        .map_err(|_| format!("超时（{timeout:?}）"))?
         .map_err(|e| e.to_string())?;
     Ok(ProbeOutput {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1025,12 +1038,12 @@ async fn probe_npm_root(node_path: &str) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-struct ProbeOutput {
-    stdout: String,
+pub(crate) struct ProbeOutput {
+    pub(crate) stdout: String,
     #[allow(dead_code)]
-    stderr: String,
+    pub(crate) stderr: String,
     #[allow(dead_code)]
-    exit_code: Option<i32>,
+    pub(crate) exit_code: Option<i32>,
 }
 
 fn first_line(s: &str) -> String {

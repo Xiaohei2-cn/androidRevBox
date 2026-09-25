@@ -10,7 +10,15 @@ import { cn } from "@/lib/utils";
 import { stripAnsi } from "@/lib/ansi";
 import { AnsiText } from "@/components/ui/AnsiText";
 import type { ConsoleEvent, FridaFilter, SessionInfo, TaskState } from "./types";
-import { DEFAULT_FILTER, filterMatch, filterStorageKey, loadFilter, saveFilter } from "./types";
+import {
+  DEFAULT_FILTER,
+  filterMatch,
+  filterStorageKey,
+  loadFilter,
+  loadWrap,
+  saveFilter,
+  saveWrap,
+} from "./types";
 
 const MAX_EVENTS = 20_000;
 /** 高频 send 打爆事件流的兜底：16ms 合并一帧（§10） */
@@ -39,6 +47,7 @@ export function FridaConsole({
   const [events, setEvents] = useState<ConsoleEvent[]>([]);
   const [status, setStatus] = useState<TaskState>("running");
   const [rawMode, setRawMode] = useState(false);
+  const [wrap, setWrap] = useState<boolean>(() => loadWrap(true));
   const [filter, setFilter] = useState<FridaFilter>(() => loadFilter(filterStorageKey(session.settings)));
   const nextId = useRef(0);
   const queue = useRef<QueuedLine[]>([]);
@@ -143,6 +152,11 @@ export function FridaConsole({
         shown={visible.length}
         rawMode={rawMode}
         onRawMode={setRawMode}
+        wrap={wrap}
+        onWrap={(v) => {
+          setWrap(v);
+          saveWrap(v);
+        }}
         onCopyTaskId={() => void copyText(session.taskId)}
         onGotoTasks={gotoTasks}
         onStop={running ? () => void taskApi.cancel(session.taskId) : undefined}
@@ -151,6 +165,7 @@ export function FridaConsole({
       <EventStream
         events={visible}
         rawMode={rawMode}
+        wrap={wrap}
         origin={origin}
         running={running}
         emptyText={t(events.length === 0 ? "hook.frida.idle" : "hook.frida.noMatch")}
@@ -178,6 +193,8 @@ function SessionHeader({
   shown,
   rawMode,
   onRawMode,
+  wrap,
+  onWrap,
   onCopyTaskId,
   onGotoTasks,
   onStop,
@@ -188,6 +205,9 @@ function SessionHeader({
   shown: number;
   rawMode: boolean;
   onRawMode: (v: boolean) => void;
+  /** false = 不折行（宽 hexdump 看整行，容器出横向滚动条） */
+  wrap: boolean;
+  onWrap: (v: boolean) => void;
   onCopyTaskId: () => void;
   onGotoTasks: () => void;
   onStop?: () => void;
@@ -230,6 +250,16 @@ function SessionHeader({
       <label className="flex shrink-0 cursor-pointer items-center gap-1 text-11px text-muted-foreground">
         <input type="checkbox" checked={rawMode} onChange={(e) => onRawMode(e.target.checked)} />
         {t("hook.frida.rawMode")}
+      </label>
+      {/* 换行开关：hexdump/表格类输出折行后列就散了，读的人需要"横向滚动看整行" */}
+      <label className="flex shrink-0 cursor-pointer items-center gap-1 text-11px text-muted-foreground">
+        <input
+          type="checkbox"
+          data-testid="wrap-toggle"
+          checked={wrap}
+          onChange={(e) => onWrap(e.target.checked)}
+        />
+        {t("hook.frida.wrapMode")}
       </label>
       {onStop && (
         <Button size="sm" variant="destructive" className="h-6 shrink-0 gap-1 px-2" onClick={onStop}>
@@ -301,12 +331,15 @@ function FilterBar({ filter, onChange }: { filter: FridaFilter; onChange: (f: Fr
 export function EventStream({
   events,
   rawMode,
+  wrap,
   origin,
   running,
   emptyText,
 }: {
   events: ConsoleEvent[];
   rawMode: boolean;
+  /** 同头部「自动换行」开关 */
+  wrap: boolean;
   origin: number | null;
   running: boolean;
   emptyText: string;
@@ -409,7 +442,7 @@ export function EventStream({
                   data-testid="frida-row"
                   ref={rowVirtualizer.measureElement}
                 >
-                  <EventRow e={e} raw={rawMode} origin={origin} />
+                  <EventRow e={e} raw={rawMode} wrap={wrap} origin={origin} />
                 </div>
               );
             })}
@@ -432,7 +465,18 @@ export function EventStream({
 
 // ===== 单事件渲染（三色分轨，§5.3-M1） =====
 
-export function EventRow({ e, raw, origin }: { e: ConsoleEvent; raw: boolean; origin: number | null }) {
+export function EventRow({
+  e,
+  raw,
+  wrap,
+  origin,
+}: {
+  e: ConsoleEvent;
+  raw: boolean;
+  /** false = 整行不折行，靠横向滚动读 */
+  wrap: boolean;
+  origin: number | null;
+}) {
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
   const k = e.evt.kind;
@@ -456,11 +500,22 @@ export function EventRow({ e, raw, origin }: { e: ConsoleEvent; raw: boolean; or
   return (
     <div
       className={cn(
-        "group flex items-start gap-2 whitespace-pre-wrap [overflow-wrap:anywhere] rounded px-1",
+        "group flex items-start gap-2 rounded px-1",
+        // 折行时优先在空格处断（hexdump 的列不能被从字节中间切开），
+        // 只有超长无空格整串才硬断；不折行时整行按原样铺开，交给容器横向滚
+        wrap ? "whitespace-pre-wrap [overflow-wrap:anywhere]" : "w-max min-w-full whitespace-pre",
         raw ? "text-zinc-400" : color,
       )}
     >
-      <span className="shrink-0 select-none text-10px text-zinc-600">{time}</span>
+      <span
+        className={cn(
+          "shrink-0 select-none bg-black/80 text-10px text-zinc-600 dark:bg-black/40",
+          // 不折行时行比视口宽：时间戳与复制键钉在两侧，不然一滚就找不到
+          !wrap && "sticky left-0 z-10",
+        )}
+      >
+        {time}
+      </span>
       {raw ? (
         <span className="path-selectable min-w-0 flex-1">{e.line}</span>
       ) : (
@@ -480,7 +535,10 @@ export function EventRow({ e, raw, origin }: { e: ConsoleEvent; raw: boolean; or
       )}
       <button
         type="button"
-        className="shrink-0 text-zinc-600 opacity-0 hover:text-zinc-300 group-hover:opacity-100"
+        className={cn(
+          "shrink-0 rounded bg-black/80 text-zinc-600 opacity-0 hover:text-zinc-300 group-hover:opacity-100 dark:bg-black/40",
+          !wrap && "sticky right-0 z-10",
+        )}
         title={t("common.copy")}
         onClick={() => {
           // 复制"看见的东西"：普通模式复制去色后的正文，原始模式复制那行 NDJSON 原文。

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { I18nProvider } from "@/i18n/I18nProvider";
 import type { ConsoleEvent } from "./types";
 import { EventRow, EventStream } from "./FridaConsole";
+import { loadWrap, saveWrap, WRAP_STORAGE_KEY } from "./types";
 
 const E = "\u001b";
 
@@ -17,10 +18,10 @@ function logEvent(line: string, msg: string): ConsoleEvent {
   };
 }
 
-function renderRow(e: ConsoleEvent, raw = false) {
+function renderRow(e: ConsoleEvent, raw = false, wrap = true) {
   return render(
     <I18nProvider>
-      <EventRow e={e} raw={raw} origin={null} />
+      <EventRow e={e} raw={raw} wrap={wrap} origin={null} />
     </I18nProvider>,
   );
 }
@@ -128,6 +129,7 @@ describe("事件流虚拟列表（不能靠绝对定位压行）", () => {
           <EventStream
             events={events}
             rawMode={false}
+            wrap
             origin={null}
             running={true}
             emptyText="空"
@@ -151,6 +153,7 @@ describe("事件流虚拟列表（不能靠绝对定位压行）", () => {
           <EventStream
             events={events}
             rawMode={false}
+            wrap
             origin={null}
             running={true}
             emptyText="空"
@@ -173,6 +176,28 @@ describe("事件流虚拟列表（不能靠绝对定位压行）", () => {
     } finally {
       restore();
     }
+  });
+
+  it("关掉换行：整行铺开 + 时间戳与复制键钉在视口两侧（宽表读法）", () => {
+    localStorage.clear();
+    const { container } = renderRow(logEvent("{}", longMsg), false, false);
+    const line = container.querySelector(".group") as HTMLElement;
+    expect(line.className).toContain("whitespace-pre");
+    expect(line.className).not.toContain("whitespace-pre-wrap");
+    expect(line.className).toContain("w-max");
+    // 行比视口宽时，两端控件必须 sticky，否则一滚就找不到时间戳/复制
+    const sticky = container.querySelectorAll(".sticky");
+    expect(sticky.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("换行偏好要留下来（读宽表的人不该每次重新点）", () => {
+    localStorage.clear();
+    saveWrap(false);
+    expect(loadWrap()).toBe(false);
+    saveWrap(true);
+    expect(loadWrap()).toBe(true);
+    localStorage.removeItem(WRAP_STORAGE_KEY);
+    expect(loadWrap()).toBe(true); // 没存过 → 默认换行
   });
 
   it("长行按整词折行，不在 hexdump 的字节中间断开", () => {
