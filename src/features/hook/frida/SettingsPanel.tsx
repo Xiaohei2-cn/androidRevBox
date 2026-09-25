@@ -164,6 +164,13 @@ export function SettingsPanel({
             {t("hook.frida.fromForeground")}
           </Button>
         </div>
+        {/*
+          这条提示是必要的，不是装饰：以前 attach 留空点启动会换回一句伪装成程序故障的
+          报错，用户由此认定"这个模式不该问我要 pid"。空着是什么意思，得在框下面说清楚。
+        */}
+        <p className="mt-1 text-10px leading-snug text-muted-foreground">
+          {t("hook.frida.targetHint")}
+        </p>
       </Field>
 
       {settings.deviceSerial && <FridaServerControl serial={settings.deviceSerial} t={t} />}

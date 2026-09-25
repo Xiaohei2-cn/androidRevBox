@@ -7,8 +7,27 @@ export interface FridaSettings {
   /** 远程模式端口（默认 27042） */
   port: string;
   runMode: "attach" | "spawn";
-  /** 包名（spawn 必填）或包名/pid（attach） */
+  /**
+   * Spawn：必填，只能是包名。
+   * Attach：**留空 = 附加设备当前前台应用**（`frida -UF` 的 -F），填了才按包名/pid 指定。
+   */
   target: string;
+}
+
+/**
+ * 会话的可读名字（任务中心与 C 区标题共用）。
+ *
+ * attach + 空目标是**合法输入**（= 附加当前前台），但直接拼出来会变成
+ * `attach  · hook.js` 这种看着像出错的空位——所以这里补上"自动前台"。
+ * 纯函数抽出来是为了能单独钉住：这条规则以前只存在于模板字符串里，没人测过。
+ */
+export function fridaSessionLabel(
+  mode: FridaSettings["runMode"],
+  target: string,
+  script: string,
+): string {
+  const who = target.trim() || "自动前台";
+  return `${mode} ${who} · ${script}`;
 }
 
 /** 一个已启动会话（= TaskService 任务，kind="frida"） */

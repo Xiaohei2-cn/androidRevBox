@@ -13,7 +13,9 @@ export default {
   "hook.frida.port": "Порт",
   "hook.frida.runMode": "Режим",
   "hook.frida.target": "Целевое приложение",
-  "hook.frida.targetPh": "пакет или pid",
+  "hook.frida.targetHint":
+    "Пустой Attach подключается к текущему фронтальному приложению (это -F у frida -UF). Пакет или pid указывайте, только если нужен конкретный процесс. Spawn всегда требует пакет.",
+  "hook.frida.targetPh": "пусто = фронтальное приложение; либо пакет / pid",
   "hook.frida.fromForeground": "Из foreground",
   "hook.frida.noForeground": "Не удалось получить пакет foreground",
   "hook.frida.launch": "Запуск",

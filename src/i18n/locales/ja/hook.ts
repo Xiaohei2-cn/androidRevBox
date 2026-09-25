@@ -13,7 +13,9 @@ export default {
   "hook.frida.port": "ポート",
   "hook.frida.runMode": "モード",
   "hook.frida.target": "対象アプリ",
-  "hook.frida.targetPh": "パッケージ名または pid",
+  "hook.frida.targetHint":
+    "Attach が空欄なら最前面アプリにアタッチします（frida -UF の -F と同じ）。特定のプロセスに固定したい時だけパッケージ名か pid を入れてください。Spawn はパッケージ名が必須です。",
+  "hook.frida.targetPh": "空欄＝最前面アプリ、またはパッケージ名/pid",
   "hook.frida.fromForeground": "前面から",
   "hook.frida.noForeground": "前面パッケージを取得できません",
   "hook.frida.launch": "起動",

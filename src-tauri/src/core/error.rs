@@ -41,6 +41,14 @@ pub enum CoreError {
 
     #[error("Agent 传输断开: {0}")]
     AgentTransportLost(String),
+
+    /// 用户的输入还没补齐：没选设备、目标没填、端点写错、脚本不在工作目录里……
+    ///
+    /// 立这个变体的理由和 `NotFound`/`Conflict` 一模一样：这些话以前都塞在「内部错误」里，
+    /// 于是 `内部错误: 目标应用（包名或 pid）不能为空` 这种提示会把人引去翻日志、怀疑程序
+    /// 坏了，而真正该做的只是把那个空着的框填上。**故障和"你还没填"必须分得开。**
+    #[error("还差一步：{0}")]
+    InvalidInput(String),
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;
@@ -58,6 +66,7 @@ impl CoreError {
             CoreError::AgentUnavailable(_) => "AGENT_UNAVAILABLE",
             CoreError::AgentIncompatible(_) => "AGENT_INCOMPATIBLE",
             CoreError::AgentTransportLost(_) => "AGENT_TRANSPORT_LOST",
+            CoreError::InvalidInput(_) => "INVALID_INPUT",
         }
     }
 }
@@ -92,6 +101,16 @@ mod tests {
         let json = serde_json::to_value(&err).expect("serialize");
         assert_eq!(json["code"], "INTERNAL");
         assert_eq!(json["message"], "内部错误: 测试");
+    }
+
+    #[test]
+    fn missing_input_is_not_reported_as_an_internal_failure() {
+        // 用户在界面上少填一项，看到的必须是"还差一步"，不能是"内部错误"——
+        // 后者会让人以为程序坏了去翻日志（这句提示真机出现过：目标应用为空）
+        let err = CoreError::InvalidInput("目标应用要填包名或 pid".into());
+        assert_eq!(err.code(), "INVALID_INPUT");
+        assert_eq!(err.to_string(), "还差一步：目标应用要填包名或 pid");
+        assert!(!err.to_string().contains("内部错误"));
     }
 
     #[test]

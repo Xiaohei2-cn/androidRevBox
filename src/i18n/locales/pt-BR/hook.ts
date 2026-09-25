@@ -13,7 +13,9 @@ export default {
   "hook.frida.port": "Porta",
   "hook.frida.runMode": "Modo",
   "hook.frida.target": "App alvo",
-  "hook.frida.targetPh": "pacote ou pid",
+  "hook.frida.targetHint":
+    "Attach vazio conecta ao app em primeiro plano (o -F de frida -UF). Preencha pacote ou pid só quando quiser um processo específico. Spawn sempre exige o pacote.",
+  "hook.frida.targetPh": "vazio = app em primeiro plano; ou pacote / pid",
   "hook.frida.fromForeground": "Primeiro plano",
   "hook.frida.noForeground": "Pacote em primeiro plano não encontrado",
   "hook.frida.launch": "Iniciar",

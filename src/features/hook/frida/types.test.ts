@@ -1,14 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { FridaEvent } from "@/api/hook";
-import {
-  DEFAULT_FILTER,
-  filterMatch,
-  filterStorageKey,
-  loadFilter,
-  saveFilter,
-  remoteSpec,
-  type ConsoleEvent,
-} from "./types";
+import { DEFAULT_FILTER, filterMatch, filterStorageKey, loadFilter, saveFilter, remoteSpec, type ConsoleEvent, fridaSessionLabel } from "./types";
 
 function evt(over: Partial<ConsoleEvent>): ConsoleEvent {
   const e: Partial<ConsoleEvent> = { id: 1, ts: 0, stream: "stdout", line: "", ...over };
@@ -65,5 +57,19 @@ describe("remoteSpec", () => {
     expect(remoteSpec({ connMode: "usb", port: "99" })).toBeUndefined();
     expect(remoteSpec({ connMode: "remote", port: "" })).toBe("127.0.0.1:27042");
     expect(remoteSpec({ connMode: "remote", port: "27043" })).toBe("127.0.0.1:27043");
+  });
+});
+
+describe("fridaSessionLabel（attach 空目标 = 自动前台）", () => {
+  it("attach 留空不报空、也不留空位：写成「自动前台」", () => {
+    expect(fridaSessionLabel("attach", "", "01hook_tcp.js")).toBe(
+      "attach 自动前台 · 01hook_tcp.js",
+    );
+    expect(fridaSessionLabel("attach", "   ", "a.js")).toBe("attach 自动前台 · a.js");
+  });
+
+  it("填了目标就用目标；spawn 的包名原样带出", () => {
+    expect(fridaSessionLabel("attach", " com.x.y ", "a.js")).toBe("attach com.x.y · a.js");
+    expect(fridaSessionLabel("spawn", "com.x.y", "a.js")).toBe("spawn com.x.y · a.js");
   });
 });

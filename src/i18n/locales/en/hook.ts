@@ -13,7 +13,9 @@ export default {
   "hook.frida.port": "Port",
   "hook.frida.runMode": "Mode",
   "hook.frida.target": "Target app",
-  "hook.frida.targetPh": "package or pid",
+  "hook.frida.targetHint":
+    "Leaving Attach empty hooks the current frontmost app (same as -F in frida -UF). Fill a package or pid only when you want a specific process. Spawn always needs a package.",
+  "hook.frida.targetPh": "empty = frontmost app; or a package / pid",
   "hook.frida.fromForeground": "Foreground",
   "hook.frida.noForeground": "Foreground package not found",
   "hook.frida.launch": "Start",

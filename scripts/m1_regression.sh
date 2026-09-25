@@ -64,6 +64,16 @@ step "adb shell 调用点已登记" \
 step "包写操作不产任务卡" \
   cargo test -p app-reverse-tools --test package_write_route -- --quiet
 
+# frida_runner 是宿主与 frida 之间唯一的翻译层，cargo 侧的测试碰不到它；
+# 没有 python3 的机器上显式跳过（跳过要看得见，不能混在 ✓ 里当成跑过了）
+echo
+if command -v python3 >/dev/null 2>&1; then
+  step "frida runner 目标解析与行协议" python3 scripts/test_frida_runner.py
+else
+  echo "=== frida runner 目标解析与行协议"
+  echo "  ⊘ 跳过：本机没有 python3（不是通过）"
+fi
+
 if [ "$DEVICE" -eq 1 ]; then
   if [ -z "$AR_SERIAL" ]; then
     echo "  ✗ --device 需要 AR_SERIAL=<serial>（adb devices 里那个）"

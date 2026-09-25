@@ -13,7 +13,9 @@ export default {
   "hook.frida.port": "端口",
   "hook.frida.runMode": "模式",
   "hook.frida.target": "目标应用",
-  "hook.frida.targetPh": "包名或 pid",
+  "hook.frida.targetHint":
+    "Attach 留空就是附加当前前台应用（等价 frida -UF 的 -F）；想固定接管某只才填包名或 pid。Spawn 必须填包名。",
+  "hook.frida.targetPh": "留空＝附加当前前台；也可填包名或 pid",
   "hook.frida.fromForeground": "取前台",
   "hook.frida.noForeground": "未获取到前台包名",
   "hook.frida.launch": "启动",

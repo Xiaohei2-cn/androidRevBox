@@ -19,7 +19,11 @@
 
 用法（宿主 adapter/frida::build_runner_args 的产出形态）：
   python -u frida_runner.py --usb <serial> | --remote 127.0.0.1:27042
-                            (--spawn|--attach) <pkg|pid> --script /abs/path/x.js
+                            (--frontmost | --attach <pkg|pid> | --spawn <pkg>)
+                            --script /abs/path/x.js
+
+三种目标里 `--frontmost` 是默认想要的那一种：它等价 frida CLI 的 `-F`，**前台是哪只由设备
+回答**，调用方既不需要填包名也不需要挖 pid。attach 留空被当成错误是早期设计的错。
 """
 
 import argparse
@@ -36,6 +40,14 @@ except ImportError:  # 环境缺 frida：协议行 + 非零退出，前端给 er
     sys.exit(3)
 
 _out_lock = threading.Lock()
+
+
+class RunnerError(Exception):
+    """面向用户的失败：只说人话。
+
+    与裸 exception 的区别在 main 里——裸的要带上 `RuntimeError: ` 这种类名前缀，
+    用户在控制台上看到的是 Python 的味道而不是"我该怎么改"。
+    """
 
 
 def emit(obj):
@@ -75,7 +87,23 @@ class Runner:
     def start(self):
         device = self.open_device()
         target = self.args.target
-        if self.args.spawn:
+        if self.args.frontmost:
+            # frida -F 的等价实现：先问设备"当前前台是哪只"，再按 pid 附加。
+            # 按 pid 而不是按包名，是因为一只前台 App 常常还带着 :remote/:push 等同名
+            # 子进程，包名 attach 会撞上歧义或找不到；pid 才是那一只。
+            app = device.get_frontmost_application()
+            if app is None:
+                raise RunnerError(
+                    "设备上没有前台应用：先解锁屏幕并打开要 hook 的 App，"
+                    "或改用 --attach <包名|pid> 指定目标"
+                )
+            pid = int(app.pid)
+            # 带回落：identifier 是包名（Android 上最有用），个别实现只给 name
+            target = str(getattr(app, "identifier", "") or getattr(app, "name", "") or pid)
+            emit_log("info", "自动附加当前前台：%s (pid %d)" % (target, pid))
+            session = device.attach(pid)
+            self.args.target = target  # 下面的 ready 行用它，界面上能看见究竟附上了谁
+        elif self.args.spawn:
             pid = device.spawn([target])
             session = device.attach(pid)
         else:
@@ -170,13 +198,20 @@ def parse_args(argv):
     conn.add_argument("--remote", help="frida-server host:port（如 127.0.0.1:27042）")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--spawn", metavar="PKG", help="冷启动注入（load 后自动 resume）")
-    mode.add_argument("--attach", metavar="PKG_OR_PID", help="附加已运行进程")
+    mode.add_argument("--attach", metavar="PKG_OR_PID", help="附加指定进程（包名或 pid）")
+    # 与 frida CLI 的 -F/--attach-frontmost 同名同义：目标由设备回答
+    mode.add_argument("--frontmost", action="store_true",
+                      help="附加设备当前前台应用（等价 frida -F；不需要目标参数）")
     parser.add_argument("--script", required=True, help="JS 脚本绝对路径")
     args = parser.parse_args(argv)
     args.spawn_target = args.spawn
     args.attach_target = args.attach
     args.spawn = bool(args.spawn)
-    args.target = args.spawn_target or args.attach_target
+    args.frontmost = bool(args.frontmost)
+    args.target = args.spawn_target or args.attach_target or ""
+    if not args.frontmost and not args.target.strip():
+        # 走到这儿说明调用方既没给目标也没说"要前台"：这是参数拼装 bug，不是用户输入问题
+        parser.error("--attach/--spawn 需要目标；想附加前台请用 --frontmost")
     return args
 
 
@@ -193,6 +228,10 @@ def main(argv=None):
 
     try:
         runner.start()
+    except RunnerError as e:
+        emit_error(str(e))
+        emit({"t": "exit", "code": 1})
+        return 1
     except frida.ProcessNotFoundError as e:
         emit_error("目标进程不存在或未运行: %s" % e)
         emit({"t": "exit", "code": 1})

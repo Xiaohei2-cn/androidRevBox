@@ -32,7 +32,11 @@ export interface HookSessionStartArgs {
   /** 远程模式：host:port；USB null */
   remote: string | null;
   spawn: boolean;
-  /** 包名（spawn）/ 包名或 pid（attach） */
+  /**
+   * Spawn：包名（必填）。
+   * Attach：包名或 pid；**空串是合法值，含义是"附加当前前台应用"**（frida -F）。
+   * 这个翻译只在宿主 `frida::resolve_target` 一处做。
+   */
   target: string;
   /** 工作目录下的 .js 文件名 */
   script: string;

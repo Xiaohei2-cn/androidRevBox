@@ -38,8 +38,8 @@ pub fn is_safe_js_script_name(name: &str) -> bool {
 pub fn parse_remote_endpoint(spec: &str) -> CoreResult<(String, u16)> {
     let spec = spec.trim();
     let Some((host, port)) = spec.rsplit_once(':') else {
-        return Err(CoreError::Internal(format!(
-            "远程端点需为 host:port 形式: {spec}"
+        return Err(CoreError::InvalidInput(format!(
+            "远程端点需为 host:port 形式（当前：{spec}）"
         )));
     };
     let host = host.trim();
@@ -48,14 +48,16 @@ pub fn parse_remote_endpoint(spec: &str) -> CoreResult<(String, u16)> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
     {
-        return Err(CoreError::Internal(format!("远程端点 host 非法: {host}")));
+        return Err(CoreError::InvalidInput(format!(
+            "远程端点 host 非法: {host}"
+        )));
     }
     let port: u16 = port
         .trim()
         .parse()
-        .map_err(|_| CoreError::Internal(format!("远程端点端口非法: {spec}")))?;
+        .map_err(|_| CoreError::InvalidInput(format!("远程端点端口非法: {spec}")))?;
     if port == 0 {
-        return Err(CoreError::Internal("远程端点端口不能为 0".into()));
+        return Err(CoreError::InvalidInput("远程端点端口不能为 0".into()));
     }
     Ok((host.to_string(), port))
 }
@@ -68,9 +70,39 @@ pub fn validate_attach_target(target: &str) -> CoreResult<()> {
     if super::adb::is_safe_pkg_name(target) {
         return Ok(());
     }
-    Err(CoreError::Internal(format!(
-        "目标需为包名或纯数字 pid: {target}"
+    Err(CoreError::InvalidInput(format!(
+        "目标要填包名或纯数字 pid（当前：{target}）"
     )))
+}
+
+/// frida 的注入目标（对应 CLI 的三种写法，分开表达、不靠"空字符串"表达意思）。
+///
+/// `Frontmost` 就是 `frida -UF` 里那个 `-F`：**附加设备当前前台应用，调用方不需要知道
+/// 包名，也不用去挖 pid**。以前 attach 只有"必须给个目标"一种形状，于是留空点启动
+/// 就换来一句伪装成程序故障的报错——那是设计错，不是用户错。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FridaTarget {
+    /// 设备当前前台应用（frida `-F`）
+    Frontmost,
+    /// 指定进程：包名或纯数字 pid
+    Attach(String),
+    /// 冷启动注入指定包名（frida `-f`）
+    Spawn(String),
+}
+
+/// 界面参数 → 注入目标。**attach 且目标留空 = 附加前台**（用户要的默认语义）。
+///
+/// 放在这一层而不是前端：前端有两条入口（行内「启动」与双击），少挡一条就还是会把空目标
+/// 发下来；口径只留一处，才不会各写各的。
+pub fn resolve_target(spawn: bool, target: &str) -> FridaTarget {
+    let trimmed = target.trim();
+    if spawn {
+        return FridaTarget::Spawn(trimmed.to_string());
+    }
+    if trimmed.is_empty() {
+        return FridaTarget::Frontmost;
+    }
+    FridaTarget::Attach(trimmed.to_string())
 }
 
 /// 组装 frida_runner.py 的参数数组（不含可执行文件）。
@@ -80,17 +112,18 @@ pub fn build_runner_args(
     runner_path: &str,
     usb_serial: Option<&str>,
     remote_endpoint: Option<&str>,
-    spawn: bool,
-    target: &str,
+    target: &FridaTarget,
     script_abs_path: &str,
 ) -> CoreResult<Vec<String>> {
     if usb_serial.is_some() && remote_endpoint.is_some() {
-        return Err(CoreError::Internal("USB 与远程模式互斥，只能选其一".into()));
+        return Err(CoreError::InvalidInput(
+            "USB 与远程模式互斥，只能选其一".into(),
+        ));
     }
     let mut args: Vec<String> = vec!["-u".to_string(), runner_path.to_string()];
     if let Some(serial) = usb_serial {
         if serial.trim().is_empty() {
-            return Err(CoreError::Internal("USB 模式缺少设备 serial".into()));
+            return Err(CoreError::InvalidInput("USB 模式缺少设备 serial".into()));
         }
         args.push("--usb".to_string());
         args.push(serial.trim().to_string());
@@ -100,25 +133,37 @@ pub fn build_runner_args(
         args.push("--remote".to_string());
         args.push(format!("{host}:{port}"));
     }
-    if target.trim().is_empty() {
-        return Err(CoreError::Internal("目标应用（包名或 pid）不能为空".into()));
-    }
-    if spawn {
-        // spawn 目标必须是包名：纯数字串会被误当 pid（is_safe_pkg_name 允许数字段）
-        let is_pid = !target.trim().is_empty() && target.trim().chars().all(|c| c.is_ascii_digit());
-        if is_pid || !super::adb::is_safe_pkg_name(target.trim()) {
-            return Err(CoreError::Internal(format!(
-                "Spawn 模式目标必须是包名: {target}"
-            )));
+    match target {
+        // 不带任何目标参数：前台是谁由设备回答（见 frida_runner.py 的 --frontmost）
+        FridaTarget::Frontmost => args.push("--frontmost".to_string()),
+        FridaTarget::Attach(name) => {
+            let name = name.trim();
+            if name.is_empty() {
+                // 走到这里说明调用方绕过了 resolve_target
+                return Err(CoreError::InvalidInput(
+                    "附加指定进程要填包名或 pid；想附加当前前台请把目标留空（等价 frida -F）"
+                        .into(),
+                ));
+            }
+            validate_attach_target(name)?;
+            args.push("--attach".to_string());
+            args.push(name.to_string());
         }
-        args.push("--spawn".to_string());
-    } else {
-        validate_attach_target(target.trim())?;
-        args.push("--attach".to_string());
+        FridaTarget::Spawn(pkg) => {
+            let pkg = pkg.trim();
+            // spawn 目标必须是包名：纯数字串会被误当 pid（is_safe_pkg_name 允许数字段）
+            let is_pid = !pkg.is_empty() && pkg.chars().all(|c| c.is_ascii_digit());
+            if pkg.is_empty() || is_pid || !super::adb::is_safe_pkg_name(pkg) {
+                return Err(CoreError::InvalidInput(format!(
+                    "Spawn 模式目标必须是包名（当前：{pkg}）"
+                )));
+            }
+            args.push("--spawn".to_string());
+            args.push(pkg.to_string());
+        }
     }
-    args.push(target.trim().to_string());
     if script_abs_path.trim().is_empty() {
-        return Err(CoreError::Internal("脚本路径不能为空".into()));
+        return Err(CoreError::InvalidInput("脚本路径不能为空".into()));
     }
     args.push("--script".to_string());
     args.push(script_abs_path.to_string());
@@ -171,13 +216,32 @@ mod tests {
     }
 
     #[test]
+    fn attach_with_no_target_means_frontmost_not_an_error() {
+        // 用户口径：attach 就该自动包名（frida -UF 的 -F），留空不是错误
+        assert_eq!(resolve_target(false, ""), FridaTarget::Frontmost);
+        assert_eq!(resolve_target(false, "   "), FridaTarget::Frontmost);
+        assert_eq!(
+            resolve_target(false, "com.x.y"),
+            FridaTarget::Attach("com.x.y".into())
+        );
+        assert_eq!(
+            resolve_target(true, "com.x.y"),
+            FridaTarget::Spawn("com.x.y".into())
+        );
+        // spawn 时留空仍然是错（没有包名没法冷启动），但报错得说人话
+        match resolve_target(true, "") {
+            FridaTarget::Spawn(pkg) => assert!(pkg.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn runner_args_shape_usb_spawn() {
         let args = build_runner_args(
             "/r/frida_runner.py",
             Some("emulator-5554"),
             None,
-            true,
-            "com.x.y",
+            &FridaTarget::Spawn("com.x.y".into()),
             "/w/hook.js",
         )
         .unwrap();
@@ -202,8 +266,7 @@ mod tests {
             "/r/frida_runner.py",
             None,
             Some("127.0.0.1:27042"),
-            false,
-            "1234",
+            &FridaTarget::Attach("1234".into()),
             "/w/hook.js",
         )
         .unwrap();
@@ -218,26 +281,90 @@ mod tests {
     }
 
     #[test]
-    fn runner_args_rejects_bad_combos() {
-        // USB 与远程互斥
-        assert!(
+    fn runner_args_frontmost_carries_no_target_at_all() {
+        // 关键形状：--frontmost 后面**不能**跟着一个目标串，否则 runner 的互斥组会打架
+        let args = build_runner_args(
+            "/r.py",
+            Some("PIXEL-1"),
+            None,
+            &FridaTarget::Frontmost,
+            "/w/01hook_tcp.js",
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-u",
+                "/r.py",
+                "--usb",
+                "PIXEL-1",
+                "--frontmost",
+                "--script",
+                "/w/01hook_tcp.js",
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_input_is_not_an_internal_error() {
+        // 这几条都是"用户还没填/填错"，历史上全部顶着「内部错误」出现（真机反馈过）
+        let cases = vec![
             build_runner_args(
                 "/r.py",
                 Some("s"),
                 Some("127.0.0.1:1"),
-                true,
-                "com.x",
-                "/w/a.js"
-            )
-            .is_err()
-        );
-        // spawn 必须包名
-        assert!(
-            build_runner_args("/r.py", Some("s"), None, true, "1234", "/w/a.js").is_err(),
-            "pid 不能 spawn"
-        );
-        // 目标/脚本为空
-        assert!(build_runner_args("/r.py", Some("s"), None, true, "", "/w/a.js").is_err());
-        assert!(build_runner_args("/r.py", Some("s"), None, true, "com.x", "").is_err());
+                &FridaTarget::Frontmost,
+                "/w/a.js",
+            ),
+            build_runner_args("/r.py", Some(""), None, &FridaTarget::Frontmost, "/w/a.js"),
+            build_runner_args(
+                "/r.py",
+                Some("s"),
+                None,
+                &FridaTarget::Spawn("1234".into()),
+                "/w/a.js",
+            ),
+            build_runner_args(
+                "/r.py",
+                Some("s"),
+                None,
+                &FridaTarget::Spawn("".into()),
+                "/w/a.js",
+            ),
+            build_runner_args(
+                "/r.py",
+                Some("s"),
+                None,
+                &FridaTarget::Attach("a b".into()),
+                "/w/a.js",
+            ),
+            build_runner_args("/r.py", Some("s"), None, &FridaTarget::Frontmost, ""),
+            // 端点写错也属同一类：输入问题不是程序故障
+            parse_remote_endpoint("127.0.0.1").map(|_| Vec::<String>::new()),
+        ];
+        for case in cases {
+            let error = case.expect_err("非法输入必须被拒");
+            assert_eq!(
+                error.code(),
+                "INVALID_INPUT",
+                "输入问题不能伪装成程序故障: {error}"
+            );
+            assert!(!error.to_string().contains("内部错误"), "{error}");
+        }
+    }
+
+    #[test]
+    fn empty_attach_string_is_refused_instead_of_silently_becoming_frontmost() {
+        // Attach("") 只能来自绕过 resolve_target 的调用方：这里明确拒，
+        // 免得"附加前台"这种事在链路中间被悄悄推断出来。
+        let error = build_runner_args(
+            "/r.py",
+            Some("s"),
+            None,
+            &FridaTarget::Attach("  ".into()),
+            "/w/a.js",
+        )
+        .expect_err("空目标不该被当成任意一种 attach");
+        assert_eq!(error.code(), "INVALID_INPUT");
     }
 }

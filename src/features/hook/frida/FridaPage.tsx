@@ -5,7 +5,7 @@ import { useI18n } from "@/i18n";
 import { SettingsPanel } from "./SettingsPanel";
 import { ScriptList } from "./ScriptList";
 import { FridaConsole } from "./FridaConsole";
-import type { FridaSettings, SessionInfo } from "./types";
+import { fridaSessionLabel, type FridaSettings, type SessionInfo } from "./types";
 import { remoteSpec } from "./types";
 
 const DEFAULT_SETTINGS: FridaSettings = {
@@ -41,13 +41,15 @@ export function FridaPage() {
           serial: settings.connMode === "usb" ? settings.deviceSerial : null,
           remote: remoteSpec(settings) ?? null,
           spawn: settings.runMode === "spawn",
+          // attach 时留空是有意义的：等价 `frida -UF` 的 -F，附加设备当前前台应用。
+          // 语义判定在宿主侧 resolve_target 一处做，这里不重复推断也不报错。
           target: settings.target.trim(),
           script: script.name,
         });
         const mode = settings.runMode;
         setSession({
           taskId,
-          name: `${mode} ${settings.target.trim()} · ${script.name}`,
+          name: fridaSessionLabel(mode, settings.target, script.name),
           startedAt: Date.now(),
           script: script.name,
           settings: { ...settings },

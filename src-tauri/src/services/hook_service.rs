@@ -214,18 +214,20 @@ impl HookService {
         }
         let workdir = self.workdir();
         if workdir.is_empty() {
-            return Err(CoreError::Internal("未选择脚本工作目录".into()));
+            return Err(CoreError::InvalidInput(
+                "还没选择脚本工作目录（设置 → Hook → 工作目录）".into(),
+            ));
         }
         let workdir_abs = Path::new(&workdir)
             .canonicalize()
-            .map_err(|_| CoreError::Internal(format!("工作目录不可访问: {workdir}")))?;
+            .map_err(|_| CoreError::InvalidInput(format!("工作目录不可访问: {workdir}")))?;
         let script_abs = workdir_abs.join(script_name);
-        let script_abs = script_abs
-            .canonicalize()
-            .map_err(|_| CoreError::Internal(format!("脚本不存在: {}", script_abs.display())))?;
+        let script_abs = script_abs.canonicalize().map_err(|_| {
+            CoreError::InvalidInput(format!("脚本不存在: {}", script_abs.display()))
+        })?;
         // canonicalize 解析符号链接后必须仍落在工作目录一层内（符号链接逃逸防线）
         if script_abs.parent() != Some(workdir_abs.as_path()) || !script_abs.is_file() {
-            return Err(CoreError::Internal(
+            return Err(CoreError::InvalidInput(
                 "脚本必须是所选工作目录下的普通 .js 文件（符号链接已拒绝）".into(),
             ));
         }
@@ -241,7 +243,9 @@ impl HookService {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         if usb.is_none() && remote.is_none() {
-            return Err(CoreError::Internal("必须选择设备（USB）或远程端点".into()));
+            return Err(CoreError::InvalidInput(
+                "还没选择设备或远程端点：USB 模式需要先在列表里选一台设备".into(),
+            ));
         }
         if let Some(ep) = remote {
             frida::parse_remote_endpoint(ep)
@@ -249,14 +253,10 @@ impl HookService {
         }
         let script_str = script_abs.to_string_lossy().into_owned();
         let runner_str = runner.to_string_lossy().into_owned();
-        let spec_args = frida::build_runner_args(
-            &runner_str,
-            usb,
-            remote,
-            args.spawn,
-            args.target.trim(),
-            &script_str,
-        )?;
+        // attach + 目标留空 = 附加设备当前前台（frida -UF 的 -F）。这里不拦也不报错：
+        // 前台是谁由 runner 在设备上问 frida-server，ready 行会把解析出的包名带回来。
+        let target = frida::resolve_target(args.spawn, &args.target);
+        let spec_args = frida::build_runner_args(&runner_str, usb, remote, &target, &script_str)?;
 
         let spec = CommandSpec {
             // frida 会话不留宿主临时文件，回收点恒为空
@@ -269,8 +269,14 @@ impl HookService {
             hide_window: true, // Windows 防黑窗（§6.2）
         };
         // 可读会话名（§5.4）：spawn com.x · hook.js / attach 1234 · hook.js
-        let mode = if args.spawn { "spawn" } else { "attach" };
-        let name = format!("frida {mode} {} · {script_name}", args.target.trim());
+        // 可读会话名（§5.4）。前台模式在启动那一刻还不知道是谁，写 frontmost 而不是
+        // 留个空位——任务列表里一个空目标看起来像出了错。
+        let (mode, who) = match &target {
+            frida::FridaTarget::Frontmost => ("attach", "frontmost".to_string()),
+            frida::FridaTarget::Attach(t) => ("attach", t.clone()),
+            frida::FridaTarget::Spawn(t) => ("spawn", t.clone()),
+        };
+        let name = format!("frida {mode} {who} · {script_name}");
         let task_id = self.tasks.start_with_kind_named("frida", &name, spec)?;
         tracing::info!(
             task_id = %task_id,
