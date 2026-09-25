@@ -137,12 +137,11 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
         Category::LegacyFallback,
         Some("AR12.1 after AR9.1"),
     ),
-    (
-        "src/services/device_service.rs",
-        "hosted_kill_legacy",
-        Category::LegacyFallback,
-        Some("AR12.1 after AR7.2"),
-    ),
+    // 原来这里登记的是 device_service::hosted_kill_legacy —— 一条
+    // `adb shell su -c "kill -9 <pid>"` 的盲杀（只按数字、不核身份）。root 终止已改走
+    // Agent 的固定提权脚本（先比 comm 再发信号），那个调用点整个被消灭，所以条目一起删：
+    // 审计要求"登记与实现不能分叉"，少一个调用点也要在这里留一句话，说明它是被删掉的、
+    // 不是漏登记的。AR12 的候选清单因此少一项。
     (
         "src/services/device_service.rs",
         "hosted_ports_legacy",
@@ -193,7 +192,10 @@ const EXPECTED_SITES_PER_CATEGORY: &[(Category, usize)] = &[
     (Category::Bootstrap, 11),
     (Category::Transport, 5),
     (Category::RawTool, 2),
-    (Category::LegacyFallback, 9),
+    // 8（原 9）：AR7.6 把 root 终止从 `adb shell su -c "kill -9 <pid>"` 改成走 Agent 的
+    // 固定提权脚本（先核身份再发信号），桌面侧那个 shell 调用点因此消失 —— AR12 少一项可删的
+    // Legacy。这里跟着下调，是为了让"少一个回退点"也变成会被机器看见的事实，而不是悄悄发生。
+    (Category::LegacyFallback, 8),
     (Category::RootBranch, 4),
 ];
 

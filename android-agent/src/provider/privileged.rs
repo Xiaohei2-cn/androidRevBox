@@ -71,6 +71,50 @@ pub(crate) fn backup_script(target: &str, backup: &str) -> String {
     format!("cp -f {target} {backup}; chmod 644 {backup}; sync; echo BACKED_UP")
 }
 
+/// 终止指定进程的特权脚本：**先核身份，再发信号**。
+///
+/// 为什么需要它：`process.kill` 的普通路径以 shell 发信号，杀不动 root 进程；而桌面侧原来的
+/// 做法是 `su -c "kill -9 <pid>"` —— 只按一个数字杀。数字会复用：界面读到 pid 与用户点下
+/// 「停止」之间哪怕隔几秒，那个 pid 也可能已经换了主人，于是"停掉 auth-server"变成
+/// 随机杀掉某个无关进程。这条脚本把 AR6.3/AR7.3 已经定下的规矩搬到提权路径上：
+/// 先比 `/proc/<pid>/comm`（同样截到 15 字符），对不上就一个信号都不发。
+///
+/// 参数：`pid` 必须是 >0 的数字，`comm` 只允许 `[A-Za-z0-9._-]`（长度 ≤15）；
+/// 两者都由调用方校验后传入，脚本里不做任何字符串拼接式的"看起来安全"。
+pub(crate) fn kill_verified_script(pid: u32, comm: &str) -> String {
+    format!(
+        "if [ ! -d /proc/{pid} ]; then echo KILL_GONE; echo {KILL_SENTINEL}; exit 0; fi; \
+         C=$(cut -d \" \" -f2 /proc/{pid}/stat 2>/dev/null | tr -d \"()\"); \
+         if [ \"$C\" != \"{comm}\" ]; then echo \"KILL_MISMATCH $C\"; echo {KILL_SENTINEL}; exit 0; fi; \
+         kill {pid} 2>/dev/null; attempt=0; \
+         while kill -0 {pid} 2>/dev/null && [ \"$attempt\" -lt 20 ]; do sleep 0.05; attempt=$((attempt + 1)); done; \
+         if kill -0 {pid} 2>/dev/null; then kill -9 {pid} 2>/dev/null; fi; \
+         attempt=0; while kill -0 {pid} 2>/dev/null && [ \"$attempt\" -lt 20 ]; do sleep 0.05; attempt=$((attempt + 1)); done; \
+         if kill -0 {pid} 2>/dev/null; then echo STILL_ALIVE; else echo KILLED; fi; echo {KILL_SENTINEL}"
+    )
+}
+
+/// `kill_verified_script` 的结束哨兵（三条出口都带它，见函数注释）。
+pub(crate) const KILL_SENTINEL: &str = "ARTKILL_DONE";
+
+/// 身份校验用的进程名白名单：只可能是 comm 的形状（截到 15 字符），
+/// 任何 shell 元字符、空格、斜杠都在这里被挡掉。
+pub(crate) fn validate_comm(comm: &str) -> Result<(), AgentError> {
+    if comm.is_empty() || comm.len() > 15 {
+        return Err(reject("comm_length", "进程名长度为 1..=15 字节"));
+    }
+    if !comm
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        return Err(reject(
+            "comm_charset",
+            format!("进程名含白名单外的字符: {comm:?}"),
+        ));
+    }
+    Ok(())
+}
+
 /// 读 `/proc/<pid>/<file>` 详情的脚本模板（AR10.6 的按需读取）。
 ///
 /// 参数**没有一个是路径**：`pid` 只能是数字、`file` 只能来自协议枚举、`max_lines` 会被
@@ -281,6 +325,39 @@ pub(crate) async fn run_privileged(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_script_verifies_identity_before_signalling() {
+        // 顺序很重要：先比 comm，再 kill —— 反过来说"停掉 auth-server"就可能杀到复用了
+        // 同一个 pid 的无关进程
+        let script = kill_verified_script(9727, "auth-server");
+        let stat_at = script.find("/proc/9727/stat").expect("要读 stat");
+        let kill_at = script.find("kill 9727").expect("要发信号");
+        assert!(stat_at < kill_at, "身份核验必须在发信号之前: {script}");
+        assert!(script.contains("KILL_MISMATCH"), "{script}");
+        assert!(script.contains(KILL_SENTINEL));
+        // 三条出口都要收尾：缺哨兵时 run_privileged 会把"名字对不上"报成 Internal
+        assert_eq!(script.matches(KILL_SENTINEL).count(), 3, "{script}");
+        // 参数不进脚本：能破坏 su 包裹或引入分隔符的名字直接拒
+        assert!(validate_comm("auth-server").is_ok());
+        for bad in [
+            "",
+            "a b",
+            "$(id)",
+            "x;rm -rf /",
+            "a'b",
+            "/sbin/x",
+            "x|y",
+            "名称",
+        ] {
+            assert!(validate_comm(bad).is_err(), "{bad} 不该被接受");
+        }
+        assert!(validate_comm("0123456789abcde").is_ok(), "15 字符是上限");
+        assert!(
+            validate_comm("0123456789abcdef").is_err(),
+            "超过 15 字符要拒"
+        );
+    }
 
     #[test]
     fn privileged_paths_reject_anything_that_could_break_the_su_wrapper() {

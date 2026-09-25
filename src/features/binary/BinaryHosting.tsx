@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Play, RefreshCw, ShieldCheck, Square, Trash2 } from "lucide-react";
+import { CircleStop, Play, RefreshCw, ShieldCheck, Square, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AdbNotReadyState } from "@/components/ui/adb-gate";
 import { deviceApi, type HostedBinary, type HostedRunRecord, type ListenPort } from "@/api/device";
@@ -58,11 +58,10 @@ export function BinaryHosting() {
   const [deviceSerial, setDeviceSerial] = useState<string | null>(null);
   const [hosted, setHosted] = useState<HostedRow[]>([]);
   /**
-   * 「设备上已有同名进程在跑，仍要再启一个？」的待确认行名。
-   * 需要这一步是因为工具后启动时看不见别人的进程：列表说"未运行"，点执行就是
-   * 一个注定失败的实例（端口被占 → 秒退）。不静默替用户决定，也不拦着他启动。
+   * 待停止的外部实例（`{name, pid}`）：点「停止进程」先亮一次确认，
+   * 因为杀进程不可逆，而我们停的又是"别人启动的"进程——没有回头路可给。
    */
-  const [confirmExternal, setConfirmExternal] = useState<string | null>(null);
+  const [pendingStop, setPendingStop] = useState<{ name: string; pid: number } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [root, setRoot] = useState(false);
   const [probing, setProbing] = useState(false);
@@ -243,7 +242,16 @@ export function BinaryHosting() {
     const asRoot = root;
     patchRow(row.name, { running: true, error: null, root: asRoot });
     try {
-      const pid = await deviceApi.binaryRun(deviceSerial, row.name, asRoot);
+      const result = await deviceApi.binaryRun(deviceSerial, row.name, asRoot);
+      if (!result.started) {
+        // 启动前的检查拦下了：它本来就在跑。这里不报红、也不谎称"已启动"，
+        // 而是刷新清单让「已在运行」显示出来，按钮随之变成「停止进程」。
+        patchRow(row.name, { running: false, error: null });
+        setNotice(result.detail ?? t("adb.binary.alreadyRunning", { pids: String(result.pid) }));
+        void refetch();
+        return;
+      }
+      const pid = result.pid;
       patchRow(row.name, { pid, running: false, ports: [], error: null });
       // 端口可能在 listen() 前几十毫秒才绑定：立即拉一次，3s 后再补一次
       void loadPorts(row.name, pid, asRoot);
@@ -258,6 +266,27 @@ export function BinaryHosting() {
    * 复核身份，PID 易主时拒止而不是照数字杀，也会顺手回收自己启动的子进程拿到死因。
    * 没有句柄（Legacy/root 启动的进程、Agent 未连接）时退回按 PID + 进程名终止。
    */
+  /**
+   * 停掉一个**不是本工具启动的**同名进程。
+   * 走 root=true：Agent 自己以 shell 运行，用户的进程常常是 `su -c` 起的（shell 杀不掉），
+   * 而这条通道在设备上先比 `/proc/<pid>/comm` 再发信号 —— 名字对不上就一个信号都不发，
+   * 免得拿一个几秒前读到的 pid 去杀掉恰好复用同号的无关进程。
+   */
+  const stopExternal = async (name: string, pid: number) => {
+    if (!deviceSerial) return;
+    setPendingStop(null);
+    setProbing(true);
+    try {
+      await deviceApi.binaryKill(deviceSerial, pid, true, name);
+      setNotice(t("adb.binary.stoppedExternal", { pid }));
+      void refetch();
+    } catch (e) {
+      setNotice(`${t("adb.binary.stopFailed")}: ${String((e as Error)?.message ?? e)}`);
+    } finally {
+      setProbing(false);
+    }
+  };
+
   const kill = async (row: HostedRow) => {
     if (!deviceSerial || row.pid === null) return;
     patchRow(row.name, { running: true, error: null });
@@ -405,6 +434,10 @@ export function BinaryHosting() {
             <ul className="divide-y text-xs">
               {hosted.map((row) => {
                 const bin = binaries.find((b) => b.name === row.name);
+                // "已经在跑"有两种：我们起的（有句柄，用既有「终止」）与别人起的（无句柄，
+                // 用下面的「停止进程」）。这一行的按钮只能有一个，否则用户不知道该点哪个。
+                const outsiders = bin?.externalPids ?? [];
+                const stopPid = outsiders[0] ?? null;
                 return (
                   <li key={row.name} className="px-3 py-2" data-testid={`hosted-${row.name}`}>
                     <div className="flex items-center gap-3">
@@ -434,6 +467,25 @@ export function BinaryHosting() {
                           <Square className="h-3 w-3" />
                           {t("adb.binary.kill")}
                         </Button>
+                      ) : stopPid !== null ? (
+                        /*
+                         * 已经有实例在跑 —— 这里不给「执行」：点了只会起一个秒退的进程。
+                         * 换成一个「停止进程」按钮（一次确认），停完按钮自己变回「执行」。
+                         */
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-6 shrink-0 gap-1 px-2 text-destructive"
+                          data-testid={`stop-external-${row.name}`}
+                          disabled={probing}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setPendingStop({ name: row.name, pid: stopPid });
+                          }}
+                        >
+                          <CircleStop className="h-3 w-3" />
+                          {t("adb.binary.stopProcess")}
+                        </Button>
                       ) : (
                         <Button
                           size="sm"
@@ -441,14 +493,8 @@ export function BinaryHosting() {
                           className="h-6 shrink-0 gap-1 px-2"
                           data-testid={`run-${row.name}`}
                           disabled={row.running || bin?.hasExec === false}
-                          onClick={() => {
-                            const outsiders = bin?.externalPids ?? [];
-                            if (outsiders.length > 0 && confirmExternal !== row.name) {
-                              // 第一次点击只把后果说清楚，不真的启动
-                              setConfirmExternal(row.name);
-                              return;
-                            }
-                            setConfirmExternal(null);
+                          onClick={(event) => {
+                            event.stopPropagation();
                             void run(row);
                           }}
                         >
@@ -479,22 +525,36 @@ export function BinaryHosting() {
                         <Trash2 className="h-3 w-3" />
                       </Button>
                     </div>
-                    {(bin?.externalPids?.length ?? 0) > 0 && (
+                    {outsiders.length > 0 && (
                       <div
                         className="mt-1.5 flex items-center gap-2 text-10px"
-                        data-testid={`external-confirm-${row.name}`}
+                        data-testid={`external-note-${row.name}`}
                       >
                         <span className="min-w-0 flex-1 text-amber-500">
-                          {t("adb.binary.externalRunning", { pids: (bin?.externalPids ?? []).join(", ") })}
+                          {t("adb.binary.alreadyRunning", { pids: outsiders.join(", ") })}
                           {" · "}
                           <span className="text-muted-foreground">{t("adb.binary.externalRunningTip")}</span>
                         </span>
-                        {confirmExternal === row.name && (
+                        {pendingStop?.name === row.name && (
                           <>
-                            <Button size="sm" variant="outline" data-testid={`confirm-run-${row.name}`} className="h-6 shrink-0 px-2" onClick={() => { setConfirmExternal(null); void run(row); }}>
-                              {t("adb.binary.confirmRun")}
+                            <span className="shrink-0 text-muted-foreground">
+                              {t("adb.binary.stopConfirm", { pid: pendingStop.pid })}
+                            </span>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 shrink-0 px-2 text-destructive"
+                              data-testid={`confirm-stop-${row.name}`}
+                              onClick={() => void stopExternal(row.name, pendingStop.pid)}
+                            >
+                              {t("adb.binary.stopProcess")}
                             </Button>
-                            <Button size="sm" variant="ghost" className="h-6 shrink-0 px-2" onClick={() => setConfirmExternal(null)}>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-6 shrink-0 px-2"
+                              onClick={() => setPendingStop(null)}
+                            >
                               {t("adb.binary.confirmCancel")}
                             </Button>
                           </>

@@ -1586,30 +1586,7 @@ mod tests {
             "拒止后进程必须还活着"
         );
 
-        // ② 声明需要 root 而 Agent 是 shell：显式 permission_denied，不去试 kill
-        let rootless = client
-            .request::<_, ProcessKillResult>(
-                PROCESS_KILL,
-                &ProcessKillParams {
-                    pid,
-                    expected_comm: Some("toybox".into()),
-                    signal: KillSignal::Kill,
-                    require_root: true,
-                },
-                Duration::from_secs(10),
-            )
-            .await
-            .expect_err("Agent 以 shell 运行，不能假装满足 root 要求");
-        let rootless = agent_error(rootless);
-        assert_eq!(rootless.code, ErrorCode::PermissionDenied, "{rootless:?}");
-        assert!(
-            adb_shell(&serial, &format!("kill -0 {pid} 2>/dev/null && echo alive"))
-                .await
-                .contains("alive"),
-            "root 拒止后进程必须还活着"
-        );
-
-        // ③ 正常终止：signaled + verified_dead，且 shell 复核确实没了
+        // ② 普通终止（shell 自属进程）：signaled + verified_dead，并且明确"这次没用 root"
         let killed: ProcessKillResult = client
             .request(
                 PROCESS_KILL,
@@ -1635,7 +1612,7 @@ mod tests {
         assert_eq!(killed.outcome, KillOutcome::Signaled);
         assert_eq!(killed.comm.as_deref(), Some("toybox"));
         assert!(killed.verified_dead, "SIGKILL 后应能确认进程消失");
-        assert!(!killed.ran_as_root);
+        assert!(!killed.ran_as_root, "shell 杀得动的进程不该谎称提权执行");
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             !adb_shell(
@@ -1646,6 +1623,33 @@ mod tests {
             .contains(&pid.to_string()),
             "设备上探测进程应已退出"
         );
+
+        /*
+         * ③ 现在换 `require_root=true` 打同一个已经消失的 pid：必须走**提权脚本**那条路
+         *    并如实回报"本来就不在了"。旧断言在这里等一个 permission_denied（政策是
+         *    "shell 就别装 root"），而 AR7.6 起这条声明的含义变成"用带身份核验的固定
+         *    提权脚本执行"（D037 定案的 root 通道），所以断言跟着改成：不拒止、不谎报，
+         *    并且要能看出它确实走了 su 那条路。真正"杀 root 进程"的正反例在
+         *    `real_agent_root_kill_requires_matching_identity` 里，用 root 探针跑。
+         */
+        let root_gone: ProcessKillResult = client
+            .request(
+                PROCESS_KILL,
+                &ProcessKillParams {
+                    pid,
+                    expected_comm: Some("toybox".into()),
+                    signal: KillSignal::Kill,
+                    require_root: true,
+                },
+                Duration::from_secs(25),
+            )
+            .await
+            .expect("提权通道对已消失的进程应当幂等成功，而不是报错");
+        assert_eq!(root_gone.outcome, KillOutcome::AlreadyGone, "{root_gone:?}");
+        assert!(root_gone.verified_dead, "不在了就是不再在了: {root_gone:?}");
+        // 出口名要能对得上：不在了就是 `process_not_running`（早退分支），
+        // 真发了信号才是 `su_script:KILLED` —— 两者混成一句"成功"就看不出设备侧走了哪条
+        assert_eq!(root_gone.detail.as_deref(), Some("process_not_running"));
 
         // ④ 幂等：再杀一次是 already_gone，不报错
         let again: ProcessKillResult = client
@@ -4319,6 +4323,113 @@ mod tests {
         } else {
             eprintln!("[zombie] 通过：{checked} 个外部 pid 逐个核过状态，都不是僵尸");
         }
+    }
+
+    /// 真机腿：**停止一个 root 起的进程时，必须先核身份**。
+    ///
+    /// 界面那个「停止进程」按钮拿的是几秒前读到的 pid，而 root 进程（用户现场的
+    /// `auth-server` 就是 `su -c` 起的）shell 杀不掉，只能走提权通道。提权通道原来
+    /// 是 `su -c "kill -9 <pid>"`：只按数字杀。这条腿钉住换掉它之后的行为——
+    /// 名字对不上时一个信号都不发、进程还活着；名字对得上才真停。
+    #[tokio::test]
+    #[ignore = "需要真机；AR104_KILL_PROBE=yes APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_root_kill -- --ignored --nocapture"]
+    async fn real_agent_root_kill_requires_matching_identity() {
+        use agent_protocol::method::PROCESS_KILL;
+        use agent_protocol::{ErrorCode, KillSignal, ProcessKillParams, ProcessKillResult};
+        if std::env::var("AR104_KILL_PROBE").unwrap_or_default() != "yes" {
+            eprintln!("[跳过] 本腿会起并杀一个 root 探针进程，需要 AR104_KILL_PROBE=yes");
+            return;
+        }
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        if !prepare_toybox_probe(&serial).await {
+            return;
+        }
+        async fn adb_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+        // ① 起一个 root 探针（shell 杀不动它，正是需要提权通道的形状）
+        let out = adb_shell(
+            &serial,
+            "su -c 'nohup /data/local/tmp/toybox sleep 240 </dev/null >/dev/null 2>&1 & echo OUTSIDE'",
+        )
+        .await;
+        assert!(out.contains("OUTSIDE"), "{out}");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let pid: u32 = adb_shell(&serial, "su -c 'pgrep -f \"toybox sleep 240\" | head -1'")
+            .await
+            .trim()
+            .parse()
+            .expect("探针进程应当存在");
+        assert!(
+            adb_shell(&serial, &format!("su -c 'kill -0 {pid} && echo ALIVE'"))
+                .await
+                .contains("ALIVE")
+        );
+
+        // ② 名字对不上：必须拒止，而且进程还活着（这就是防 PID 复用杀错人）
+        let wrong = client
+            .request::<_, ProcessKillResult>(
+                PROCESS_KILL,
+                &ProcessKillParams {
+                    pid,
+                    expected_comm: Some("definitely-not-this".into()),
+                    signal: KillSignal::Term,
+                    require_root: true,
+                },
+                Duration::from_secs(25),
+            )
+            .await
+            .expect_err("身份不符时不能真的发信号");
+        assert!(
+            matches!(&wrong, AgentClientError::Remote(remote)
+                if remote.code == ErrorCode::PreconditionFailed),
+            "{wrong:?}"
+        );
+        assert!(
+            adb_shell(&serial, &format!("su -c 'kill -0 {pid} && echo ALIVE'"))
+                .await
+                .contains("ALIVE"),
+            "名字不符却把进程杀了——身份核验没生效"
+        );
+        eprintln!("[kill] 身份不符已拒止，pid {pid} 仍然活着");
+
+        // ③ 名字对得上：提权通道真停，并确认消失
+        let ok = client
+            .request::<_, ProcessKillResult>(
+                PROCESS_KILL,
+                &ProcessKillParams {
+                    pid,
+                    expected_comm: Some("toybox".into()),
+                    signal: KillSignal::Term,
+                    require_root: true,
+                },
+                Duration::from_secs(25),
+            )
+            .await
+            .expect("身份相符时提权终止应当成功");
+        assert!(ok.ran_as_root, "结论要如实说明这次是提权执行的");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let gone = adb_shell(
+            &serial,
+            &format!("su -c 'kill -0 {pid} 2>/dev/null || echo GONE'"),
+        )
+        .await;
+        assert!(gone.contains("GONE"), "提权终止后进程还在: {gone}");
+        eprintln!("[kill] 通过：名字对不上不动手，名字对上才停掉 root 进程 pid={pid}");
+        manager.disconnect(&serial).await.unwrap();
     }
 
     /// AR9.1 前置真机腿：root 探测改由 Agent 执行后，结论必须与 Legacy `su -c id`

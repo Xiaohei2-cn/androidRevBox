@@ -265,28 +265,83 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     // 页面测试不重复假装覆盖了它。
   });
 
-  it("外部同名实例要被标出来，点执行先说后果再问一次", async () => {
-    // 这是"软件后启动"的真实现场：进程在跑但我们没有句柄，列表会说"未运行"。
-    // 直接再启一个只会因端口被占秒退 —— 所以界面必须先说清，并且不静默替用户决定。
-    // 这一条要的是"我们没启动过它"的现场：清掉运行表，界面才会给执行按钮而不是终止
+  it("已经在跑就只给一个「停止进程」按钮：确认后才动手，且绝不顺手起一个", async () => {
+    // 用户的口径就是这条：启动前先查在不在跑；在跑就给一个杀死进程的按钮。
+    // 运行表清空，模拟"软件后启动、这个实例不是我们起的"。
     device.hostedRuns.mockResolvedValue([]);
+    device.binaryRun.mockResolvedValue({
+      pid: 31337,
+      started: false,
+      externalPids: [31337],
+      detail: "frida-server 已经在跑（pid 31337），不是本工具启动的",
+    });
+    device.binaryKill.mockResolvedValue(undefined);
     renderPage(<BinaryHosting />);
-    const chip = await screen.findByTestId("external-frida-server");
-    expect(chip.textContent ?? "").toContain("31337");
-    // 双击把文件加入下区托管
-    const row = await screen.findByTestId("bin-frida-server");
-    fireEvent.doubleClick(row.querySelector("button") ?? row);
+    expect(await screen.findByTestId("external-frida-server")).toBeTruthy();
+    fireEvent.doubleClick((screen.getByTestId("bin-frida-server").querySelector("button") ??
+      screen.getByTestId("bin-frida-server")) as Element);
     const hosted = await screen.findByTestId("hosted-frida-server");
-    expect(hosted.textContent ?? "").toContain("外部在跑 pid 31337");
-    // 第一次点执行：不启动，只把确认条亮出来
+    expect(hosted.textContent ?? "").toContain("已在运行 pid 31337");
+    // 关键反向断言：这一行**没有**「执行」按钮 —— 点了也只会起一个秒退的进程
+    expect(screen.queryByTestId("run-frida-server")).toBeNull();
     device.binaryRun.mockClear();
-    fireEvent.click(screen.getByTestId("run-frida-server"));
+    device.binaryKill.mockClear();
+    // 停止后清单会重新拉一次：这次报告"没有外部实例了"，模拟进程真被停掉
+    device.binaries.mockResolvedValue([
+      {
+        name: "frida-server",
+        path: "/data/local/tmp/frida-server",
+        size: 53_539_200,
+        perms: "-rwxr-xr-x",
+        hasExec: true,
+        externalPids: [],
+      },
+    ]);
+    fireEvent.click(screen.getByTestId("stop-external-frida-server"));
+    // 不可逆操作先确认一次，不直接杀
+    expect(device.binaryKill).not.toHaveBeenCalled();
+    const note = await screen.findByTestId("external-note-frida-server");
+    expect(note.textContent ?? "").toContain("31337");
+    fireEvent.click(screen.getByTestId("confirm-stop-frida-server"));
+    // root=true：目标可能是 su 起的（shell 杀不动）；带上名字，设备端先核身份再发信号
+    await waitFor(() =>
+      expect(device.binaryKill).toHaveBeenCalledWith("PIXEL-1", 31337, true, "frida-server"),
+    );
     expect(device.binaryRun).not.toHaveBeenCalled();
-    const confirm = await screen.findByTestId("external-confirm-frida-server");
-    expect(confirm.textContent ?? "").toContain("端口已被占用");
-    // 「仍然执行」才真的执行（用户明确要起第二个实例时不该拦死）
-    fireEvent.click(screen.getByTestId("confirm-run-frida-server"));
-    await waitFor(() => expect(device.binaryRun).toHaveBeenCalledTimes(1));
+    // 停下来之后，同一行才变回「执行」
+    await waitFor(() => expect(screen.getByTestId("run-frida-server")).toBeTruthy());
+  });
+
+  it("就算界面状态是旧的，桌面侧拦下了第二次启动也只说「已经在跑」，不报成失败", async () => {
+    // binaryRun 返回 started=false：这是"没起新的"，不是"起失败了"——
+    // 报红色失败会让人以为自己的二进制坏了。
+    device.hostedRuns.mockResolvedValue([]);
+    device.binaries.mockResolvedValue([
+      {
+        name: "frida-server",
+        path: "/data/local/tmp/frida-server",
+        size: 53_539_200,
+        perms: "-rwxr-xr-x",
+        hasExec: true,
+        externalPids: [],
+      },
+    ]);
+    device.binaryRun.mockResolvedValue({
+      pid: 4242,
+      started: false,
+      externalPids: [4242],
+      detail: "frida-server 已经在跑（pid 4242），不是本工具启动的",
+    });
+    renderPage(<BinaryHosting />);
+    // 清单是异步来的，先等它出现（上一条测试是"先等到有外部实例"才动的，这里同理）
+    const row = await screen.findByTestId("bin-frida-server");
+    fireEvent.doubleClick((row.querySelector("button") ?? row) as Element);
+    await screen.findByTestId("hosted-frida-server");
+    fireEvent.click(screen.getByTestId("run-frida-server"));
+    await waitFor(() =>
+      expect(screen.getAllByText(/已经在跑|已有一个实例在跑/).length).toBeGreaterThan(0),
+    );
+    expect(document.body.textContent ?? "").not.toContain("启动失败");
   });
 
   it("进程端口两个方向都能渲染（PID→端口、端口→PID）", async () => {

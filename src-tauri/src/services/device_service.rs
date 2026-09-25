@@ -444,6 +444,32 @@ pub struct DeviceService {
     watch_started: Mutex<bool>,
 }
 
+/// 托管启动的结果视图（App 侧模型，不是协议 DTO：前端只关心"起没起、谁在跑"）。
+///
+/// `started=false` 不是失败：**它已经有一个实例在跑**，我们按用户要的口径不做无声重启，
+/// 而是把那个 pid 交回界面，让界面给一个「停止进程」的按钮。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostedRunView {
+    /// 界面对象：真正在跑的那个 pid（我们起的，或者本来就在跑的）
+    pub pid: u32,
+    pub started: bool,
+    /// 不是本工具启动的同名进程（没有句柄，只能按身份核验后终止）
+    pub external_pids: Vec<u32>,
+    pub detail: Option<String>,
+}
+
+/// 「是不是已经有实例在跑」的判断本身（不碰 IO，便于单测）。
+///
+/// 优先报外部实例：那才是"软件后启动"的现场，界面要给的按钮是「停止进程」；
+/// 我们自己起的那条有句柄，走既有的「终止」。两边都没有才返回 `None`（可以启动）。
+fn pick_already_running(externals: &[u32], our_running_pid: Option<u32>) -> Option<(u32, bool)> {
+    if let Some(pid) = externals.first() {
+        return Some((*pid, true));
+    }
+    our_running_pid.map(|pid| (pid, false))
+}
+
 impl DeviceService {
     pub fn new(
         runner: Arc<dyn AdbRunner>,
@@ -1144,7 +1170,25 @@ impl DeviceService {
     /// （参数数组 exec + 落盘运行记录 + 稳定句柄），`root=true` 走 Legacy `su -c`（D026）。
     /// 两条路径都在启动后复查存活并在失败时读日志尾部给真实死因——秒退的原因
     /// （CANNOT LINK / exec format / Permission denied）几乎只存在于 stderr。
-    pub async fn hosted_run(&self, serial: &str, name: &str, root: bool) -> CoreResult<u32> {
+    pub async fn hosted_run(
+        &self,
+        serial: &str,
+        name: &str,
+        root: bool,
+    ) -> CoreResult<HostedRunView> {
+        // **启动前先查在不在跑**（用户要的口径）：不看一眼就 spawn 一个，端口被占时只会
+        // 留下一条"启动后立即退出"，而真相是"它本来就在跑"。这里同时看两处：
+        // 我们自己的运行表（有句柄，界面本来就显示运行中）与设备上的同名外部进程。
+        if let Some(view) = self.hosted_already_running(serial, name).await {
+            audit_hosted_write(
+                serial,
+                HOSTED_START,
+                name,
+                "preflight",
+                &Ok("already_running".to_string()),
+            );
+            return Ok(view);
+        }
         if root {
             return self.hosted_run_as_root(serial, name).await;
         }
@@ -1229,7 +1273,12 @@ impl DeviceService {
                 "{name} 启动后立即退出：{detail}{exit}"
             )));
         }
-        Ok(status.record.pid)
+        Ok(HostedRunView {
+            pid: status.record.pid,
+            started: true,
+            external_pids: Vec::new(),
+            detail: None,
+        })
     }
 
     /// 查这个托管文件在设备上有没有"别人启动的同名进程"——工具晚启动时，这是唯一能看到
@@ -1254,6 +1303,58 @@ impl DeviceService {
                 Vec::new()
             }
         }
+    }
+
+    /// 启动前的"是不是已经在跑"检查。两条来源都要看，缺一不可：
+    /// ① 设备上的**同名外部进程**（别人起的，我们没句柄）；
+    /// ② 我们自己的运行表里还活着的那条（有句柄，界面的「终止」本来就能停它）。
+    /// 查不到就当没在跑（Legacy 通道看不见进程时也是这样）——宁可让后面的启动流程
+    /// 照旧走一遍，也不拿"我没看见"当成"它不存在"去报一句假冲突。
+    async fn hosted_already_running(&self, serial: &str, name: &str) -> Option<HostedRunView> {
+        let externals = self
+            .hosted_binaries(serial)
+            .await
+            .ok()
+            .and_then(|list| {
+                list.into_iter()
+                    .find(|binary| binary.name == name)
+                    .map(|binary| binary.external_pids)
+            })
+            .unwrap_or_default();
+        let ours = self
+            .hosted_runs(serial)
+            .await
+            .ok()
+            .and_then(|runs| {
+                runs.into_iter()
+                    .find(|record| record.name == name && record.state == HostedRunState::Running)
+            })
+            .map(|record| record.pid);
+        let (pid, external) = pick_already_running(&externals, ours)?;
+        Some(if external {
+            HostedRunView {
+                pid,
+                started: false,
+                external_pids: externals.clone(),
+                detail: Some(format!(
+                    "{name} 已经在跑（pid {}），不是本工具启动的",
+                    externals
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            }
+        } else {
+            HostedRunView {
+                pid,
+                started: false,
+                external_pids: Vec::new(),
+                detail: Some(format!(
+                    "{name} 已由本工具启动（pid {pid}），要换参数请先终止它"
+                )),
+            }
+        })
     }
 
     /// 按句柄停止托管进程（AR7.3，写操作）。
@@ -1320,7 +1421,7 @@ impl DeviceService {
     /// `$!` 拿到的是子 shell pid 而非二进制 pid（kill/复查就全错了）；`;` 确保只有
     /// nohup 一段进后台，nohup exec 后 pid 即二进制 pid。整段经 su -c 单引号包裹：
     /// 外层 shell 不动 `&`/`$!`/重定向，由 root 内层 shell 解释（否则 su 只收到 `cd`）。
-    async fn hosted_run_as_root(&self, serial: &str, name: &str) -> CoreResult<u32> {
+    async fn hosted_run_as_root(&self, serial: &str, name: &str) -> CoreResult<HostedRunView> {
         let root = true;
         if !adb::is_safe_hosted_name(name) {
             return Err(CoreError::Internal(format!(
@@ -1368,7 +1469,12 @@ impl DeviceService {
                 "{name} 启动后立即退出：{detail}"
             )));
         }
-        Ok(pid)
+        Ok(HostedRunView {
+            pid,
+            started: true,
+            external_pids: Vec::new(),
+            detail: None,
+        })
     }
 
     /// 读托管启动日志尾部（截 2KB 防日志爆炸）。
@@ -1435,20 +1541,12 @@ impl DeviceService {
         expected_comm: Option<String>,
         root: bool,
     ) -> CoreResult<()> {
-        if root {
-            let result = self.hosted_kill_legacy(serial, pid).await;
-            audit_process_kill(
-                serial,
-                pid,
-                expected_comm.as_deref(),
-                "legacy_adb",
-                &result
-                    .as_ref()
-                    .map(|_| "ok".to_string())
-                    .map_err(|error| error.to_string()),
-            );
-            return result;
-        }
+        // root 与非 root 走同一条通道，只差一个 `require_root` 声明：root 分支由 Agent 侧
+        // **带身份核验的固定提权脚本**承担。以前这里直接退回 `su -c "kill -9 <pid>"`，
+        // 只按一个数字杀、不核身份 —— 界面点的正是几秒前读到的 pid，中间一旦 PID 复用，
+        // "停掉 auth-server"就变成随机杀掉某个无关进程（AR6.3/AR7.3 早就为普通路径立了
+        // "先核身份再发信号"的规矩，root 支路不该是例外）。
+        // 写操作照旧不自动回退：Agent 不在线就明确报错（D028）。
         // 写操作要求 Agent 在线：这里不静默安装，也不回退 adb shell，
         // 而是给可执行指引（设备页 → 安装/连接 Agent），避免用户以为进程已被杀。
         if !matches!(
@@ -1491,7 +1589,7 @@ impl DeviceService {
             pid,
             expected_comm: expected_comm.clone(),
             signal: KillSignal::Kill,
-            require_root: false,
+            require_root: root,
         };
         let result = self
             .android
@@ -1513,21 +1611,8 @@ impl DeviceService {
             .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))
     }
 
-    /// Legacy 终止路径（仅 root 支路使用）：`su -c kill -9 <pid>`。
-    async fn hosted_kill_legacy(&self, serial: &str, pid: u32) -> CoreResult<()> {
-        let cmd = adb::su_wrap(&format!("kill -9 {pid}"));
-        let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
-        let out = self.run_adb(&args).await?;
-        if out.exit_code != Some(0) {
-            return Err(CoreError::Internal(format!(
-                "kill 失败（进程可能已退出）: {}",
-                out.stderr.trim()
-            )));
-        }
-        Ok(())
-    }
-
     /// 兼容入口：托管页仍按 (pid, root) 调用，内部转 `process_kill`。
+    /// root=true 也走 Agent（身份核验 + 固定提权脚本），不再有 Legacy 盲杀分支。
     pub async fn hosted_kill(&self, serial: &str, pid: u32, root: bool) -> CoreResult<()> {
         self.process_kill(serial, pid, None, root).await
     }
@@ -3308,6 +3393,21 @@ fn log_device_info_shadow_diff(serial: &str, agent: &DeviceInfo, legacy: &Device
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn preflight_prefers_the_external_instance_and_starts_only_when_both_are_empty() {
+        // 外部在跑 → 报外部（界面给「停止进程」），哪怕我们自己也有一条在跑
+        assert_eq!(
+            pick_already_running(&[9727], Some(1234)),
+            Some((9727, true)),
+            "软件后启动的现场必须先报外部实例"
+        );
+        // 只有我们自己起的 → 走既有「终止」，也不起第二个
+        assert_eq!(pick_already_running(&[], Some(1234)), Some((1234, false)));
+        let nothing: Option<(u32, bool)> = None;
+        // 两边都没有才允许启动
+        assert_eq!(pick_already_running(&[], None), nothing);
+    }
 
     #[test]
     fn external_pids_survive_the_agent_to_ui_mapping() {

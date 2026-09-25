@@ -512,8 +512,10 @@ pub struct ProcessKillParams {
     pub expected_comm: Option<String>,
     #[serde(default)]
     pub signal: KillSignal,
-    /// 调用方声明这次终止必须 root。Agent 以 shell 身份运行时应显式拒绝，
-    /// 不得「试一下失败再说」——那会让 UI 把权限问题当成进程问题。
+    /// 调用方声明这次终止需要 root。Agent 自己仍以 shell 身份运行，**不是**"试一下失败再说"
+    /// （那会把权限问题伪装成进程问题），而是改跑一条带身份核验的固定提权脚本：
+    /// 脚本先比 `/proc/<pid>/comm` 再发信号，名字对不上就一个信号都不发。
+    /// su 不可用时仍然如实报 `permission_denied`。
     #[serde(default)]
     pub require_root: bool,
 }

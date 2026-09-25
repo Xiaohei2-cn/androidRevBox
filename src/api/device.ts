@@ -184,6 +184,16 @@ export interface ForwardRule {
   remote: string;
 }
 
+/** 托管启动结果（App 侧模型，camelCase）：区分"我起了"与"本来就在跑" */
+export interface HostedRunView {
+  pid: number;
+  /** false = 本次没有启动任何东西，因为它已经在跑 */
+  started: boolean;
+  /** 不是本工具启动的同名进程 pid（没有句柄，只能按身份核验后终止） */
+  externalPids: number[];
+  detail?: string | null;
+}
+
 /** /data/local/tmp 下被托管的 ELF 二进制 */
 export interface HostedBinary {
   name: string;
@@ -426,9 +436,13 @@ export const deviceApi = {
   binaryChmod(serial: string, name: string, root = false): Promise<void> {
     return invokeCommand<void>("device_binary_chmod", { serial, name, root });
   },
-  /** 后台启动二进制，返回 pid（root=true 走 su -c） */
-  binaryRun(serial: string, name: string, root = false): Promise<number> {
-    return invokeCommand<number>("device_binary_run", { serial, name, root });
+  /**
+   * 后台启动二进制。**桌面侧启动前会先查"是不是已经有实例在跑"**：
+   * 在跑就不起新进程，而是把在跑的 pid 交回来（`started: false`），
+   * 由界面给「停止进程」按钮 —— 不是丢一句"启动失败"。
+   */
+  binaryRun(serial: string, name: string, root = false): Promise<HostedRunView> {
+    return invokeCommand<HostedRunView>("device_binary_run", { serial, name, root });
   },
   /** 托管运行表（AR7.2，Agent only）：真实运行状态与稳定句柄 */
   hostedRuns(serial: string): Promise<HostedRunRecord[]> {

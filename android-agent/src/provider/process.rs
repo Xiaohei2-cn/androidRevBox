@@ -312,17 +312,15 @@ impl ProcessesProvider {
             ));
         }
         let ran_as_root = effective_uid() == Some(0);
-        if params.require_root && !ran_as_root {
-            return Err(AgentError::new(
-                ErrorCode::PermissionDenied,
-                "终止该进程需要 root，Agent 当前以 shell 身份运行",
-            )
-            .with_details(serde_json::json!({
-                "reason": "root_required",
-                "agent_uid": effective_uid().unwrap_or(u32::MAX),
-            })));
-        }
         let identity = read_process_identity(params.pid).await;
+        // 调用方声明"这次必须 root"：Agent 仍然保持 shell 身份，改走**写死的提权脚本**
+        // （D037/D038）。原来这里直接拒止，理由是"别把权限问题说成进程问题"——那是对的，
+        // 但拒止把 root 手机上明明可做的终止也一起挡了，桌面侧只能退回
+        // `su -c "kill -9 <pid>"`：只按数字杀，不核身份。现在这条通道既保留身份核验
+        // （脚本先比 comm 再发信号），又把权限问题说清楚（su 不可用时仍报 PermissionDenied）。
+        if params.require_root && !ran_as_root {
+            return kill_via_su(&params, identity.as_ref()).await;
+        }
         guard_identity(params.pid, &params, identity.as_ref())?;
         let comm = identity
             .as_ref()
@@ -405,6 +403,103 @@ struct ProcessIdentity {
 }
 
 /// 执行前重读 `/proc/<pid>`；`None` 表示进程不存在（幂等分支）。
+/// 提权终止：先读身份，再跑带身份核验的固定脚本，结果映射回既有的 `ProcessKillResult`。
+///
+/// 三条出口都诚实：进程不在了 = 幂等成功；名字对不上 = `precondition_failed`
+/// （明确告诉调用方"pid 可能已被复用，我什么都没做"）；发了信号但没死 =
+/// `signaled` + `verified_dead=false`（界面已有的"未确认"分支，不冒充成功）。
+async fn kill_via_su(
+    params: &ProcessKillParams,
+    identity: Option<&ProcessIdentity>,
+) -> Result<Value, AgentError> {
+    // signal 目前是 TERM/KILL 枚举；提权脚本按"先 TERM 再 KILL"的有界流程走，
+    // 显式 KILL 也安全（脚本对同一 pid 只做一次收敛）
+    if identity.is_none() {
+        // 进程本来就不在了：**在核名字、拼脚本之前**就走幂等分支。
+        // （第一版在这里先 validate_comm，空名字被判成"进程名长度不合法"，
+        // 于是"重复点停止"变成一句看着像参数错误的 InvalidRequest。）
+        audit(params, "already_gone", None, "-", true);
+        return serialize(ProcessKillResult {
+            pid: params.pid,
+            signal: params.signal,
+            outcome: KillOutcome::AlreadyGone,
+            comm: None,
+            cmdline: None,
+            uid: None,
+            ran_as_root: true,
+            verified_dead: true,
+            detail: Some("process_not_running".to_owned()),
+        });
+    }
+    // **先按调用方给的期望名字核身份**，再动手：这条提权路径如果只信"实际读到的 comm"，
+    // 就等于把 AR6.3 立下的防 PID 复用规矩整条漏掉（第一版就是这么错的——期望名字
+    // 写成 "definitely-not-this" 也照样把进程杀了，靠真机腿才抓出来）。
+    guard_identity(params.pid, params, identity)?;
+    let comm = identity
+        .and_then(|value| value.comm.clone())
+        .unwrap_or_default();
+    let uid = identity.and_then(|value| value.uid);
+    privileged::validate_comm(&comm)?;
+    let output = privileged::run_privileged(
+        "终止进程",
+        &privileged::kill_verified_script(params.pid, &comm),
+        privileged::KILL_SENTINEL,
+    )
+    .await?;
+    let verdict = output
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            line.starts_with("KILLED")
+                || line.starts_with("STILL_ALIVE")
+                || line.starts_with("KILL_GONE")
+                || line.starts_with("KILL_MISMATCH")
+        })
+        .unwrap_or_default()
+        .to_owned();
+    let (outcome, verified_dead, audit_step) = if verdict == "KILL_GONE" {
+        (KillOutcome::AlreadyGone, true, "already_gone")
+    } else if verdict == "KILLED" {
+        (KillOutcome::Signaled, true, "killed_as_root")
+    } else if verdict == "STILL_ALIVE" {
+        (KillOutcome::Signaled, false, "still_alive")
+    } else if let Some(actual) = verdict.strip_prefix("KILL_MISMATCH") {
+        let actual = actual.trim();
+        audit(params, "identity_mismatch", uid, &comm, true);
+        return Err(AgentError::new(
+            ErrorCode::PreconditionFailed,
+            format!(
+                "pid={} 现在的进程名是 {actual:?}，与期望的 {comm:?} 不一致（PID 可能已被复用）；没有发送任何信号",
+                params.pid
+            ),
+        )
+        .with_details(serde_json::json!({
+            "reason": "identity_mismatch",
+            "expected_comm": comm,
+            "actual_comm": actual,
+        })));
+    } else {
+        audit(params, "unexpected_verdict", uid, &comm, true);
+        return Err(AgentError::new(
+            ErrorCode::Internal,
+            format!("提权终止没有回有效结论: {output}"),
+        ));
+    };
+    audit(params, audit_step, uid, &comm, true);
+    serialize(ProcessKillResult {
+        pid: params.pid,
+        signal: params.signal,
+        outcome,
+        comm: Some(comm),
+        cmdline: identity.and_then(|value| value.cmdline.clone()),
+        uid,
+        ran_as_root: true,
+        verified_dead,
+        // 结论原样带回去：出问题时一眼能看出是脚本哪条出口走到的，而不是"未知失败"
+        detail: Some(format!("su_script:{verdict}")),
+    })
+}
+
 async fn read_process_identity(pid: u32) -> Option<ProcessIdentity> {
     let comm = read_trimmed(&format!("{PROC}/{pid}/comm")).await;
     let cmdline = read_cmdline(&format!("{PROC}/{pid}/cmdline")).await;

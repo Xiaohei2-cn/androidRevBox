@@ -14,7 +14,9 @@ use crate::adapters::adb::{
     DeviceEntry, DeviceInfo, FileEntry, HostedBinary, ListenPort, PortHolder,
 };
 use crate::core::error::{CoreError, CoreResult};
-use crate::services::device_service::{AdbEnvironment, DeviceChangedPayload, ForwardRule};
+use crate::services::device_service::{
+    AdbEnvironment, DeviceChangedPayload, ForwardRule, HostedRunView,
+};
 
 // ===== 环境 / 列表 =====
 
@@ -186,14 +188,17 @@ pub async fn device_binary_chmod(
         .await
 }
 
-/// 后台启动二进制，返回 pid（root=true 走 su -c）
+/// 后台启动二进制。**启动前先查"是不是已经有实例在跑"**：在跑就不起新的，而是把在跑的
+/// pid 与"它是外部启动的"这个事实交回界面，由界面给「停止进程」按钮（用户口径：
+/// 检查在前，给一个杀死进程的按钮，而不是丢一句启动失败）。root=true 走带身份核验的
+/// 提权通道，不再用"按数字 kill -9"那种盲杀。
 #[tauri::command]
 pub async fn device_binary_run(
     state: tauri::State<'_, AppState>,
     serial: String,
     name: String,
     root: Option<bool>,
-) -> CoreResult<u32> {
+) -> CoreResult<HostedRunView> {
     state
         .device
         .hosted_run(&serial, &name, root.unwrap_or(false))
