@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { SubTabs } from "@/components/nav/SubTabs";
 import { PageHeader } from "@/components/ui/page-header";
 import { ForwardManager } from "@/features/adb/ForwardManager";
-import { BinaryHosting } from "@/features/adb/BinaryHosting";
 import { ProcPorts } from "@/features/adb/ProcPorts";
 import { Placeholder } from "@/components/nav/Placeholder";
 import { useAppNav } from "@/app/nav";
@@ -11,9 +10,10 @@ import { useI18n } from "@/i18n";
 /**
  * ADB 页（原「终端」主 tab 改造）：多个子标签。
  * - 端口转发：五行默认行 + 可增行，每行独立建立/删除/验证；
- * - 二进制托管：/data/local/tmp 下 ELF 的浏览/授权/后台执行/终止；
+ * - 二进制托管已移到「二进制」主 tab（第四十七轮）：它管的是"跑哪个二进制"，
+ *   与 so 替换同属一类活儿，和端口转发/进程端口这两条 ADB 能力不是一回事。
  * - 终端等后续能力继续追加为子标签。
- * P10：frida 前置检查失败时经 pendingAdbTab 深链切到转发/托管 tab。
+ * P10：frida 前置检查失败时经 pendingAdbTab 深链切到端口转发 tab。
  */
 export function AdbPage() {
   const { pendingAdbTab } = useAppNav();
@@ -34,11 +34,6 @@ export function AdbPage() {
           id: "forward",
           label: "端口转发",
           content: <ForwardManager />,
-        },
-        {
-          id: "binary-hosting",
-          label: "二进制托管",
-          content: <BinaryHosting />,
         },
         {
           id: "proc-ports",

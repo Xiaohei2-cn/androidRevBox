@@ -4,7 +4,8 @@ import { ArrowRightLeft, OctagonX, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AdbNotReadyState } from "@/components/ui/adb-gate";
 import { deviceApi, type PortHolder } from "@/api/device";
-import { DeviceBar, InfoChip } from "@/features/adb/BinaryHosting";
+import { DeviceBar } from "@/components/ui/device-bar";
+import { InfoChip } from "@/components/ui/info-chip";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 

@@ -67,7 +67,14 @@ vi.mock("@/api/task", async (importOriginal) => {
   return { ...actual, taskApi: { ...actual.taskApi, ...task } };
 });
 vi.mock("@/app/nav", () => ({
-  useAppNav: () => ({ tab: "adb", subTab: "binary-hosting", go: vi.fn(), goAdbSubTab: vi.fn() }),
+  useAppNav: () => ({
+    tab: "binary",
+    subTab: "hosting",
+    go: vi.fn(),
+    goAdbSubTab: vi.fn(),
+    pendingBinaryTab: null,
+    gotoBinarySubTab: vi.fn(),
+  }),
   useActiveTab: () => true,
 }));
 vi.mock("@/hooks/useDragDropPath", () => ({ useDragDropPath: vi.fn() }));
@@ -78,7 +85,9 @@ vi.mock("@/api/agent", async (importOriginal) => {
 });
 
 import { AgentSessionSection, DevicesPage } from "@/features/devices/DevicesPage";
-import { BinaryHosting } from "@/features/adb/BinaryHosting";
+import { BinaryHosting } from "@/features/binary/BinaryHosting";
+import { BinaryPage } from "@/features/binary/BinaryPage";
+import { AdbPage } from "@/features/adb/AdbPage";
 import { ForwardManager } from "@/features/adb/ForwardManager";
 import { ProcPorts } from "@/features/adb/ProcPorts";
 import { TasksPage } from "@/features/tasks/TasksPage";
@@ -223,6 +232,18 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     });
     fireEvent.click((await screen.findAllByText("验证"))[0]);
     await waitFor(() => expect(document.body.textContent).toContain("生效"));
+  });
+
+  it("托管入口挂在「二进制」主 tab 下，ADB 页不再出现它（搬完别留半个）", async () => {
+    // 这一条钉的是"位置"：托管管的是"跑哪个二进制"，与 so 替换同类；
+    // 端口转发/进程端口才是 ADB 那页的事。位置飘走时 frida 的修复深链也会指错页，
+    // 所以这里同时盯住 AdbPage 不许把 tab 加回来。
+    renderPage(<BinaryPage />);
+    expect(await screen.findByRole("tab", { name: "二进制托管" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "so 替换" })).toBeTruthy();
+    renderPage(<AdbPage />);
+    await screen.findByRole("tab", { name: "端口转发" });
+    expect(screen.queryAllByRole("tab", { name: "二进制托管" }).length).toBe(1);
   });
 
   it("托管页用协议 DTO 对账：运行中的 pid 与可停止状态来自 hosted.runs", async () => {

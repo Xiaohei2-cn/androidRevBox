@@ -30,9 +30,16 @@ interface AppNav {
   /** 设备页子 tab 请求（列表/信息；null = 用默认） */
   pendingDevicesTab: "list" | "info" | null;
   gotoDeviceList: () => void;
-  /** ADB 页子 tab 请求（端口转发/二进制托管；P10 frida 前置检查修复深链） */
-  pendingAdbTab: "forward" | "binary-hosting" | null;
-  gotoAdbSubTab: (tab: "forward" | "binary-hosting") => void;
+  /** ADB 页子 tab 请求（P10 frida 前置检查深链：端口转发） */
+  pendingAdbTab: "forward" | null;
+  gotoAdbSubTab: (tab: "forward") => void;
+  /**
+   * 「二进制」页子 tab 请求（so 替换 / 二进制托管）。
+   * 托管原来挂在 ADB 页下，frida 的修复深链也跟着指那边；主 tab 归位后深链必须一起
+   * 改指，否则点「去托管 frida-server」会跳到一个已经没有托管入口的页面。
+   */
+  pendingBinaryTab: "so-replace" | "hosting" | null;
+  gotoBinarySubTab: (tab: "so-replace" | "hosting") => void;
   /** 任务中心（P10 会话头「跳任务中心」） */
   gotoTasks: () => void;
 }
@@ -50,6 +57,8 @@ const DEFAULT_NAV: AppNav = {
   gotoDeviceList: () => undefined,
   pendingAdbTab: null,
   gotoAdbSubTab: () => undefined,
+  pendingBinaryTab: null,
+  gotoBinarySubTab: () => undefined,
   gotoTasks: () => undefined,
 };
 
@@ -60,7 +69,8 @@ export function AppNavProvider({ children }: { children: ReactNode }) {
   const [pendingConfigKey, setPendingConfigKey] = useState<string | null>(null);
   const [pendingDeviceSerial, setPendingDeviceSerial] = useState<string | null>(null);
   const [pendingDevicesTab, setPendingDevicesTab] = useState<"list" | "info" | null>(null);
-  const [pendingAdbTab, setPendingAdbTab] = useState<"forward" | "binary-hosting" | null>(null);
+  const [pendingAdbTab, setPendingAdbTab] = useState<"forward" | null>(null);
+  const [pendingBinaryTab, setPendingBinaryTab] = useState<"so-replace" | "hosting" | null>(null);
 
   const gotoConfig = useCallback((key: string) => {
     setTab("settings");
@@ -80,9 +90,14 @@ export function AppNavProvider({ children }: { children: ReactNode }) {
     setPendingDevicesTab("list");
   }, []);
 
-  const gotoAdbSubTab = useCallback((next: "forward" | "binary-hosting") => {
+  const gotoAdbSubTab = useCallback((next: "forward") => {
     setTab("terminal");
     setPendingAdbTab(next);
+  }, []);
+
+  const gotoBinarySubTab = useCallback((next: "so-replace" | "hosting") => {
+    setTab("binary");
+    setPendingBinaryTab(next);
   }, []);
 
   const gotoTasks = useCallback(() => setTab("tasks"), []);
@@ -101,6 +116,8 @@ export function AppNavProvider({ children }: { children: ReactNode }) {
       gotoDeviceList,
       pendingAdbTab,
       gotoAdbSubTab,
+      pendingBinaryTab,
+      gotoBinarySubTab,
       gotoTasks,
     }),
     [
@@ -115,6 +132,8 @@ export function AppNavProvider({ children }: { children: ReactNode }) {
       gotoDeviceList,
       pendingAdbTab,
       gotoAdbSubTab,
+      pendingBinaryTab,
+      gotoBinarySubTab,
       gotoTasks,
     ],
   );

@@ -3,18 +3,14 @@ import { useQuery } from "@tanstack/react-query";
 import { Play, RefreshCw, ShieldCheck, Square, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AdbNotReadyState } from "@/components/ui/adb-gate";
-import {
-  deviceApi,
-  type DeviceEntry,
-  type HostedBinary,
-  type HostedRunRecord,
-  type ListenPort,
-} from "@/api/device";
+import { deviceApi, type HostedBinary, type HostedRunRecord, type ListenPort } from "@/api/device";
+import { DeviceBar } from "@/components/ui/device-bar";
+import { InfoChip } from "@/components/ui/info-chip";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 
 /**
- * 二进制托管（ADB 页子标签）：管理 /data/local/tmp 下的 ELF 文件。
+ * 二进制托管（「二进制」主 tab 的子标签，第四十七轮从 ADB 页挪过来）：管理 /data/local/tmp 下的 ELF 文件。
  * - 上区：Agent `hosted.list` 列出托管目录里的 ELF（文件头 magic 判定，不依赖设备端
  *   `file` 命令）——绿色 = 有执行权限（双击加入下区托管），红色 = 无执行权限
  *   （「赋予权限」走 Agent `hosted.chmod`，只补执行位且幂等）；
@@ -535,99 +531,3 @@ export function BinaryHosting() {
 }
 
 /** 信息胶囊：纯文本可选中（path-selectable 单击全选/拖选/右键复制），非按钮 */
-export function InfoChip({
-  label,
-  testid,
-  title,
-  className,
-}: {
-  label: string;
-  testid: string;
-  title?: string;
-  className?: string;
-}) {
-  return (
-    <span
-      data-testid={testid}
-      title={title}
-      className={cn(
-        "path-selectable max-w-full break-all rounded bg-emerald-500/10 px-1.5 py-0.5 font-mono text-emerald-500",
-        className,
-      )}
-    >
-      {label}
-    </span>
-  );
-}
-
-export function DeviceBar({
-  online,
-  selected,
-  onSelect,
-  onRefresh,
-  refreshing,
-  root,
-  probing,
-  onRootChange,
-}: {
-  online: DeviceEntry[];
-  selected: string | null;
-  onSelect: (s: string) => void;
-  onRefresh: () => void;
-  refreshing: boolean;
-  root: boolean;
-  probing: boolean;
-  onRootChange: (checked: boolean) => void;
-}) {
-  const { t } = useI18n();
-  return (
-    <div className="flex shrink-0 items-center gap-2 text-xs">
-      {online.length === 0 && <span className="text-muted-foreground">{t("adb.forward.rowInactive")}</span>}
-      {online.length === 1 && (
-        <span className="font-mono text-muted-foreground">-s {online[0].serial}</span>
-      )}
-      {online.length > 1 && (
-        <label className="flex items-center gap-2">
-          <span className="font-mono text-muted-foreground">-s</span>
-          <select
-            className="h-7 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
-            value={selected ?? ""}
-            onChange={(e) => onSelect(e.target.value)}
-          >
-            {online.map((d) => (
-              <option key={d.serial} value={d.serial}>
-                {d.model || d.serial}（{d.serial}）
-              </option>
-            ))}
-          </select>
-        </label>
-      )}
-      <label
-        className={cn(
-          "ml-auto flex shrink-0 items-center gap-1.5 text-muted-foreground",
-          probing && "opacity-50",
-        )}
-        title={t("adb.binary.rootHint")}
-      >
-        <input
-          type="checkbox"
-          aria-label={t("adb.binary.rootLabel")}
-          disabled={probing || !selected}
-          checked={root}
-          onChange={(e) => onRootChange(e.target.checked)}
-        />
-        Root (su)
-      </label>
-      <Button
-        size="sm"
-        variant="outline"
-        className="h-7 gap-1 px-2"
-        disabled={refreshing || !selected}
-        onClick={onRefresh}
-      >
-        <RefreshCw className={cn("h-3 w-3", refreshing && "animate-spin")} />
-        {t("common.refresh")}
-      </Button>
-    </div>
-  );
-}

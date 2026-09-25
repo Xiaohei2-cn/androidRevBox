@@ -73,7 +73,7 @@ export function SettingsPanel({
     staleTime: 5_000,
   });
 
-  const { gotoConfig, gotoAdbSubTab } = useAppNav();
+  const { gotoConfig, gotoAdbSubTab, gotoBinarySubTab } = useAppNav();
 
   const fillForeground = async () => {
     if (!settings.deviceSerial) return;
@@ -172,7 +172,7 @@ export function SettingsPanel({
         onFix={(kind) => {
           if (kind === "adb" || kind === "python") gotoConfig(kind === "adb" ? "app.adb.path" : "app.python.path");
           else if (kind === "remote") gotoAdbSubTab("forward");
-          else if (kind === "runner" || kind === "frida-server") gotoAdbSubTab("binary-hosting");
+          else if (kind === "runner" || kind === "frida-server") gotoBinarySubTab("hosting");
         }}
       />
 
