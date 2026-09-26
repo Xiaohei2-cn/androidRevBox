@@ -17,7 +17,7 @@ export default {
 
   "settings.clickThrough.label": "Clicar através das áreas transparentes",
   "settings.clickThrough.hint":
-    "Quando ativo, só dois pontos da barra de abas à esquerda entregam os cliques ao app de trás: a faixa transparente à esquerda dos botões e o corpo translúcido da aba inativa. Os vãos entre as abas, as áreas de clique dos ícones, a aba ativa e toda a área de conteúdo continuam recebendo os cliques. Os 12px externos de cada borda permanecem zona de redimensionamento, então dá para ajustar o tamanho a qualquer momento. O estado atual aparece abaixo.",
+    "Quando ativo, exatamente uma área entrega os cliques ao app de trás: a faixa transparente à ESQUERDA de cada aba. O corpo da aba, o ícone, os vãos entre abas, a aba ativa e toda a área de conteúdo continuam recebendo os cliques — clicar numa aba é operação básica e nunca deve atravessar. Os 12px externos de cada borda permanecem zona de redimensionamento. O estado atual aparece abaixo.",
 
   "settings.clickThrough.status.solid": "Agora: o cursor está sobre conteúdo real, esta ferramenta mantém os cliques",
   "settings.clickThrough.status.passing": "Agora: o cursor está numa área transparente, os cliques vão para o app de trás",

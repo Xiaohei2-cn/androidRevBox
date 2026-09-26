@@ -74,9 +74,9 @@ export function MainTabRail() {
       {MAIN_TABS.map((item) => (
         <div key={item.id} className="flex w-full items-stretch justify-end">
           {/*
-            本行齿块左边的透明留白：全项目唯一"让出点击"的容器之一（另一处是未选中
-            齿块本体，见 MainTabButton）。按行声明，所以滚动与选中态变宽都不会错位；
-            行容器自己不标记 → 齿块之间那 6px 缝落在 nav/行之间，默认接住。
+            本行齿块左边的透明留白：全项目**唯一**让出点击的地方。按行声明，所以滚动、
+            选中态齿块变宽都不会错位。齿块本身（含图标和它下面那一圈）、齿块之间那 6px 缝、
+            行容器与 nav 都不标 → 一律接住：点 tab 绝不能穿到后面的 App 去。
           */}
           <span aria-hidden data-click-through="pass" className="min-w-0 flex-1" />
           <MainTabButton
@@ -120,10 +120,10 @@ function MainTabButton({
       type="button"
       aria-label={label}
       aria-current={active ? "true" : undefined}
-      // 未选中齿块本体只有那层半透明着色 → 让出去；图标热区标回 solid（否则切不了页）。
-      // 选中态是实心 bg-primary + 中文标签，本来就是实体：**必须显式标 solid**，
-      // 不然会被 nav 的 pass 一路穿透掉，当前页的 tab 就成了点不动的空壳。
-      data-click-through={active ? "solid" : "pass"}
+      // 整个齿块一律接住点击（**不标 pass，也不留小热区**）：它就是"点哪个 tab"的目标。
+      // 上一版把未选中齿块本体标成穿透、只在图标外留 24×24 热区，结果齿块 36×40 居中
+      // 一个 24×24 → 图标下面正好空着 8px：想点 tab 却穿到后面的 App，直接影响操作。
+      // 穿透只保留在齿块**左边**那条留白上（见下面的行内 span）。
       onClick={onClick}
       className={cn(
         "app-surface group relative flex h-10 shrink-0 select-none items-center justify-center self-end rounded-l-xl border border-r-0 border-border/60",
@@ -137,13 +137,7 @@ function MainTabButton({
           {label}
         </span>
       ) : (
-        /*
-         * 图标外面这块 pad 是齿块上唯一的实体热区：24×24 居中，占 36×40 齿块的大部分，
-         * 剩下那一圈透明边才让给后面的 App。热区大小想调就改这里（h-6/w-6）。
-         */
-        <span data-click-through="solid" className="grid h-6 w-6 shrink-0 place-items-center">
-          <Icon className="h-4 w-4" />
-        </span>
+        <Icon className="h-4 w-4" />
       )}
     </button>
   );

@@ -46,38 +46,45 @@ describe("MainTabRail", () => {
     );
   });
 
-  it("穿透只给齿块左边的留白与未选中齿块本体：tab 之间的小空隙必须接住", () => {
-    // 用户第二轮收窄要求：第一版整条栏标 pass，把齿块之间那 6px 缝（gap-1.5）也一起送了出去。
-    // 现在留白是**按行**声明的（滚动、选中态变宽都不会错位），而缝属于行与行之间的 nav，
-    // nav 自己没有标记 → 默认接住。
+  it("齿块整体必须接住点击：穿透只给齿块左边的留白", () => {
+    // 用户实测：图标下半部分点下去穿到了后面的 App —— 因为上一版把未选中齿块本体标成
+    // 穿透，只在图标外留 24×24 热区，而齿块是 36×40：图标下面正好空着 8px。
+    // 点 tab 是基本操作，这种"差 8px 就穿"的设计不成立，所以齿块整体收回为实体。
     renderRail();
     const nav = screen.getByRole("navigation");
     expect(nav.getAttribute("data-click-through")).toBeNull();
 
     const teeth = screen.getAllByRole("button");
-    const inactive = teeth.filter((t) => t.getAttribute("aria-current") !== "true");
-    const active = teeth.filter((t) => t.getAttribute("aria-current") === "true");
-    expect(active).toHaveLength(1);
-    for (const tooth of inactive) {
-      expect(tooth.getAttribute("data-click-through")).toBe("pass"); // 半透明本体让出
-      expect(tooth.querySelector('[data-click-through="solid"]')).toBeTruthy(); // 图标热区接住
+    expect(teeth).toHaveLength(13);
+    for (const tooth of teeth) {
+      // 齿块自己不标，且它的整条祖先链里也不能有 pass —— 否则"点哪里都是这个 tab"就不成立
+      expect(tooth.getAttribute("data-click-through")).toBeNull();
+      for (let node: HTMLElement | null = tooth.parentElement; node; node = node.parentElement) {
+        expect(node.getAttribute("data-click-through")).not.toBe("pass");
+      }
+      // 图标也不该再被包一层"热区"（那种小热区正是这次事故的形状）。
+      // 选中的 tab 显示的是中文标签、没有图标，所以只在有图标时断言。
+      const icon = tooth.querySelector("svg");
+      if (icon) expect(icon.parentElement).toBe(tooth);
     }
-    // 选中态是实心 bg-primary + 中文标签，本来就是实体，必须显式 solid
-    expect(active[0].getAttribute("data-click-through")).toBe("solid");
 
-    // 每一行只有一个留白带 + 顶部带，且它们都不是按钮；行容器本身不许带标记
+    // 唯一的穿透区：每行齿块左边那条留白带；行容器与 nav 都没有声明
     const rows = nav.querySelectorAll(":scope > div");
     expect(rows).toHaveLength(13);
     for (const row of rows) {
       expect(row.getAttribute("data-click-through")).toBeNull();
-      // 行里"让出点击"的非按钮元素只有一个：齿块左边那条留白带
-      // （未选中齿块本体也标了 pass，但它是 button，另一段断言在管）
-      expect(row.querySelectorAll('span[data-click-through="pass"]')).toHaveLength(1);
-      expect(row.querySelector("button")).toBeTruthy();
+      const strips = row.querySelectorAll('span[data-click-through="pass"]');
+      expect(strips).toHaveLength(1);
+      expect(strips[0].className).toContain("flex-1"); // 剩下的宽度全归留白，齿块多宽都不错位
+      expect(row.contains(strips[0])).toBe(true);
+      // 留白带排在齿块左边（它先渲染，齿块靠右）
+      expect(row.firstElementChild).toBe(strips[0]);
+      expect(row.lastElementChild?.tagName).toBe("BUTTON");
     }
-    // 顶部那 56px 是 nav 自己的 padding → 不标任何穿透声明（接住点击）
-    expect(nav.querySelectorAll(":scope > span[data-click-through=\"pass\"]")).toHaveLength(0);
+    // 顶部那 56px 是 nav 的 padding（没有声明 → 接住），不额外做元素：
+    // 做成 flex 子元素会被 nav 的 gap 多推 6px，整条栏与内容区顶边错位
     expect(nav.className).toContain("pt-14");
+    expect(nav.querySelectorAll(":scope > span[data-click-through=\"pass\"]")).toHaveLength(0);
   });
 
   it("当前激活 tab 标记 aria-current", () => {
