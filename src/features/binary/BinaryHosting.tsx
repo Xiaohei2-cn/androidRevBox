@@ -44,6 +44,7 @@ import {
   PROBE_TIMEOUT_MS,
   argsProblem,
   classifyProbe,
+  drillVerdict,
   describeProbeFacts,
   encodeStamp,
   loadLaunchPrefs,
@@ -58,14 +59,17 @@ import {
   stampOf,
   compareStamp,
   decodeStamp,
+  extractOptionCandidates,
   probeHiddenBytes,
   utf8Bytes,
   MAX_STDIN_BYTES,
+  type DrillVerdict,
   type LaunchPrefs,
 } from "./hostedLaunch";
 import { DeviceBar } from "@/components/ui/device-bar";
 import { InfoChip } from "@/components/ui/info-chip";
-import { useI18n } from "@/i18n";
+import { useI18n, type TranslateFn } from "@/i18n";
+import { useAppNav } from "@/app/nav";
 import { cn } from "@/lib/utils";
 
 /**
@@ -142,34 +146,38 @@ interface HostedRow {
   /** 行内展开（参数与 stdin 那一块） */
   expanded: boolean;
   /** 探测状态（null = 这一轮没探过） */
-  probe: ProbeState | null;
+  probe: ProbeNode | null;
   /** 持续输入草稿与在途标记 */
   feed: string;
   feeding: boolean;
 }
 
 /**
- * 一次探测的界面状态。
+ * 一层探测的状态，可嵌套：`children` 的键是下钻用的参数前缀。
  *
- * 循环放在界面侧逐条发（一条候选 = 一次 IPC）：这样"中断"只要不再发下一条就行，
- * 不需要额外的取消协议；进度也天然是一条一条长出来的。
+ * 为什么做成树：多级 help 的真实形状就是树——`xxx --help` 里说它有 `-U` 这类入口，
+ * `xxx -U --help` 又给出一层。而过程态只想要一根进度条，所以这里不存"第几条"
+ * 这种中间量：已试的条数就是 results 的长度。
  */
-interface ProbeState {
+interface ProbeNode {
   running: boolean;
-  /** 已试到的候选下标（用于"接着试完"与进度显示） */
-  index: number;
+  /** 这一层的路径：[] = 直接探二进制；["-U"] = 探 `xxx -U --help` */
+  path: string[];
   results: ProbeRow[];
+  children: Record<string, ProbeNode>;
   /**
-   * 面板顶部的一句话：预检没过、或九条候选报的是同一句话时写这里。
-   * 九条一模一样的错误不是九条信息，是一条信息重复了九遍——用户该看到的
-   * 是"探测需要 Agent 在线，而它现在断了"，外加一个能点的出路。
+   * 顶部一句话：预检没过、或整层候选报的是同一句话时写这里。
+   * 同一句重复九遍不叫九条信息，叫一条信息重复了九遍。
    */
   banner?: string;
-  /** banner 说的是"重连 Agent 就有救"时给按钮 */
-  canReconnect?: boolean;
+  /**
+   * 只有下钻层才有：与父层比对后的判词。
+   * `same` 必须明说——把同一份总帮助摆在 `-D` 底下，用户会以为那就是 `-D` 的说明。
+   */
+  verdict?: DrillVerdict;
 }
 
-/** 一条候选的回执：要么有设备事实，要么有这次调用本身的错误 */
+/** 一条候选的回执：要么有设备回传的事实，要么有这次调用本身的错误 */
 interface ProbeRow {
   candidate: string;
   result?: HostedProbeResult;
@@ -227,6 +235,10 @@ function newHostedRow(
   };
 }
 
+/** 下钻最多几层、每层最多给几个入口（再多就没人会在这一屏里读了） */
+const MAX_DRILL_DEPTH = 2;
+const MAX_DRILL_CHIPS = 6;
+
 /**
  * 界面语言 → 给接口看的语言名。
  *
@@ -257,6 +269,8 @@ const TRANSLATE_SOURCE = "英文";
 
 export function BinaryHosting({ active = true }: { active?: boolean }) {
   const { t, locale } = useI18n();
+  /** 「去设置里配翻译接口」用：跳设置页并聚焦那一项（配置属于设置，不属于探测面板） */
+  const { gotoConfig } = useAppNav();
   const [deviceSerial, setDeviceSerial] = useState<string | null>(null);
   const [hosted, setHosted] = useState<HostedRow[]>([]);
   /**
@@ -282,9 +296,7 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
   const probeAbort = useRef<Record<string, boolean>>({});
   /** 翻译接口的本机配置（key 只在后端，这里只有后 4 位） */
   const [aiConfig, setAiConfig] = useState<AiConfig | null>(null);
-  /** 正在编辑接口配置的那一行（null = 没开） */
-  const [aiEditor, setAiEditor] = useState<string | null>(null);
-  const [aiDraft, setAiDraft] = useState({ baseUrl: "", model: "", enabled: false, apiKey: "" });
+
 
   const { data: env } = useQuery({
     queryKey: ["adb", "environment"],
@@ -446,103 +458,86 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
     patchRow(row.name, { launch });
   };
 
-  /** 只改探测状态（没在探的行不动它，避免出现一个空面板） */
-  const patchProbe = (name: string, updater: (p: ProbeState) => ProbeState) =>
+  /**
+   * 改某一层的探测状态。
+   *
+   * `path` 是下钻层级：[] = 第一层，["-U"] = `xxx -U --help` 那一层。
+   * 整棵树不可变重建：直接 mutate 会让 React 拿到同一个对象而跳过重渲染，
+   * 表现就是"进度条不动了"。
+   */
+  const patchNode = (name: string, path: string[], updater: (node: ProbeNode) => ProbeNode) => {
+    const walk = (node: ProbeNode | undefined, depth: number): ProbeNode | undefined => {
+      if (!node) return undefined;
+      if (depth >= path.length) return updater(node);
+      const child = walk(node.children[path[depth]], depth + 1);
+      if (!child) return node;
+      return { ...node, children: { ...node.children, [path[depth]]: child } };
+    };
     setHosted((hs) =>
-      hs.map((h) => (h.name === name && h.probe ? { ...h, probe: updater(h.probe) } : h)),
+      hs.map((h) => {
+        if (h.name !== name || !h.probe) return h;
+        const next = walk(h.probe, 0);
+        return next ? { ...h, probe: next } : h;
+      }),
     );
+  };
+
+  /** 中断标记的键：同一行的不同层要能各自中断 */
+  const probeKey = (name: string, path: string[]) => [name, ...path].join("\u0000");
 
   /**
-   * 逐条候选探测（UI-6 第二层）。
+   * 一层探测：把候选表按顺序各起一次。
    *
-   * 三条不可让的口径：
-   * ① 一次只问一个候选 → 中断就是"不再发下一条"，进度是一条条长出来的；
-   * ② 命中即停（打完东西且自己退了），但**不宣称"这就是它真正的用法"**，
-   *    也不把它当结论显示；全部落空只说"我试过这些都不像"；
-   * ③ 界面不猜"算不算帮助"：分类只用设备回传的事实（有没有输出 / 有没有退 / 多久 / 什么码）。
+   * 三条口径：
+   * ① 一次只问一个候选，中断 = 不再发下一条（不需要取消协议）；
+   * ② **过程中界面只给进度**（用户要求：不要一路刷中间信息），结束才出结果；
+   * ③ 命中即停，但文案只说"打完东西就自己退了"，不宣称这是官方用法；
+   *    全落空也只说"我试过这些都不像"。
    */
-  const runProbe = async (row: HostedRow, restart: boolean) => {
+  const probeLevel = async (row: HostedRow, path: string[]) => {
     if (!deviceSerial) return;
-    // 预检：探测是写操作，Agent 不在时后端一条都不起。先把这句说出来，
-    // 免得用户看到九行失败却不知道为什么。
-    try {
-      const status = await agentApi.status(deviceSerial);
-      const verdict = probePreflight(status);
-      if (verdict.kind === "agentOffline") {
-        patchRow(row.name, {
-          expanded: true,
-          probe: {
-            running: false,
-            index: 0,
-            results: [],
-            banner: t("adb.binary.probeNeedAgent", {
-              state: verdict.state,
-              detail: verdict.detail ?? "-",
-            }),
-            canReconnect: true,
-          },
-        });
+    const name = row.name;
+    const prefix = [...splitArgs(row.launch.argsText), ...path];
+    const key = probeKey(name, path);
+    patchNode(name, path, (node) => ({ ...node, running: true, banner: undefined }));
+    probeAbort.current[key] = false;
+    for (const candidate of HELP_CANDIDATES) {
+      if (probeAbort.current[key]) {
+        patchNode(name, path, (node) => ({ ...node, running: false }));
         return;
       }
-      if (verdict.kind === "methodMissing") {
-        patchRow(row.name, {
-          expanded: true,
-          probe: {
-            running: false,
-            index: 0,
-            results: [],
-            banner: t("adb.binary.probeOldAgent", { version: verdict.agentVersion ?? "-" }),
-            canReconnect: true,
-          },
-        });
-        return;
-      }
-    } catch {
-      // 预检只是"先问一句"，读不到不等于探测不能跑：继续往下问设备，让设备说了算。
-      // 这里不吞掉任何判断——真正的原因仍会在第一条候选的失败行里原样显示出来。
-    }
-    const prefix = splitArgs(row.launch.argsText);
-    const start = restart ? 0 : row.probe?.results.length ?? 0;
-    if (start >= HELP_CANDIDATES.length) return;
-    patchRow(row.name, {
-      expanded: true,
-      probe: { running: true, index: start, results: restart ? [] : (row.probe?.results ?? []) },
-    });
-    probeAbort.current[row.name] = false;
-    for (let i = start; i < HELP_CANDIDATES.length; i += 1) {
-      if (probeAbort.current[row.name]) return; // 中断：停在已试过的这些上，不改口说"没有"
-      const candidate = HELP_CANDIDATES[i];
       try {
         const result = await deviceApi.binaryProbe(
           deviceSerial,
-          row.name,
+          name,
           [...prefix, candidate],
           PROBE_TIMEOUT_MS,
         );
-        patchProbe(row.name, (p) => ({
-          ...p,
-          index: i + 1,
-          results: [...p.results.filter((r) => r.candidate !== candidate), { candidate, result, translating: false }],
+        patchNode(name, path, (node) => ({
+          ...node,
+          results: [
+            ...node.results.filter((r) => r.candidate !== candidate),
+            { candidate, result, translating: false },
+          ],
         }));
         if (probeLooksLikeHelp(result)) {
-          patchProbe(row.name, (p) => ({ ...p, running: false }));
+          patchNode(name, path, (node) => ({ ...node, running: false }));
           setNotice(t("adb.binary.probeHit", { candidate }));
           return;
         }
       } catch (e) {
         const message = String((e as Error)?.message ?? e);
-        patchProbe(row.name, (p) => ({
-          ...p,
-          index: i + 1,
+        patchNode(name, path, (node) => ({
+          ...node,
           results: [
-            ...p.results.filter((r) => r.candidate !== candidate),
+            ...node.results.filter((r) => r.candidate !== candidate),
             { candidate, error: message, translating: false },
           ],
         }));
         if (looksLikeMissingCommand(message)) {
-          // 前端比后端新（或反过来）：这条要求的是重启/重新构建 App，不是重连设备
-          patchProbe(row.name, (p) => ({
-            ...p,
+          // 前端比后端新（或反过来）：这条要的是重启/重新构建 App，跑满九条只会误导
+          patchNode(name, path, (node) => ({
+            ...node,
             running: false,
             banner: t("adb.binary.probeRebuildHint"),
           }));
@@ -550,22 +545,97 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
         }
       }
     }
-    patchProbe(row.name, (p) => {
-      const same = repeatedError(p.results.map((r) => r.error));
-      return { ...p, running: false, ...(same ? { banner: same } : {}) };
-    });
-    setNotice(t("adb.binary.probeNone"));
+    patchNode(name, path, (node) => ({
+      ...node,
+      running: false,
+      banner: (() => {
+        const same = repeatedError(node.results.map((r) => r.error));
+        return same ?? t("adb.binary.probeNone");
+      })(),
+    }));
   };
 
-  /** 重连 Agent 后接着探：让"探测不生效"有一种不需要你去找按钮的出路 */
+  /** 按路径取某一层的节点（翻译与面板都要用，写两份必然漂移） */
+  const nodeAt = (node: ProbeNode | null | undefined, path: string[]): ProbeNode | undefined =>
+    path.length === 0 ? (node ?? undefined) : nodeAt(node?.children[path[0]], path.slice(1));
+
+  /** 「接着试完」这一层：预检已经过了，不再重复问一次设备 */
+  const runProbeAt = async (row: HostedRow, path: string[]) => {
+    await probeLevel(row, path);
+  };
+
+  /** 建一层节点（父节点下挂 children[key]） */
+  const ensureLevel = (name: string, path: string[]) =>
+    setHosted((hs) =>
+      hs.map((h) => {
+        if (h.name !== name) return h;
+        const empty = (at: string[]): ProbeNode => ({
+          running: false,
+          path: at,
+          results: [],
+          children: {},
+        });
+        if (path.length === 0) return { ...h, expanded: true, probe: h.probe ?? empty([]) };
+        const probe = h.probe ?? empty([]);
+        const children: Record<string, ProbeNode> = { ...probe.children };
+        let cursor = children;
+        path.forEach((token, index) => {
+          const last = index === path.length - 1;
+          const existing = cursor[token] ?? empty(path.slice(0, index + 1));
+          cursor[token] = existing;
+          if (!last) cursor = { ...existing.children };
+        });
+        return { ...h, expanded: true, probe: { ...probe, children } };
+      }),
+    );
+
+  /**
+   * 点「探测帮助」：先预检，再逐条问设备。
+   *
+   * 预检存在的理由：探测是写操作，Agent 不在线时后端一条都不起。
+   * 那句"需要 Agent 在线"必须在动手之前说，而且要有一个能按的出路，
+   * 不能留给用户从九行同样的失败里自己悟。
+   */
+  const runProbe = async (row: HostedRow) => {
+    if (!deviceSerial) return;
+    ensureLevel(row.name, []);
+    try {
+      const verdict = probePreflight(await agentApi.status(deviceSerial));
+      if (verdict.kind === "agentOffline") {
+        patchNode(row.name, [], (node) => ({
+          ...node,
+          results: [],
+          canReconnect: true,
+          banner: t("adb.binary.probeNeedAgent", {
+            state: verdict.state,
+            detail: verdict.detail ?? "-",
+          }),
+        }));
+        return;
+      }
+      if (verdict.kind === "methodMissing") {
+        patchNode(row.name, [], (node) => ({
+          ...node,
+          results: [],
+          canReconnect: true,
+          banner: t("adb.binary.probeOldAgent", { version: verdict.agentVersion ?? "-" }),
+        }));
+        return;
+      }
+    } catch {
+      // 预检读不到不拦路：照旧问设备，真原因仍会出现在第一条候选里
+    }
+    await probeLevel(row, []);
+  };
+
+  /** 重连 Agent 后接着探：让"会话断了"有一种不用去设备页找按钮的出路 */
   const reconnectAndRetry = async (row: HostedRow) => {
     if (!deviceSerial) return;
     setProbing(true);
     try {
       await agentApi.restart(deviceSerial);
       setNotice(t("adb.binary.probeReconnected"));
-      patchRow(row.name, { probe: null });
-      await runProbe({ ...row, probe: null }, true);
+      await runProbe({ ...row, probe: null });
     } catch (e) {
       setNotice(`${t("adb.binary.probeReconnectFail")}: ${String((e as Error)?.message ?? e)}`);
     } finally {
@@ -574,30 +644,91 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
   };
 
   /**
-   * 把某条候选的输出翻成界面语言。
+   * 下钻一层：前缀来自**上一层它自己打出来的帮助文本**。
    *
-   * 只翻"有内容的那一条流"：help 程序惯例把用法写 stdout，报错写 stderr，
-   * 两个都翻等于把同样的钱花两遍。原文一律保留在卡片里——译文只是辅助，
-   * 判据还得是设备报回来的事实。
+   * 这就是多级 help（`xxx -U --help` 还有下一层）的做法——不给任何程序写模板，
+   * 也不扫二进制里的字符串：程序愿意写进帮助里的选项，就是它承认的入口。
+   * 每个前缀最多起 9 次进程、每次都有超时与杀进程组兜底，所以再深也不会失控；
+   * 界面只允许向下钻 MAX_DRILL_DEPTH 层，防止点出一棵没法看的树。
    */
-  const translateProbe = async (name: string, candidate: string) => {
-    const row = hosted.find((h) => h.name === name);
-    const item = row?.probe?.results.find((r) => r.candidate === candidate);
-    const result = item?.result;
-    if (!result) return;
-    const raw = result.stdout.trim() ? result.stdout : result.stderr;
-    const text = stripAnsi(raw);
-    patchProbe(name, (p) => ({
-      ...p,
-      results: p.results.map((r) =>
+  const drillInto = async (
+    row: HostedRow,
+    path: string[],
+    token: string,
+    parentText: string,
+  ) => {
+    if (!deviceSerial) return;
+    const next = [...path, token];
+    if (next.length > MAX_DRILL_DEPTH) return;
+    ensureLevel(row.name, next);
+    const argv = [...splitArgs(row.launch.argsText), ...next];
+    const ask = async (flag: string) => {
+      try {
+        return await deviceApi.binaryProbe(
+          deviceSerial,
+          row.name,
+          [...argv, flag],
+          PROBE_TIMEOUT_MS,
+        );
+      } catch (e) {
+        return { error: String((e as Error)?.message ?? e) } as const;
+      }
+    };
+    const rows: ProbeRow[] = [];
+    let best = "";
+    const first = await ask("--help");
+    if ("error" in first) {
+      rows.push({ candidate: "--help", error: first.error, translating: false });
+    } else {
+      rows.push({ candidate: "--help", result: first, translating: false });
+      if (probeHasOutput(first)) best = first.stdout + first.stderr;
+    }
+    // 长写法没有内容时才试短写法：有的程序只认 `-h`，反过来也一样
+    if (!best) {
+      const second = await ask("-h");
+      if ("error" in second) {
+        rows.push({ candidate: "-h", error: second.error, translating: false });
+      } else {
+        rows.push({ candidate: "-h", result: second, translating: false });
+        if (probeHasOutput(second)) best = second.stdout + second.stderr;
+      }
+    }
+    patchNode(row.name, next, (node) => ({
+      ...node,
+      results: rows,
+      verdict: drillVerdict(stripAnsi(best), parentText, best.trim().length > 0),
+    }));
+  };
+
+  /**
+   * 翻某一条候选的输出。
+   *
+   * 只翻"有内容的那一条流"（用法常在 stdout、报错在 stderr），
+   * 且**翻完之后不再显示原文**（用户口径）：一份文本摆两份，读的人反而要自己核对
+   * 哪份才是它说的。原文的字节数与退出码仍在事实行里，判据没被藏起来。
+   */
+  const translateProbe = async (row: HostedRow, path: string[], candidate: string) => {
+    // 取"那一层"的节点：下钻之后的候选不在第一层里，写死 path.length===0 会让
+    // 第二层的翻译按钮按下去没反应（第一版就是这样）
+    const result = nodeAt(row.probe, path)?.results.find((r) => r.candidate === candidate)?.result;
+    const text = result ? stripAnsi(result.stdout.trim() ? result.stdout : result.stderr) : "";
+    if (!text) return;
+    const at = (node: ProbeNode): ProbeNode => ({
+      ...node,
+      results: node.results.map((r) =>
         r.candidate === candidate ? { ...r, translating: true, translateNote: undefined } : r,
       ),
-    }));
+    });
+    patchNode(row.name, path, at);
     try {
-      const out = await aiApi.translate(text, TRANSLATE_LANGS[locale] ?? "简体中文", TRANSLATE_SOURCE);
-      patchProbe(name, (p) => ({
-        ...p,
-        results: p.results.map((r) =>
+      const out = await aiApi.translate(
+        text,
+        TRANSLATE_LANGS[locale] ?? "简体中文",
+        TRANSLATE_SOURCE,
+      );
+      patchNode(row.name, path, (node) => ({
+        ...node,
+        results: node.results.map((r) =>
           r.candidate === candidate
             ? {
                 ...r,
@@ -611,10 +742,10 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
         ),
       }));
     } catch (e) {
-      // 翻译坏了绝不改判探测结果：原文照看，失败原因单独说一句
-      patchProbe(name, (p) => ({
-        ...p,
-        results: p.results.map((r) =>
+      // 翻译坏了不改判探测：留着原文并说一句为什么
+      patchNode(row.name, path, (node) => ({
+        ...node,
+        results: node.results.map((r) =>
           r.candidate === candidate
             ? {
                 ...r,
@@ -1016,33 +1147,21 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
     }
   };
 
-  /** 读翻译配置（key 只留在后端，这里只拿得到后 4 位） */
+  /**
+   * 读翻译配置。
+   *
+   * 界面上**只有开关与"去设置"的入口**，没有输入框：配置 API 接口属于设置页，
+   * 挂在托管行里会让"我想知道这程序怎么用"和"我在配 key"两件事挤在同一屏，
+   * 也让一个只读探测面板长出保存按钮。
+   */
   const loadAi = useCallback(async () => {
     try {
-      const cfg = await aiApi.getConfig();
-      setAiConfig(cfg);
-      setAiDraft({ baseUrl: cfg.baseUrl, model: cfg.model, enabled: cfg.enabled, apiKey: "" });
-    } catch (e) {
-      setNotice(String((e as Error)?.message ?? e));
+      setAiConfig(await aiApi.getConfig());
+    } catch {
+      // 读不到配置就当没开：探测本身不该被翻译拖累
+      setAiConfig(null);
     }
   }, []);
-
-  const saveAi = useCallback(async () => {
-    try {
-      // apiKey 留空 = 不动它（后端不会把它回传给我们，所以无从"保持原值"）
-      const cfg = await aiApi.setConfig({
-        baseUrl: aiDraft.baseUrl,
-        model: aiDraft.model,
-        enabled: aiDraft.enabled,
-        apiKey: aiDraft.apiKey ? aiDraft.apiKey : undefined,
-      });
-      setAiConfig(cfg);
-      setAiDraft({ baseUrl: cfg.baseUrl, model: cfg.model, enabled: cfg.enabled, apiKey: "" });
-      setNotice(t("adb.binary.translateSaved", { tail: cfg.keyTail || "-" }));
-    } catch (e) {
-      setNotice(String((e as Error)?.message ?? e));
-    }
-  }, [aiDraft, t]);
 
   /** 输入通道能不能写：只认设备回传的 stdin_mode */
   const feedOpen = (row: HostedRow) => !!row.handle && !row.root && row.stdinMode === "open";
@@ -1343,7 +1462,7 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                         title={t("adb.binary.probeTip")}
                         onClick={(event) => {
                           event.stopPropagation();
-                          void runProbe(row, true);
+                          void runProbe(row);
                           void loadAi();
                         }}
                       >
@@ -1600,254 +1719,32 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                     )}
 
                     {row.probe && (
-                      <div
-                        className="mt-1.5 flex flex-col gap-1.5 rounded-md border bg-card p-2"
-                        data-testid={`probe-panel-${row.name}`}
-                      >
-                        <div className="flex flex-wrap items-center gap-1.5 text-10px">
-                          <span className="min-w-0 flex-1 text-muted-foreground">
-                            {row.probe.running
-                              ? t("adb.binary.probeRunning", {
-                                  index: String(row.probe.results.length + 1),
-                                  total: String(HELP_CANDIDATES.length),
-                                  candidate:
-                                    HELP_CANDIDATES[Math.min(row.probe.index, HELP_CANDIDATES.length - 1)] ?? "",
-                                })
-                              : t("adb.binary.probeTried", { count: String(row.probe.results.length) })}
-                          </span>
-                          {row.probe.running ? (
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="h-6 shrink-0 gap-1 px-2 text-destructive"
-                              data-testid={`probe-abort-${row.name}`}
-                              onClick={() => {
-                                probeAbort.current[row.name] = true;
-                                patchProbe(row.name, (p) => ({ ...p, running: false }));
-                              }}
-                            >
-                              <Square className="h-3 w-3" />
-                              {t("adb.binary.probeAbort")}
-                            </Button>
-                          ) : (
-                            row.probe.results.length < HELP_CANDIDATES.length && (
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-6 shrink-0 px-2"
-                                data-testid={`probe-continue-${row.name}`}
-                                onClick={() => void runProbe(row, false)}
-                              >
-                                {t("adb.binary.probeContinue")}
-                              </Button>
-                            )
-                          )}
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="h-6 shrink-0 gap-1 px-1.5 text-muted-foreground"
-                            data-testid={`probe-ai-${row.name}`}
-                            title={t("adb.binary.translateConfig")}
-                            onClick={() => {
-                              setAiEditor(aiEditor === row.name ? null : row.name);
-                              void loadAi();
-                            }}
-                          >
-                            <Settings2 className="h-3 w-3" />
-                            {aiConfig?.enabled
-                              ? t("adb.binary.translateOn", { tail: aiConfig.keyTail || "-" })
-                              : t("adb.binary.translateOff")}
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="h-6 shrink-0 px-1.5 text-muted-foreground"
-                            onClick={() => patchRow(row.name, { probe: null })}
-                          >
-                            <X className="h-3 w-3" />
-                          </Button>
-                        </div>
-                        {row.probe.banner && (
-                          <div
-                            className="flex flex-wrap items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 p-1.5"
-                            data-testid={`probe-banner-${row.name}`}
-                          >
-                            <span className="min-w-0 flex-1 break-all text-10px leading-relaxed text-amber-500">
-                              {row.probe.banner}
-                            </span>
-                            {row.probe.canReconnect && (
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-6 shrink-0 gap-1 px-2"
-                                data-testid={`probe-reconnect-${row.name}`}
-                                onClick={() => void reconnectAndRetry(row)}
-                              >
-                                <RefreshCw className="h-3 w-3" />
-                                {t("adb.binary.probeReconnect")}
-                              </Button>
-                            )}
-                          </div>
-                        )}
-                        <p className="text-10px leading-relaxed text-muted-foreground">
-                          {t("adb.binary.probeShellOnly")}
-                        </p>
-                        {aiEditor === row.name && (
-                          <div
-                            className="flex flex-col gap-1.5 rounded-md border bg-muted/30 p-2"
-                            data-testid={`ai-editor-${row.name}`}
-                          >
-                            <input
-                              aria-label={t("adb.binary.translateBaseUrl")}
-                              className="h-6 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
-                              placeholder="https://…/v1"
-                              value={aiDraft.baseUrl}
-                              onChange={(e) => setAiDraft({ ...aiDraft, baseUrl: e.target.value })}
-                            />
-                            <input
-                              aria-label={t("adb.binary.translateModel")}
-                              className="h-6 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
-                              placeholder="gpt-4o-mini"
-                              value={aiDraft.model}
-                              onChange={(e) => setAiDraft({ ...aiDraft, model: e.target.value })}
-                            />
-                            <input
-                              aria-label={t("adb.binary.translateKey")}
-                              type="password"
-                              autoComplete="off"
-                              className="h-6 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
-                              placeholder={
-                                aiConfig?.hasApiKey
-                                  ? t("adb.binary.translateKeyKept", { tail: aiConfig.keyTail })
-                                  : "sk-…"
-                              }
-                              value={aiDraft.apiKey}
-                              onChange={(e) => setAiDraft({ ...aiDraft, apiKey: e.target.value })}
-                            />
-                            <label className="flex items-center gap-1 text-10px">
-                              <input
-                                type="checkbox"
-                                className="h-3 w-3"
-                                checked={aiDraft.enabled}
-                                onChange={(e) => setAiDraft({ ...aiDraft, enabled: e.target.checked })}
-                              />
-                              {t("adb.binary.translateEnabled")}
-                            </label>
-                            <p className="text-10px leading-relaxed text-muted-foreground">
-                              {t("adb.binary.translateNotice", { url: aiDraft.baseUrl || "-" })}
-                            </p>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="h-6 self-start px-2"
-                              data-testid={`ai-save-${row.name}`}
-                              onClick={() => void saveAi()}
-                            >
-                              {t("adb.binary.translateSave")}
-                            </Button>
-                          </div>
-                        )}
-                        {row.probe.results.length === 0 && (
-                          <p className="text-10px text-muted-foreground">{t("adb.binary.probeWaiting")}</p>
-                        )}
-                        <ul className="flex flex-col gap-1.5">
-                          {row.probe.results.map((item) => (
-                            <li
-                              key={item.candidate}
-                              className="rounded-md border border-border/60 p-1.5"
-                              data-testid={`probe-item-${row.name}-${item.candidate}`}
-                            >
-                              <div className="flex flex-wrap items-center gap-1.5">
-                                <code className="shrink-0 rounded bg-muted px-1 font-mono text-10px">
-                                  {item.candidate}
-                                </code>
-                                <span
-                                  className={cn(
-                                    "shrink-0 rounded px-1.5 py-0.5 text-10px",
-                                    item.result ? categoryTone(item.result) : "bg-red-500/10 text-red-500",
-                                  )}
-                                >
-                                  {item.result
-                                    ? t(probeCategoryKey(item.result))
-                                    : t("adb.binary.probeCallFail")}
-                                </span>
-                                <span className="min-w-0 flex-1 break-all text-10px text-muted-foreground">
-                                  {item.result ? describeProbeFacts(item.result) : item.error}
-                                </span>
-                                {item.result && probeHasOutput(item.result) && (
-                                  <Button
-                                    size="sm"
-                                    variant="ghost"
-                                    className="h-5 shrink-0 gap-1 px-1.5 text-10px"
-                                    data-testid={`probe-translate-${row.name}-${item.candidate}`}
-                                    disabled={item.translating || !aiConfig?.enabled}
-                                    title={
-                                      aiConfig?.enabled
-                                        ? t("adb.binary.translateNotice", { url: aiConfig.baseUrl || "-" })
-                                        : t("adb.binary.translateNeed")
-                                    }
-                                    onClick={() => void translateProbe(row.name, item.candidate)}
-                                  >
-                                    <Languages className="h-3 w-3" />
-                                    {item.translating
-                                      ? t("adb.binary.translating")
-                                      : t("adb.binary.translate", {
-                                          lang: TRANSLATE_LANGS[locale] ?? "简体中文",
-                                        })}
-                                  </Button>
-                                )}
-                              </div>
-                              {(["stdout", "stderr"] as const).map((stream) => {
-                                const text = item.result ? stripAnsi(item.result[stream]) : "";
-                                if (!text) return null;
-                                return (
-                                  <div key={stream} className="mt-1">
-                                    <p className="text-10px text-muted-foreground">{stream}</p>
-                                    <pre
-                                      className="path-selectable max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-1 font-mono text-10px"
-                                      data-testid={`probe-${stream}-${row.name}-${item.candidate}`}
-                                    >
-                                      {text}
-                                    </pre>
-                                  </div>
-                                );
-                              })}
-                              {item.result?.truncated && (
-                                <p className="mt-1 text-10px text-amber-500" data-testid={`probe-truncated-${row.name}-${item.candidate}`}>
-                                  {t("adb.binary.probeTruncated", {
-                                    bytes: String(probeHiddenBytes(item.result)),
-                                  })}
-                                </p>
-                              )}
-                              {item.result?.still_running && (
-                                <p className="mt-1 text-10px text-destructive" data-testid={`probe-alive-${row.name}-${item.candidate}`}>
-                                  {t("adb.binary.probeStillRunning", { pid: String(item.result.pid) })}
-                                </p>
-                              )}
-                              {item.translated && (
-                                <div className="mt-1">
-                                  <p className="text-10px text-muted-foreground">
-                                    {t("adb.binary.translated", {
-                                      lang: TRANSLATE_LANGS[locale] ?? "简体中文",
-                                    })}
-                                  </p>
-                                  <pre
-                                    className="path-selectable max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-1 text-10px"
-                                    data-testid={`probe-translated-${row.name}-${item.candidate}`}
-                                  >
-                                    {item.translated}
-                                  </pre>
-                                </div>
-                              )}
-                              {item.translateNote && (
-                                <p className="mt-1 break-all text-10px text-muted-foreground">
-                                  {item.translateNote}
-                                </p>
-                              )}
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
+                      <ProbeLevelView
+                        name={row.name}
+                        node={row.probe}
+                        aiEnabled={Boolean(aiConfig?.enabled)}
+                        aiTail={aiConfig?.keyTail ?? ""}
+                        targetLang={TRANSLATE_LANGS[locale] ?? "简体中文"}
+                        t={t}
+                        canReconnect
+                        onAbort={(path) => {
+                          // 中断：不再发下一条。已试过的结果留着，不改口说"没有"
+                          probeKey(row.name, path);
+                          probeAbort.current[probeKey(row.name, path)] = true;
+                          patchNode(row.name, path, (node) => ({ ...node, running: false }));
+                        }}
+                        onRetry={async (path) => {
+                          const fresh: HostedRow = { ...row, probe: null };
+                          await runProbeAt(fresh, path);
+                        }}
+                        onDrill={async (path, token, parentText) => {
+                          await drillInto(row, path, token, parentText);
+                        }}
+                        onTranslate={(path, candidate) => void translateProbe(row, path, candidate)}
+                        onConfig={() => gotoConfig("app.ai.base_url")}
+                        onClose={(target) => patchRow(target, { probe: null })}
+                        onReconnect={() => void reconnectAndRetry(row)}
+                      />
                     )}
                     {row.error && (
                       <p className="mt-1.5 break-all text-11px leading-relaxed text-destructive" data-testid={`err-${row.name}`}>
@@ -1896,3 +1793,295 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
 }
 
 /** 信息胶囊：纯文本可选中（path-selectable 单击全选/拖选/右键复制），非按钮 */
+
+/**
+ * 探测面板（递归渲染每一层）。
+ *
+ * 两条界面口径是用户明确要的：
+ * ① 探测**过程中只给进度**——一路刷九张卡片既读不清也吵；结束才出结果；
+ * ② 翻了译文就**不再摆原文**——同一份内容摆两份，读的人还得自己核对哪份算数。
+ * 事实行（耗时、码/信号、真实字节数、有没有杀干净）任何情况下都在：那是判据，不是装饰。
+ */
+function ProbeLevelView(props: {
+  name: string;
+  node: ProbeNode;
+  aiEnabled: boolean;
+  aiTail: string;
+  targetLang: string;
+  t: TranslateFn;
+  onAbort: (path: string[]) => void;
+  onRetry: (path: string[]) => void;
+  onDrill: (path: string[], token: string, parentText: string) => void;
+  onTranslate: (path: string[], candidate: string) => void;
+  onConfig: () => void;
+  onClose: (name: string) => void;
+  canReconnect: boolean;
+  onReconnect: () => void;
+}) {
+  const {
+    name,
+    node,
+    aiEnabled,
+    targetLang,
+    t,
+    onAbort,
+    onRetry,
+    onDrill,
+    onTranslate,
+    onConfig,
+    onClose,
+    canReconnect,
+    onReconnect,
+  } = props;
+  const path = node.path;
+  const depth = path.length;
+  const done = node.results.length;
+  const pct = Math.min(100, Math.round((done / HELP_CANDIDATES.length) * 100));
+  const next = HELP_CANDIDATES[Math.min(done, HELP_CANDIDATES.length - 1)];
+  return (
+    <div
+      className={depth === 0 ? "flex flex-col gap-1.5" : "ml-3 flex flex-col gap-1.5 border-l pl-2"}
+      data-testid={depth === 0 ? `probe-panel-${name}` : `probe-drill-${name}-${path.join("_")}`}
+    >
+      {depth > 0 && (
+        <div className="flex flex-col gap-1">
+          <p className="font-mono text-10px text-muted-foreground">
+            {t("adb.binary.probeDrillTitle", { args: path.join(" ") })}
+          </p>
+          {/* 判词只在跑完之后说；same 与 none 必须明说，否则用户会把总帮助当成这个参数的说明 */}
+          {!node.running && node.verdict && node.verdict !== "deeper" && (
+            <p
+              className={cn(
+                "text-10px leading-relaxed",
+                node.verdict === "same" ? "text-muted-foreground" : "text-amber-500",
+              )}
+              data-testid={`probe-verdict-${name}-${path.join("_")}`}
+            >
+              {t(
+                node.verdict === "same"
+                  ? "adb.binary.probeDrillSame"
+                  : "adb.binary.probeDrillNone",
+              )}
+            </p>
+          )}
+        </div>
+      )}
+      {node.running ? (
+        <div className="flex items-center gap-2" data-testid={`probe-progress-${name}`}>
+          <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full rounded-full bg-emerald-500 transition-all"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <span className="shrink-0 text-10px text-muted-foreground" data-testid={`probe-current-${name}`}>
+            {done}/{HELP_CANDIDATES.length} · {next}
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 shrink-0 gap-1 px-2 text-destructive"
+            data-testid={`probe-abort-${name}`}
+            onClick={() => onAbort(path)}
+          >
+            <Square className="h-3 w-3" />
+            {t("adb.binary.probeAbort")}
+          </Button>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1.5">
+          {node.banner && (
+            <div
+              className="flex flex-wrap items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 p-1.5"
+              data-testid={`probe-banner-${name}`}
+            >
+              <span className="min-w-0 flex-1 break-all text-10px leading-relaxed text-amber-500">
+                {node.banner}
+              </span>
+              {canReconnect && depth === 0 && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6 shrink-0 gap-1 px-2"
+                  data-testid={`probe-reconnect-${name}`}
+                  onClick={onReconnect}
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  {t("adb.binary.probeReconnect")}
+                </Button>
+              )}
+            </div>
+          )}
+          <div className="flex flex-wrap items-center gap-1.5 text-10px">
+            <span className="min-w-0 flex-1 text-muted-foreground">
+              {t("adb.binary.probeTried", { count: String(done) })}
+            </span>
+            {done < HELP_CANDIDATES.length && done > 0 && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-6 shrink-0 px-2"
+                data-testid={`probe-continue-${name}`}
+                onClick={() => void onRetry(path)}
+              >
+                {t("adb.binary.probeContinue")}
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 shrink-0 gap-1 px-1.5 text-muted-foreground"
+              data-testid={`probe-close-${name}`}
+              title={t("adb.binary.probeClose")}
+              onClick={() => onClose(name)}
+            >
+              <X className="h-3 w-3" />
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 shrink-0 gap-1 px-1.5 text-muted-foreground"
+              data-testid={`probe-config-${name}`}
+              title={t("adb.binary.translateGoConfig")}
+              onClick={onConfig}
+            >
+              <Settings2 className="h-3 w-3" />
+              {aiEnabled ? t("adb.binary.translateOn", { tail: props.aiTail }) : t("adb.binary.translateOff")}
+            </Button>
+          </div>
+          {depth === 0 && (
+            <p className="text-10px leading-relaxed text-muted-foreground">
+              {t("adb.binary.probeShellOnly")}
+            </p>
+          )}
+          <ul className="flex flex-col gap-1.5">
+            {node.results.map((item) => {
+              const showTranslation = Boolean(item.translated);
+              const streams: Array<["stdout" | "stderr", string]> = showTranslation
+                ? []
+                : [
+                    ["stdout", item.result ? stripAnsi(item.result.stdout) : ""],
+                    ["stderr", item.result ? stripAnsi(item.result.stderr) : ""],
+                  ];
+              const chips =
+                item.result && probeLooksLikeHelp(item.result) && depth < MAX_DRILL_DEPTH
+                  ? extractOptionCandidates(
+                      `${item.result.stdout}\n${item.result.stderr}`,
+                      [...HELP_CANDIDATES, ...path],
+                    ).slice(0, MAX_DRILL_CHIPS)
+                  : [];
+              return (
+                <li
+                  key={item.candidate}
+                  className="rounded-md border border-border/60 p-1.5"
+                  data-testid={`probe-item-${name}-${path.join("_")}-${item.candidate}`}
+                >
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <code className="shrink-0 rounded bg-muted px-1 font-mono text-10px">
+                      {[...path, item.candidate].join(" ")}
+                    </code>
+                    <span
+                      className={cn(
+                        "shrink-0 rounded px-1.5 py-0.5 text-10px",
+                        item.result ? categoryTone(item.result) : "bg-red-500/10 text-red-500",
+                      )}
+                    >
+                      {item.result ? t(probeCategoryKey(item.result)) : t("adb.binary.probeCallFail")}
+                    </span>
+                    <span className="min-w-0 flex-1 break-all text-10px text-muted-foreground">
+                      {item.result ? describeProbeFacts(item.result) : item.error}
+                    </span>
+                    {item.result && probeHasOutput(item.result) && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-5 shrink-0 gap-1 px-1.5 text-10px"
+                        data-testid={`probe-translate-${name}-${item.candidate}`}
+                        disabled={item.translating}
+                        title={aiEnabled ? t("adb.binary.translateNotice", { url: "" }) : t("adb.binary.translateNeed")}
+                        onClick={() => (aiEnabled ? onTranslate(path, item.candidate) : onConfig())}
+                      >
+                        <Languages className="h-3 w-3" />
+                        {item.translating
+                          ? t("adb.binary.translating")
+                          : aiEnabled
+                            ? t("adb.binary.translate", { lang: targetLang })
+                            : t("adb.binary.translateGoConfig")}
+                      </Button>
+                    )}
+                  </div>
+                  {streams.map(
+                    ([stream, text]) =>
+                      text && (
+                        <div key={stream} className="mt-1">
+                          <p className="text-10px text-muted-foreground">{stream}</p>
+                          <pre className="path-selectable max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-1 font-mono text-10px">
+                            {text}
+                          </pre>
+                        </div>
+                      ),
+                  )}
+                  {showTranslation && (
+                    <div className="mt-1">
+                      <p className="text-10px text-muted-foreground">
+                        {t("adb.binary.translated", { lang: targetLang })}
+                      </p>
+                      <pre className="path-selectable max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-1 text-10px">
+                        {item.translated}
+                      </pre>
+                    </div>
+                  )}
+                  {item.result?.truncated && (
+                    <p className="mt-1 text-10px text-amber-500">
+                      {t("adb.binary.probeTruncated", { bytes: String(probeHiddenBytes(item.result)) })}
+                    </p>
+                  )}
+                  {item.result?.still_running && (
+                    <p className="mt-1 text-10px text-destructive">
+                      {t("adb.binary.probeStillRunning", { pid: String(item.result.pid) })}
+                    </p>
+                  )}
+                  {item.translateNote && (
+                    <p className="mt-1 break-all text-10px text-muted-foreground">{item.translateNote}</p>
+                  )}
+                  {chips.length > 0 && (
+                    <div className="mt-1 flex flex-wrap items-center gap-1" data-testid={`probe-chips-${name}-${item.candidate}`}>
+                      <span className="text-10px text-muted-foreground">
+                        {t("adb.binary.probeDrillHint", { candidate: item.candidate })}
+                      </span>
+                      {chips.map((token) => (
+                        <button
+                          key={token}
+                          type="button"
+                          className="shrink-0 rounded border border-input px-1 font-mono text-10px hover:bg-accent disabled:opacity-50"
+                          data-testid={`probe-drill-${name}-${item.candidate}-${token}`}
+                          disabled={Boolean(node.children[token]?.running)}
+                          title={t("adb.binary.probeDrillTip")}
+                          onClick={() =>
+                            void onDrill(
+                              path,
+                              token,
+                              item.result ? stripAnsi(`${item.result.stdout}\n${item.result.stderr}`) : "",
+                            )}
+                        >
+                          {token}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          {Object.entries(node.children).map(([token, child]) => (
+            <ProbeLevelView
+              key={token}
+              {...props}
+              node={child}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

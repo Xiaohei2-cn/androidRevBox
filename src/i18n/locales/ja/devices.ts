@@ -269,4 +269,11 @@ export default {
   "adb.binary.probeReconnected": "Agent を再接続しました。探索を続けます",
   "adb.binary.probeReconnectFail": "Agent 再接続に失敗",
   "adb.binary.probeRebuildHint": "デスクトップ側に device_binary_probe コマンドがありません：App が旧ビルドです。再起動か再ビルド後に再試行してください",
+  "adb.binary.translateGoConfig": "設定で翻訳インターフェースを設定",
+  "adb.binary.probeDrillTitle": "一段掘る：{args}",
+  "adb.binary.probeDrillHint": "ヘルプ自身が入口を挙げています。クリックで一段掘ります：",
+  "adb.binary.probeDrillTip": "その引数を前置きにして、ヘルプの書き方をもう一度試す",
+  "adb.binary.probeClose": "結果を閉じる",
+  "adb.binary.probeDrillSame": "この項目に独自の階層はありません：同じ全体ヘルプが出ます",
+  "adb.binary.probeDrillNone": "何も返りませんでした：この前置きを受け付けないか、下の層に説明が無い",
 } as const;

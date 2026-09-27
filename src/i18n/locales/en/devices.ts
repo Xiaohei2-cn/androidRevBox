@@ -269,4 +269,11 @@ export default {
   "adb.binary.probeReconnected": "Agent reconnected, probing again",
   "adb.binary.probeReconnectFail": "Agent reconnect failed",
   "adb.binary.probeRebuildHint": "The desktop has no device_binary_probe command: the App is an old build, restart or rebuild it",
+  "adb.binary.translateGoConfig": "Configure translation in Settings",
+  "adb.binary.probeDrillTitle": "Deeper probe: {args}",
+  "adb.binary.probeDrillHint": "Its own help lists these entries; click one to probe a level deeper:",
+  "adb.binary.probeDrillTip": "Use it as a prefix and try each help flag again",
+  "adb.binary.probeClose": "Dismiss probe results",
+  "adb.binary.probeDrillSame": "This entry has no level of its own: it prints the same overall help",
+  "adb.binary.probeDrillNone": "Nothing came back: it does not take this prefix, or the next level has no text",
 } as const;

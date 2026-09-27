@@ -56,4 +56,12 @@ export default {
   "settings.tab.about": "Sobre",
   "settings.donate.title": "Doar",
   "settings.donate.description": "Se esta ferramenta te ajuda, considere apoiar o desenvolvedor — canais de doação (Alipay / WeChat / Afadian etc.) serão adicionados aqui.",
+  "settings.ai.title": "Serviço de tradução (para a sonda de ajuda)",
+  "settings.ai.hint": "O texto de ajuda pode ser traduzido para o idioma da interface. Opcional: o original é sempre guardado.",
+  "settings.ai.baseUrl": "URL do serviço (https; local http://127.0.0.1)",
+  "settings.ai.model": "Nome do modelo",
+  "settings.ai.key": "Chave de API (guardada localmente, não é reexibida)",
+  "settings.ai.kept": "Configurada (termina em {tail}) — em branco mantém",
+  "settings.ai.enable": "Ativar tradução (senão o painel mostra só o original)",
+  "settings.ai.privacy": "O texto traduzido vai para o URL definido — nunca para o dispositivo nem para o log. A chave fica nesta máquina; a interface mostra só os últimos 4 caracteres.",
 } as const;

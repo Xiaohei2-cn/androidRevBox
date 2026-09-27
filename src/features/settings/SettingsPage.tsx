@@ -8,6 +8,7 @@ import {
 } from "@/lib/clickThroughStatus";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
+import { aiApi } from "@/api/ai";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
@@ -53,6 +54,7 @@ export function SettingsPage() {
 
   // 「去配置」跨 tab 定位：目标键落在环境 tab（未来新键按前缀归 tab）
   const targetTab = pendingConfigKey?.startsWith("app.tools.") ||
+      pendingConfigKey?.startsWith("app.ai.") ||
       pendingConfigKey === "app.python.path" ||
       pendingConfigKey === "app.node.path" ||
       pendingConfigKey === "app.adb.path"
@@ -292,6 +294,30 @@ function EnvironmentTab() {
 
       <Card>
         <CardHeader>
+          <CardTitle>{t("settings.ai.title")}</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <p className="text-xs leading-relaxed text-muted-foreground">{t("settings.ai.hint")}</p>
+          <ConfigInputRow
+            label={t("settings.ai.baseUrl")}
+            configKey="app.ai.base_url"
+            placeholder="https://…/v1"
+            mono
+            onSaved={() => void queryClient.invalidateQueries({ queryKey: ["ai", "config"] })}
+          />
+          <ConfigInputRow
+            label={t("settings.ai.model")}
+            configKey="app.ai.model"
+            placeholder="gpt-4o-mini"
+            mono
+            onSaved={() => void queryClient.invalidateQueries({ queryKey: ["ai", "config"] })}
+          />
+          <AiKeyRow />
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
           <CardTitle>{t("settings.tools.label")}</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
@@ -374,6 +400,107 @@ function SystemTab() {
 
 /** 通用配置行：从后端 snapshot 回显初值，点「应用」落库（后端做键白名单 + 值校验）。
  *  从卡片「去配置」跳转进来时：自动滚动到位、聚焦输入框、蓝框闪烁两下。 */
+/**
+ * 翻译接口剩下的两样：API key 与开关。
+ *
+ * key 不能用 `ConfigInputRow`：那张表决定「什么会被整包快照发给前端」，
+ * 而 key 恰恰不能进快照，所以它走 `ai_*` 两条专用命令——
+ * 读回来只有 `hasApiKey` + 后 4 位。**界面上没有回显 key 的地方，也就没有
+ * "看一眼确认一下"的习惯**，这是故意的：能显示一次就能被截图、被贴给别人。
+ * 留空保存 = 保持原值不动。
+ */
+function AiKeyRow() {
+  const { t } = useI18n();
+  const { pendingConfigKey, clearPendingConfig } = useAppNav();
+  const [flash, setFlash] = useState(false);
+  const [apiKey, setApiKey] = useState("");
+  const [enabled, setEnabled] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const { data: cfg, refetch } = useQuery({
+    queryKey: ["ai", "config"],
+    queryFn: () => aiApi.getConfig(),
+  });
+  const seeded = useRef(false);
+  if (cfg && !seeded.current) {
+    seeded.current = true;
+    setEnabled(cfg.enabled);
+  }
+
+  useEffect(() => {
+    if (pendingConfigKey !== "app.ai.api_key" && pendingConfigKey !== "app.ai.enabled") return;
+    const el = inputRef.current;
+    if (!el) return;
+    el.closest("div")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.focus();
+    setFlash(true);
+    const timer = setTimeout(() => {
+      setFlash(false);
+      clearPendingConfig();
+    }, 1600);
+    return () => clearTimeout(timer);
+  }, [pendingConfigKey, clearPendingConfig]);
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await aiApi.setConfig({
+        baseUrl: cfg?.baseUrl ?? "",
+        model: cfg?.model ?? "",
+        enabled,
+        // 空串在这里当"不动它"：回显不存在，用户没重新输就该保留原值
+        apiKey: apiKey ? apiKey : undefined,
+      });
+      setApiKey("");
+      await refetch();
+    } catch (e) {
+      setError(String((e as Error)?.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <input
+          ref={inputRef}
+          type="password"
+          autoComplete="off"
+          aria-label={t("settings.ai.key")}
+          data-testid="setting-ai-key"
+          className={cn(
+            "h-8 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 font-mono text-xs",
+            flash && "config-flash",
+          )}
+          placeholder={
+            cfg?.hasApiKey ? t("settings.ai.kept", { tail: cfg.keyTail }) : "sk-…"
+          }
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+        />
+        <Button size="sm" variant="outline" disabled={busy} onClick={() => void save()}>
+          {t("common.apply")}
+        </Button>
+      </div>
+      <label className="flex items-center gap-2 text-xs">
+        <input
+          type="checkbox"
+          className="h-3.5 w-3.5"
+          data-testid="setting-ai-enabled"
+          checked={enabled}
+          onChange={(e) => setEnabled(e.target.checked)}
+        />
+        {t("settings.ai.enable")}
+      </label>
+      <p className="text-xs leading-relaxed text-muted-foreground">{t("settings.ai.privacy")}</p>
+      {error && <p className="break-all text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
 function ConfigInputRow({
   label,
   configKey,

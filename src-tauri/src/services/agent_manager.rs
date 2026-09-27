@@ -4242,6 +4242,22 @@ mod tests {
             );
         }
 
+        // ①′ 多级 help 的数据通路：argv 带两个前缀也要能原样送达（下钻靠它）
+        if let Ok(target) = std::env::var("AR8_PROBE_NAME") {
+            let plain = probe(&client, &target, vec!["--help".into()], None).await;
+            let drilled = probe(&client, &target, vec!["-D".into(), "--help".into()], None).await;
+            eprintln!(
+                "[probe 下钻] 直接 --help={} 字节 / -D --help={} 字节 同一份={}",
+                plain.stdout_bytes,
+                drilled.stdout_bytes,
+                plain.stdout == drilled.stdout
+            );
+            assert!(
+                drilled.started && drilled.stdout_bytes > 0,
+                "带前缀的第二次探测拿不到输出，界面就没法判断有没有更深一层"
+            );
+        }
+
         // ① 有输出且自己退
         let loud = probe(
             &client,

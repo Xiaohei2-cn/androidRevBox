@@ -269,4 +269,11 @@ export default {
   "adb.binary.probeReconnected": "Агент переподключён, продолжаю проверку",
   "adb.binary.probeReconnectFail": "Не удалось переподключить агент",
   "adb.binary.probeRebuildHint": "В приложении нет команды device_binary_probe: это старая сборка, перезапустите или пересоберите",
+  "adb.binary.translateGoConfig": "Настроить перевод в параметрах",
+  "adb.binary.probeDrillTitle": "Углублённая проверка: {args}",
+  "adb.binary.probeDrillHint": "В его же справке есть такие точки; нажмите, чтобы проверить глубже:",
+  "adb.binary.probeDrillTip": "Использовать как префикс и снова перебрать флаги справки",
+  "adb.binary.probeClose": "Закрыть результаты",
+  "adb.binary.probeDrillSame": "У этого пункта нет своего уровня: выводится та же общая справка",
+  "adb.binary.probeDrillNone": "Ничего не вернулось: этот префикс не принимается или ниже описания нет",
 } as const;

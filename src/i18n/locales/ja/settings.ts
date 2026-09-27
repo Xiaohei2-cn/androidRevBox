@@ -56,4 +56,12 @@ export default {
   "settings.tab.about": "について",
   "settings.donate.title": "寄付",
   "settings.donate.description": "このツールが役に立ったら開発者を応援してください — 寄付チャネル（Alipay / WeChat / Afdian など）はここに追加されます。",
+  "settings.ai.title": "翻訳エンドポイント（ヘルプ探索用）",
+  "settings.ai.hint": "ヘルプ文言をUI言語へ翻訳できます。未設定でも使えます：原文は必ず残ります。",
+  "settings.ai.baseUrl": "エンドポイント URL（https。ローカルは http://127.0.0.1）",
+  "settings.ai.model": "モデル名",
+  "settings.ai.key": "API key（本マシンにのみ保存・再表示なし）",
+  "settings.ai.kept": "設定済み（末尾 {tail}）· 空欄なら変更しません",
+  "settings.ai.enable": "翻訳を有効化（オンにすると探索パネルに訳文が出る）",
+  "settings.ai.privacy": "翻訳対象の文言は設定した URL へ送られます（デバイスには送りません、日志にも残しません）。key は本マシンにのみ保存され、画面には末尾 4 文字だけ出ます。",
 } as const;

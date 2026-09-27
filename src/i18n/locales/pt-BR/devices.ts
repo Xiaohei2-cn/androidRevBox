@@ -269,4 +269,11 @@ export default {
   "adb.binary.probeReconnected": "Agent reconectado, sondagem retomada",
   "adb.binary.probeReconnectFail": "Falha ao reconectar o Agent",
   "adb.binary.probeRebuildHint": "O aplicativo não tem o comando device_binary_probe: é uma compilação antiga, reinicie ou recompile",
+  "adb.binary.translateGoConfig": "Configurar tradução em Definições",
+  "adb.binary.probeDrillTitle": "Sonda mais funda: {args}",
+  "adb.binary.probeDrillHint": "A própria ajuda lista estas entradas; clique para explorar um nível abaixo:",
+  "adb.binary.probeDrillTip": "Use como prefixo e tenta cada flag de ajuda de novo",
+  "adb.binary.probeClose": "Fechar resultados",
+  "adb.binary.probeDrillSame": "Esta entrada não tem nível próprio: imprime a mesma ajuda geral",
+  "adb.binary.probeDrillNone": "Nada veio: não aceita este prefixo ou o nível abaixo não tem texto",
 } as const;

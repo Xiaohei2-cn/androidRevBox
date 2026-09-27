@@ -56,4 +56,12 @@ export default {
   "settings.tab.about": "About",
   "settings.donate.title": "Donate",
   "settings.donate.description": "If this tool helps you, consider supporting the developer — donation channels (Alipay / WeChat / Afadian etc.) will be added here.",
+  "settings.ai.title": "Translation endpoint (for help probing)",
+  "settings.ai.hint": "Help text can be translated into the interface language. Optional: the original is always kept.",
+  "settings.ai.baseUrl": "Endpoint URL (https; local may use http://127.0.0.1)",
+  "settings.ai.model": "Model name",
+  "settings.ai.key": "API key (stored locally, never shown back)",
+  "settings.ai.kept": "Configured (ends {tail}) — blank keeps it",
+  "settings.ai.enable": "Enable translation (otherwise the panel shows only the original)",
+  "settings.ai.privacy": "Translated text is sent to the URL you set — never to the device, never logged. The key stays on this machine; the UI only shows its last 4 characters.",
 } as const;

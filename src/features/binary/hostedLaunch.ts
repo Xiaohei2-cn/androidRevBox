@@ -319,3 +319,66 @@ export function repeatedError(errors: (string | undefined)[]): string | null {
   const first = texts[0];
   return texts.every((text) => text === first) ? first : null;
 }
+
+/** 下一级探测最多取这么多个前缀，避免把一张帮助读成一串进程 */
+export const MAX_NEXT_LEVEL_PREFIXES = 12;
+
+/**
+ * 从**它自己打出来的帮助文本**里取"可以再探一层"的参数前缀。
+ *
+ * 为什么这不算"扫字面量"：我们不去二进制里捞字符串，只读这次真实输出的 stdout/stderr。
+ * 程序愿意打在帮助里的选项，就是它承认的入口；没打在帮助里的我们不猜。
+ * 于是多级 help（`xxx -U --help` 还有下一层）不用为每个程序写模板：
+ * 第一层探出来的文本自己就是第二层的候选表。
+ *
+ * 取的是**声明位**的短/长选项（行首缩进后紧跟 `-X` / `--xxx`，可形如 `-h, --help`），
+ * 描述里顺便提到的 `-x` 不算；带值的（`--listen=ADDR`、`-p PORT`）也不当前缀
+ * ——拿它们去起一次只会因为缺参数而报错，那是一条噪音。
+ */
+export function extractOptionCandidates(text: string, alreadyTried: string[]): string[] {
+  const skip = new Set(alreadyTried);
+  const seen = new Set<string>();
+  const found: string[] = [];
+  const isOption = (token: string) => /^-{1,2}[A-Za-z][\w-]*$/.test(token);
+  for (const line of text.split('\n')) {
+    // 声明行的形状：缩进 + 选项 [, 选项] + （空格 + 说明）。
+    // 说明句里顺带提到的 `--certificate` 不算入口——那是散文，不是它能接的东西。
+    // 逗号不能算进 token（`-D,` 不是选项），所以用 [^\s,]+ 取
+    const m = /^[ \t]+(-[^\s,]+)(?:[ \t]*,[ \t]*(-[^\s,]+))?/.exec(line);
+    if (!m) continue;
+    const tokens = [m[1], m[2]].filter((v): v is string => !!v);
+    // 带值的选项（`--listen=ADDR`）不当"下一层前缀"：拿它去起一次只会因缺参数报错
+    if (tokens.some((token) => token.includes("="))) continue;
+    if (!tokens.every(isOption)) continue;
+    for (const token of tokens) {
+      if (skip.has(token) || seen.has(token)) continue;
+      seen.add(token);
+      found.push(token);
+    }
+  }
+  return found.slice(0, MAX_NEXT_LEVEL_PREFIXES);
+}
+
+/**
+ * 判断"这一项到底有没有自己的一层"。
+ *
+ * 不要为每个前缀盲跑九条候选：绝大多数程序对 `-D --help` 打的就是**同一份**总帮助
+ * （GLib 系尤其明显，实测 frida-server 改名的那个二进制就是），跑满九条只是浪费九次进程。
+ * 一次的输出与父层比一下就能分三种情况说清楚：
+ * - `none`：什么都没打 → 这一项没有下一层（也可能它压根不接受这个前缀）；
+ * - `same`：打的是同一份 → 没有独立的一层，别让人误以为"这就是该参数的说明"；
+ * - `deeper`：内容不同 → 真有一层，展开给人看，还能继续往下钻。
+ */
+export type DrillVerdict = "none" | "same" | "deeper";
+
+export function drillVerdict(
+  childText: string,
+  parentText: string,
+  childHasOutput: boolean,
+): DrillVerdict {
+  if (!childHasOutput) return "none";
+  const child = childText.trim();
+  const parent = parentText.trim();
+  if (parent.length > 0 && child === parent) return "same";
+  return "deeper";
+}

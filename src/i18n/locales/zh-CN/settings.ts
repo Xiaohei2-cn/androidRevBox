@@ -55,4 +55,12 @@ export default {
   "settings.tab.about": "关于",
   "settings.donate.title": "捐赠",
   "settings.donate.description": "如果这个工具对你有帮助，欢迎支持开发者——捐赠渠道（支付宝/微信/爱发电等）将在此接入。",
+  "settings.ai.title": "翻译接口（探测帮助用）",
+  "settings.ai.hint": "探测到帮助文本后可翻成界面语言。不配也能用：原文一定保留，翻译只是辅助。",
+  "settings.ai.baseUrl": "接口地址（https；本机服务可用 http://127.0.0.1）",
+  "settings.ai.model": "模型名",
+  "settings.ai.key": "API key（只存本机，不回显）",
+  "settings.ai.kept": "已配置（尾号 {tail}）· 留空表示不改",
+  "settings.ai.enable": "启用翻译（探测面板上才会出现「译文」）",
+  "settings.ai.privacy": "待译文本会发送到你填的地址，不会下发设备、不进日志；API key 只存本机，界面只看得到后 4 位。",
 } as const;

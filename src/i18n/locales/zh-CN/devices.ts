@@ -269,4 +269,11 @@ export default {
   "adb.binary.probeReconnected": "Agent 已重连，继续探测",
   "adb.binary.probeReconnectFail": "Agent 重连没成功",
   "adb.binary.probeRebuildHint": "桌面端没有 device_binary_probe 这个命令：App 还是旧构建，重启或重新构建后再试",
+  "adb.binary.translateGoConfig": "去设置里配翻译接口",
+  "adb.binary.probeDrillTitle": "再探一层：{args}",
+  "adb.binary.probeDrillHint": "它自己说还有这些入口，点一个再探一层：",
+  "adb.binary.probeDrillTip": "用这个参数当占位前缀，再逐条试帮助写法",
+  "adb.binary.probeClose": "收起探测结果",
+  "adb.binary.probeDrillSame": "这一项没有独立的一层：它打的是同一份总帮助（很多 GLib/单级程序就这样）",
+  "adb.binary.probeDrillNone": "这一项问不出东西：它不接受这个前缀，或者下一层没有说明",
 } as const;
