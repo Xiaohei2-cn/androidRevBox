@@ -4221,6 +4221,27 @@ mod tests {
 
         let runs_before = table_size(&client).await;
 
+        // ⓪ 可选：拿**用户真实遇到的那个文件**验一次（界面用的同一条接口）。
+        // 只测 toybox 的腿能证明"我的实现自洽"，证明不了"用户那点下去有没有东西"。
+        if let Ok(target) = std::env::var("AR8_PROBE_NAME") {
+            let arg = std::env::var("AR8_PROBE_ARG").unwrap_or_else(|_| "--help".into());
+            let real = probe(&client, &target, vec![arg.clone()], None).await;
+            eprintln!(
+                "[probe 真实目标] name={target} arg={arg} started={} exit={:?} timed_out={} bytes={}/{} head={:?}",
+                real.started,
+                real.exit_code,
+                real.timed_out,
+                real.stdout_bytes,
+                real.stderr_bytes,
+                &real.stdout.chars().take(90).collect::<String>()
+            );
+            assert!(
+                real.started && !real.timed_out && real.stdout_bytes > 0,
+                "用户实测能出帮助的文件，探测也必须拿到输出：{:?}",
+                real.detail
+            );
+        }
+
         // ① 有输出且自己退
         let loud = probe(
             &client,

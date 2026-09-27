@@ -263,4 +263,10 @@ export default {
   "adb.binary.translateSaved": "已保存到本机（key 尾号 {tail}）",
   "adb.binary.translateNotice": "待译原文会发送到你配置的接口：{url}。key 只留在本机，不下发设备、不进日志。",
   "adb.binary.translateTruncated": "原文超过上限，只翻了前 {chars} 字",
+  "adb.binary.probeNeedAgent": "探测需要 Agent 在线（当前会话：{state}）· 详情：{detail}",
+  "adb.binary.probeOldAgent": "设备端 Agent 没宣告 hosted.probe（当前版本 {version}）：重连一次就会自动装上新产物",
+  "adb.binary.probeReconnect": "重连 Agent",
+  "adb.binary.probeReconnected": "Agent 已重连，继续探测",
+  "adb.binary.probeReconnectFail": "Agent 重连没成功",
+  "adb.binary.probeRebuildHint": "桌面端没有 device_binary_probe 这个命令：App 还是旧构建，重启或重新构建后再试",
 } as const;

@@ -264,3 +264,58 @@ export function probeHiddenBytes(result: HostedProbeResult): number {
   const shown = utf8Bytes(result.stdout) + utf8Bytes(result.stderr);
   return Math.max(0, result.stdout_bytes + result.stderr_bytes - shown);
 }
+
+/**
+ * 探测前的预检：把"点了没反应"变成一句能说清是谁不在的话。
+ *
+ * 为什么要预检：探测是**写操作**（会在设备上起进程），Agent 不在线时后端一律拒，
+ * 不悄悄回退 adb。于是一个断掉的会话在界面上的表现就是"九条候选全部失败"——
+ * 用户看到的是"探测不生效"，而真相是"这个功能需要 Agent 在线，而它现在断了"。
+ * 那句话必须在动手之前就说，而且要给出可点的出路。
+ */
+export type ProbePreflight =
+  | { kind: "ok" }
+  | { kind: "agentOffline"; state: string; detail?: string }
+  | { kind: "methodMissing"; agentVersion?: string };
+
+const READY_STATES = new Set(["ready", "degraded"]);
+
+export function probePreflight(status: {
+  state: string;
+  lastError?: string | null;
+  agentVersion?: string | null;
+  capabilities?: { method: string; available: boolean }[];
+}): ProbePreflight {
+  if (!READY_STATES.has(status.state)) {
+    return { kind: "agentOffline", state: status.state, detail: status.lastError ?? undefined };
+  }
+  // 能力表没探完时（空数组）不做判罚：那属于"还不知道"，交给设备侧回答
+  const caps = status.capabilities ?? [];
+  if (caps.length > 0 && !caps.some((c) => c.method === "hosted.probe" && c.available)) {
+    return { kind: "methodMissing", agentVersion: status.agentVersion ?? undefined };
+  }
+  return { kind: "ok" };
+}
+
+/**
+ * "桌面命令没注册"的样子：前端比后端新（或反过来）时的典型报错。
+ * 不识别成一般的失败，因为它要求的是**重启/重新构建 App**，不是重连设备。
+ */
+export function looksLikeMissingCommand(message: string): boolean {
+  const text = message.toLowerCase();
+  return (
+    text.includes("not found") ||
+    text.includes("does not exist") ||
+    text.includes("unknown command") ||
+    message.includes("不存在") ||
+    message.includes("未注册")
+  );
+}
+
+/** 同一句话重复九遍不是信息，是噪音：把完全相同的失败原因归并成一条 */
+export function repeatedError(errors: (string | undefined)[]): string | null {
+  const texts = errors.filter((value): value is string => !!value);
+  if (texts.length < 2) return null;
+  const first = texts[0];
+  return texts.every((text) => text === first) ? first : null;
+}

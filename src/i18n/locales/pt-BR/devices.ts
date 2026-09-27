@@ -263,4 +263,10 @@ export default {
   "adb.binary.translateSaved": "Salvo localmente (key termina em {tail})",
   "adb.binary.translateNotice": "O texto traduzido é enviado ao serviço configurado: {url}. A chave fica nesta máquina: nunca vai ao dispositivo nem ao log.",
   "adb.binary.translateTruncated": "Original acima do limite: só os primeiros {chars} caracteres foram traduzidos",
+  "adb.binary.probeNeedAgent": "A sonda precisa do Agent online (sessão: {state}) · detalhe: {detail}",
+  "adb.binary.probeOldAgent": "O Agent no dispositivo não anuncia hosted.probe (versão {version}): reconectar instala o artefato novo",
+  "adb.binary.probeReconnect": "Reconectar Agent",
+  "adb.binary.probeReconnected": "Agent reconectado, sondagem retomada",
+  "adb.binary.probeReconnectFail": "Falha ao reconectar o Agent",
+  "adb.binary.probeRebuildHint": "O aplicativo não tem o comando device_binary_probe: é uma compilação antiga, reinicie ou recompile",
 } as const;

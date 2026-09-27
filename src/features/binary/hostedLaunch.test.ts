@@ -13,7 +13,10 @@ import {
   emptyLaunchPrefs,
   encodeStamp,
   loadLaunchPrefs,
+  looksLikeMissingCommand,
   probeHasOutput,
+  probePreflight,
+  repeatedError,
   probeLooksLikeHelp,
   saveLaunchPrefs,
   splitArgs,
@@ -189,5 +192,57 @@ describe("版本指纹（mtime + size）", () => {
     saveLaunchPrefs("SERIAL1", "toybox", emptyLaunchPrefs());
     expect(localStorage.getItem("adb.binary.launch.SERIAL1.toybox.args")).toBeNull();
     expect(loadLaunchPrefs("SERIAL1", "toybox")).toEqual(emptyLaunchPrefs());
+  });
+});
+
+describe("探测前的预检（把「点了没反应」说成一句人话）", () => {
+  it("Agent 会话没就绪就不去起进程", () => {
+    const verdict = probePreflight({ state: "disconnected", lastError: "adb forward 失败" });
+    expect(verdict.kind).toBe("agentOffline");
+    if (verdict.kind === "agentOffline") {
+      expect(verdict.state).toBe("disconnected");
+      expect(verdict.detail).toContain("forward");
+    }
+  });
+
+  it("Agent 在线但没宣告 hosted.probe 判成「版本旧」", () => {
+    expect(
+      probePreflight({
+        state: "ready",
+        agentVersion: "0.2.1",
+        capabilities: [{ method: "hosted.start", available: true }],
+      }).kind,
+    ).toBe("methodMissing");
+    expect(
+      probePreflight({
+        state: "degraded",
+        agentVersion: "0.2.2",
+        capabilities: [
+          { method: "hosted.start", available: true },
+          { method: "hosted.probe", available: true },
+        ],
+      }).kind,
+    ).toBe("ok");
+  });
+
+  it("能力表还没探完（空）时不下判语：那属于不知道，不是不可用", () => {
+    expect(probePreflight({ state: "ready", capabilities: [] }).kind).toBe("ok");
+    expect(probePreflight({ state: "ready" }).kind).toBe("ok");
+  });
+
+  it("识别「命令没注册」，因为它要的是重启 App 而不是重连设备", () => {
+    expect(looksLikeMissingCommand("Command device_binary_probe not found")).toBe(true);
+    expect(looksLikeMissingCommand("Unknown command: `device_binary_probe`")).toBe(true);
+    expect(looksLikeMissingCommand("命令 device_binary_probe 不存在")).toBe(true);
+    expect(looksLikeMissingCommand("hosted.probe 需要 Agent 在线")).toBe(false);
+  });
+
+  it("九条同样的失败归并成一条，不同的不归并", () => {
+    expect(repeatedError(["需要 Agent 在线", "需要 Agent 在线", "需要 Agent 在线"])).toBe(
+      "需要 Agent 在线",
+    );
+    expect(repeatedError(["a", "b"])).toBeNull();
+    expect(repeatedError(["只剩一条", undefined])).toBeNull();
+    expect(repeatedError([undefined, undefined])).toBeNull();
   });
 });

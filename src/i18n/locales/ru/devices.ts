@@ -263,4 +263,10 @@ export default {
   "adb.binary.translateSaved": "Сохранено локально (key оканчивается {tail})",
   "adb.binary.translateNotice": "Переводимый текст отправляется в настроенный сервис: {url}. Key остаётся на этой машине: не уходит на устройство и не пишется в журнал.",
   "adb.binary.translateTruncated": "Оригинал превысил лимит: переведены только первые {chars} символов",
+  "adb.binary.probeNeedAgent": "Проверке нужен онлайн-агент (сессия: {state}) · подробности: {detail}",
+  "adb.binary.probeOldAgent": "Agent на устройстве не объявляет hosted.probe (версия {version}): переподключение установит новый артефакт",
+  "adb.binary.probeReconnect": "Переподключить агент",
+  "adb.binary.probeReconnected": "Агент переподключён, продолжаю проверку",
+  "adb.binary.probeReconnectFail": "Не удалось переподключить агент",
+  "adb.binary.probeRebuildHint": "В приложении нет команды device_binary_probe: это старая сборка, перезапустите или пересоберите",
 } as const;

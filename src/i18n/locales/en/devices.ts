@@ -263,4 +263,10 @@ export default {
   "adb.binary.translateSaved": "Saved locally (key ends {tail})",
   "adb.binary.translateNotice": "The text being translated is sent to your configured endpoint: {url}. The key stays on this machine: never pushed to the device, never logged.",
   "adb.binary.translateTruncated": "Original exceeded the cap; only the first {chars} characters were translated",
+  "adb.binary.probeNeedAgent": "Probing needs the Agent online (session: {state}) · detail: {detail}",
+  "adb.binary.probeOldAgent": "The on-device Agent does not declare hosted.probe (version {version}): reconnecting installs the new artifact",
+  "adb.binary.probeReconnect": "Reconnect Agent",
+  "adb.binary.probeReconnected": "Agent reconnected, probing again",
+  "adb.binary.probeReconnectFail": "Agent reconnect failed",
+  "adb.binary.probeRebuildHint": "The desktop has no device_binary_probe command: the App is an old build, restart or rebuild it",
 } as const;

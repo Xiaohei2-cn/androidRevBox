@@ -263,4 +263,10 @@ export default {
   "adb.binary.translateSaved": "本マシンに保存しました（key 末尾 {tail}）",
   "adb.binary.translateNotice": "翻訳対象の原文は設定した接口に送信されます：{url}。key は本マシンに留まり、デバイスへも日志へも行きません。",
   "adb.binary.translateTruncated": "原文が上限を超えたため最初の {chars} 文字のみ翻訳しました",
+  "adb.binary.probeNeedAgent": "探索には Agent の接続が必要です（セッション：{state}）· 詳細：{detail}",
+  "adb.binary.probeOldAgent": "デバイス側 Agent が hosted.probe を告知していません（ version {version}）：再接続すると新しい成果物が自動で入ります",
+  "adb.binary.probeReconnect": "Agent 再接続",
+  "adb.binary.probeReconnected": "Agent を再接続しました。探索を続けます",
+  "adb.binary.probeReconnectFail": "Agent 再接続に失敗",
+  "adb.binary.probeRebuildHint": "デスクトップ側に device_binary_probe コマンドがありません：App が旧ビルドです。再起動か再ビルド後に再試行してください",
 } as const;

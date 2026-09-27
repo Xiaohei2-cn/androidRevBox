@@ -38,6 +38,7 @@ import {
 import { loadRootPref, saveRootPref, shouldTryRoot } from "@/lib/hostedRoot";
 import { stripAnsi } from "@/lib/ansi";
 import { aiApi, type AiConfig } from "@/api/ai";
+import { agentApi } from "@/api/agent";
 import {
   HELP_CANDIDATES,
   PROBE_TIMEOUT_MS,
@@ -46,8 +47,11 @@ import {
   describeProbeFacts,
   encodeStamp,
   loadLaunchPrefs,
+  looksLikeMissingCommand,
   probeCategoryKey,
   probeHasOutput,
+  probePreflight,
+  repeatedError,
   probeLooksLikeHelp,
   saveLaunchPrefs,
   splitArgs,
@@ -155,6 +159,14 @@ interface ProbeState {
   /** 已试到的候选下标（用于"接着试完"与进度显示） */
   index: number;
   results: ProbeRow[];
+  /**
+   * 面板顶部的一句话：预检没过、或九条候选报的是同一句话时写这里。
+   * 九条一模一样的错误不是九条信息，是一条信息重复了九遍——用户该看到的
+   * 是"探测需要 Agent 在线，而它现在断了"，外加一个能点的出路。
+   */
+  banner?: string;
+  /** banner 说的是"重连 Agent 就有救"时给按钮 */
+  canReconnect?: boolean;
 }
 
 /** 一条候选的回执：要么有设备事实，要么有这次调用本身的错误 */
@@ -451,6 +463,44 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
    */
   const runProbe = async (row: HostedRow, restart: boolean) => {
     if (!deviceSerial) return;
+    // 预检：探测是写操作，Agent 不在时后端一条都不起。先把这句说出来，
+    // 免得用户看到九行失败却不知道为什么。
+    try {
+      const status = await agentApi.status(deviceSerial);
+      const verdict = probePreflight(status);
+      if (verdict.kind === "agentOffline") {
+        patchRow(row.name, {
+          expanded: true,
+          probe: {
+            running: false,
+            index: 0,
+            results: [],
+            banner: t("adb.binary.probeNeedAgent", {
+              state: verdict.state,
+              detail: verdict.detail ?? "-",
+            }),
+            canReconnect: true,
+          },
+        });
+        return;
+      }
+      if (verdict.kind === "methodMissing") {
+        patchRow(row.name, {
+          expanded: true,
+          probe: {
+            running: false,
+            index: 0,
+            results: [],
+            banner: t("adb.binary.probeOldAgent", { version: verdict.agentVersion ?? "-" }),
+            canReconnect: true,
+          },
+        });
+        return;
+      }
+    } catch {
+      // 预检只是"先问一句"，读不到不等于探测不能跑：继续往下问设备，让设备说了算。
+      // 这里不吞掉任何判断——真正的原因仍会在第一条候选的失败行里原样显示出来。
+    }
     const prefix = splitArgs(row.launch.argsText);
     const start = restart ? 0 : row.probe?.results.length ?? 0;
     if (start >= HELP_CANDIDATES.length) return;
@@ -480,18 +530,47 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
           return;
         }
       } catch (e) {
+        const message = String((e as Error)?.message ?? e);
         patchProbe(row.name, (p) => ({
           ...p,
           index: i + 1,
           results: [
             ...p.results.filter((r) => r.candidate !== candidate),
-            { candidate, error: String((e as Error)?.message ?? e), translating: false },
+            { candidate, error: message, translating: false },
           ],
         }));
+        if (looksLikeMissingCommand(message)) {
+          // 前端比后端新（或反过来）：这条要求的是重启/重新构建 App，不是重连设备
+          patchProbe(row.name, (p) => ({
+            ...p,
+            running: false,
+            banner: t("adb.binary.probeRebuildHint"),
+          }));
+          return;
+        }
       }
     }
-    patchProbe(row.name, (p) => ({ ...p, running: false }));
+    patchProbe(row.name, (p) => {
+      const same = repeatedError(p.results.map((r) => r.error));
+      return { ...p, running: false, ...(same ? { banner: same } : {}) };
+    });
     setNotice(t("adb.binary.probeNone"));
+  };
+
+  /** 重连 Agent 后接着探：让"探测不生效"有一种不需要你去找按钮的出路 */
+  const reconnectAndRetry = async (row: HostedRow) => {
+    if (!deviceSerial) return;
+    setProbing(true);
+    try {
+      await agentApi.restart(deviceSerial);
+      setNotice(t("adb.binary.probeReconnected"));
+      patchRow(row.name, { probe: null });
+      await runProbe({ ...row, probe: null }, true);
+    } catch (e) {
+      setNotice(`${t("adb.binary.probeReconnectFail")}: ${String((e as Error)?.message ?? e)}`);
+    } finally {
+      setProbing(false);
+    }
   };
 
   /**
@@ -1588,6 +1667,28 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                             <X className="h-3 w-3" />
                           </Button>
                         </div>
+                        {row.probe.banner && (
+                          <div
+                            className="flex flex-wrap items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 p-1.5"
+                            data-testid={`probe-banner-${row.name}`}
+                          >
+                            <span className="min-w-0 flex-1 break-all text-10px leading-relaxed text-amber-500">
+                              {row.probe.banner}
+                            </span>
+                            {row.probe.canReconnect && (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 shrink-0 gap-1 px-2"
+                                data-testid={`probe-reconnect-${row.name}`}
+                                onClick={() => void reconnectAndRetry(row)}
+                              >
+                                <RefreshCw className="h-3 w-3" />
+                                {t("adb.binary.probeReconnect")}
+                              </Button>
+                            )}
+                          </div>
+                        )}
                         <p className="text-10px leading-relaxed text-muted-foreground">
                           {t("adb.binary.probeShellOnly")}
                         </p>
