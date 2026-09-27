@@ -22,6 +22,23 @@ export async function pickFile(
   return typeof picked === "string" ? picked : null;
 }
 
+/**
+ * 多选文件（访达里一次选中多个二进制再打开）；取消返回 null。
+ * 与 pickFile 分开是因为 `multiple` 改变返回值形状，混在一个函数里会让调用方猜类型。
+ */
+export async function pickFiles(
+  opts: {
+    title?: string;
+    defaultPath?: string;
+    filters?: { name: string; extensions: string[] }[];
+  } = {},
+): Promise<string[] | null> {
+  if (!hasTauri()) return null;
+  const picked = await open({ multiple: true, directory: false, ...opts });
+  if (Array.isArray(picked)) return picked;
+  return typeof picked === "string" ? [picked] : null;
+}
+
 /** 选择单个目录；取消返回 null */
 export async function pickDirectory(title?: string): Promise<string | null> {
   if (!hasTauri()) return null;

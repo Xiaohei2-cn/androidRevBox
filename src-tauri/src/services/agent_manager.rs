@@ -4349,6 +4349,138 @@ mod tests {
         eprintln!("[adopt] 通过：root 支路起的进程能认领、能幂等、顶包被拒、停完不留假 running");
     }
 
+    /// 真机腿（UI-4）：**上传这条链在设备上到底是什么形状** —— push 进去的文件立刻可见吗、
+    /// 有执行位吗、`hosted.chmod` 补完之后呢。
+    ///
+    /// 页面测试只能拿 mock 的任务终态证明"我按流程调了接口"，证明不了设备侧的真实行为；
+    /// 而"上传成功却起不动"这种投诉恰恰全在这几步里。所以这条腿走的就是界面用的同一组接口：
+    /// `hosted.list` → `hosted.chmod` → `hosted.list`，一次都不读界面。
+    #[tokio::test]
+    #[ignore = "需要真机；AR7_UPLOAD_PROBE=yes APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_hosted_upload -- --ignored --nocapture"]
+    async fn real_agent_hosted_upload_is_listed_then_chmodded() {
+        use agent_protocol::method::{HOSTED_CHMOD, HOSTED_LIST};
+        use agent_protocol::{
+            HostedChmodParams, HostedChmodResult, HostedListParams, HostedListResult,
+        };
+        if std::env::var("AR7_UPLOAD_PROBE").unwrap_or_default() != "yes" {
+            eprintln!("[跳过] 本腿会往设备上推一个探针文件，需要 AR7_UPLOAD_PROBE=yes");
+            return;
+        }
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        const NAME: &str = "artool_upload_probe.bin";
+        let remote = format!("/data/local/tmp/{NAME}");
+        let local = std::env::temp_dir().join(NAME);
+        let _ = std::fs::remove_file(&local);
+
+        async fn adb(args: &[&str]) -> String {
+            let out = tokio::process::Command::new("adb")
+                .args(args)
+                .output()
+                .await
+                .expect("adb 可用");
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        }
+
+        // 上传源用本仓的 aarch64 Agent 产物：真 ELF、跨机器可得，而且**不用 adb pull** ——
+        // 第一版拉 /system/bin/toybox，shell 身份连 stat 都被 SELinux 拒了。
+        // 实测另有一条：本地 0644 推上去落成 0666（设备 umask 决定，不保留本地模式），
+        // 补完执行位就是 -rwxrwxrwx —— 收紧与否是产品口径，见 §10，别在通用 chmod 里顺手做。
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/android-agent/aarch64/android-agent");
+        if !source.is_file() {
+            eprintln!("[跳过] 本机没有 aarch64 Agent 产物：先跑 scripts/build_android_agent.sh");
+            return;
+        }
+        std::fs::copy(&source, &local).expect("复制上传源");
+        // 本地抹掉执行位再推：不抹就测不到"上传后要补权限"这个真实场景，这条腿等于空跑
+        std::fs::set_permissions(&local, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .expect("本地 chmod 可用");
+        let pushed = adb(&["-s", &serial, "push", &local.to_string_lossy(), &remote]).await;
+        assert!(pushed.contains("1 file"), "adb push 失败：{pushed}");
+
+        async fn listed(
+            client: &AgentClient,
+            name: &str,
+        ) -> Option<agent_protocol::HostedBinaryInfo> {
+            client
+                .request::<_, HostedListResult>(
+                    HOSTED_LIST,
+                    &HostedListParams {},
+                    Duration::from_secs(20),
+                )
+                .await
+                .expect("hosted.list 应当可用")
+                .binaries
+                .into_iter()
+                .find(|b| b.name == name)
+        }
+
+        // ① 刚 push 进来的文件：立刻出现在托管列表，且**没有**执行位
+        //    （toybox 的权限位是 r-xr-xr-x，adb push 保留源权限，所以这条断言在 Pixel 上成立；
+        //    万一设备/ROM 改了行为，这里失败也是有效信息：说明"要不要补权限"不能假设）
+        let fresh = listed(&client, NAME)
+            .await
+            .expect("push 后应立刻能在列表里看到");
+        eprintln!(
+            "[upload] 刚推上去：mode={} has_exec={}",
+            fresh.mode_text, fresh.has_exec
+        );
+        assert!(
+            !fresh.has_exec,
+            "本地已 chmod 0644 再 push，探针本该缺执行位（这正是上传后要补的场景），实际 {}",
+            fresh.mode_text
+        );
+
+        // ② hosted.chmod 补执行位：只加 0o111，其余位不动
+        let chmodded = client
+            .request::<_, HostedChmodResult>(
+                HOSTED_CHMOD,
+                &HostedChmodParams { name: NAME.into() },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("hosted.chmod 应当成功");
+        assert!(
+            chmodded.has_exec,
+            "补完执行位仍不可执行，界面就会继续显示红色"
+        );
+        assert_eq!(
+            chmodded.mode & 0o111,
+            0o111,
+            "三个执行位都要补上：{:o}",
+            chmodded.mode
+        );
+        eprintln!("[upload] 补权限后：mode={}", chmodded.mode_text);
+
+        // ③ 再读一次列表：绿色来自设备回读，不是本地猜的
+        let after = listed(&client, NAME).await.expect("列表里应当还在");
+        assert!(after.has_exec);
+        assert!(
+            after.mode & 0o600 != 0,
+            "只该加执行位，不该顺手改读写位：{:o}",
+            after.mode
+        );
+
+        // 收尾：把探针删掉，不在用户机器上留东西
+        adb(&["-s", &serial, "shell", &format!("rm -f {remote}")]).await;
+        let _ = std::fs::remove_file(&local);
+        assert!(listed(&client, NAME).await.is_none(), "探针没清干净");
+        manager.disconnect(&serial).await.unwrap();
+        eprintln!("[upload] 通过：push→立刻可见(缺执行位)→chmod 补 0o111→回读为绿色→已清理");
+    }
+
     /// 真机腿：端口被占时**第二个实例的真实死因要能被认出来**，不能落在"内部错误"里。
     ///
     /// 与上面那条 `real_agent_hosted_notices_externally_started_process` 是一对：

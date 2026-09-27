@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { CircleStop, Play, RefreshCw, ShieldCheck, Square, Trash2 } from "lucide-react";
+import { CircleStop, Play, RefreshCw, ShieldCheck, Square, Trash2, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AdbNotReadyState } from "@/components/ui/adb-gate";
 import {
@@ -10,6 +10,10 @@ import {
   type HostedRunRecord,
   type ListenPort,
 } from "@/api/device";
+import { pickFiles } from "@/api/dialog";
+import { waitForTask } from "@/lib/waitForTask";
+import { useDragDropPath } from "@/hooks/useDragDropPath";
+import { planHostedUpload, rejectReasonText } from "@/lib/hostedUpload";
 import { DeviceBar } from "@/components/ui/device-bar";
 import { InfoChip } from "@/components/ui/info-chip";
 import { useI18n } from "@/i18n";
@@ -88,7 +92,7 @@ const saveNote = (serial: string, name: string, value: string) => {
   else localStorage.removeItem(noteKey(serial, name));
 };
 
-export function BinaryHosting() {
+export function BinaryHosting({ active = true }: { active?: boolean }) {
   const { t } = useI18n();
   const [deviceSerial, setDeviceSerial] = useState<string | null>(null);
   const [hosted, setHosted] = useState<HostedRow[]>([]);
@@ -100,6 +104,12 @@ export function BinaryHosting() {
   const [notice, setNotice] = useState<string | null>(null);
   const [root, setRoot] = useState(false);
   const [probing, setProbing] = useState(false);
+  /**
+   * 进行中的上传：文件名 → 任务 id（空串 = 刚点下去还没提交完）。
+   * 与行的 running/busy 分开算（D076：一个布尔不许兼表两义）——
+   * 正在上传绝不该把那一行的「终止」禁掉。
+   */
+  const [uploads, setUploads] = useState<Record<string, string>>({});
 
   const { data: env } = useQuery({
     queryKey: ["adb", "environment"],
@@ -280,6 +290,106 @@ export function BinaryHosting() {
       setProbing(false);
     }
   };
+
+  /**
+   * 上传一批宿主文件到托管目录：`adb push`（TaskService 长任务）→ 等终态 →
+   * 回读托管列表确认它真成了"可托管的文件" → 缺执行位就补 0o111（幂等，走 hosted.chmod）。
+   *
+   * 两点是刻意的：
+   * ① 覆盖/在跑只用**当场从设备读回来**的事实判断，不拿本地缓存猜；
+   * ② 每个文件单独回结果。一次拖进来三个文件，"哪个成了、哪个被拒、为什么被拒"
+   *    必须看得见 —— 静默丢文件是这类入口最坏的写法。
+   */
+  const uploadPaths = useCallback(
+    async (paths: string[]) => {
+      if (!deviceSerial) {
+        setNotice(t("adb.binary.uploadNoDevice"));
+        return;
+      }
+      const [listed, runs] = await Promise.all([
+        deviceApi.binaries(deviceSerial).catch(() => [] as HostedBinary[]),
+        deviceApi.hostedRuns(deviceSerial).catch(() => [] as HostedRunRecord[]),
+      ]);
+      const plan = planHostedUpload(paths, {
+        names: new Set(listed.map((b) => b.name)),
+        runningNames: new Set(runs.filter((r) => r.state === "running").map((r) => r.name)),
+      });
+      const lines: string[] = plan.rejected.map((r) => `${r.path}：${rejectReasonText(r.reason)}`);
+      for (const item of plan.accepted) {
+        setUploads((u) => ({ ...u, [item.name]: "" }));
+        try {
+          const taskId = await deviceApi.push(deviceSerial, item.local, item.remote);
+          setUploads((u) => ({ ...u, [item.name]: taskId }));
+          const status = await waitForTask(taskId);
+          if (status !== "success") {
+            lines.push(t("adb.binary.uploadFailed", { name: item.name, status: String(status) }));
+            continue;
+          }
+          // push 成功 ≠ 能托管：列表只收 ELF，缺执行位也起不动 → 当场回读确认
+          const after = await deviceApi
+            .binaries(deviceSerial)
+            .catch(() => [] as HostedBinary[]);
+          const found = after.find((b) => b.name === item.name);
+          if (!found) {
+            lines.push(t("adb.binary.uploadNotListed", { name: item.name }));
+            continue;
+          }
+          if (!found.hasExec) {
+            try {
+              await deviceApi.binaryChmod(deviceSerial, item.name, false);
+            } catch (e) {
+              lines.push(
+                `${item.name}：${t("adb.binary.uploadChmodFailed")}：${String((e as Error)?.message ?? e)}`,
+              );
+            }
+          }
+          lines.push(
+            t(
+              item.running
+                ? "adb.binary.uploadOkRunning"
+                : item.overwrite
+                  ? "adb.binary.uploadOkOverwrite"
+                  : "adb.binary.uploadOk",
+              { name: item.name },
+            ),
+          );
+        } catch (e) {
+          lines.push(`${item.name}：${String((e as Error)?.message ?? e)}`);
+        } finally {
+          setUploads((u) => {
+            const next = { ...u };
+            delete next[item.name];
+            return next;
+          });
+        }
+      }
+      await refetch();
+      void refetchRuns();
+      setNotice(lines.length > 0 ? lines.join("\n") : t("adb.binary.uploadNothing"));
+    },
+    [deviceSerial, refetch, refetchRuns, t],
+  );
+
+  const uploadingNames = Object.keys(uploads);
+
+  const pickAndUpload = useCallback(async () => {
+    try {
+      const picked = await pickFiles({ title: t("adb.binary.upload") });
+      if (picked && picked.length > 0) await uploadPaths(picked);
+    } catch (e) {
+      setNotice(String((e as Error)?.message ?? e));
+    }
+  }, [t, uploadPaths]);
+
+  // 访达拖入 → 上传。Tauri 会拦下原生拖放并经 IPC 给出真实绝对路径，
+  // HTML5 dataTransfer 在 webview 里只有文件名，拿不到能用的路径（所以必须走这个 hook）。
+  const onDropPaths = useCallback(
+    (paths: string[]) => {
+      void uploadPaths(paths);
+    },
+    [uploadPaths],
+  );
+  useDragDropPath({ onPaths: onDropPaths, enabled: active });
 
   const chmod = async (b: HostedBinary) => {
     if (!deviceSerial) return;
@@ -516,9 +626,39 @@ export function BinaryHosting() {
 
       {/* 下区：托管执行 */}
       <section className="flex shrink-0 max-h-[45%] flex-col gap-1" aria-label={t("adb.binary.hostTitle")}>
-        <div className="flex shrink-0 items-center justify-between">
+        <div className="flex shrink-0 items-center justify-between gap-2">
           <h3 className="text-xs font-semibold">{t("adb.binary.hostTitle")}</h3>
-          <span className="text-10px text-muted-foreground">{t("adb.binary.dblClickAdd")}</span>
+          <div className="flex min-w-0 items-center justify-end gap-2">
+            {uploadingNames.length > 0 && (
+              <span
+                className="shrink-0 text-10px text-sky-500"
+                data-testid="hosted-uploading"
+                title={t("adb.binary.uploadingHint")}
+              >
+                <RefreshCw className="mr-0.5 inline h-2.5 w-2.5 animate-spin" />
+                {t("adb.binary.uploading", { names: uploadingNames.join("、") })}
+              </span>
+            )}
+            <span className="truncate text-10px text-muted-foreground">
+              {t("adb.binary.dblClickAdd")}
+            </span>
+            {/*
+              上传入口。没设备就直接禁掉并写明原因：这时候点只会得到一句"要先选一台设备"。
+              注意 disabled 的依据是"能不能开始这个动作"，不是设备状态（D076）。
+            */}
+            <Button
+              size="sm"
+              variant="outline"
+              data-testid="upload-binary"
+              className="h-6 shrink-0 gap-1 px-2"
+              disabled={!deviceSerial}
+              title={!deviceSerial ? t("adb.binary.uploadNoDevice") : t("adb.binary.uploadHint")}
+              onClick={() => void pickAndUpload()}
+            >
+              <Upload className="h-3 w-3" />
+              {t("adb.binary.upload")}
+            </Button>
+          </div>
         </div>
         <div className="min-h-0 flex-1 overflow-auto rounded-xl border border-border/70 bg-card shadow-card">
           {hosted.length === 0 ? (
@@ -755,7 +895,10 @@ export function BinaryHosting() {
       </section>
 
       {notice && (
-        <p className="shrink-0 break-all rounded-md border bg-muted/40 px-2 py-1 text-xs text-muted-foreground" data-testid="binary-notice">
+        <p
+          className="shrink-0 break-all whitespace-pre-line rounded-md border bg-muted/40 px-2 py-1 text-xs text-muted-foreground"
+          data-testid="binary-notice"
+        >
           {notice}
         </p>
       )}

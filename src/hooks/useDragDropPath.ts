@@ -11,12 +11,18 @@ import { useEffect } from "react";
  * 跳过订阅，调用方保持手填输入框可用。`enabled` 供页面按需暂停（如切走 tab）。
  */
 export function useDragDropPath(opts: {
-  onPath: (path: string) => void;
+  /** 只关心第一个文件时用（so 替换那种单值输入框）；与 onPaths 至少给一个 */
+  onPath?: (path: string) => void;
+  /**
+   * 需要一次拿全所有拖入文件时用这个（多选拖入）；给了 onPaths 就不再调 onPath。
+   * 只回调首个的旧行为留给"拖一个 so 进输入框"那种场景。
+   */
+  onPaths?: (paths: string[]) => void;
   /** 文件扩展名白名单（小写、不带点）；空/缺省 = 不限 */
   extensions?: string[];
   enabled?: boolean;
 }): void {
-  const { onPath, extensions, enabled = true } = opts;
+  const { onPath, onPaths, extensions, enabled = true } = opts;
   // 调用方常传字面量数组（每次 render 新引用）；序列化为稳定依赖，
   // 避免 effect 频繁重建导致反复订阅/退订 webview 拖放事件
   const extKey = extensions?.join(",") ?? "";
@@ -29,18 +35,15 @@ export function useDragDropPath(opts: {
         const { getCurrentWebview } = await import("@tauri-apps/api/webview");
         const fn = await getCurrentWebview().onDragDropEvent((event) => {
           if (event.payload.type !== "drop") return;
-          for (const p of event.payload.paths) {
-            const exts = extKey ? extKey.split(",") : [];
-          if (exts.length === 0) {
-              onPath(p);
-              return;
-            }
+          const exts = extKey ? extKey.split(",") : [];
+          const hit = event.payload.paths.filter((p) => {
+            if (exts.length === 0) return true;
             const lower = p.toLowerCase();
-            if (exts.some((ext) => lower.endsWith(`.${ext}`))) {
-              onPath(p);
-              return;
-            }
-          }
+            return exts.some((ext) => lower.endsWith(`.${ext}`));
+          });
+          if (hit.length === 0) return;
+          if (onPaths) onPaths(hit);
+          else onPath?.(hit[0]);
         });
         if (disposed) fn();
         else unlisten = fn;
@@ -52,5 +55,5 @@ export function useDragDropPath(opts: {
       disposed = true;
       unlisten?.();
     };
-  }, [onPath, extKey, enabled]);
+  }, [onPath, onPaths, extKey, enabled]);
 }

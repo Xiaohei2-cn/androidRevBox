@@ -50,6 +50,7 @@ const device = vi.hoisted(() => ({
   logcat: vi.fn(),
 }));
 
+const dialog = vi.hoisted(() => ({ pickFiles: vi.fn(), pickFile: vi.fn(), pickDirectory: vi.fn() }));
 const task = vi.hoisted(() => ({
   list: vi.fn(),
   run: vi.fn(),
@@ -78,6 +79,11 @@ vi.mock("@/app/nav", () => ({
   useActiveTab: () => true,
 }));
 vi.mock("@/hooks/useDragDropPath", () => ({ useDragDropPath: vi.fn() }));
+vi.mock("@/api/dialog", () => ({
+  pickFiles: dialog.pickFiles,
+  pickFile: dialog.pickFile,
+  pickDirectory: dialog.pickDirectory,
+}));
 const agentMocks = vi.hoisted(() => ({ diagnostics: vi.fn(), install: vi.fn(), restart: vi.fn() }));
 vi.mock("@/api/agent", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/api/agent")>();
@@ -396,6 +402,96 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     // 登记上了就不该出现「未登记」标记，也不该出现「停止进程」（那是给表外进程用的）
     expect(screen.queryByTestId("running-untracked-frida-server")).toBeNull();
     expect(screen.queryByTestId("stop-external-frida-server")).toBeNull();
+  });
+
+  it("上传文件：推到托管目录、等任务终态、缺执行位补权限，被拒的要给原因", async () => {
+    const hosted = [
+      {
+        name: "frida-server",
+        path: "/data/local/tmp/frida-server",
+        size: 53_539_200,
+        perms: "-rw-r--r--", // 刚 push 上去的样子：没有执行位
+        hasExec: false,
+        externalProcs: [],
+      },
+    ];
+    device.binaries.mockResolvedValue(hosted);
+    dialog.pickFiles.mockResolvedValue([
+      "/Users/x/Downloads/frida-server",
+      "/Users/x/Downloads/中文",
+    ]);
+    device.push.mockResolvedValue("task-push-1");
+    task.list.mockResolvedValue([
+      {
+        id: "task-push-1",
+        taskType: "adb.push",
+        name: "adb push",
+        status: "success",
+        exitCode: 0,
+        createdAt: 0,
+        finishedAt: 1,
+      },
+    ]);
+    device.binaryChmod.mockResolvedValue(undefined);
+    renderPage(<BinaryHosting />);
+    const btn = await screen.findByTestId("upload-binary");
+    // 设备是异步选上的：没 serial 时这个按钮是 disabled，点了等于没点（别测空气）
+    await waitFor(() => expect(btn).toBeEnabled());
+    fireEvent.click(btn);
+    // 只推合法名字那一个，目标路径钉死在托管目录
+    await waitFor(() =>
+      expect(device.push).toHaveBeenCalledWith(
+        "PIXEL-1",
+        "/Users/x/Downloads/frida-server",
+        "/data/local/tmp/frida-server",
+      ),
+    );
+    expect(device.push).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(device.binaryChmod).toHaveBeenCalledWith("PIXEL-1", "frida-server", false),
+    );
+    const notice = await screen.findByTestId("binary-notice");
+    // 同名文件已在托管目录里 → 必须说成覆盖，不能装作是新文件
+    expect(notice.textContent ?? "").toContain("覆盖");
+    // 被白名单拒掉的那个必须带原因：静默丢文件是这类入口最坏的写法
+    expect(notice.textContent ?? "").toContain("白名单");
+  });
+
+  it("上传任务没跑完就照实说，不报成功、也不去补权限", async () => {
+    device.binaries.mockResolvedValue([]);
+    dialog.pickFiles.mockResolvedValue(["/Users/x/Downloads/newbin"]);
+    device.push.mockResolvedValue("task-push-2");
+    task.list.mockResolvedValue([
+      {
+        id: "task-push-2",
+        taskType: "adb.push",
+        name: "adb push",
+        status: "failed",
+        exitCode: 1,
+        createdAt: 0,
+        finishedAt: 1,
+      },
+    ]);
+    device.binaryChmod.mockClear();
+    renderPage(<BinaryHosting />);
+    const btn2 = await screen.findByTestId("upload-binary");
+    await waitFor(() => expect(btn2).toBeEnabled());
+    fireEvent.click(btn2);
+    const notice = await screen.findByTestId("binary-notice");
+    await waitFor(() => expect(notice.textContent ?? "").toContain("上传未完成"));
+    expect(notice.textContent ?? "").toContain("failed");
+    expect(device.binaryChmod).not.toHaveBeenCalled();
+  });
+
+  it("没选设备时上传按钮必须是灰的，而且灰得有理由", async () => {
+    device.list.mockResolvedValue([]);
+    renderPage(<BinaryHosting />);
+    const btn = await screen.findByTestId("upload-binary");
+    expect(btn).toBeDisabled();
+    expect(btn.getAttribute("title")).toContain("要先选一台设备");
+    device.list.mockResolvedValue([
+      { serial: "PIXEL-1", state: "device", transport: "usb", model: "Pixel 6" },
+    ]);
   });
 
   it("没登记进托管表：标成「已在运行（未登记）」，不拿桌面记忆冒充设备状态", async () => {

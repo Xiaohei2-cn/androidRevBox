@@ -21,7 +21,7 @@ import { cn } from "@/lib/utils";
 
 type Abi = "arm64" | "arm";
 
-export function SoReplacePage() {
+export function SoReplacePage({ active = true }: { active?: boolean }) {
   const { t } = useI18n();
   const [deviceSerial, setDeviceSerial] = useState<string | null>(null);
   const [localPath, setLocalPath] = useState("");
@@ -59,7 +59,8 @@ export function SoReplacePage() {
   useDragDropPath({
     onPath: onDropSo,
     extensions: useMemo(() => ["so"], []),
-    enabled: binaryActive,
+    // 还要看子页：二进制主 tab 里有拖放订阅的页面有两个（见 BinaryPage 的 active 传参）
+    enabled: binaryActive && active,
   });
   const canPreview = !!deviceSerial && /^[A-Za-z0-9._-]+$/.test(pkg.trim()) && !!soName;
 

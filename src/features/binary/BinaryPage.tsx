@@ -30,12 +30,15 @@ export function BinaryPage() {
             {
               id: "so-replace",
               label: "so 替换",
-              content: <SoReplacePage />,
+              // 子页是 keep-mounted（SubTabs 用 forceMount + hidden），所以两个页面都活着。
+              // 访达拖放是 webview 级事件、不带坐标，只能靠这里告诉它"谁在眼前"：
+              // 不传 active 的话，在托管页拖一个 .so 会同时填进 so 替换的输入框。
+              content: <SoReplacePage active={subTab === "so-replace"} />,
             },
             {
               id: "hosting",
               label: "二进制托管",
-              content: <BinaryHosting />,
+              content: <BinaryHosting active={subTab === "hosting"} />,
             },
           ]}
         />
