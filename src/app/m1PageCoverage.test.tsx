@@ -465,6 +465,15 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
       },
     ]);
     device.binaryChmod.mockResolvedValue(undefined);
+    // 设备回读的实际权限才是"收紧成功"的依据（/sdcard 那类 FUSE 会吃掉某些位）
+    device.fsChmod.mockResolvedValue({
+      path: "/data/local/tmp/frida-server",
+      mode: 0o755,
+      mode_text: "-rwxr-xr-x",
+      previous_mode: 0o666,
+      previous_mode_text: "-rw-rw-rw-",
+      verified: true,
+    });
     renderPage(<BinaryHosting />);
     const btn = await screen.findByTestId("upload-binary");
     // 设备是异步选上的：没 serial 时这个按钮是 disabled，点了等于没点（别测空气）
@@ -479,15 +488,57 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
       ),
     );
     expect(device.push).toHaveBeenCalledTimes(1);
-    // 补权限跟着当前身份走：Root 默认开 → 走 su 链路（root 属主的历史文件 shell 改不动）
+    // 落地即收成 0755（走 filesystem.chmod，带精确模式），不再只"加执行位"
     await waitFor(() =>
-      expect(device.binaryChmod).toHaveBeenCalledWith("PIXEL-1", "frida-server", true),
+      expect(device.fsChmod).toHaveBeenCalledWith(
+        "PIXEL-1",
+        "/data/local/tmp/frida-server",
+        0o755,
+      ),
     );
+    expect(device.binaryChmod).not.toHaveBeenCalled();
     const notice = await screen.findByTestId("binary-notice");
+    // 权限显示的是**设备回读值**，不是我们传进去的那个数
+    expect(notice.textContent ?? "").toContain("-rwxr-xr-x");
     // 同名文件已在托管目录里 → 必须说成覆盖，不能装作是新文件
     expect(notice.textContent ?? "").toContain("覆盖");
     // 被白名单拒掉的那个必须带原因：静默丢文件是这类入口最坏的写法
     expect(notice.textContent ?? "").toContain("白名单");
+  });
+
+  it("收不成 0755 时退回只补执行位，并且明说「组/其他仍可写」的风险", async () => {
+    device.binaries.mockResolvedValue([
+      {
+        name: "newbin",
+        path: "/data/local/tmp/newbin",
+        size: 100,
+        perms: "-rw-rw-rw-",
+        hasExec: false,
+        externalProcs: [],
+      },
+    ]);
+    dialog.pickFiles.mockResolvedValue(["/Users/x/Downloads/newbin"]);
+    device.push.mockResolvedValue("task-loose-1");
+    task.list.mockResolvedValue([
+      { id: "task-loose-1", status: "success", exitCode: 0, finishedAt: 1 },
+    ]);
+    // FUSE/SELinux 一类会把位吃掉：回读说没收成，界面就不能说"已收紧"
+    device.fsChmod.mockResolvedValue({
+      path: "/data/local/tmp/newbin",
+      mode: 0o777,
+      mode_text: "-rwxrwxrwx",
+      previous_mode: 0o666,
+      previous_mode_text: "-rw-rw-rw-",
+      verified: true,
+    });
+    device.binaryChmod.mockClear();
+    renderPage(<BinaryHosting />);
+    const btn = await screen.findByTestId("upload-binary");
+    await waitFor(() => expect(btn).toBeEnabled());
+    fireEvent.click(btn);
+    const notice = await screen.findByTestId("binary-notice");
+    await waitFor(() => expect(notice.textContent ?? "").toContain("仍可写"));
+    expect(notice.textContent ?? "").toContain("-rwxrwxrwx");
   });
 
   it("上传任务没跑完就照实说，不报成功、也不去补权限", async () => {

@@ -13,7 +13,12 @@ import {
 import { pickFiles } from "@/api/dialog";
 import { waitForTask } from "@/lib/waitForTask";
 import { useDragDropPath } from "@/hooks/useDragDropPath";
-import { planHostedUpload, rejectReasonText } from "@/lib/hostedUpload";
+import {
+  isTightened,
+  planHostedUpload,
+  rejectReasonText,
+  UPLOAD_FILE_MODE,
+} from "@/lib/hostedUpload";
 import { loadRootPref, saveRootPref, shouldTryRoot } from "@/lib/hostedRoot";
 import { DeviceBar } from "@/components/ui/device-bar";
 import { InfoChip } from "@/components/ui/info-chip";
@@ -365,15 +370,36 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
             lines.push(t("adb.binary.uploadNotListed", { name: item.name }));
             continue;
           }
-          if (!found.hasExec) {
-            try {
-              // 用当前身份：以 root 起过的进程可能留下 root 属主文件，shell chmod 会失败
-              await deviceApi.binaryChmod(deviceSerial, item.name, root);
-            } catch (e) {
+          /*
+           * 落地权限收紧到 0755：adb push 保留的是设备 umask 后的模式（实测本地 0644 → 设备
+           * 0666），补完执行位就是 -rwxrwxrwx —— 托管目录里"谁都能改"的可执行文件，
+           * 下次启动跑的是哪个二进制就不由我们说了。以**设备回读的实际模式**为准判断成没成，
+           * 不拿"我调用过 chmod"当成功。
+           */
+          let modeText = found.perms;
+          try {
+            const done = await deviceApi.fsChmod(deviceSerial, item.remote, UPLOAD_FILE_MODE);
+            if (isTightened(done.mode)) {
+              modeText = done.mode_text;
+            } else {
               lines.push(
-                `${item.name}：${t("adb.binary.uploadChmodFailed")}：${String((e as Error)?.message ?? e)}`,
+                t("adb.binary.uploadLoose", { name: item.name, mode: done.mode_text }),
               );
+              modeText = done.mode_text;
             }
+          } catch (e) {
+            // 收不成也要保证"能跑"：退回旧的纪律——只补执行位，不动其它位
+            try {
+              await deviceApi.binaryChmod(deviceSerial, item.name, root);
+            } catch {
+              // 连执行位都没补上：下面照实报，不报成功
+            }
+            lines.push(
+              t("adb.binary.uploadChmodFailed", {
+                name: item.name,
+                detail: String((e as Error)?.message ?? e),
+              }),
+            );
           }
           lines.push(
             t(
@@ -382,7 +408,7 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                 : item.overwrite
                   ? "adb.binary.uploadOkOverwrite"
                   : "adb.binary.uploadOk",
-              { name: item.name },
+              { name: item.name, mode: modeText },
             ),
           );
         } catch (e) {

@@ -4473,12 +4473,48 @@ mod tests {
             after.mode
         );
 
+        // ④ UI-6 的正题：上传流程会把落地权限**收成 0755**（adb push 保留设备 umask 后的模式，
+        //    实测 0666；只补执行位就成了 -rwxrwxrwx，谁都能改这个待执行的文件）。
+        //    用的是界面同一个 filesystem.chmod + 同一个 0o755，判据是设备回读的 mode。
+        let tightened = client
+            .request::<_, agent_protocol::FilesystemChmodResult>(
+                agent_protocol::method::FILESYSTEM_CHMOD,
+                &agent_protocol::FilesystemChmodParams {
+                    path: remote.clone(),
+                    mode: 0o755,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("filesystem.chmod 应当成功");
+        assert_eq!(
+            tightened.mode & 0o777,
+            0o755,
+            "落成 {}",
+            tightened.mode_text
+        );
+        assert!(tightened.verified, "设备没回读到就别宣称收紧了");
+        eprintln!(
+            "[upload] 收成 0755：{} → {}",
+            tightened.previous_mode_text, tightened.mode_text
+        );
+        let settled = listed(&client, NAME).await.expect("列表里应当还在");
+        assert_eq!(
+            settled.mode & 0o777,
+            0o755,
+            "托管列表回读也应当是 0755，实际 {}",
+            settled.mode_text
+        );
+
         // 收尾：把探针删掉，不在用户机器上留东西
         adb(&["-s", &serial, "shell", &format!("rm -f {remote}")]).await;
         let _ = std::fs::remove_file(&local);
         assert!(listed(&client, NAME).await.is_none(), "探针没清干净");
         manager.disconnect(&serial).await.unwrap();
-        eprintln!("[upload] 通过：push→立刻可见(缺执行位)→chmod 补 0o111→回读为绿色→已清理");
+        eprintln!(
+            "[upload] 通过：push→立刻可见(缺执行位)→hosted.chmod 补 0o111→filesystem.chmod 收成 \
+             0755→列表回读一致→已清理"
+        );
     }
 
     /// 真机腿：端口被占时**第二个实例的真实死因要能被认出来**，不能落在"内部错误"里。

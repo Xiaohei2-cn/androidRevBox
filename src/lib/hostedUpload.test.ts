@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  isTightened,
   hostedBaseName,
   isSafeHostedName,
   planHostedUpload,
@@ -66,5 +67,14 @@ describe("planHostedUpload", () => {
     const plan = planHostedUpload(["/a/x.bin", "/b/x.bin"], none);
     expect(plan.accepted).toHaveLength(1);
     expect(plan.rejected[0].reason).toBe("duplicate");
+  });
+});
+
+describe("上传落地权限", () => {
+  it("0755 才算收紧；真机 push 出来的 0666 与补完执行位的 0777 都不算", () => {
+    expect(isTightened(0o755)).toBe(true);
+    expect(isTightened(0o666)).toBe(false);
+    expect(isTightened(0o777)).toBe(false);
+    expect(isTightened(0o754)).toBe(false);
   });
 });

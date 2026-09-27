@@ -9,6 +9,22 @@
 /** 托管目录：与 Desktop `adapters::adb::HOSTED_DIR`、Agent `hosted::HOSTED_DIR` 同值 */
 export const HOSTED_DIR = "/data/local/tmp";
 
+/**
+ * 上传落地的目标权限。
+ *
+ * 为什么要在上传流程里显式收：`adb push` 落成的是**设备 umask 之后的模式**，不保留本地权限
+ * （真机实测：本地 0644 → 设备 0666）。托管目录里的可执行文件如果对组/其他可写，
+ * 就等于把"下次启动跑的是哪个二进制"交给任何能碰到这个路径的进程；
+ * 上传是我们自己产的文件，所以落地即收成 0755（rwxr-xr-x）。
+ * 通用 `hosted.chmod` 的纪律是"只加 0o111、不动其它位"，收紧不该塞进它 —— 只在这条路上做。
+ */
+export const UPLOAD_FILE_MODE = 0o755;
+
+/** 以设备回读的模式为准判断"真的收紧了吗"（/sdcard 那类 FUSE 会吃掉某些位） */
+export function isTightened(mode: number, expected = UPLOAD_FILE_MODE): boolean {
+  return (mode & 0o777) === expected;
+}
+
 /** 与 Rust `is_safe_hosted_name` 同形，另加 Agent `hosted_path` 的 128 长度上限 */
 export function isSafeHostedName(name: string): boolean {
   return (
