@@ -14,6 +14,7 @@ import { pickFiles } from "@/api/dialog";
 import { waitForTask } from "@/lib/waitForTask";
 import { useDragDropPath } from "@/hooks/useDragDropPath";
 import { planHostedUpload, rejectReasonText } from "@/lib/hostedUpload";
+import { loadRootPref, saveRootPref, shouldTryRoot } from "@/lib/hostedRoot";
 import { DeviceBar } from "@/components/ui/device-bar";
 import { InfoChip } from "@/components/ui/info-chip";
 import { useI18n } from "@/i18n";
@@ -155,12 +156,40 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
     retry: false,
   });
 
-  // 设备切换：托管区清空（pid 属于旧设备）；Root 探测状态失效
+  // 设备切换：托管区清空（pid 属于旧设备）；Root 按「该设备的偏好 + 现场探测」决定
   useEffect(() => {
     setHosted([]);
     setNotice(null);
-    setRoot(false);
-  }, [deviceSerial]);
+    if (!deviceSerial) {
+      setRoot(false);
+      return;
+    }
+    if (!shouldTryRoot(loadRootPref(deviceSerial))) {
+      setRoot(false);
+      return;
+    }
+    // 没手动选过 → 默认想开，但必须探一次 su：探不过就保持普通执行**并说明**，
+    // 安静地把 root 当已生效比不开更糟（shell 起的 frida-server 注入不了别人）
+    let cancelled = false;
+    setProbing(true);
+    void (async () => {
+      try {
+        const ok = await deviceApi.binarySuCheck(deviceSerial);
+        if (cancelled) return;
+        setRoot(ok);
+        if (!ok) setNotice(t("adb.binary.suFail"));
+      } catch (e) {
+        if (cancelled) return;
+        setRoot(false);
+        setNotice(String((e as Error)?.message ?? e));
+      } finally {
+        if (!cancelled) setProbing(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceSerial, t]);
 
   /**
    * 用运行表校正/补齐托管行：设备端说在跑就是在跑，说退了就把状态收回去。
@@ -268,10 +297,11 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
     [deviceSerial],
   );
 
-  /** 勾选 Root：先 su -c id 探测；不可用则不开启并提示 */
+  /** 勾选 Root：先 su -c id 探测；不可用则不开启并提示。手动选择按设备记住 */
   const toggleRoot = async (checked: boolean) => {
     if (!checked) {
       setRoot(false);
+      saveRootPref(deviceSerial, false);
       return;
     }
     if (!deviceSerial) return;
@@ -280,6 +310,7 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
       const ok = await deviceApi.binarySuCheck(deviceSerial);
       if (ok) {
         setRoot(true);
+        saveRootPref(deviceSerial, true);
         setNotice(t("adb.binary.suOk"));
       } else {
         setNotice(t("adb.binary.suFail"));
@@ -336,7 +367,8 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
           }
           if (!found.hasExec) {
             try {
-              await deviceApi.binaryChmod(deviceSerial, item.name, false);
+              // 用当前身份：以 root 起过的进程可能留下 root 属主文件，shell chmod 会失败
+              await deviceApi.binaryChmod(deviceSerial, item.name, root);
             } catch (e) {
               lines.push(
                 `${item.name}：${t("adb.binary.uploadChmodFailed")}：${String((e as Error)?.message ?? e)}`,
@@ -367,7 +399,7 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
       void refetchRuns();
       setNotice(lines.length > 0 ? lines.join("\n") : t("adb.binary.uploadNothing"));
     },
-    [deviceSerial, refetch, refetchRuns, t],
+    [deviceSerial, refetch, refetchRuns, root, t],
   );
 
   const uploadingNames = Object.keys(uploads);

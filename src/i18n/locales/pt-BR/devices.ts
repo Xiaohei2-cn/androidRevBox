@@ -168,7 +168,7 @@ export default {
   "adb.binary.portsLoading": "Consultando portas…",
   "adb.binary.noPorts": "Nenhuma porta LISTEN",
   "adb.binary.rootLabel": "Executar como root",
-  "adb.binary.rootHint": "Marcado, chmod/exec/encerramento passam por su -c; a disponibilidade do su é sondada antes de ativar. Cada linha trava sua identidade ao executar; o encerramento usa sempre o mesmo contexto.",
+  "adb.binary.rootHint": "Root (su): ligado por padrão. A página testa o su uma vez; se responder, chmod/iniciar/parar rodam como root, senão continua sem privilégio e diz o motivo. Sua escolha manual é lembrada por aparelho (desligue uma vez num celular sem root e ele para de tentar)",
   "adb.binary.suOk": "su disponível: alternado para execução root",
   "adb.binary.suFail": "su indisponível (sem root ou acesso negado), mantendo sem root",
   "adb.binary.removeRow": "Remover da lista hospedada",

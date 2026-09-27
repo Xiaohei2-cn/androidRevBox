@@ -168,7 +168,7 @@ export default {
   "adb.binary.portsLoading": "端口查询中…",
   "adb.binary.noPorts": "无 LISTEN 端口",
   "adb.binary.rootLabel": "Root 执行",
-  "adb.binary.rootHint": "勾选后 chmod/执行/终止整链路经 su -c；开启前先探测 su 是否可用。已托管行的身份在执行瞬间锁定，kill 始终同链路。",
+  "adb.binary.rootHint": "Root (su)：默认开。进页面会探一次 su，探得过就以 root 执行 chmod/启动/终止；探不过会保持普通执行并说明原因。你的手动选择按设备记住（在非 root 机器上关过一次，之后不再自动尝试）",
   "adb.binary.suOk": "su 可用：已切换 Root 执行",
   "adb.binary.suFail": "su 不可用（未 root 或拒绝授权），保持普通执行",
   "adb.binary.removeRow": "从托管区移除",

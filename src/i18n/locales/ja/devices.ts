@@ -168,7 +168,7 @@ export default {
   "adb.binary.portsLoading": "ポート取得中…",
   "adb.binary.noPorts": "LISTEN ポートなし",
   "adb.binary.rootLabel": "Root で実行",
-  "adb.binary.rootHint": "チェックすると chmod/実行/終了がすべて su -c 経由になります。有効化前に su の利用可否を調査します。各ホスト行は実行瞬間の身份で固定され、kill は常に同じコンテキストです。",
+  "adb.binary.rootHint": "Root (su)：デフォルトオン。ページ表示時に su を一度だけ確認し、通れば chmod/起動/停止を root で実行します。通らなければ通常実行のまま理由を表示します。手動での選択はデバイス単位で記憶されます（非 root 端末で一度オフにすれば以後は試みません）",
   "adb.binary.suOk": "su 利用可：Root 実行に切替",
   "adb.binary.suFail": "su 使用不可（未 root または拒否）、通常実行のまま",
   "adb.binary.removeRow": "ホスト一覧から削除",

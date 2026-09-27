@@ -404,6 +404,38 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     expect(screen.queryByTestId("stop-external-frida-server")).toBeNull();
   });
 
+  it("Root 默认开：进页面探一次 su，探得过就以 root 身份待命", async () => {
+    localStorage.clear();
+    device.binarySuCheck.mockResolvedValue(true);
+    renderPage(<BinaryHosting />);
+    const box = (await screen.findByRole("checkbox", { name: "Root 执行" })) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(true));
+    // 是探出来的，不是写死的：没探过就不该假装 root 生效
+    expect(device.binarySuCheck).toHaveBeenCalledWith("PIXEL-1");
+  });
+
+  it("su 不可用时保持普通执行，并且必须说明原因（安静降级比不开更糟）", async () => {
+    localStorage.clear();
+    device.binarySuCheck.mockResolvedValue(false);
+    renderPage(<BinaryHosting />);
+    const box = (await screen.findByRole("checkbox", { name: "Root 执行" })) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(false));
+    const notice = await screen.findByTestId("binary-notice");
+    expect(notice.textContent ?? "").toContain("保持普通执行");
+  });
+
+  it("这台机手动关过就不再自动开、也不再探测（非 root 手机不该每次被试）", async () => {
+    localStorage.clear();
+    localStorage.setItem("adb.binary.root.PIXEL-1", "0");
+    device.binarySuCheck.mockClear();
+    renderPage(<BinaryHosting />);
+    const box = (await screen.findByRole("checkbox", { name: "Root 执行" })) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(device.binarySuCheck).not.toHaveBeenCalled();
+    localStorage.clear();
+  });
+
   it("上传文件：推到托管目录、等任务终态、缺执行位补权限，被拒的要给原因", async () => {
     const hosted = [
       {
@@ -447,8 +479,9 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
       ),
     );
     expect(device.push).toHaveBeenCalledTimes(1);
+    // 补权限跟着当前身份走：Root 默认开 → 走 su 链路（root 属主的历史文件 shell 改不动）
     await waitFor(() =>
-      expect(device.binaryChmod).toHaveBeenCalledWith("PIXEL-1", "frida-server", false),
+      expect(device.binaryChmod).toHaveBeenCalledWith("PIXEL-1", "frida-server", true),
     );
     const notice = await screen.findByTestId("binary-notice");
     // 同名文件已在托管目录里 → 必须说成覆盖，不能装作是新文件

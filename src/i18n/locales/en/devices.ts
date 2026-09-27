@@ -168,7 +168,7 @@ export default {
   "adb.binary.portsLoading": "Querying ports…",
   "adb.binary.noPorts": "No LISTEN port",
   "adb.binary.rootLabel": "Run as root",
-  "adb.binary.rootHint": "When checked, chmod/run/kill all go through su -c; su availability is probed before enabling. Each hosted row locks its identity at run time; kill always uses the same context.",
+  "adb.binary.rootHint": "Root (su): on by default. The page probes su once; if it answers, chmod/start/stop run as root, otherwise it stays unprivileged and says why. Your manual choice is remembered per device (switch it off once on a non-rooted phone and it stops trying)",
   "adb.binary.suOk": "su available: switched to root execution",
   "adb.binary.suFail": "su unavailable (device not rooted or access denied), staying non-root",
   "adb.binary.removeRow": "Remove from hosted list",
