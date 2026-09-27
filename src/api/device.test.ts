@@ -43,13 +43,54 @@ describe("deviceApi command contract", () => {
     expect(invokeCommand.mock.calls).toEqual([
       ["device_binaries", { serial: "serial-1" }],
       ["device_binary_chmod", { serial: "serial-1", name: "toybox", root: true }],
-      ["device_binary_run", { serial: "serial-1", name: "toybox", root: false }],
+      [
+        "device_binary_run",
+        {
+          serial: "serial-1",
+          name: "toybox",
+          root: false,
+          args: [],
+          stdinData: null,
+          interactive: false,
+        },
+      ],
       ["device_hosted_runs", { serial: "serial-1" }],
       [
         "device_hosted_stop",
         { serial: "serial-1", handle: "aabbccdd00112233", expectedPid: 4242 },
       ],
       ["device_binary_ports", { serial: "serial-1", pid: 4242, root: false }],
+    ]);
+  });
+
+  /// UI-6 第一/二/四层的 IPC 形状：参数与输入都按这套键上线，
+  /// 空 stdin 必须是 null（后端拿它区分"没填"和"填了空串"），探测的 timeoutMs 同理。
+  it("carries launch args, probe and running input with stable keys", async () => {
+    await deviceApi.binaryRun("serial-1", "toybox", true, ["a b", "c;id"], "y\n", true);
+    await deviceApi.binaryRun("serial-1", "toybox", false, [], "", false);
+    await deviceApi.binaryProbe("serial-1", "toybox", ["-h"], 4000);
+    await deviceApi.hostedWrite("serial-1", "handle-1", "1\n", false);
+    await deviceApi.hostedWrite("serial-1", "handle-1", "", true);
+
+    expect(invokeCommand.mock.calls).toEqual([
+      [
+        "device_binary_run",
+        {
+          serial: "serial-1",
+          name: "toybox",
+          root: true,
+          args: ["a b", "c;id"],
+          stdinData: "y\n",
+          interactive: true,
+        },
+      ],
+      [
+        "device_binary_run",
+        { serial: "serial-1", name: "toybox", root: false, args: [], stdinData: null, interactive: false },
+      ],
+      ["device_binary_probe", { serial: "serial-1", name: "toybox", args: ["-h"], timeoutMs: 4000 }],
+      ["device_hosted_write", { serial: "serial-1", handle: "handle-1", text: "1\n", close: false }],
+      ["device_hosted_write", { serial: "serial-1", handle: "handle-1", text: "", close: true }],
     ]);
   });
 

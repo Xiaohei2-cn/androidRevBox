@@ -17,16 +17,19 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 use agent_protocol::method::{
-    HOSTED_ADOPT, HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP,
+    HOSTED_ADOPT, HOSTED_CHMOD, HOSTED_LIST, HOSTED_PROBE, HOSTED_START, HOSTED_STATUS,
+    HOSTED_STOP, HOSTED_WRITE,
 };
 use agent_protocol::{
     AgentError, ErrorCode, ExternalProc, FileKind, HostedAdoptParams, HostedAdoptResult,
     HostedBinaryInfo, HostedChmodParams, HostedChmodResult, HostedListParams, HostedListResult,
-    HostedRunRecord, HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams,
-    HostedStatusResult, HostedStopParams, HostedStopResult, KillOutcome, KillSignal,
+    HostedProbeParams, HostedProbeResult, HostedRunRecord, HostedRunState, HostedStartParams,
+    HostedStartResult, HostedStatusParams, HostedStatusResult, HostedStdinMode, HostedStopParams,
+    HostedStopResult, HostedWriteParams, HostedWriteResult, KillOutcome, KillSignal,
     PERMISSION_BITS, ProviderHealth, ProviderInfo, render_mode_text,
 };
 use serde::{Deserialize, Serialize};
@@ -42,6 +45,8 @@ const HOSTED_METHODS: &[&str] = &[
     HOSTED_START,
     HOSTED_STATUS,
     HOSTED_STOP,
+    HOSTED_PROBE,
+    HOSTED_WRITE,
 ];
 /// 托管目录固定路径（与 Desktop 的 `adb::HOSTED_DIR` 一致，用户指定的默认目录）。
 const HOSTED_DIR: &str = "/data/local/tmp";
@@ -50,6 +55,10 @@ const STATE_DIR: &str = "/data/local/tmp/app-reverse-tools-hosted";
 const MAX_BINARIES: usize = 2_000;
 /// 记录文件保留上限（按 mtime 留最近这些），防止长期堆积。
 const MAX_RUN_RECORDS: usize = 200;
+/// 探测结束后最多再等输出流这么久：等不到就按已读到的收口，并在结果里说明
+const STREAM_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+/// stdin 上限来自协议层（两条支路共用同一个数，见 `MAX_HOSTED_STDIN_BYTES`）
+const MAX_STDIN_BYTES: usize = agent_protocol::MAX_HOSTED_STDIN_BYTES;
 /// 发信号后确认进程消失的有界等待：超时只说「未确认」，不谎报已停止。
 const STOP_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_500);
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -69,6 +78,13 @@ struct Table {
 struct ManagedRun {
     record: HostedRunRecord,
     child: Option<tokio::process::Child>,
+    /// 持续输入的写入端。
+    ///
+    /// 用 `tokio::sync::Mutex` 而不是直接把 `ChildStdin` 放着：写入是 async 的，
+    /// 绝不能带着 `std::sync::Mutex` 的守卫去 await（future 就不 Send 了）。
+    /// 只有 Agent 亲自起、且启动时接管了 stdin 的记录才会有；重启/认领/Root 支路都是 None，
+    /// 界面上的「已失去输入通道」就是从这里的实况来的，不是靠记录里的声称。
+    stdin: Option<Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
     source: RunSource,
 }
 
@@ -145,6 +161,8 @@ impl Provider for HostedProvider {
                 HOSTED_START => self.start(params),
                 HOSTED_STATUS => self.status(params),
                 HOSTED_STOP => self.stop(params),
+                HOSTED_PROBE => self.probe(params).await,
+                HOSTED_WRITE => self.write(params).await,
                 _ => Err(AgentError::new(
                     ErrorCode::UnsupportedMethod,
                     format!("unsupported hosted method: {method}"),
@@ -245,26 +263,8 @@ impl HostedProvider {
                 "agent_uid": effective_uid(),
             })));
         }
-        let path = hosted_path(&params.name)?;
-        let metadata = std::fs::metadata(&path).map_err(|error| io_error("stat", &path, error))?;
-        if !metadata.is_file() {
-            return Err(invalid(
-                "not_a_regular_file",
-                format!("托管目标不是普通文件: {}", display(&path)),
-            ));
-        }
-        if !is_elf(&path).unwrap_or(false) {
-            return Err(invalid(
-                "not_an_elf",
-                format!("托管目标不是 ELF 可执行文件: {}", display(&path)),
-            ));
-        }
-        if metadata.mode() & 0o100 == 0 {
-            return Err(invalid(
-                "not_executable",
-                format!("缺少 owner 执行位，请先调 hosted.chmod: {}", display(&path)),
-            ));
-        }
+        // 路径/普通文件/ELF/执行位这四道检查与 probe 共用（同一个判据不能两份实现）
+        let path = validated_executable(&params.name)?;
         let log_path = format!("{HOSTED_DIR}/.{}.run.log", params.name);
         let stdout = std::fs::OpenOptions::new()
             .create(true)
@@ -276,17 +276,24 @@ impl HostedProvider {
         let stderr = stdout.try_clone().map_err(|error| {
             AgentError::new(ErrorCode::Internal, format!("dup 日志句柄失败: {error}"))
         })?;
+        // 一次性 stdin：有内容才接管道，没有就照旧给 /dev/null
+        // （给 /dev/null 是有意的：不接管 stdin 的程序读到 EOF 会自己往下走）
+        let stdin_data = take_one_shot_stdin(params.stdin_data.as_deref())?;
         let mut command = tokio::process::Command::new(&path);
         command
             .current_dir(HOSTED_DIR)
             .args(&params.args)
-            .stdin(std::process::Stdio::null())
+            .stdin(if stdin_data.is_some() || params.interactive_stdin {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .stdout(std::process::Stdio::from(stdout))
             .stderr(std::process::Stdio::from(stderr))
             // 独立进程组：Agent 停止时不把托管进程一起带走（对齐原 nohup 语义）
             .process_group(0)
             .kill_on_drop(false);
-        let child = command.spawn().map_err(|error| {
+        let mut child = command.spawn().map_err(|error| {
             AgentError::new(
                 ErrorCode::Internal,
                 format!("启动 {} 失败: {error}", params.name),
@@ -298,6 +305,53 @@ impl HostedProvider {
         })?;
         let pid = child.id().unwrap_or(0);
         let start_time_ticks = read_start_time_ticks(pid).unwrap_or(0);
+        // 写入端先取出来。两种用法**必须走两条路**：
+        // - 一次性输入：写完后由这个任务**持有并 drop** 管道 —— 管道的 EOF 是"写端全关了"
+        //   才出现的，把它存进运行表就永远不关，等 stdin 的程序会一直卡着
+        //   （真机腿抓到过：cat 收完内容不退，状态写着 once 却还 Running）；
+        // - 持续输入：句柄留在运行表里（界面上的输入框只在设备说 open 时才长出来）。
+        let interactive = params.interactive_stdin;
+        let mut pipe = (stdin_data.is_some() || interactive)
+            .then(|| child.stdin.take())
+            .flatten();
+        // 状态按**实际拿到什么**记，不按调用方要求记：要了持续输入而管道没接上却记成
+        // Open，界面上就会长出一个吞字的假输入框。
+        let stdin_mode = match (&pipe, interactive) {
+            (Some(_), true) => HostedStdinMode::Open,
+            (Some(_), false) => HostedStdinMode::Once,
+            (None, _) => HostedStdinMode::None,
+        };
+        let stdin_arc = if interactive {
+            pipe.take().map(|p| Arc::new(tokio::sync::Mutex::new(p)))
+        } else {
+            None
+        };
+        if let Some(arc) = stdin_arc.clone() {
+            // 持续输入：首段内容（如果有）写进同一个管道，但**不关**
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let mut pipe = arc.lock().await;
+                if let Some(text) = stdin_data {
+                    if let Err(error) = pipe.write_all(text.as_bytes()).await {
+                        eprintln!("hosted: 写启动输入失败 pid={pid}: {error}");
+                    }
+                }
+            });
+        } else if let Some(pipe) = pipe.take() {
+            // 一次性：写完就让它随任务结束一起关掉，这就是 EOF。
+            // 子进程不读 stdin 时写入会堵在管道里 —— 所以不能在主路径上同步写。
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let mut pipe = pipe;
+                if let Some(text) = stdin_data {
+                    if let Err(error) = pipe.write_all(text.as_bytes()).await {
+                        eprintln!("hosted: 写启动输入失败 pid={pid}: {error}");
+                    }
+                }
+                let _ = pipe.shutdown().await;
+                drop(pipe); // 管道的 EOF 发生在写端全部关闭时
+            });
+        }
         let handle = random_handle()?;
         let record = HostedRunRecord {
             handle: handle.clone(),
@@ -306,6 +360,8 @@ impl HostedProvider {
             start_time_ticks,
             started_at_unix: unix_now(),
             log_path: log_path.clone(),
+            args: params.args.clone(),
+            stdin_mode: Some(stdin_mode),
             root: false,
             state: HostedRunState::Running,
             exit_code: None,
@@ -317,6 +373,7 @@ impl HostedProvider {
             ManagedRun {
                 record: record.clone(),
                 child: Some(child),
+                stdin: stdin_arc,
                 source: RunSource::Spawned,
             },
         );
@@ -442,6 +499,11 @@ impl HostedProvider {
             start_time_ticks: ticks,
             started_at_unix: started_unix.unwrap_or_else(unix_now),
             log_path: format!("{HOSTED_DIR}/.{}.run.log", params.name),
+            // 认领进来的记录也要带参数：root 支路 Agent 没见过那次 exec，
+            // 不带上就只剩 pid，界面上看不出"当初用什么参数跑的"
+            args: params.args.clone(),
+            // 认领来的进程 Agent 没见过那次 exec，stdin 在谁手里都不知道：只能记"没有通道"
+            stdin_mode: Some(HostedStdinMode::None),
             root,
             state: HostedRunState::Running,
             exit_code: None,
@@ -453,6 +515,8 @@ impl HostedProvider {
             ManagedRun {
                 record: record.clone(),
                 child: None,
+                // root/Legacy 支路起的进程：Agent 没见过那次 exec，没有 stdin 句柄
+                stdin: None,
                 source: RunSource::Adopted,
             },
         );
@@ -650,6 +714,348 @@ impl HostedProvider {
     }
 
     /// 首次调用时从磁盘对账（构造期不做 IO）。
+    /// 输入通道写坏了：收回句柄并把记录降级，别让界面继续显示"可输入"。
+    fn drop_stdin(&self, handle: &str, mode: HostedStdinMode) {
+        let mut table = self.lock();
+        if let Some(run) = table.runs.get_mut(handle) {
+            run.stdin = None;
+            run.record.stdin_mode = Some(mode);
+            let record = run.record.clone();
+            self.persist(&record);
+        }
+    }
+
+    /// 第二层：拿一组参数把托管二进制起来一次，只回报事实。
+    ///
+    /// 与 `start` 的三条差别，都是为了"探测连试九个候选也不该在手机上留下东西"：
+    /// ① 不进运行表、不落记录、不追加 `.name.run.log`；
+    /// ② 到点没退就**连整个进程组**一起杀（只杀父进程会留下占端口的孤儿），
+    ///    杀完回读 `/proc` 确认；确认不了就写 `still_running=true`，不装作清干净了；
+    /// ③ 探测一律不给 stdin（`/dev/null`）：否则"它在等输入"会被误报成"它进了服务模式"。
+    ///
+    /// Agent 只有 shell 身份，探测也就以 shell 跑，不假装能提权（同 D026）；
+    /// 必须 root 才能起的东西会给出退出码与报错，那本身也是有用的事实。
+    ///
+    /// 这里**不判断"这段输出算不算帮助"**：每个程序触发 help 后的反应差别太大，
+    /// 任何模板化识别都会把误判当结论。stdout/stderr 原文带回去给人看，
+    /// 分类只按客观事实（有没有输出、有没有退、多久、什么码）。
+    async fn probe(&self, params: Value) -> Result<Value, AgentError> {
+        let params: HostedProbeParams = parse_params(params)?;
+        if params.args.len() > agent_protocol::MAX_HOSTED_ARGS {
+            return Err(invalid(
+                "too_many_args",
+                format!(
+                    "探测参数 {} 个，超过上限 {}",
+                    params.args.len(),
+                    agent_protocol::MAX_HOSTED_ARGS
+                ),
+            ));
+        }
+        for arg in &params.args {
+            if arg.len() > agent_protocol::MAX_HOSTED_ARG_LEN {
+                return Err(invalid(
+                    "arg_too_long",
+                    format!(
+                        "单个参数最长 {} 字节，这里有一个 {} 字节",
+                        agent_protocol::MAX_HOSTED_ARG_LEN,
+                        arg.len()
+                    ),
+                ));
+            }
+        }
+        let timeout = std::time::Duration::from_millis(
+            params
+                .timeout_ms
+                .unwrap_or(agent_protocol::HOSTED_PROBE_DEFAULT_TIMEOUT_MS)
+                .clamp(200, agent_protocol::HOSTED_PROBE_MAX_TIMEOUT_MS),
+        );
+        // 与 start 共用同一套目标检查：不能借探测去"顺便执行"托管目录外的东西
+        // 非法文件名是调用方的 bug：这种照旧响亮报错，不混进"这个文件跑不了"
+        let path = hosted_path(&params.name)?;
+        let path = match check_executable_target(&path).map(|()| path.clone()) {
+            Ok(path) => path,
+            Err(error) => {
+                // 探测的意义就是"这样跑会怎样"。目标本身不可执行是一类**结论**
+                // （界面归到"无法执行"），不能报成"我没连上设备"那种失败。
+                return serialize(HostedProbeResult {
+                    args: params.args.clone(),
+                    started: false,
+                    pid: 0,
+                    exit_code: None,
+                    signal: None,
+                    timed_out: false,
+                    killed: false,
+                    still_running: false,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                    truncated: false,
+                    elapsed_ms: 0,
+                    detail: Some(describe_refusal(&error)),
+                });
+            }
+        };
+
+        let mut command = tokio::process::Command::new(&path);
+        command
+            .current_dir(HOSTED_DIR)
+            .args(&params.args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                // "起不来"是一种结论，不是一次 RPC 失败：报成错误的话，界面就分不出
+                // "这个文件无法执行"和"我没连上设备"这两件完全不同的事
+                return serialize(HostedProbeResult {
+                    args: params.args.clone(),
+                    started: false,
+                    pid: 0,
+                    exit_code: None,
+                    signal: None,
+                    timed_out: false,
+                    killed: false,
+                    still_running: false,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                    truncated: false,
+                    elapsed_ms: 0,
+                    detail: Some(spawn_failure_hint(&error)),
+                });
+            }
+        };
+        let pid = child.id().unwrap_or(0);
+        // 刚起来时的启动时刻：后面判断"还在 /proc 里的是不是同一个进程"全靠它
+        let born_ticks = read_start_time_ticks(pid);
+        let out_sink = Arc::new(Sink::default());
+        let err_sink = Arc::new(Sink::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut pumps = Vec::new();
+        if let Some(pipe) = child.stdout.take() {
+            pumps.push(tokio::spawn(pump_read(
+                pipe,
+                out_sink.clone(),
+                stop.clone(),
+            )));
+        }
+        if let Some(pipe) = child.stderr.take() {
+            pumps.push(tokio::spawn(pump_read(
+                pipe,
+                err_sink.clone(),
+                stop.clone(),
+            )));
+        }
+
+        let began = std::time::Instant::now();
+        let mut timed_out = false;
+        let mut killed = false;
+        let mut status: Option<std::process::ExitStatus> = None;
+        let mut detail: Option<String> = None;
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(value)) => status = Some(value),
+            Ok(Err(error)) => detail = Some(format!("等待退出失败: {error}")),
+            Err(_) => {
+                timed_out = true;
+                kill_process_group(pid);
+                let _ = child.start_kill();
+                killed = true;
+                // 杀完再收一次：拿到信号退出码就照实记，收不到就留 None（不猜）
+                if let Ok(Ok(value)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(1_000), child.wait())
+                        .await
+                {
+                    status = Some(value);
+                }
+            }
+        }
+        let elapsed_ms = began.elapsed().as_millis() as u64;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for handle in pumps {
+            let abort = handle.abort_handle();
+            // 输出流可能被后代进程继续持有：只等有界时间，等不到就用已读到的部分并说明
+            if tokio::time::timeout(STREAM_GRACE, handle).await.is_err() {
+                abort.abort();
+                detail =
+                    Some("输出流没随进程关闭（可能有后代进程还持有它），已按有界等待收口".into());
+            }
+        }
+
+        // 还在不在：按启动时刻比。光看 /proc 存在会把 PID 复用说成"它没退"
+        let (still_running, alive_detail) = match (born_ticks, read_start_time_ticks(pid)) {
+            (Some(born), Some(now)) => {
+                (now == born, (now != born).then(|| "pid_reused".to_string()))
+            }
+            (Some(_), None) => (false, None),
+            (None, _) => (
+                std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                Some("start_time_unreadable".to_string()),
+            ),
+        };
+        if detail.is_none() {
+            detail = alive_detail;
+        }
+        let (stdout_text, stdout_kept) = out_sink.snapshot();
+        let (stderr_text, stderr_kept) = err_sink.snapshot();
+        let truncated = stdout_kept < out_sink.total() || stderr_kept < err_sink.total();
+        eprintln!(
+            "audit method={HOSTED_PROBE} name={} args={:?} exit={:?} signal={:?} timed_out={timed_out} elapsed_ms={elapsed_ms}",
+            params.name,
+            params.args,
+            status.as_ref().and_then(|value| value.code()),
+            status.as_ref().and_then(|value| value.signal()),
+        );
+        serialize(HostedProbeResult {
+            args: params.args,
+            started: true,
+            pid,
+            exit_code: status.as_ref().and_then(|value| value.code()),
+            signal: status.as_ref().and_then(|value| value.signal()),
+            timed_out,
+            killed,
+            still_running,
+            stdout: stdout_text,
+            stderr: stderr_text,
+            stdout_bytes: out_sink.total(),
+            stderr_bytes: err_sink.total(),
+            truncated,
+            elapsed_ms,
+            detail,
+        })
+    }
+
+    /// 第四层：向运行中的托管进程持续输入。
+    ///
+    /// 能不能写得看**设备上的句柄实况**，不看记录里的声称：Agent 重启后记录还在、
+    /// 进程也可能还在，但 stdin 的写入端早断了。那种情况必须明确拒掉并说清原因，
+    /// 界面才能显示"已失去输入通道"，而不是留一个看着能输、其实把字吞掉的框。
+    async fn write(&self, params: Value) -> Result<Value, AgentError> {
+        use tokio::io::AsyncWriteExt as _;
+        let params: HostedWriteParams = parse_params(params)?;
+        if params.text.len() > agent_protocol::MAX_HOSTED_WRITE_BYTES {
+            return Err(invalid(
+                "write_too_large",
+                format!(
+                    "单次输入 {} 字节，超过上限 {} 字节",
+                    params.text.len(),
+                    agent_protocol::MAX_HOSTED_WRITE_BYTES
+                ),
+            ));
+        }
+        self.ensure_loaded()?;
+        // 取句柄这段不跨 await：带着表锁去写管道会把整张表钉住
+        let pipe = {
+            let mut table = self.lock();
+            let Some(run) = table.runs.get_mut(&params.handle) else {
+                return Err(AgentError::new(
+                    ErrorCode::NotFound,
+                    format!("没有句柄 {} 的运行记录", params.handle),
+                )
+                .with_details(serde_json::json!({ "reason": "unknown_handle" })));
+            };
+            // 先判"进程还在不在"，再判"通道在不在"：往一只已经退了的处理上写字，
+            // 报"没通道"会把真原因（它已经死了）盖掉。
+            // 但这句判断必须**拿得出证据**才说：自己起的孩子用 try_wait 实收
+            // （收到状态顺手 reap，退出码就有了）；手里没孩子时只认记录里
+            // refresh 已经判过的状态，不去猜——猜出来的"已退出"会遮掉
+            // "根本没有输入通道"这个可操作的实话说。
+            let gone = match run.child.as_mut() {
+                Some(child) => {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        reap(run);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => run.record.state == HostedRunState::Exited,
+            };
+            if gone {
+                return Err(invalid(
+                    "process_exited",
+                    format!("进程已退出，这句输入没人收（{:?}）", run.record.exit_code),
+                ));
+            }
+            match (run.stdin.clone(), run.record.stdin_mode) {
+                (Some(pipe), Some(HostedStdinMode::Open)) => pipe,
+                (_, mode) => {
+                    // 原因按**记录声称的状态**判：声称能写却拿不出句柄，才是"通道丢了"；
+                    // 本来就一次性用完/没有接管，那是"这条通道没开着"，两句话不一样。
+                    let reason = if run.record.stdin_mode == Some(HostedStdinMode::Open) {
+                        "stdin_handle_gone"
+                    } else {
+                        "stdin_closed"
+                    };
+                    return Err(invalid(
+                        "stdin_unavailable",
+                        format!(
+                            "这条记录现在没有可用的输入通道（设备侧状态：{}）",
+                            mode.map(HostedStdinMode::as_str)
+                                .unwrap_or("老版本 Agent 未告知"),
+                        ),
+                    )
+                    .with_details(serde_json::json!({
+                        "reason": reason,
+                        "stdin_mode": mode.map(HostedStdinMode::as_str),
+                    })));
+                }
+            }
+        };
+        let mut guard = pipe.lock().await;
+        let wrote = guard.write_all(params.text.as_bytes()).await;
+        if let Err(error) = wrote {
+            drop(guard);
+            // 写不进去说明这条通道已经是死的了：把实况收回并降级记录，别留着骗界面
+            self.drop_stdin(&params.handle, HostedStdinMode::Lost);
+            return Err(
+                AgentError::new(ErrorCode::Internal, format!("写入失败: {error}"))
+                    .with_details(serde_json::json!({ "reason": "stdin_broken" })),
+            );
+        }
+        let _ = guard.flush().await;
+        let closing = params.close;
+        if closing {
+            // shutdown 之后就是 EOF：程序读到 EOF 自己往下走，这条通道到此为止
+            let _ = guard.shutdown().await;
+        }
+        drop(guard);
+
+        let mut table = self.lock();
+        let run = match table.runs.get_mut(&params.handle) {
+            Some(run) => run,
+            None => {
+                return Err(AgentError::new(
+                    ErrorCode::NotFound,
+                    format!("写入期间运行记录 {} 消失了", params.handle),
+                )
+                .with_details(serde_json::json!({ "reason": "unknown_handle" })));
+            }
+        };
+        if closing {
+            run.stdin = None;
+            run.record.stdin_mode = Some(HostedStdinMode::Once);
+        }
+        let record = run.record.clone();
+        self.persist(&record);
+        let stdin_mode = record.stdin_mode.unwrap_or(HostedStdinMode::None);
+        eprintln!(
+            "audit method={HOSTED_WRITE} handle={} bytes={} close={closing} stdin_mode={}",
+            params.handle,
+            params.text.len(),
+            stdin_mode.as_str()
+        );
+        serialize(HostedWriteResult {
+            record,
+            bytes_written: params.text.len() as u64,
+            stdin_mode,
+        })
+    }
+
     fn ensure_loaded(&self) -> Result<(), AgentError> {
         let mut table = self.lock();
         if table.loaded {
@@ -673,6 +1079,10 @@ impl HostedProvider {
                         continue;
                     };
                     let mut record = stored.record;
+                    // 写入端跟着上一个 Agent 一起没了：进程可能还活着，但再也喂不进去
+                    if record.stdin_mode == Some(HostedStdinMode::Open) {
+                        record.stdin_mode = Some(HostedStdinMode::Lost);
+                    }
                     let (state, detail) = reconcile(record.start_time_ticks, record.pid);
                     record.state = state;
                     // 已不是自己的子进程，没有退出码可 claim
@@ -685,6 +1095,7 @@ impl HostedProvider {
                         ManagedRun {
                             record,
                             child: None,
+                            stdin: None,
                             source: RunSource::Reconciled,
                         },
                     );
@@ -1122,6 +1533,12 @@ fn comm_matches(name: &str, comm: &str) -> bool {
 }
 
 /// 确认死亡时顺手回收自己持有的子进程，把真实退出码/信号留在记录里。
+/// 回收自己起的子进程并记下死因。
+///
+/// ⚠️ 只能在**已经确认它退了**之后调用：本函数会放掉 `child` 句柄，
+/// 进程还在跑就叫它，等于把"以后还能收到退出码"这件事扔掉——
+/// 界面上就只剩一个" exited 但不知道码"的记录。`refresh` 里那一步是
+/// 先 `try_wait` 拿到状态才清句柄的，别照它抄成"无条件 reap"。
 fn reap(run: &mut ManagedRun) {
     let Some(child) = run.child.as_mut() else {
         return;
@@ -1193,6 +1610,162 @@ fn unix_now() -> u64 {
 fn effective_uid() -> u32 {
     // SAFETY: geteuid 无前置条件，也不改进程状态。
     unsafe { libc::geteuid() }
+}
+
+/// 把"没起来"的原因收成一句可判读的话：设备侧的 reason 码 + Agent 的中文说明。
+///
+/// 界面靠 reason 分类（不是靠正则匹配中文），所以这个串里必须两者都带上。
+fn describe_refusal(error: &AgentError) -> String {
+    let reason = error
+        .details
+        .as_ref()
+        .and_then(|value| value.get("reason"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    format!("{reason}: {}", error.message)
+}
+
+/// start 与 probe 共用的目标检查：托管目录内、普通文件、ELF、有 owner 执行位。
+///
+/// 两处必须同一份实现：探测历史上就是"能不能跑"的第二条路，判据一旦分叉，
+/// 就会出现 start 拒了而 probe 偷偷执行（或反过来）这种没人能解释的差别。
+fn validated_executable(name: &str) -> Result<PathBuf, AgentError> {
+    let path = hosted_path(name)?;
+    check_executable_target(&path)?;
+    Ok(path)
+}
+
+/// 目标本身能不能执行：普通文件 / ELF / owner 执行位。
+///
+/// 单独拆出来是给 probe 用的——"这个文件跑不了"在探测里是一类**结论**，
+/// 而"文件名非法"是调用方的 bug，两者不能混成同一种回话。
+fn check_executable_target(path: &Path) -> Result<(), AgentError> {
+    let metadata = std::fs::metadata(path).map_err(|error| io_error("stat", path, error))?;
+    if !metadata.is_file() {
+        return Err(invalid(
+            "not_a_regular_file",
+            format!("托管目标不是普通文件: {}", display(path)),
+        ));
+    }
+    if !is_elf(path).unwrap_or(false) {
+        return Err(invalid(
+            "not_an_elf",
+            format!("托管目标不是 ELF 可执行文件: {}", display(path)),
+        ));
+    }
+    if metadata.mode() & 0o100 == 0 {
+        return Err(invalid(
+            "not_executable",
+            format!("缺少 owner 执行位，请先调 hosted.chmod: {}", display(path)),
+        ));
+    }
+    Ok(())
+}
+
+/// 探测时一条输出流的去处：留住的字节 + 进程真实写出的字节。
+///
+/// 两个数都要有：只显示"留了多少"会把截断说成"它只输出了这些"。
+#[derive(Default)]
+struct Sink {
+    kept: Mutex<Vec<u8>>,
+    total: std::sync::atomic::AtomicU64,
+}
+
+impl Sink {
+    fn snapshot(&self) -> (String, u64) {
+        let kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            String::from_utf8_lossy(&kept).into_owned(),
+            kept.len() as u64,
+        )
+    }
+
+    fn total(&self) -> u64 {
+        self.total.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// 一直读到这一端关闭为止；超过上限的部分**继续读但不留**。
+///
+/// 为什么不能读满就停：管道塞满后进程会卡在 write 上不退，探测结论就变成
+/// "它没退出"——那是我们自己的读法造成的假象。
+async fn pump_read<R>(mut reader: R, sink: Arc<Sink>, stop: Arc<AtomicBool>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt as _;
+    let mut chunk = vec![0_u8; 8 * 1024];
+    loop {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        match reader.read(&mut chunk).await {
+            Ok(0) => return,
+            Ok(n) => {
+                sink.total
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                let mut kept = sink
+                    .kept
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let room = agent_protocol::MAX_HOSTED_PROBE_OUTPUT_BYTES.saturating_sub(kept.len());
+                let take = room.min(n);
+                kept.extend_from_slice(&chunk[..take]);
+            }
+            // 读不动就当这条流没有输出：退出码与信号仍是事实，不额外编原因
+            Err(_) => return,
+        }
+    }
+}
+
+/// 杀掉整个进程组（负 pid）。
+///
+/// 探测与启动都用 `process_group(0)` 起孩子，pgid 就等于那次进程的 pid。
+/// 只 `child.kill()` 的话，它 fork 出去的那一半会留在设备上占着端口——
+/// 这正是本工具"换个参数再起就 bind failed"的来历。
+fn kill_process_group(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let target = -(pid as libc::pid_t);
+    // SIGKILL 而不是 TERM：探测超时的候选多半正在等输入或已经进了服务模式
+    unsafe { libc::kill(target, libc::SIGKILL) };
+}
+
+/// 起不来的原因要说人话：errno 谁都不想看，但"为什么"必须留下。
+fn spawn_failure_hint(error: &std::io::Error) -> String {
+    let errno = error.raw_os_error().unwrap_or_default();
+    let hint: String = match errno {
+        13 => "没有执行权限（先给它加执行位，或确认它所在目录没有 noexec)".into(),
+        2 => "文件不存在（列表可能已经过期，刷新一次再看)".into(),
+        8 => "不是可执行格式（ELF 头对但架构或动态链接器不对)".into(),
+        26 => "文件正忙（已被另一个进程占用)".into(),
+        _ => error.to_string(),
+    };
+    format!("无法执行: {hint}（errno {errno}）")
+}
+
+/// 一次性启动输入的校验：超限就拒，**绝不截断**。
+///
+/// 截断等于让目标程序读到半句输入（少一个换行、少一段配置），现场比"起不来"难查得多。
+/// 空字符串按"没填"处理：走 `/dev/null`，程序读到 EOF 自己往下走。
+fn take_one_shot_stdin(text: Option<&str>) -> Result<Option<String>, AgentError> {
+    let Some(text) = text.filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    if text.len() > MAX_STDIN_BYTES {
+        return Err(invalid(
+            "stdin_too_large",
+            format!(
+                "启动输入 {} 字节，超过上限 {MAX_STDIN_BYTES} 字节；这里不截断，请改小，或改用运行中持续输入",
+                text.len()
+            ),
+        ));
+    }
+    Ok(Some(text.to_owned()))
 }
 
 fn invalid(reason: &str, message: impl Into<String>) -> AgentError {
@@ -1524,6 +2097,8 @@ mod tests {
             start_time_ticks: ticks,
             started_at_unix: 1_760_000_000,
             log_path: "/data/local/tmp/.toybox.run.log".into(),
+            args: Vec::new(),
+            stdin_mode: Some(HostedStdinMode::Open),
             root: false,
             state: HostedRunState::Running,
             exit_code: None,
@@ -1626,6 +2201,7 @@ mod tests {
             ManagedRun {
                 record: record("aabb", 4242, 11),
                 child: None,
+                stdin: None,
                 source: RunSource::Reconciled,
             },
         );
@@ -1641,6 +2217,7 @@ mod tests {
             ManagedRun {
                 record: record("ccdd", 9999, 7),
                 child: None,
+                stdin: None,
                 source: RunSource::Spawned,
             },
         );
@@ -1681,12 +2258,160 @@ mod tests {
         assert_eq!(loose.expected_pid, None);
     }
 
+    /// 探测的入参检查必须**在看文件之前**：越界的 argv 不该让设备去 open 一次。
+    #[tokio::test]
+    async fn probe_rejects_oversized_argv_before_touching_the_filesystem() {
+        let provider = HostedProvider::new();
+        let many: Vec<String> = (0..agent_protocol::MAX_HOSTED_ARGS + 1)
+            .map(|index| index.to_string())
+            .collect();
+        let error = provider
+            .probe(serde_json::json!({ "name": "toybox", "args": many }))
+            .await
+            .expect_err("参数个数越界必须拒");
+        assert_eq!(error.details.unwrap()["reason"], "too_many_args");
+        let long = "x".repeat(agent_protocol::MAX_HOSTED_ARG_LEN + 1);
+        let error = provider
+            .probe(serde_json::json!({ "name": "toybox", "args": [long] }))
+            .await
+            .expect_err("单参数过长必须拒");
+        assert_eq!(error.details.unwrap()["reason"], "arg_too_long");
+    }
+
+    /// 目标本身不可执行是一类**结论**（界面归"无法执行"），不是这次 RPC 失败：
+    /// 报成失败的话，界面就分不出"这个文件跑不了"和"我没连上设备"。
+    #[tokio::test]
+    async fn probe_reports_unusable_target_as_a_result_not_an_error() {
+        let provider = HostedProvider::new();
+        let value = provider
+            .probe(serde_json::json!({ "name": "definitely-absent-bin", "args": ["-h"] }))
+            .await
+            .expect("探测缺文件应当作为结论返回");
+        let result: HostedProbeResult = serde_json::from_value(value).unwrap();
+        assert!(!result.started, "没起来就得说没起来");
+        assert!(!result.timed_out && !result.killed, "没起来与超时是两回事");
+        let detail = result.detail.expect("没起来必须给出原因");
+        assert!(
+            detail.starts_with("not_found"),
+            "detail 要带 reason 码，界面按它分类而不是匹配中文：{detail}"
+        );
+        // 非法文件名仍然是一次错误（白名单守卫必须响亮）
+        assert!(
+            provider
+                .probe(serde_json::json!({ "name": "../escape", "args": ["-h"] }))
+                .await
+                .is_err()
+        );
+    }
+
+    /// 超时的兜底：上限来自协议层，Agent 自己也要夹住，
+    /// 否则一个 600s 的 timeout 会把"探测"变成"在设备上挂一个服务"。
+    #[test]
+    fn probe_timeout_is_clamped_to_the_protocol_bounds() {
+        let params: HostedProbeParams = serde_json::from_value(serde_json::json!({
+            "name": "toybox", "timeout_ms": 999_999_u64
+        }))
+        .unwrap();
+        let clamped = params
+            .timeout_ms
+            .unwrap_or(agent_protocol::HOSTED_PROBE_DEFAULT_TIMEOUT_MS)
+            .clamp(200, agent_protocol::HOSTED_PROBE_MAX_TIMEOUT_MS);
+        assert_eq!(clamped, agent_protocol::HOSTED_PROBE_MAX_TIMEOUT_MS);
+        let absent: HostedProbeParams =
+            serde_json::from_value(serde_json::json!({ "name": "toybox" })).unwrap();
+        assert_eq!(
+            absent
+                .timeout_ms
+                .unwrap_or(agent_protocol::HOSTED_PROBE_DEFAULT_TIMEOUT_MS),
+            4_000
+        );
+    }
+
+    /// 持续输入的门槛看**句柄实况**：记录声称 Open 而句柄已经没了（Agent 重启过），
+    /// 必须拒掉并把原因带回去——界面据此显示"已失去输入通道"，而不是留个吞字的框。
+    #[tokio::test]
+    async fn write_refuses_when_the_record_claims_open_but_no_handle_exists() {
+        let provider = table_with(record("aabbccddeeff0011", 4242, 11), RunSource::Reconciled);
+        let error = provider
+            .write(serde_json::json!({ "handle": "aabbccddeeff0011", "text": "y\n" }))
+            .await
+            .expect_err("没有句柄就没有通道");
+        assert_eq!(
+            error.details.as_ref().unwrap()["reason"],
+            "stdin_handle_gone"
+        );
+        // 一次性输入用完之后（once）同样写不进去：那条管道早就 EOF 了
+        let once = HostedRunRecord {
+            stdin_mode: Some(HostedStdinMode::Once),
+            ..record("112233445566", 4242, 11)
+        };
+        let provider = table_with(once, RunSource::Spawned);
+        let error = provider
+            .write(serde_json::json!({ "handle": "112233445566", "text": "y\n" }))
+            .await
+            .expect_err("once 之后不该再写得进去");
+        assert_eq!(error.details.as_ref().unwrap()["reason"], "stdin_closed");
+    }
+
+    /// 未知句柄与超限输入都要在碰到进程之前就拒掉。
+    #[tokio::test]
+    async fn write_rejects_unknown_handle_and_oversized_text() {
+        let provider = HostedProvider::new();
+        let error = provider
+            .write(serde_json::json!({ "handle": "ffffffffffffffff", "text": "hi" }))
+            .await
+            .expect_err("没有这条记录");
+        assert_eq!(error.code, ErrorCode::NotFound);
+        assert_eq!(error.details.unwrap()["reason"], "unknown_handle");
+        let big = "x".repeat(agent_protocol::MAX_HOSTED_WRITE_BYTES + 1);
+        let error = provider
+            .write(serde_json::json!({ "handle": "ffffffffffffffff", "text": big }))
+            .await
+            .expect_err("超限必须拒，不截断");
+        assert_eq!(error.details.unwrap()["reason"], "write_too_large");
+    }
+
+    /// 输出流的截断只该发生在**回传**：真实写出量必须仍然报得出来，
+    /// 否则界面会把"我只留了 64K"说成"它只输出了 64K"。
+    #[tokio::test]
+    async fn probe_output_sink_keeps_head_and_reports_true_total() {
+        let sink = Arc::new(Sink::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let payload = vec![b'a'; agent_protocol::MAX_HOSTED_PROBE_OUTPUT_BYTES + 4_096];
+        pump_read(std::io::Cursor::new(payload.clone()), sink.clone(), stop).await;
+        let (text, kept) = sink.snapshot();
+        assert_eq!(kept as usize, agent_protocol::MAX_HOSTED_PROBE_OUTPUT_BYTES);
+        assert_eq!(sink.total() as usize, payload.len());
+        assert_eq!(text.len(), agent_protocol::MAX_HOSTED_PROBE_OUTPUT_BYTES);
+        assert!(text.starts_with('a'), "留的必须是开头");
+    }
+
+    /// 一次性 stdin：空串按"没填"处理（走 /dev/null），超限明确拒且不截断。
+    #[test]
+    fn one_shot_stdin_rejects_over_limit_instead_of_truncating() {
+        assert!(take_one_shot_stdin(None).unwrap().is_none());
+        assert!(
+            take_one_shot_stdin(Some("")).unwrap().is_none(),
+            "空串等于没填：不该因此把 stdin 从 /dev/null 改成管道"
+        );
+        let text = "x".repeat(agent_protocol::MAX_HOSTED_STDIN_BYTES);
+        assert_eq!(
+            take_one_shot_stdin(Some(&text)).unwrap().unwrap().len(),
+            text.len()
+        );
+        let error = take_one_shot_stdin(Some(
+            &"x".repeat(agent_protocol::MAX_HOSTED_STDIN_BYTES + 1),
+        ))
+        .expect_err("超限必须拒");
+        assert_eq!(error.details.unwrap()["reason"], "stdin_too_large");
+    }
+
     #[test]
     fn hosted_provider_info_is_stable_and_methods_unique() {
         let provider = HostedProvider::new();
         assert_eq!(provider.info().name, "hosted");
         assert_eq!(provider.methods(), HOSTED_METHODS);
-        assert_eq!(HOSTED_METHODS.len(), 6);
+        assert_eq!(HOSTED_METHODS.len(), 8);
     }
 
     #[test]
@@ -1718,6 +2443,7 @@ mod tests {
             table.runs.insert(
                 record.handle.clone(),
                 ManagedRun {
+                    stdin: None,
                     record,
                     child: None,
                     source,
@@ -1805,9 +2531,9 @@ mod tests {
     }
 
     #[test]
-    fn hosted_provider_declares_all_six_hosted_methods() {
+    fn hosted_provider_declares_all_eight_hosted_methods() {
         let provider = HostedProvider::new();
-        assert_eq!(provider.methods().len(), 6);
+        assert_eq!(provider.methods().len(), 8);
         assert!(provider.methods().contains(&HOSTED_STOP));
         // AR7.7 新增：认领方法必须被宣告出来，否则 Desktop 的路由看不到它
         assert!(provider.methods().contains(&HOSTED_ADOPT));

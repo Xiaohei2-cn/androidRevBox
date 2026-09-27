@@ -61,39 +61,5 @@ export const taskApi = {
   },
 };
 
-/**
- * 把一行 shell 输入拆成 executable + args（不执行任何 shell 展开，
- * 引号支持包裹含空格的参数）。前端只负责解析，执行永远在 Rust CommandSpec。
- */
-export function tokenizeCommand(line: string): { executable: string; args: string[] } | null {
-  const trimmed = line.trim();
-  if (!trimmed) return null;
-  const tokens: string[] = [];
-  let current = "";
-  let quote: '"' | "'" | null = null;
-  let has = false;
-  for (const ch of trimmed) {
-    if (quote) {
-      if (ch === quote) {
-        quote = null;
-      } else {
-        current += ch;
-      }
-    } else if (ch === '"' || ch === "'") {
-      quote = ch;
-      has = true;
-    } else if (/\s/.test(ch)) {
-      if (has || current) {
-        tokens.push(current);
-        current = "";
-        has = false;
-      }
-    } else {
-      current += ch;
-    }
-  }
-  if (has || current) tokens.push(current);
-  if (tokens.length === 0) return null;
-  const [executable, ...args] = tokens;
-  return { executable, args };
-}
+// 分词本体在 `@/lib/commandTokens`（纯逻辑，别处也要用）；这里转出是给既有调用方留的原路径
+export { tokenizeCommand } from "@/lib/commandTokens";

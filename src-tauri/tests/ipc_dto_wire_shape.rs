@@ -17,10 +17,10 @@ use std::path::PathBuf;
 use agent_protocol::{
     FileKind, FileStat, FilesystemChmodResult, FilesystemMkdirResult, FilesystemPreviewResult,
     FilesystemRemoveResult, FilesystemRenameResult, FilesystemStatResult, FridaServerStartResult,
-    FridaServerState, FridaServerStatusResult, FridaServerStopResult, HostedRunRecord,
-    HostedRunState, HostedStopResult, KillOutcome, OperationStep, PackageUninstallResult,
-    PackageWriteAction, PackageWriteResult, PreviewEncoding, ProcFile, ProcessProcReadResult,
-    ReplaceNativeLibraryResult, WriteOutcome,
+    FridaServerState, FridaServerStatusResult, FridaServerStopResult, HostedProbeResult,
+    HostedRunRecord, HostedRunState, HostedStdinMode, HostedStopResult, HostedWriteResult,
+    KillOutcome, OperationStep, PackageUninstallResult, PackageWriteAction, PackageWriteResult,
+    PreviewEncoding, ProcFile, ProcessProcReadResult, ReplaceNativeLibraryResult, WriteOutcome,
 };
 use serde_json::Value;
 
@@ -55,6 +55,8 @@ fn run_record() -> HostedRunRecord {
         start_time_ticks: 2,
         started_at_unix: 3,
         log_path: "/data/local/tmp/x.log".into(),
+        args: vec!["-l".into()],
+        stdin_mode: Some(HostedStdinMode::Open),
         root: false,
         state: HostedRunState::Running,
         exit_code: None,
@@ -150,7 +152,52 @@ fn cases() -> Vec<(&'static str, Value, Vec<&'static str>)> {
         (
             "HostedRunRecord",
             serde_json::to_value(run_record()).unwrap(),
-            vec!["start_time_ticks", "started_at_unix", "log_path"],
+            vec![
+                "start_time_ticks",
+                "started_at_unix",
+                "log_path",
+                "stdin_mode",
+            ],
+        ),
+        // UI-6 第二/四层：这两个 DTO 也是裸传协议结构，前端声明必须逐键对齐
+        (
+            "HostedProbeResult",
+            serde_json::to_value(HostedProbeResult {
+                args: vec!["-h".into()],
+                started: true,
+                pid: 77,
+                exit_code: Some(0),
+                signal: None,
+                timed_out: false,
+                killed: false,
+                still_running: false,
+                stdout: "Usage".into(),
+                stderr: String::new(),
+                stdout_bytes: 5,
+                stderr_bytes: 0,
+                truncated: false,
+                elapsed_ms: 12,
+                detail: None,
+            })
+            .unwrap(),
+            vec![
+                "exit_code",
+                "stdout_bytes",
+                "stderr_bytes",
+                "elapsed_ms",
+                "still_running",
+                "timed_out",
+            ],
+        ),
+        (
+            "HostedWriteResult",
+            serde_json::to_value(HostedWriteResult {
+                record: run_record(),
+                bytes_written: 2,
+                stdin_mode: HostedStdinMode::Open,
+            })
+            .unwrap(),
+            vec!["bytes_written", "stdin_mode"],
         ),
         (
             "HostedStopResult",

@@ -81,6 +81,10 @@ if [ "$DEVICE" -eq 1 ]; then
   else
     export AR4_TEST_SERIAL="$AR_SERIAL" AR6_TEST_SERIAL="$AR_SERIAL" AR7_TEST_SERIAL="$AR_SERIAL"
     export AR8_TEST_SERIAL="$AR_SERIAL" AR9_TEST_SERIAL="$AR_SERIAL" APPLIST_TEST_SERIAL="$AR_SERIAL"
+    # 这几条腿的开关必须在这里给：它们**没开关就自己打印"跳过"然后返回通过**，
+    # 于是"回归全绿"里其实一条都没跑（本仓库反复强调的那类假绿）。
+    # 都只起自己的探针进程并在结尾收掉，不改设备上的应用状态。
+    export AR77_ADOPT_PROBE=yes AR8_ARGS_STDIN=yes AR8_PROBE=yes AR8_WRITE=yes
     step "Agent 产物已重编译" bash scripts/build_android_agent.sh aarch64
     # 真机腿串行跑：并行会在同一个 Agent 会话上互相踩踏
     LEGS=(cargo test --workspace -- --ignored --test-threads=1)

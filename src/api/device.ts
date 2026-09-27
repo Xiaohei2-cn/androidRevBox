@@ -145,9 +145,61 @@ export interface HostedRunRecord {
   log_path: string;
   root: boolean;
   state: HostedRunState;
+  /** 启动时用的参数数组（来自设备记录，不是界面记忆）。
+   *  空数组时设备侧整个键省略，所以这里必须允许 undefined——
+   *  "没带参数"与"没回读到参数"在两处提示里要说不同的话。 */
+  args?: string[];
+  /**
+   * stdin 通道现状（UI-6 第四层）。三件事必须分开：
+   * `undefined` = 老版本 Agent 没告诉我们（显示"未知"）；
+   * `"none"` = 确实没接管；`"open"` 才是真能持续输入。
+   * 拿"我起过它"当能输入的依据，界面上就会长出一个吞字的假输入框。
+   */
+  stdin_mode?: HostedStdinMode | null;
   /** 只有 Agent 亲自启动并已回收的进程才有退出码 */
   exit_code?: number | null;
   detail?: string | null;
+}
+
+/** 托管进程的 stdin 通道现状（wire 上是这些字面值） */
+export type HostedStdinMode = "none" | "open" | "once" | "lost";
+
+/**
+ * 一次参数探测的结果（UI-6 第二层）。
+ *
+ * ⚠️ 这里**没有**"算不算帮助"的判断：设备只报事实（有没有输出、退没退、多久、
+ * 什么码、有没有杀干净），分类由 `hostedLaunch.classifyProbe` 按这些事实做。
+ * 字段名与 wire 一致（snake_case），由 `ipc_dto_wire_shape.rs` 钉住。
+ */
+export interface HostedProbeResult {
+  /** 这次实际用的 argv */
+  args: string[];
+  /** false = 连进程都没起来（无法执行），原因在 detail */
+  started: boolean;
+  pid: number;
+  exit_code?: number | null;
+  /** 被信号终止时的信号号（11=SIGSEGV 这类也是"有反应"） */
+  signal?: number | null;
+  /** 到时间还没退，已由设备侧连进程组一起终止 */
+  timed_out: boolean;
+  killed: boolean;
+  /** 终止后回读 /proc 仍在：这一条必须让界面看见，不能装作清干净了 */
+  still_running: boolean;
+  stdout: string;
+  stderr: string;
+  /** 截断**之前**进程真实写出的字节数（这两个数才代表"它到底输出了多少"） */
+  stdout_bytes: number;
+  stderr_bytes: number;
+  truncated: boolean;
+  elapsed_ms: number;
+  detail?: string | null;
+}
+
+/** 持续输入的回执（UI-6 第四层） */
+export interface HostedWriteResult {
+  record: HostedRunRecord;
+  bytes_written: number;
+  stdin_mode: HostedStdinMode;
 }
 
 /** 按句柄停止托管进程的结果（AR7.3） */
@@ -214,6 +266,11 @@ export interface HostedBinary {
    * 只有 Agent 通道给得出这些数（Legacy 的 ls -l 看不见进程）。
    */
   externalProcs: ExternalProc[];
+  /**
+   * 设备上的修改时间（秒）。与 size 一起构成"这份参数是给哪个版本用的"的指纹。
+   * Legacy 的 `ls -l` 给不出可信时间时为 null：这时界面只说"没做版本核对"。
+   */
+  mtimeUnix?: number | null;
 }
 
 /**
@@ -461,8 +518,63 @@ export const deviceApi = {
    * 在跑就不起新进程，而是把在跑的 pid 交回来（`started: false`），
    * 由界面给「停止进程」按钮 —— 不是丢一句"启动失败"。
    */
-  binaryRun(serial: string, name: string, root = false): Promise<HostedRunView> {
-    return invokeCommand<HostedRunView>("device_binary_run", { serial, name, root });
+  /**
+   * 后台启动二进制（UI-6 第一/四层）。
+   *
+   * `args` 是参数数组：Agent 支路直交 exec（不进 shell，所以含空格/分号都不用转义）；
+   * Root 支路由桌面把参数落成设备上的文件、命令模板按行还原，值不进命令行。
+   * `stdinData` 是一次性启动输入（写完给 EOF）；`interactive` 才是要**保持**输入通道，
+   * 只有 Agent 支路支持（Root 支路会被后端明确拒绝，不是默默忽略）。
+   */
+  binaryRun(
+    serial: string,
+    name: string,
+    root = false,
+    args: string[] = [],
+    stdinData?: string,
+    interactive = false,
+  ): Promise<HostedRunView> {
+    return invokeCommand<HostedRunView>("device_binary_run", {
+      serial,
+      name,
+      root,
+      args,
+      stdinData: stdinData && stdinData.length > 0 ? stdinData : null,
+      interactive,
+    });
+  },
+  /**
+   * 用一组参数探测一次会怎样（UI-6 第二层）。
+   *
+   * 一次只问一个候选，所以"中断"就是不再发下一条；每条的超时与杀进程组都在设备侧完成。
+   * 这条会在设备上起进程，Agent 不在线时后端直接拒（不悄悄回退 adb shell）。
+   */
+  binaryProbe(
+    serial: string,
+    name: string,
+    args: string[] = [],
+    timeoutMs?: number,
+  ): Promise<HostedProbeResult> {
+    return invokeCommand<HostedProbeResult>("device_binary_probe", {
+      serial,
+      name,
+      args,
+      timeoutMs: timeoutMs ?? null,
+    });
+  },
+  /** 向运行中的托管进程持续输入；close=true 写完这句给出 EOF（通道就此结束） */
+  hostedWrite(
+    serial: string,
+    handle: string,
+    text: string,
+    close = false,
+  ): Promise<HostedWriteResult> {
+    return invokeCommand<HostedWriteResult>("device_hosted_write", {
+      serial,
+      handle,
+      text,
+      close,
+    });
   },
   /** 托管运行表（AR7.2，Agent only）：真实运行状态与稳定句柄 */
   hostedRuns(serial: string): Promise<HostedRunRecord[]> {

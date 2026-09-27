@@ -4074,6 +4074,8 @@ mod tests {
                 &HostedStartParams {
                     name: "toybox".into(),
                     args: vec!["sleep".into(), "120".into()],
+                    stdin_data: None,
+                    interactive_stdin: false,
                     root: false,
                 },
                 Duration::from_secs(20),
@@ -4129,6 +4131,792 @@ mod tests {
         );
         manager.disconnect(&serial).await.unwrap();
         eprintln!("[hosted] 通过：外部实例看得见，自己起的不算外部");
+    }
+
+    /// 真机腿（UI-6 第二层）：探测只回报事实，并且**不留东西在手机上**。
+    ///
+    /// 钉住四件在宿主机上想不出来的事：
+    /// ① 有输出且自己退（toybox echo）→ started/退出码/stdout 都对得上；
+    /// ② 无输出且不退出（toybox sleep）→ 到点必须由设备侧**连进程组一起杀掉**，
+    ///    并且回读 `/proc` 确认它真没了——这条是"探测九次不该在手机上留下服务"的底线；
+    /// ③ 非 ELF 的文件不能报成"我没连上设备"，要作为"无法执行"这一类结论回来；
+    /// ④ 探测不进运行表：探过九次，表里也不该多出九条记录。
+    #[tokio::test]
+    #[ignore = "需要真机；AR8_PROBE=yes APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_hosted_probe_classifies_facts -- --ignored --nocapture"]
+    async fn real_agent_hosted_probe_classifies_facts() {
+        use crate::services::agent_client::AgentClientError;
+        use agent_protocol::method::HOSTED_PROBE;
+        use agent_protocol::{ErrorCode, HostedProbeParams, HostedProbeResult};
+        if std::env::var("AR8_PROBE").unwrap_or_default() != "yes" {
+            eprintln!("[跳过] 本腿会在设备上反复起进程，需要 AR8_PROBE=yes");
+            return;
+        }
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        assert!(
+            prepare_toybox_probe(&serial).await,
+            "探针 toybox 没准备好，本腿无法进行"
+        );
+
+        async fn adb_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用")
+                .stdout;
+            String::from_utf8_lossy(&output).into_owned()
+        }
+        async fn probe(
+            client: &AgentClient,
+            name: &str,
+            args: Vec<String>,
+            timeout_ms: Option<u64>,
+        ) -> HostedProbeResult {
+            client
+                .request::<_, HostedProbeResult>(
+                    HOSTED_PROBE,
+                    &HostedProbeParams {
+                        name: name.into(),
+                        args,
+                        timeout_ms,
+                    },
+                    Duration::from_secs(35),
+                )
+                .await
+                .expect("hosted.probe 应当可用")
+        }
+        /// 设备上还在的 toybox 进程。
+        ///
+        /// 刻意用 `pgrep -x`（按进程名精确匹配）而不是 `pgrep -f`：后者会把
+        /// **这条命令自己的 `sh -c` 外壳**也算进来（外壳的命令行里就带着那个模式），
+        /// 于是"杀干净了"永远验不过——第一版就是这么误判了一次。
+        async fn pids_of(serial: &str, name: &str) -> Vec<String> {
+            adb_shell(serial, &format!("pgrep -x {name}"))
+                .await
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        }
+        async fn table_size(client: &AgentClient) -> usize {
+            client
+                .request::<_, agent_protocol::HostedListResult>(
+                    agent_protocol::method::HOSTED_LIST,
+                    &agent_protocol::HostedListParams {},
+                    Duration::from_secs(20),
+                )
+                .await
+                .expect("hosted.list 应当可用")
+                .runs
+                .len()
+        }
+
+        let runs_before = table_size(&client).await;
+
+        // ① 有输出且自己退
+        let loud = probe(
+            &client,
+            "toybox",
+            vec!["echo".into(), "探测在响".into()],
+            None,
+        )
+        .await;
+        eprintln!(
+            "[probe echo] {:?}",
+            (&loud.exit_code, &loud.stdout, &loud.elapsed_ms)
+        );
+        assert!(loud.started, "echo 应当起得来");
+        assert_eq!(loud.exit_code, Some(0), "自然退出的码要收到");
+        assert!(
+            loud.stdout.contains("探测在响"),
+            "中文输出要原样回来：{:?}",
+            loud.stdout
+        );
+        assert!(!loud.timed_out && !loud.still_running, "它退了就不该说还在");
+
+        // ② 无输出且不退出：到点杀干净
+        let quiet = probe(
+            &client,
+            "toybox",
+            vec!["sleep".into(), "30".into()],
+            Some(600),
+        )
+        .await;
+        eprintln!(
+            "[probe sleep] timed_out={} killed={} still={} signal={:?} 残留={:?}",
+            quiet.timed_out, quiet.killed, quiet.still_running, quiet.signal, quiet.detail
+        );
+        assert!(
+            quiet.started && quiet.timed_out,
+            "sleep 30 在 600ms 下必须判成没退"
+        );
+        assert!(quiet.killed, "没退的候选要被设备侧终止");
+        assert!(
+            quiet.stdout.trim().is_empty(),
+            "sleep 不该有输出：静默且没退的那一侧——{:?}",
+            quiet.stdout
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let leftovers = pids_of(&serial, "toybox").await;
+        assert!(
+            leftovers.is_empty(),
+            "探测起的进程必须一个都不留在设备上：{leftovers:?}"
+        );
+        assert!(!quiet.still_running, "回读要确认它没了：{:?}", quiet.detail);
+
+        // ③ 非 ELF 是"无法执行"这一类结论，不是一次 RPC 失败
+        let junk = std::path::Path::new("/data/local/tmp/ar8_probe_junk");
+        adb_shell(&serial, &format!("echo not-elf > {}", junk.display())).await;
+        adb_shell(&serial, "chmod 755 /data/local/tmp/ar8_probe_junk").await;
+        let unusable = probe(&client, "ar8_probe_junk", vec!["--help".into()], None).await;
+        eprintln!(
+            "[probe junk] started={} detail={:?}",
+            unusable.started, unusable.detail
+        );
+        assert!(!unusable.started, "非 ELF 起不来，要照实说");
+        let junk_detail = unusable.detail.unwrap_or_default();
+        assert!(
+            junk_detail.starts_with("not_an_elf"),
+            "要带可判读的原因码，界面按它分类：{junk_detail}"
+        );
+        // 非法文件名是调用方的 bug：这条必须响亮报错，不能混进"无法执行"
+        let refused = client
+            .request::<_, HostedProbeResult>(
+                HOSTED_PROBE,
+                &HostedProbeParams {
+                    name: "../escape".into(),
+                    args: vec![],
+                    timeout_ms: None,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect_err("非法文件名必须报错而不是当成结论");
+        assert!(matches!(refused, AgentClientError::Remote(_)));
+        assert_eq!(
+            match refused {
+                AgentClientError::Remote(e) => e.code,
+                other => panic!("应当来自设备侧：{other:?}"),
+            },
+            ErrorCode::InvalidRequest
+        );
+
+        // ④ 探测不许往运行表里塞记录
+        let runs_after = table_size(&client).await;
+        assert_eq!(
+            runs_before, runs_after,
+            "探了三次，运行表不该多出记录（{runs_before} -> {runs_after}）"
+        );
+
+        adb_shell(&serial, "rm -f /data/local/tmp/ar8_probe_junk").await;
+    }
+
+    /// 真机腿（UI-6 第四层）：持续输入**按设备上的句柄实况**说话。
+    ///
+    /// 这条腿存在的理由：用户要的是"运行中还能喂输入"，而最容易骗人的实现是
+    /// 界面上摆了个输入框、字其实掉进了黑洞。所以三步都要验：
+    /// ① Agent 起一只 `cat`（接管并保留 stdin）→ 记录里 stdin_mode=open；
+    /// ② 两句分两次喂进去 → 日志里两句都在，且顺序对；
+    /// ③ close 之后 → stdin_mode 变 once，再喂必须被明确拒（不是静默吞掉），
+    ///    而 `cat` 收到 EOF 自己退出、退出码收得到。
+    /// 另外证一条反向的：一次性启动输入（不保留通道）起的过程，喂不进去要报错。
+    #[tokio::test]
+    #[ignore = "需要真机；AR8_WRITE=yes APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_hosted_write_feeds_running_process -- --ignored --nocapture"]
+    async fn real_agent_hosted_write_feeds_running_process() {
+        use crate::services::agent_client::AgentClientError;
+        use agent_protocol::method::{HOSTED_LIST, HOSTED_START, HOSTED_STOP, HOSTED_WRITE};
+        use agent_protocol::{
+            HostedListParams, HostedListResult, HostedStartParams, HostedStdinMode,
+        };
+        if std::env::var("AR8_WRITE").unwrap_or_default() != "yes" {
+            eprintln!("[跳过] 本腿会在设备上起进程并持续写入，需要 AR8_WRITE=yes");
+            return;
+        }
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        assert!(prepare_toybox_probe(&serial).await, "探针 toybox 没准备好");
+
+        async fn adb_shell(serial: &str, command: &str) -> String {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用")
+                .stdout;
+            String::from_utf8_lossy(&output).into_owned()
+        }
+        async fn live(client: &AgentClient, name: &str) -> agent_protocol::HostedRunRecord {
+            client
+                .request::<_, HostedListResult>(
+                    HOSTED_LIST,
+                    &HostedListParams {},
+                    Duration::from_secs(20),
+                )
+                .await
+                .expect("hosted.list 应当可用")
+                .runs
+                .into_iter()
+                .find(|run| {
+                    run.name == name && run.state == agent_protocol::HostedRunState::Running
+                })
+                .unwrap_or_else(|| panic!("运行表里没有正在跑的 {name}"))
+        }
+        async fn read_log(serial: &str) -> String {
+            adb_shell(serial, "cat /data/local/tmp/.toybox.run.log").await
+        }
+
+        adb_shell(&serial, "rm -f /data/local/tmp/.toybox.run.log").await;
+
+        // ① 保留输入通道地起一只 cat
+        let started = client
+            .request::<_, agent_protocol::HostedStartResult>(
+                HOSTED_START,
+                &HostedStartParams {
+                    name: "toybox".into(),
+                    args: vec!["cat".into()],
+                    stdin_data: Some("第一行\n".into()),
+                    interactive_stdin: true,
+                    root: false,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("接管 stdin 的启动应当成功")
+            .record;
+        assert_eq!(
+            started.stdin_mode,
+            Some(HostedStdinMode::Open),
+            "接住了才算 open；没接住却记成 open 就是骗界面"
+        );
+        let handle = started.handle.clone();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // ② 分两次喂：一句一句是这一层的基本单位
+        for line in ["第二行\n", "第三行\n"] {
+            let wrote = client
+                .request::<_, agent_protocol::HostedWriteResult>(
+                    HOSTED_WRITE,
+                    &agent_protocol::HostedWriteParams {
+                        handle: handle.clone(),
+                        text: line.into(),
+                        close: false,
+                    },
+                    Duration::from_secs(15),
+                )
+                .await
+                .expect("运行中输入应当写得进去");
+            assert_eq!(wrote.bytes_written, line.len() as u64);
+            assert_eq!(
+                wrote.stdin_mode,
+                HostedStdinMode::Open,
+                "没关闭就该还是 open"
+            );
+        }
+        let logged = read_log(&serial).await;
+        eprintln!("[write] 日志={logged:?}");
+        assert!(
+            logged.contains("第一行") && logged.contains("第二行") && logged.contains("第三行"),
+            "一次性输入与后续输入都要原样到达：{logged:?}"
+        );
+        assert_eq!(
+            live(&client, "toybox").await.state,
+            agent_protocol::HostedRunState::Running
+        );
+
+        // ③ 关闭：EOF 之后 cat 自己退出，再喂就该被明确拒
+        let closed = client
+            .request::<_, agent_protocol::HostedWriteResult>(
+                HOSTED_WRITE,
+                &agent_protocol::HostedWriteParams {
+                    handle: handle.clone(),
+                    text: String::new(),
+                    close: true,
+                },
+                Duration::from_secs(15),
+            )
+            .await
+            .expect("关闭输入通道应当成功");
+        assert_eq!(closed.stdin_mode, HostedStdinMode::Once, "关完就是 once");
+        let refused = client
+            .request::<_, agent_protocol::HostedWriteResult>(
+                HOSTED_WRITE,
+                &agent_protocol::HostedWriteParams {
+                    handle: handle.clone(),
+                    text: "还想再喂\n".into(),
+                    close: false,
+                },
+                Duration::from_secs(15),
+            )
+            .await
+            .expect_err("关掉之后写不进去，必须报错而不是静默");
+        let reason = match refused {
+            AgentClientError::Remote(error) => error
+                .details
+                .as_ref()
+                .and_then(|value| value.get("reason"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            other => panic!("应当来自设备侧：{other:?}"),
+        };
+        assert!(
+            matches!(reason.as_str(), "stdin_closed" | "process_exited"),
+            "关掉后写不进要给出可判读的原因：{reason}"
+        );
+        // cat 收到 EOF 就先退了，所以设备更可能说"进程已退出"而不是"通道关了"：
+        // 两句是同一件事的两个侧面，界面上都归到"这条记录再也喂不进去"
+        eprintln!("[write] 关闭后再写的设备判词={reason}");
+        let mut exited = None;
+        for _ in 0..12 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let run = client
+                .request::<_, HostedListResult>(
+                    HOSTED_LIST,
+                    &HostedListParams {},
+                    Duration::from_secs(20),
+                )
+                .await
+                .unwrap()
+                .runs
+                .into_iter()
+                .find(|run| run.handle == handle);
+            if let Some(run) = run
+                && run.state == agent_protocol::HostedRunState::Exited
+            {
+                exited = Some(run);
+                break;
+            }
+        }
+        let run = exited.expect("cat 收到 EOF 后应当退出并被回收");
+        assert_eq!(
+            run.exit_code,
+            Some(0),
+            "退出码要收得到——收不到就是回收任务没跑起来：{}",
+            serde_json::to_string(&run).unwrap_or_default()
+        );
+
+        // ④ 反向证据：不保留通道起的过程，喂进去只会骗界面
+        adb_shell(&serial, "rm -f /data/local/tmp/.toybox.run.log").await;
+        let once = client
+            .request::<_, agent_protocol::HostedStartResult>(
+                HOSTED_START,
+                &HostedStartParams {
+                    name: "toybox".into(),
+                    args: vec!["sleep".into(), "60".into()],
+                    stdin_data: None,
+                    interactive_stdin: false,
+                    root: false,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("不带输入通道的启动应当成功")
+            .record;
+        assert_eq!(once.stdin_mode, Some(HostedStdinMode::None));
+        let refused = client
+            .request::<_, agent_protocol::HostedWriteResult>(
+                HOSTED_WRITE,
+                &agent_protocol::HostedWriteParams {
+                    handle: once.handle.clone(),
+                    text: "x\n".into(),
+                    close: false,
+                },
+                Duration::from_secs(15),
+            )
+            .await
+            .expect_err("本来就没通道，写不进去");
+        match refused {
+            AgentClientError::Remote(error) => {
+                assert_eq!(error.details.unwrap()["reason"], "stdin_closed")
+            }
+            other => panic!("应当来自设备侧：{other:?}"),
+        }
+
+        // 收尾：停掉留下的进程，删掉日志与记录
+        let _ = client
+            .request::<_, agent_protocol::HostedStopResult>(
+                HOSTED_STOP,
+                &agent_protocol::HostedStopParams {
+                    handle: once.handle.clone(),
+                    expected_pid: Some(once.pid),
+                    signal: agent_protocol::KillSignal::Term,
+                },
+                Duration::from_secs(20),
+            )
+            .await;
+        adb_shell(&serial, "rm -f /data/local/tmp/.toybox.run.log").await;
+        adb_shell(
+            &serial,
+            &format!(
+                "rm -f /data/local/tmp/app-reverse-tools-hosted/{}.json",
+                once.handle
+            ),
+        )
+        .await;
+        let left = adb_shell(&serial, "pgrep -x toybox").await;
+        eprintln!("[write 收尾] 仍在的 toybox={:?}", left.trim());
+    }
+
+    /// 真机腿（UI-6 第一层）：参数与一次性 stdin **真的到达进程**，两条支路各跑一遍。
+    ///
+    /// 这条腿钉的是三件事，都不是能在宿主机上想当然的：
+    /// ① Agent 支路参数数组直交 exec：`echo a b c;id` 必须原样成 3 个 argv，
+    ///    日志里出现 `uid=0` 就说明分号被 shell 执行了（那是注入，不是参数）；
+    /// ② 一次性 stdin 原样进进程并给出 EOF：`cat` 打完两行就自己退出，
+    ///    退出码收得到才算写完（写完不 shutdown 的话 cat 会永远卡在读上）；
+    /// ③ Root 支路用"参数落盘 + 固定模板按行还原"，命令行里不出现参数值：
+    ///    这条是上一轮实测出来的教训——`su -c` 的位置参数在这台设备的 su 上不透传，
+    ///    而把参数拼进引号里，分号后面那条命令会被 root 执行。
+    /// 顺带验：记录里回读得到 `args`（界面"当初用什么参数跑的"就靠它）、
+    /// `.args`/`.stdin` 文件用完被模板自己删掉、超限 stdin 被明确拒绝而不是截断。
+    #[tokio::test]
+    #[ignore = "需要真机；AR8_ARGS_STDIN=yes APPLIST_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_hosted_carries_args_and_stdin -- --ignored --nocapture"]
+    async fn real_agent_hosted_carries_args_and_stdin() {
+        use crate::services::agent_client::AgentClientError;
+        use agent_protocol::method::{HOSTED_ADOPT, HOSTED_LIST, HOSTED_START};
+        use agent_protocol::{
+            ErrorCode, HostedListParams, HostedListResult, HostedRunState, HostedStartParams,
+        };
+        if std::env::var("AR8_ARGS_STDIN").unwrap_or_default() != "yes" {
+            eprintln!("[跳过] 本腿会在设备上真的起进程，需要 AR8_ARGS_STDIN=yes");
+            return;
+        }
+        let serial = std::env::var("APPLIST_TEST_SERIAL").expect("APPLIST_TEST_SERIAL is required");
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        );
+        manager.connect_resolved(&serial).await.unwrap();
+        let client = manager.client(&serial).unwrap();
+        assert!(
+            prepare_toybox_probe(&serial).await,
+            "探针 toybox 没准备好，本腿无法进行"
+        );
+
+        async fn adb_shell(serial: &str, command: &str) -> (String, String) {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "shell", command])
+                .output()
+                .await
+                .expect("adb shell 可用");
+            (
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        }
+        async fn push(serial: &str, local: &std::path::Path, remote: &str) {
+            let output = tokio::process::Command::new("adb")
+                .args(["-s", serial, "push", &local.to_string_lossy(), remote])
+                .output()
+                .await
+                .expect("adb push 可用");
+            assert!(
+                output.status.success(),
+                "push {remote} 失败: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        async fn exists(serial: &str, path: &str) -> bool {
+            adb_shell(serial, &format!("if [ -e {path} ]; then echo YES; fi"))
+                .await
+                .0
+                .contains("YES")
+        }
+        /// 设备运行表里某个名字当前在跑的 pid（增量断言的基准）
+        async fn running_pids(client: &AgentClient, name: &str) -> Vec<u32> {
+            runs_of(client)
+                .await
+                .into_iter()
+                .filter(|run| run.name == name && run.state == HostedRunState::Running)
+                .map(|run| run.pid)
+                .collect()
+        }
+
+        async fn record_by_handle(
+            client: &AgentClient,
+            handle: &str,
+        ) -> agent_protocol::HostedRunRecord {
+            runs_of(client)
+                .await
+                .into_iter()
+                .find(|run| run.handle == handle)
+                .unwrap_or_else(|| panic!("运行表里找不到句柄 {handle}"))
+        }
+
+        async fn runs_of(client: &AgentClient) -> Vec<agent_protocol::HostedRunRecord> {
+            client
+                .request::<_, HostedListResult>(
+                    HOSTED_LIST,
+                    &HostedListParams {},
+                    Duration::from_secs(20),
+                )
+                .await
+                .expect("hosted.list 应当可用")
+                .runs
+        }
+        fn log_path(name: &str) -> String {
+            format!("/data/local/tmp/.{name}.run.log")
+        }
+        async fn clear_log(serial: &str, name: &str) {
+            adb_shell(serial, &format!("rm -f {}", log_path(name))).await;
+        }
+        async fn read_log(serial: &str, name: &str) -> String {
+            adb_shell(serial, &format!("cat {}", log_path(name)))
+                .await
+                .0
+        }
+
+        // ===== ① Agent 支路：参数原样进 argv，分号不被执行 =====
+        clear_log(&serial, "toybox").await;
+        let args: Vec<String> = vec!["echo".into(), "a b".into(), "c;id".into()];
+        let started = client
+            .request::<_, agent_protocol::HostedStartResult>(
+                HOSTED_START,
+                &HostedStartParams {
+                    name: "toybox".into(),
+                    args: args.clone(),
+                    stdin_data: None,
+                    interactive_stdin: false,
+                    root: false,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("带参数启动应当成功")
+            .record;
+        assert_eq!(started.args, args, "记录里要回读得到启动参数");
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let logged = read_log(&serial, "toybox").await;
+        eprintln!("[args] 日志={logged:?}");
+        assert!(
+            logged.contains("a b c;id"),
+            "参数应原样成 argv（含空格与分号）：{logged:?}"
+        );
+        assert!(
+            !logged.contains("uid=0"),
+            "分号被当成参数而不是命令：出现 uid=0 说明发生了注入"
+        );
+
+        // ===== ② Agent 支路：一次性 stdin 原样到达并给出 EOF =====
+        clear_log(&serial, "toybox").await;
+        let stdin_text = "第一行\n第二行\n";
+        let cat = client
+            .request::<_, agent_protocol::HostedStartResult>(
+                HOSTED_START,
+                &HostedStartParams {
+                    name: "toybox".into(),
+                    args: vec!["cat".into()],
+                    stdin_data: Some(stdin_text.into()),
+                    interactive_stdin: false,
+                    root: false,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("带启动输入拉起 cat 应当成功")
+            .record;
+        // cat 收到 EOF 就该自己退出：收不到退出码说明写入端没关
+        // 按**自己这次的句柄**查，不是"表里任何一条叫 toybox 的"：
+        // 上一轮中断留下的同名进程会让后者把别人的状态算到这条头上（第一版就被这样判红过）
+        let mut seen = None;
+        for _ in 0..12 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let run = record_by_handle(&client, &cat.handle).await;
+            if run.state == HostedRunState::Exited {
+                seen = Some(run);
+                break;
+            }
+        }
+        let run = seen.unwrap_or_else(|| panic!("cat 应因 stdin 关闭而退出： {:?}", cat));
+        assert_eq!(run.exit_code, Some(0), "退出码要收得到：{:?}", run);
+        let logged = read_log(&serial, "toybox").await;
+        assert!(
+            logged.contains("第一行") && logged.contains("第二行"),
+            "中文 stdin 应原样进进程：{logged:?}"
+        );
+
+        // ===== ③ Agent 支路：超限 stdin 明确拒绝，不截断 =====
+        let too_much = "x".repeat(agent_protocol::MAX_HOSTED_STDIN_BYTES + 1);
+        let refused = client
+            .request::<_, agent_protocol::HostedStartResult>(
+                HOSTED_START,
+                &HostedStartParams {
+                    name: "toybox".into(),
+                    args: vec!["cat".into()],
+                    stdin_data: Some(too_much),
+                    interactive_stdin: false,
+                    root: false,
+                },
+                Duration::from_secs(20),
+            )
+            .await;
+        let AgentClientError::Remote(error) =
+            refused.expect_err("超限 stdin 必须被拒，而不是截断后照样起进程")
+        else {
+            panic!("超限拒绝应当来自设备侧，而不是传输层");
+        };
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|value| value.get("reason"))
+                .and_then(|reason| reason.as_str()),
+            Some("stdin_too_large"),
+            "错误要带可判读的原因：{error:?}"
+        );
+        // 判"被拒的这次没偷偷起进程"要按**增量**：别的腿可能正当着有一只 toybox 在跑，
+        // 那句不该算在本条头上（第一版就是被上一轮遗留的 cat 判红的）
+        let before_refused = running_pids(&client, "toybox").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after_refused = running_pids(&client, "toybox").await;
+        let spawned_anyway: Vec<u32> = after_refused
+            .iter()
+            .filter(|pid| !before_refused.contains(pid))
+            .copied()
+            .collect();
+        assert!(
+            spawned_anyway.is_empty(),
+            "超限被拒的这一次不许留下新起的进程：{spawned_anyway:?}（拒前={before_refused:?}）"
+        );
+
+        async fn root_run(serial: &str, args: Vec<String>, stdin: Option<&str>) -> u32 {
+            use crate::adapters::adb;
+            let carried = adb::HostedCarried {
+                args: true,
+                stdin: stdin.is_some(),
+            };
+            let local_args = std::env::temp_dir().join("ar8_root.args");
+            std::fs::write(&local_args, adb::hosted_args_file_bytes(&args))
+                .expect("写本地参数文件");
+            push(serial, &local_args, &adb::hosted_args_file("toybox")).await;
+            let local_stdin = std::env::temp_dir().join("ar8_root.stdin");
+            if let Some(text) = stdin {
+                std::fs::write(&local_stdin, text).expect("写本地 stdin 文件");
+                push(serial, &local_stdin, &adb::hosted_stdin_file("toybox")).await;
+            }
+            let cmd = adb::hosted_run_cmd("toybox", &log_path("toybox"), carried);
+            // 命令行本身只该出现文件路径：出现参数值就是回到了老的可注入写法。
+            // args[0] 是 toybox 的 applet 名，与模板里的 echo $! 会撞词，故从第二位起查。
+            for value in args.iter().skip(1) {
+                assert!(
+                    !cmd.contains(value.as_str()),
+                    "命令行里漏出了参数值 {value}：{cmd}"
+                );
+            }
+            clear_log(serial, "toybox").await;
+            let (out, err) = adb_shell(serial, &adb::su_wrap(&cmd)).await;
+            assert!(err.trim().is_empty(), "su 起带参进程却报错：{err}");
+            out.trim()
+                .lines()
+                .last()
+                .and_then(|line| line.trim().parse().ok())
+                .unwrap_or_else(|| panic!("拿不到 pid，输出={out:?}"))
+        }
+
+        let pid = root_run(
+            &serial,
+            vec!["cat".into()],
+            Some("root 第一行\nroot 第二行\n"),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let logged = read_log(&serial, "toybox").await;
+        eprintln!("[root stdin] pid={pid} 日志={logged:?}");
+        assert!(
+            logged.contains("root 第一行") && logged.contains("root 第二行"),
+            "stdin 文件应原样进进程：{logged:?}"
+        );
+        assert!(
+            !exists(&serial, &adb::hosted_args_file("toybox")).await,
+            "参数文件要被模板自己删掉，不能留在用户手机上"
+        );
+        assert!(
+            !exists(&serial, &adb::hosted_stdin_file("toybox")).await,
+            "stdin 文件要被模板自己删掉"
+        );
+
+        // ④b 含空格与分号的参数：原样进 argv，分号没有被 root 执行
+        let root_args: Vec<String> = vec!["echo".into(), "root a b".into(), "c;id".into()];
+        let pid = root_run(&serial, root_args.clone(), None).await;
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let logged = read_log(&serial, "toybox").await;
+        eprintln!("[root args] 日志={logged:?}");
+        assert!(
+            logged.contains("root a b c;id"),
+            "参数应原样成 argv（空格不拆、分号不执行）：{logged:?}"
+        );
+        assert!(
+            !logged.contains("uid=0"),
+            "出现 uid=0 说明分号后面的命令被 root 执行了：{logged:?}"
+        );
+        let _ = adb_shell(&serial, &adb::su_wrap(&format!("kill {pid}"))).await;
+
+        // ④c 认领时把参数一起登记：界面上"当初用什么参数跑的"来自设备
+        let sleep_args: Vec<String> = vec!["sleep".into(), "120".into()];
+        let pid = root_run(&serial, sleep_args.clone(), None).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let adopted = client
+            .request::<_, agent_protocol::HostedAdoptResult>(
+                HOSTED_ADOPT,
+                &agent_protocol::HostedAdoptParams {
+                    name: "toybox".into(),
+                    pid,
+                    args: sleep_args.clone(),
+                    root: true,
+                },
+                Duration::from_secs(20),
+            )
+            .await
+            .expect("证据齐全时应当认领成功");
+        assert_eq!(
+            adopted.record.args, sleep_args,
+            "root 支路的参数只能靠桌面回读带进记录"
+        );
+        assert!(adopted.record.root, "属主要按实测 uid 记成 root");
+        let _ = adb_shell(&serial, &adb::su_wrap(&format!("kill {pid}"))).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        // 收尾：本腿在设备上留下的日志与落盘记录都清掉（toybox 本体留给别的腿复用）
+        let left = adb_shell(
+            &serial,
+            r"ls -a /data/local/tmp/ | grep -E '[.]args$|[.]stdin$'",
+        )
+        .await
+        .0;
+        assert!(
+            left.trim().is_empty(),
+            "参数/stdin 临时文件必须被模板自己删掉：{left:?}"
+        );
+        let _ = adb_shell(&serial, "rm -f /data/local/tmp/.toybox.run.log").await;
+        for handle in runs_of(&client)
+            .await
+            .into_iter()
+            .filter(|run| run.name == "toybox")
+            .map(|run| run.handle)
+        {
+            let _ = adb_shell(
+                &serial,
+                &format!("rm -f /data/local/tmp/app-reverse-tools-hosted/{handle}.json"),
+            )
+            .await;
+        }
     }
 
     /// 真机腿（AR7.7）：**root 支路起的进程能被认领进运行表**，且认领只认设备上的实证。
@@ -4216,6 +5004,7 @@ mod tests {
                 &HostedAdoptParams {
                     name: "toybox".into(),
                     pid,
+                    args: Vec::new(),
                     root: true,
                 },
                 Duration::from_secs(20),
@@ -4269,6 +5058,7 @@ mod tests {
                 &HostedAdoptParams {
                     name: "toybox".into(),
                     pid,
+                    args: Vec::new(),
                     root: true,
                 },
                 Duration::from_secs(20),
@@ -4288,6 +5078,7 @@ mod tests {
                 &HostedAdoptParams {
                     name: "toybox".into(),
                     pid: 1,
+                    args: Vec::new(),
                     root: true,
                 },
                 Duration::from_secs(20),
@@ -4581,6 +5372,8 @@ mod tests {
                         "-s".into(),
                         "127.0.0.1".into(),
                     ],
+                    stdin_data: None,
+                    interactive_stdin: false,
                     root: false,
                 },
                 Duration::from_secs(20),
@@ -4987,6 +5780,8 @@ mod tests {
                         "-p".into(),
                         PROBE_PORT.to_string(),
                     ],
+                    stdin_data: None,
+                    interactive_stdin: false,
                     root: false,
                 },
                 Duration::from_secs(15),
@@ -5290,6 +6085,8 @@ mod tests {
                 "-p".into(),
                 PROBE_PORT.to_string(),
             ],
+            stdin_data: None,
+            interactive_stdin: false,
             root: false,
         };
         let started: HostedStartResult = client
@@ -5401,6 +6198,8 @@ mod tests {
                     &HostedStartParams {
                         name: "../escape".into(),
                         args: vec![],
+                        stdin_data: None,
+                        interactive_stdin: false,
                         root: false,
                     },
                     Duration::from_secs(10),
@@ -5418,6 +6217,8 @@ mod tests {
                     &HostedStartParams {
                         name: PROBE.into(),
                         args: vec![],
+                        stdin_data: None,
+                        interactive_stdin: false,
                         root: true,
                     },
                     Duration::from_secs(10),

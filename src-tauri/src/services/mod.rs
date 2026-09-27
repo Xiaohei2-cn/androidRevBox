@@ -4,6 +4,7 @@
 pub mod agent_artifact;
 pub mod agent_client;
 pub mod agent_manager;
+pub mod ai_service;
 pub mod android_backend;
 pub mod apk_bundle;
 pub mod config_service;

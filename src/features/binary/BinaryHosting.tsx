@@ -1,13 +1,29 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { CircleStop, Play, RefreshCw, ShieldCheck, Square, Trash2, Upload } from "lucide-react";
+import {
+  CircleStop,
+  Languages,
+  Play,
+  RefreshCw,
+  Send,
+  Settings2,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sparkles,
+  Square,
+  Trash2,
+  Upload,
+  X,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AdbNotReadyState } from "@/components/ui/adb-gate";
 import {
   deviceApi,
   type ExternalProc,
   type HostedBinary,
+  type HostedProbeResult,
   type HostedRunRecord,
+  type HostedStdinMode,
   type ListenPort,
 } from "@/api/device";
 import { pickFiles } from "@/api/dialog";
@@ -20,6 +36,29 @@ import {
   UPLOAD_FILE_MODE,
 } from "@/lib/hostedUpload";
 import { loadRootPref, saveRootPref, shouldTryRoot } from "@/lib/hostedRoot";
+import { stripAnsi } from "@/lib/ansi";
+import { aiApi, type AiConfig } from "@/api/ai";
+import {
+  HELP_CANDIDATES,
+  PROBE_TIMEOUT_MS,
+  argsProblem,
+  classifyProbe,
+  describeProbeFacts,
+  encodeStamp,
+  loadLaunchPrefs,
+  probeCategoryKey,
+  probeHasOutput,
+  probeLooksLikeHelp,
+  saveLaunchPrefs,
+  splitArgs,
+  stampOf,
+  compareStamp,
+  decodeStamp,
+  probeHiddenBytes,
+  utf8Bytes,
+  MAX_STDIN_BYTES,
+  type LaunchPrefs,
+} from "./hostedLaunch";
 import { DeviceBar } from "@/components/ui/device-bar";
 import { InfoChip } from "@/components/ui/info-chip";
 import { useI18n } from "@/i18n";
@@ -81,6 +120,51 @@ interface HostedRow {
   portsLoading: boolean;
   /** 备注（用途说明），localStorage 持久化 */
   note: string;
+  /**
+   * 启动偏好（参数 / 一次性 stdin / 是否保持输入通道 / 保存时的版本指纹）。
+   * 按「设备 + 文件」持久化：这台机器上 frida-server 的端口参数不该跟到另一台去，
+   * 而同一个文件换了版本之后，旧参数也不能当作仍然适用。
+   */
+  launch: LaunchPrefs;
+  /**
+   * 设备记录里回读到的启动参数（UI-6 第一层）。
+   *
+   * 界面上"当初用什么参数跑的"必须来自设备，不来自这里的输入框：输入框是**下一次**
+   * 要用的参数，记录里那条才是**这一次**跑着的进程真正用的。两者不一样时要说清是哪个。
+   */
+  deviceArgs?: string[];
+  /** stdin 通道现状（来自设备记录；undefined = 老 Agent 没告知，只能显示"未知"） */
+  stdinMode?: HostedStdinMode | null;
+  /** 行内展开（参数与 stdin 那一块） */
+  expanded: boolean;
+  /** 探测状态（null = 这一轮没探过） */
+  probe: ProbeState | null;
+  /** 持续输入草稿与在途标记 */
+  feed: string;
+  feeding: boolean;
+}
+
+/**
+ * 一次探测的界面状态。
+ *
+ * 循环放在界面侧逐条发（一条候选 = 一次 IPC）：这样"中断"只要不再发下一条就行，
+ * 不需要额外的取消协议；进度也天然是一条一条长出来的。
+ */
+interface ProbeState {
+  running: boolean;
+  /** 已试到的候选下标（用于"接着试完"与进度显示） */
+  index: number;
+  results: ProbeRow[];
+}
+
+/** 一条候选的回执：要么有设备事实，要么有这次调用本身的错误 */
+interface ProbeRow {
+  candidate: string;
+  result?: HostedProbeResult;
+  error?: string;
+  translating: boolean;
+  translated?: string;
+  translateNote?: string;
 }
 
 /** 常驻快捷备注选项（值为写入备注的文本本身，跨语言固定） */
@@ -98,8 +182,69 @@ const saveNote = (serial: string, name: string, value: string) => {
   else localStorage.removeItem(noteKey(serial, name));
 };
 
+/**
+ * 新托管行的初始值。三个入口（双击加入 / 设备运行表补进来 / 上传后加入）
+ * 都必须走这里：漏一个字段就会在运行时拿到 undefined，而那些字段恰好都是
+ * "缺了也不报错、只是界面不说实话"的那一类（stdinMode 缺省应当显示未知，
+ * 而不是显示成可输入）。
+ */
+function newHostedRow(
+  name: string,
+  serial: string | null,
+  over: Partial<HostedRow> = {},
+): HostedRow {
+  return {
+    name,
+    handle: null,
+    pid: null,
+    running: false,
+    busy: false,
+    error: null,
+    root: false,
+    tracked: false,
+    ports: [],
+    portsLoading: false,
+    note: loadNote(serial, name),
+    launch: loadLaunchPrefs(serial, name),
+    stdinMode: undefined,
+    expanded: false,
+    probe: null,
+    feed: "",
+    feeding: false,
+    ...over,
+  };
+}
+
+/**
+ * 界面语言 → 给接口看的语言名。
+ *
+ * 起始语言固定填英文：托管二进制的 help 文本几乎都是英文，
+ * 让接口自己猜容易把"猜错源语言"当成"翻译坏了"。真要改，改这里而不是改界面文案。
+ */
+/** 分类的颜色：绿=拿到东西了，黄=要留意，红=没起来。不额外暗示"这就是帮助" */
+function categoryTone(result?: HostedProbeResult): string {
+  if (!result) return "bg-red-500/10 text-red-500";
+  switch (classifyProbe(result)) {
+    case "output-exited":
+      return "bg-emerald-500/10 text-emerald-500";
+    case "unusable":
+      return "bg-red-500/10 text-red-500";
+    default:
+      return "bg-amber-500/10 text-amber-500";
+  }
+}
+
+const TRANSLATE_LANGS: Record<string, string> = {
+  "zh-CN": "简体中文",
+  en: "English",
+  ru: "русский",
+  "pt-BR": "português (Brasil)",
+  ja: "日本語",
+};
+const TRANSLATE_SOURCE = "英文";
+
 export function BinaryHosting({ active = true }: { active?: boolean }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const [deviceSerial, setDeviceSerial] = useState<string | null>(null);
   const [hosted, setHosted] = useState<HostedRow[]>([]);
   /**
@@ -116,6 +261,18 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
    * 正在上传绝不该把那一行的「终止」禁掉。
    */
   const [uploads, setUploads] = useState<Record<string, string>>({});
+  /**
+   * 探测的中断标记（按文件名）。
+   *
+   * 用 ref 而不是 state：循环每轮都要读它，而 state 在闭包里是旧值 ——
+   * 那样点「中断」要等下一轮渲染之后才生效，用户看到的就是"点了没反应"。
+   */
+  const probeAbort = useRef<Record<string, boolean>>({});
+  /** 翻译接口的本机配置（key 只在后端，这里只有后 4 位） */
+  const [aiConfig, setAiConfig] = useState<AiConfig | null>(null);
+  /** 正在编辑接口配置的那一行（null = 没开） */
+  const [aiEditor, setAiEditor] = useState<string | null>(null);
+  const [aiDraft, setAiDraft] = useState({ baseUrl: "", model: "", enabled: false, apiKey: "" });
 
   const { data: env } = useQuery({
     queryKey: ["adb", "environment"],
@@ -218,6 +375,9 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
             running: true,
             root: live.root,
             tracked: true,
+            // 这两个数只认设备：输入框里的参数是"下一次要用的"，不是"这一次用的"
+            deviceArgs: live.args,
+            stdinMode: live.stdin_mode,
           };
         }
         if (!live && row.pid !== null && !row.tracked && !row.busy) {
@@ -239,20 +399,18 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
       const known = new Set(next.map((row) => row.name));
       for (const run of runs) {
         if (run.state !== "running" || known.has(run.name)) continue;
-        next.push({
-          name: run.name,
-          handle: run.handle,
-          pid: run.pid,
-          // 从设备运行表补进来的行：这条当然是设备认得的
-          tracked: true,
-          running: true,
-          busy: false,
-          error: null,
-          root: run.root,
-          ports: [],
-          portsLoading: false,
-          note: loadNote(deviceSerial, run.name),
-        });
+        next.push(
+          newHostedRow(run.name, deviceSerial, {
+            // 从设备运行表补进来的行：这条当然是设备认得的
+            handle: run.handle,
+            pid: run.pid,
+            tracked: true,
+            running: true,
+            root: run.root,
+            deviceArgs: run.args,
+            stdinMode: run.stdin_mode,
+          }),
+        );
         known.add(run.name);
       }
       return next;
@@ -262,27 +420,181 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
   const patchRow = (name: string, p: Partial<HostedRow>) =>
     setHosted((hs) => hs.map((h) => (h.name === name ? { ...h, ...p } : h)));
 
+  /**
+   * 改启动偏好并立刻持久化（按设备 + 文件）。
+   *
+   * 写在这里而不是 setState 的 updater 里：React 严格模式会把 updater 调两次，
+   * 那会变成"同一个动作往 localStorage 写两遍"——值一样所以没人会发现，
+   * 但副作用该留在事件处理器里这条规矩一旦破掉，后面就没人分得清哪次写入是真的。
+   */
+  const patchLaunch = (row: HostedRow, p: Partial<LaunchPrefs>) => {
+    if (!deviceSerial) return;
+    const launch = { ...row.launch, ...p };
+    saveLaunchPrefs(deviceSerial, row.name, launch);
+    patchRow(row.name, { launch });
+  };
+
+  /** 只改探测状态（没在探的行不动它，避免出现一个空面板） */
+  const patchProbe = (name: string, updater: (p: ProbeState) => ProbeState) =>
+    setHosted((hs) =>
+      hs.map((h) => (h.name === name && h.probe ? { ...h, probe: updater(h.probe) } : h)),
+    );
+
+  /**
+   * 逐条候选探测（UI-6 第二层）。
+   *
+   * 三条不可让的口径：
+   * ① 一次只问一个候选 → 中断就是"不再发下一条"，进度是一条条长出来的；
+   * ② 命中即停（打完东西且自己退了），但**不宣称"这就是它真正的用法"**，
+   *    也不把它当结论显示；全部落空只说"我试过这些都不像"；
+   * ③ 界面不猜"算不算帮助"：分类只用设备回传的事实（有没有输出 / 有没有退 / 多久 / 什么码）。
+   */
+  const runProbe = async (row: HostedRow, restart: boolean) => {
+    if (!deviceSerial) return;
+    const prefix = splitArgs(row.launch.argsText);
+    const start = restart ? 0 : row.probe?.results.length ?? 0;
+    if (start >= HELP_CANDIDATES.length) return;
+    patchRow(row.name, {
+      expanded: true,
+      probe: { running: true, index: start, results: restart ? [] : (row.probe?.results ?? []) },
+    });
+    probeAbort.current[row.name] = false;
+    for (let i = start; i < HELP_CANDIDATES.length; i += 1) {
+      if (probeAbort.current[row.name]) return; // 中断：停在已试过的这些上，不改口说"没有"
+      const candidate = HELP_CANDIDATES[i];
+      try {
+        const result = await deviceApi.binaryProbe(
+          deviceSerial,
+          row.name,
+          [...prefix, candidate],
+          PROBE_TIMEOUT_MS,
+        );
+        patchProbe(row.name, (p) => ({
+          ...p,
+          index: i + 1,
+          results: [...p.results.filter((r) => r.candidate !== candidate), { candidate, result, translating: false }],
+        }));
+        if (probeLooksLikeHelp(result)) {
+          patchProbe(row.name, (p) => ({ ...p, running: false }));
+          setNotice(t("adb.binary.probeHit", { candidate }));
+          return;
+        }
+      } catch (e) {
+        patchProbe(row.name, (p) => ({
+          ...p,
+          index: i + 1,
+          results: [
+            ...p.results.filter((r) => r.candidate !== candidate),
+            { candidate, error: String((e as Error)?.message ?? e), translating: false },
+          ],
+        }));
+      }
+    }
+    patchProbe(row.name, (p) => ({ ...p, running: false }));
+    setNotice(t("adb.binary.probeNone"));
+  };
+
+  /**
+   * 把某条候选的输出翻成界面语言。
+   *
+   * 只翻"有内容的那一条流"：help 程序惯例把用法写 stdout，报错写 stderr，
+   * 两个都翻等于把同样的钱花两遍。原文一律保留在卡片里——译文只是辅助，
+   * 判据还得是设备报回来的事实。
+   */
+  const translateProbe = async (name: string, candidate: string) => {
+    const row = hosted.find((h) => h.name === name);
+    const item = row?.probe?.results.find((r) => r.candidate === candidate);
+    const result = item?.result;
+    if (!result) return;
+    const raw = result.stdout.trim() ? result.stdout : result.stderr;
+    const text = stripAnsi(raw);
+    patchProbe(name, (p) => ({
+      ...p,
+      results: p.results.map((r) =>
+        r.candidate === candidate ? { ...r, translating: true, translateNote: undefined } : r,
+      ),
+    }));
+    try {
+      const out = await aiApi.translate(text, TRANSLATE_LANGS[locale] ?? "简体中文", TRANSLATE_SOURCE);
+      patchProbe(name, (p) => ({
+        ...p,
+        results: p.results.map((r) =>
+          r.candidate === candidate
+            ? {
+                ...r,
+                translating: false,
+                translated: out.text,
+                translateNote: out.sourceTruncated
+                  ? t("adb.binary.translateTruncated", { chars: String(out.sentChars) })
+                  : undefined,
+              }
+            : r,
+        ),
+      }));
+    } catch (e) {
+      // 翻译坏了绝不改判探测结果：原文照看，失败原因单独说一句
+      patchProbe(name, (p) => ({
+        ...p,
+        results: p.results.map((r) =>
+          r.candidate === candidate
+            ? {
+                ...r,
+                translating: false,
+                translateNote: t("adb.binary.translateFail", {
+                  detail: String((e as Error)?.message ?? e),
+                }),
+              }
+            : r,
+        ),
+      }));
+    }
+  };
+
+  /**
+   * 运行中持续输入（UI-6 第四层）。
+   *
+   * 「发送」自动补一个换行（交互式程序基本都按行读），要原样送就用「原样发送」；
+   * 「结束输入」发完这段并关闭写入端（EOF）。
+   * 写不进去时设备侧会明确回 reason，界面原样转述——不把它圆成"已发送"。
+   */
+  const sendFeed = async (row: HostedRow, mode: "line" | "raw" | "close") => {
+    if (!deviceSerial || !row.handle || row.feeding) return;
+    const body = row.feed;
+    if (mode === "line" && !body.endsWith("\n")) {
+      // 补换行这件事写在按钮提示里，不偷偷做：有人就是在等一个不带换行的按键
+      patchRow(row.name, { feed: body + "\n" });
+    }
+    const text = mode === "line" && !body.endsWith("\n") ? body + "\n" : body;
+    patchRow(row.name, { feeding: true });
+    try {
+      const wrote = await deviceApi.hostedWrite(
+        deviceSerial,
+        row.handle,
+        text,
+        mode === "close",
+      );
+      patchRow(row.name, {
+        feed: mode === "close" ? row.feed : "",
+        feeding: false,
+        stdinMode: wrote.stdin_mode,
+      });
+      setNotice(
+        mode === "close"
+          ? t("adb.binary.feedClosed", { bytes: String(wrote.bytes_written) })
+          : t("adb.binary.feedSent", { bytes: String(wrote.bytes_written) }),
+      );
+    } catch (e) {
+      patchRow(row.name, {
+        feeding: false,
+        error: t("adb.binary.feedFail", { detail: String((e as Error)?.message ?? e) }),
+      });
+    }
+  };
+
   const addHosted = (b: HostedBinary) => {
     if (!b.hasExec) return; // 红色不可双击托管（先 chmod）
     setHosted((hs) =>
-      hs.some((h) => h.name === b.name)
-        ? hs
-        : [
-            ...hs,
-            {
-              name: b.name,
-              handle: null,
-              pid: null,
-              tracked: false,
-              running: false,
-              busy: false,
-              error: null,
-              root: false,
-              ports: [],
-              portsLoading: false,
-              note: loadNote(deviceSerial, b.name),
-            },
-          ],
+      hs.some((h) => h.name === b.name) ? hs : [...hs, newHostedRow(b.name, deviceSerial)],
     );
   };
 
@@ -464,11 +776,35 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
     // 只挡"在途请求"：绝不能拿 running（设备说它在跑）当守卫 —— 那正是上一轮把
     // 「终止」按钮禁成灰色的同一个混淆。
     if (!deviceSerial || row.busy) return;
+    const args = splitArgs(row.launch.argsText);
+    // 本地预检只拦"注定被设备拒掉"的形状；参数最终怎么落进 argv 由设备侧说了算
+    const problem = argsProblem(args, root);
+    if (problem && problem.includes("超过")) {
+      patchRow(row.name, { error: problem });
+      return;
+    }
+    const stdinBytes = utf8Bytes(row.launch.stdinText);
+    if (stdinBytes > MAX_STDIN_BYTES) {
+      patchRow(row.name, {
+        error: t("adb.binary.stdinTooLong", {
+          bytes: String(stdinBytes),
+          max: String(MAX_STDIN_BYTES),
+        }),
+      });
+      return;
+    }
     // 启动身份 = 点击瞬间的 Root 开关；写回本行，kill/复查永远同链路
     const asRoot = root;
     patchRow(row.name, { busy: true, error: null, root: asRoot });
     try {
-      const result = await deviceApi.binaryRun(deviceSerial, row.name, asRoot);
+      const result = await deviceApi.binaryRun(
+        deviceSerial,
+        row.name,
+        asRoot,
+        args,
+        row.launch.stdinText || undefined,
+        row.launch.interactive,
+      );
       if (!result.started) {
         // 启动前的检查拦下了：它本来就在跑。这里不报红、也不谎称"已启动"，
         // 而是刷新清单让「已在运行」显示出来，按钮随之变成「停止进程」。
@@ -483,6 +819,9 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
        * 登记进运行表的显示成普通 pid chip；没登记上的（Agent 未在线、认领被拒）
        * 显示成「已在运行（未登记）」——写「未运行」是假的，按"本工具在管着它"来显示也是假的。
        */
+      // 用这组参数成功起过一次 = 认可了它对应的那一版文件：指纹随之确认。
+      // 只在 started 的这条分支做（没起成功就不该改用户的确认状态）。
+      const bin = binaries.find((b) => b.name === row.name);
       patchRow(row.name, {
         pid,
         tracked: result.tracked,
@@ -490,7 +829,19 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
         busy: false,
         ports: [],
         error: null,
+        // 刚用这组参数起过一次 = 用户认可了它，指纹随之确认；
+        // 只提示不自动清空，是因为文件被替换过但参数往往仍然能用
+        deviceArgs: args,
+        ...(bin && row.launch.argsText
+          ? { launch: { ...row.launch, stamp: encodeStamp(stampOf(bin)) } }
+          : {}),
       });
+      if (bin && row.launch.argsText) {
+        saveLaunchPrefs(deviceSerial, row.name, {
+          ...row.launch,
+          stamp: encodeStamp(stampOf(bin)),
+        });
+      }
       // 成功也可能带话要交代（登记失败的原因）：不能只在失败时才让用户看见
       if (result.detail) setNotice(result.detail);
       // 立刻回查设备表：pid/状态以设备为准，不等 5s 轮询
@@ -583,6 +934,53 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
       void refetchRuns();
     } catch (e) {
       patchRow(row.name, { busy: false, error: String((e as Error)?.message ?? e) });
+    }
+  };
+
+  /** 读翻译配置（key 只留在后端，这里只拿得到后 4 位） */
+  const loadAi = useCallback(async () => {
+    try {
+      const cfg = await aiApi.getConfig();
+      setAiConfig(cfg);
+      setAiDraft({ baseUrl: cfg.baseUrl, model: cfg.model, enabled: cfg.enabled, apiKey: "" });
+    } catch (e) {
+      setNotice(String((e as Error)?.message ?? e));
+    }
+  }, []);
+
+  const saveAi = useCallback(async () => {
+    try {
+      // apiKey 留空 = 不动它（后端不会把它回传给我们，所以无从"保持原值"）
+      const cfg = await aiApi.setConfig({
+        baseUrl: aiDraft.baseUrl,
+        model: aiDraft.model,
+        enabled: aiDraft.enabled,
+        apiKey: aiDraft.apiKey ? aiDraft.apiKey : undefined,
+      });
+      setAiConfig(cfg);
+      setAiDraft({ baseUrl: cfg.baseUrl, model: cfg.model, enabled: cfg.enabled, apiKey: "" });
+      setNotice(t("adb.binary.translateSaved", { tail: cfg.keyTail || "-" }));
+    } catch (e) {
+      setNotice(String((e as Error)?.message ?? e));
+    }
+  }, [aiDraft, t]);
+
+  /** 输入通道能不能写：只认设备回传的 stdin_mode */
+  const feedOpen = (row: HostedRow) => !!row.handle && !row.root && row.stdinMode === "open";
+
+  const feedHint = (row: HostedRow): string => {
+    if (row.root) return t("adb.binary.feedRoot");
+    switch (row.stdinMode) {
+      case "open":
+        return t("adb.binary.feedOpen");
+      case "once":
+        return t("adb.binary.feedOnce");
+      case "lost":
+        return t("adb.binary.feedLost");
+      case "none":
+        return t("adb.binary.feedNone");
+      default:
+        return t("adb.binary.feedUnknown");
     }
   };
 
@@ -838,6 +1236,45 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                           <RefreshCw className={cn("h-3 w-3", row.portsLoading && "animate-spin")} />
                         </Button>
                       )}
+                      {/* 启动配置（参数 / stdin / 输入通道）：一个开合按钮就够，默认收起 */}
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className={cn(
+                          "h-6 shrink-0 gap-1 px-1.5 text-muted-foreground",
+                          row.launch.argsText && "text-foreground",
+                        )}
+                        data-testid={`launch-toggle-${row.name}`}
+                        title={t("adb.binary.argsToggleTip")}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          patchRow(row.name, { expanded: !row.expanded });
+                        }}
+                      >
+                        <SlidersHorizontal className="h-3 w-3" />
+                        {row.launch.argsText ? t("adb.binary.argsFilled") : t("adb.binary.args")}
+                      </Button>
+                      {/* 探测帮助：只在用户点击时才去设备上起进程，绝不自动跑 */}
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-6 shrink-0 gap-1 px-2"
+                        data-testid={`probe-${row.name}`}
+                        disabled={!!row.probe?.running}
+                        title={t("adb.binary.probeTip")}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void runProbe(row, true);
+                          void loadAi();
+                        }}
+                      >
+                        {row.probe?.running ? (
+                          <RefreshCw className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <Sparkles className="h-3 w-3" />
+                        )}
+                        {t("adb.binary.probe")}
+                      </Button>
                       <Button
                         size="sm"
                         variant="ghost"
@@ -918,6 +1355,399 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                         ))}
                       </select>
                     </div>
+
+                    {/* 设备记录里回读到的参数：这是"这一次在跑的进程当初怎么起的"，
+                        与上面输入框里的"下一次要用的"是两件事，必须分开显示 */}
+                    {row.running && (row.deviceArgs?.length ?? 0) > 0 && (
+                      <p
+                        className="path-selectable mt-1.5 break-all font-mono text-10px text-muted-foreground"
+                        data-testid={`device-args-${row.name}`}
+                        title={t("adb.binary.deviceArgsTip")}
+                      >
+                        {t("adb.binary.deviceArgs", { args: row.deviceArgs?.join(" ") ?? "" })}
+                      </p>
+                    )}
+
+                    {row.expanded && (
+                      <div
+                        className="mt-1.5 flex flex-col gap-1.5 rounded-md border bg-muted/30 p-2"
+                        data-testid={`launch-${row.name}`}
+                      >
+                        <input
+                          aria-label={t("adb.binary.argsLabel", { name: row.name })}
+                          data-testid={`args-${row.name}`}
+                          className="path-selectable h-6 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
+                          placeholder={t("adb.binary.argsPlaceholder")}
+                          value={row.launch.argsText}
+                          onChange={(e) => patchLaunch(row, { argsText: e.target.value })}
+                        />
+                        {(() => {
+                          const problem = argsProblem(splitArgs(row.launch.argsText), root);
+                          return problem ? (
+                            <p className="text-10px leading-relaxed text-amber-500" data-testid={`args-problem-${row.name}`}>
+                              {problem}
+                            </p>
+                          ) : null;
+                        })()}
+                        {(() => {
+                          const bin = binaries.find((b) => b.name === row.name);
+                          if (!row.launch.argsText || !bin) return null;
+                          const verdict = compareStamp(
+                            decodeStamp(row.launch.stamp),
+                            stampOf(bin),
+                          );
+                          if (verdict === "changed") {
+                            return (
+                              <div className="flex items-center gap-1.5" data-testid={`stamp-changed-${row.name}`}>
+                                <span className="min-w-0 flex-1 text-10px text-amber-500">
+                                  {t("adb.binary.stampStale")}
+                                </span>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-5 shrink-0 px-1.5 text-10px"
+                                  onClick={() => patchLaunch(row, { stamp: encodeStamp(stampOf(bin)) })}
+                                >
+                                  {t("adb.binary.stampConfirm")}
+                                </Button>
+                              </div>
+                            );
+                          }
+                          if (verdict === "unknown") {
+                            return (
+                              <p className="text-10px text-muted-foreground" data-testid={`stamp-unknown-${row.name}`}>
+                                {t("adb.binary.stampUnknown")}
+                              </p>
+                            );
+                          }
+                          return null;
+                        })()}
+                        <textarea
+                          aria-label={t("adb.binary.stdinLabel")}
+                          data-testid={`stdin-${row.name}`}
+                          className="path-selectable h-16 rounded-md border border-input bg-transparent px-2 py-1 font-mono text-xs"
+                          placeholder={t("adb.binary.stdinPlaceholder")}
+                          value={row.launch.stdinText}
+                          onChange={(e) => patchLaunch(row, { stdinText: e.target.value })}
+                        />
+                        <div className="flex items-center gap-2 text-10px text-muted-foreground">
+                          <span className="shrink-0">
+                            {utf8Bytes(row.launch.stdinText)} / {MAX_STDIN_BYTES} 字节
+                          </span>
+                          <label className="flex shrink-0 items-center gap-1">
+                            <input
+                              type="checkbox"
+                              className="h-3 w-3"
+                              data-testid={`interactive-${row.name}`}
+                              checked={row.launch.interactive}
+                              onChange={(e) => patchLaunch(row, { interactive: e.target.checked })}
+                            />
+                            {t("adb.binary.stdinInteractive")}
+                          </label>
+                          {root && row.launch.interactive && (
+                            <span className="min-w-0 flex-1 text-amber-500" data-testid={`interactive-root-warn-${row.name}`}>
+                              {t("adb.binary.stdinInteractiveRoot")}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 运行中的持续输入：只有设备说"通道开着"才给框。
+                        给一个看着能输、其实吞字的框，比不给更糟 */}
+                    {row.running && row.handle && (
+                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                        {feedOpen(row) ? (
+                          <>
+                            <input
+                              aria-label={t("adb.binary.feedLabel", { name: row.name })}
+                              data-testid={`feed-${row.name}`}
+                              className="h-6 min-w-0 flex-1 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
+                              placeholder={t("adb.binary.feedPlaceholder")}
+                              value={row.feed}
+                              disabled={row.feeding}
+                              onChange={(e) => patchRow(row.name, { feed: e.target.value })}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  e.preventDefault();
+                                  void sendFeed(row, "line");
+                                }
+                              }}
+                            />
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 shrink-0 gap-1 px-2"
+                              data-testid={`feed-send-${row.name}`}
+                              disabled={row.feeding || row.feed === ""}
+                              title={t("adb.binary.feedSendTip")}
+                              onClick={() => void sendFeed(row, "line")}
+                            >
+                              <Send className="h-3 w-3" />
+                              {t("adb.binary.feedSend")}
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-6 shrink-0 px-2 text-10px"
+                              data-testid={`feed-raw-${row.name}`}
+                              disabled={row.feeding || row.feed === ""}
+                              title={t("adb.binary.feedRawTip")}
+                              onClick={() => void sendFeed(row, "raw")}
+                            >
+                              {t("adb.binary.feedRaw")}
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-6 shrink-0 px-2 text-10px"
+                              data-testid={`feed-close-${row.name}`}
+                              disabled={row.feeding}
+                              title={t("adb.binary.feedCloseTip")}
+                              onClick={() => void sendFeed(row, "close")}
+                            >
+                              {t("adb.binary.feedClose")}
+                            </Button>
+                          </>
+                        ) : (
+                          <span
+                            className="min-w-0 flex-1 text-10px text-muted-foreground"
+                            data-testid={`feed-hint-${row.name}`}
+                          >
+                            {feedHint(row)}
+                          </span>
+                        )}
+                      </div>
+                    )}
+
+                    {row.probe && (
+                      <div
+                        className="mt-1.5 flex flex-col gap-1.5 rounded-md border bg-card p-2"
+                        data-testid={`probe-panel-${row.name}`}
+                      >
+                        <div className="flex flex-wrap items-center gap-1.5 text-10px">
+                          <span className="min-w-0 flex-1 text-muted-foreground">
+                            {row.probe.running
+                              ? t("adb.binary.probeRunning", {
+                                  index: String(row.probe.results.length + 1),
+                                  total: String(HELP_CANDIDATES.length),
+                                  candidate:
+                                    HELP_CANDIDATES[Math.min(row.probe.index, HELP_CANDIDATES.length - 1)] ?? "",
+                                })
+                              : t("adb.binary.probeTried", { count: String(row.probe.results.length) })}
+                          </span>
+                          {row.probe.running ? (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 shrink-0 gap-1 px-2 text-destructive"
+                              data-testid={`probe-abort-${row.name}`}
+                              onClick={() => {
+                                probeAbort.current[row.name] = true;
+                                patchProbe(row.name, (p) => ({ ...p, running: false }));
+                              }}
+                            >
+                              <Square className="h-3 w-3" />
+                              {t("adb.binary.probeAbort")}
+                            </Button>
+                          ) : (
+                            row.probe.results.length < HELP_CANDIDATES.length && (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 shrink-0 px-2"
+                                data-testid={`probe-continue-${row.name}`}
+                                onClick={() => void runProbe(row, false)}
+                              >
+                                {t("adb.binary.probeContinue")}
+                              </Button>
+                            )
+                          )}
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-6 shrink-0 gap-1 px-1.5 text-muted-foreground"
+                            data-testid={`probe-ai-${row.name}`}
+                            title={t("adb.binary.translateConfig")}
+                            onClick={() => {
+                              setAiEditor(aiEditor === row.name ? null : row.name);
+                              void loadAi();
+                            }}
+                          >
+                            <Settings2 className="h-3 w-3" />
+                            {aiConfig?.enabled
+                              ? t("adb.binary.translateOn", { tail: aiConfig.keyTail || "-" })
+                              : t("adb.binary.translateOff")}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-6 shrink-0 px-1.5 text-muted-foreground"
+                            onClick={() => patchRow(row.name, { probe: null })}
+                          >
+                            <X className="h-3 w-3" />
+                          </Button>
+                        </div>
+                        <p className="text-10px leading-relaxed text-muted-foreground">
+                          {t("adb.binary.probeShellOnly")}
+                        </p>
+                        {aiEditor === row.name && (
+                          <div
+                            className="flex flex-col gap-1.5 rounded-md border bg-muted/30 p-2"
+                            data-testid={`ai-editor-${row.name}`}
+                          >
+                            <input
+                              aria-label={t("adb.binary.translateBaseUrl")}
+                              className="h-6 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
+                              placeholder="https://…/v1"
+                              value={aiDraft.baseUrl}
+                              onChange={(e) => setAiDraft({ ...aiDraft, baseUrl: e.target.value })}
+                            />
+                            <input
+                              aria-label={t("adb.binary.translateModel")}
+                              className="h-6 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
+                              placeholder="gpt-4o-mini"
+                              value={aiDraft.model}
+                              onChange={(e) => setAiDraft({ ...aiDraft, model: e.target.value })}
+                            />
+                            <input
+                              aria-label={t("adb.binary.translateKey")}
+                              type="password"
+                              autoComplete="off"
+                              className="h-6 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
+                              placeholder={
+                                aiConfig?.hasApiKey
+                                  ? t("adb.binary.translateKeyKept", { tail: aiConfig.keyTail })
+                                  : "sk-…"
+                              }
+                              value={aiDraft.apiKey}
+                              onChange={(e) => setAiDraft({ ...aiDraft, apiKey: e.target.value })}
+                            />
+                            <label className="flex items-center gap-1 text-10px">
+                              <input
+                                type="checkbox"
+                                className="h-3 w-3"
+                                checked={aiDraft.enabled}
+                                onChange={(e) => setAiDraft({ ...aiDraft, enabled: e.target.checked })}
+                              />
+                              {t("adb.binary.translateEnabled")}
+                            </label>
+                            <p className="text-10px leading-relaxed text-muted-foreground">
+                              {t("adb.binary.translateNotice", { url: aiDraft.baseUrl || "-" })}
+                            </p>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 self-start px-2"
+                              data-testid={`ai-save-${row.name}`}
+                              onClick={() => void saveAi()}
+                            >
+                              {t("adb.binary.translateSave")}
+                            </Button>
+                          </div>
+                        )}
+                        {row.probe.results.length === 0 && (
+                          <p className="text-10px text-muted-foreground">{t("adb.binary.probeWaiting")}</p>
+                        )}
+                        <ul className="flex flex-col gap-1.5">
+                          {row.probe.results.map((item) => (
+                            <li
+                              key={item.candidate}
+                              className="rounded-md border border-border/60 p-1.5"
+                              data-testid={`probe-item-${row.name}-${item.candidate}`}
+                            >
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <code className="shrink-0 rounded bg-muted px-1 font-mono text-10px">
+                                  {item.candidate}
+                                </code>
+                                <span
+                                  className={cn(
+                                    "shrink-0 rounded px-1.5 py-0.5 text-10px",
+                                    item.result ? categoryTone(item.result) : "bg-red-500/10 text-red-500",
+                                  )}
+                                >
+                                  {item.result
+                                    ? t(probeCategoryKey(item.result))
+                                    : t("adb.binary.probeCallFail")}
+                                </span>
+                                <span className="min-w-0 flex-1 break-all text-10px text-muted-foreground">
+                                  {item.result ? describeProbeFacts(item.result) : item.error}
+                                </span>
+                                {item.result && probeHasOutput(item.result) && (
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-5 shrink-0 gap-1 px-1.5 text-10px"
+                                    data-testid={`probe-translate-${row.name}-${item.candidate}`}
+                                    disabled={item.translating || !aiConfig?.enabled}
+                                    title={
+                                      aiConfig?.enabled
+                                        ? t("adb.binary.translateNotice", { url: aiConfig.baseUrl || "-" })
+                                        : t("adb.binary.translateNeed")
+                                    }
+                                    onClick={() => void translateProbe(row.name, item.candidate)}
+                                  >
+                                    <Languages className="h-3 w-3" />
+                                    {item.translating
+                                      ? t("adb.binary.translating")
+                                      : t("adb.binary.translate", {
+                                          lang: TRANSLATE_LANGS[locale] ?? "简体中文",
+                                        })}
+                                  </Button>
+                                )}
+                              </div>
+                              {(["stdout", "stderr"] as const).map((stream) => {
+                                const text = item.result ? stripAnsi(item.result[stream]) : "";
+                                if (!text) return null;
+                                return (
+                                  <div key={stream} className="mt-1">
+                                    <p className="text-10px text-muted-foreground">{stream}</p>
+                                    <pre
+                                      className="path-selectable max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-1 font-mono text-10px"
+                                      data-testid={`probe-${stream}-${row.name}-${item.candidate}`}
+                                    >
+                                      {text}
+                                    </pre>
+                                  </div>
+                                );
+                              })}
+                              {item.result?.truncated && (
+                                <p className="mt-1 text-10px text-amber-500" data-testid={`probe-truncated-${row.name}-${item.candidate}`}>
+                                  {t("adb.binary.probeTruncated", {
+                                    bytes: String(probeHiddenBytes(item.result)),
+                                  })}
+                                </p>
+                              )}
+                              {item.result?.still_running && (
+                                <p className="mt-1 text-10px text-destructive" data-testid={`probe-alive-${row.name}-${item.candidate}`}>
+                                  {t("adb.binary.probeStillRunning", { pid: String(item.result.pid) })}
+                                </p>
+                              )}
+                              {item.translated && (
+                                <div className="mt-1">
+                                  <p className="text-10px text-muted-foreground">
+                                    {t("adb.binary.translated", {
+                                      lang: TRANSLATE_LANGS[locale] ?? "简体中文",
+                                    })}
+                                  </p>
+                                  <pre
+                                    className="path-selectable max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-1 text-10px"
+                                    data-testid={`probe-translated-${row.name}-${item.candidate}`}
+                                  >
+                                    {item.translated}
+                                  </pre>
+                                </div>
+                              )}
+                              {item.translateNote && (
+                                <p className="mt-1 break-all text-10px text-muted-foreground">
+                                  {item.translateNote}
+                                </p>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
                     {row.error && (
                       <p className="mt-1.5 break-all text-11px leading-relaxed text-destructive" data-testid={`err-${row.name}`}>
                         {row.error}

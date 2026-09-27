@@ -294,6 +294,13 @@ pub struct HostedBinary {
     /// 只有 Agent 通道给得出：Legacy 的 `ls -l` + `file` 只看文件，看不见进程。
     #[serde(default)]
     pub external_procs: Vec<ExternalProcView>,
+    /// 设备上的修改时间（秒）。用来判"存下来的参数是不是给这个版本的文件用的"。
+    ///
+    /// 是 `Option` 而不是硬凑一个数：Agent `hosted.stat` 给得出，Legacy 的
+    /// `ls -l` 只有一个本地化日期串，猜成时间戳就等于拿猜测当指纹。
+    /// 拿不到时界面显示"没做版本核对"，不假装核对过。
+    #[serde(default)]
+    pub mtime_unix: Option<i64>,
 }
 
 /// 校验托管文件名：仅允许安全字符（防 shell 注入 / 路径逃逸）。
@@ -366,6 +373,8 @@ pub fn hosted_binaries(ls_stdout: &str, file_stdout: &str) -> Vec<HostedBinary> 
             perms: fe.perms,
             // Legacy 的 `ls -l` + `file` 只看文件，看不见进程：表外同名进程只有 Agent 报得出
             external_procs: Vec::new(),
+            // 同上：这条腿给不出可信的 mtime，宁可不比对也不拿日期串猜一个
+            mtime_unix: None,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -422,14 +431,100 @@ pub fn is_root_probe_ok(stdout: &str) -> bool {
     stdout.contains("uid=0")
 }
 
-/// 托管后台启动命令模板：`cd <dir>; nohup ./<name> >log 2>&1 & echo $!`。
-/// ⚠️ 用 `;` 而非 `&&`：`&&` 优先级低于 `&`，会把整个 `cd && nohup`
-/// 复合式后台化，`$!` 拿到子 shell pid 而非二进制 pid。
-/// root=true 时整段 su -c 单引号包裹（外层 shell 不动 &/$!/重定向）。
-pub fn hosted_run_cmd(name: &str, log: &str, root: bool) -> String {
+/// 参数/stdin 落盘用的远端文件名（隐藏文件，跟 `.name.run.log` 同族）。
+/// 名字已过 `is_safe_hosted_name`（不以 `.` 开头、无斜杠无空格），拼出来的路径没有歧义。
+pub fn hosted_args_file(name: &str) -> String {
+    format!("{HOSTED_DIR}/.{name}.args")
+}
+pub fn hosted_stdin_file(name: &str) -> String {
+    format!("{HOSTED_DIR}/.{name}.stdin")
+}
+
+/// root 支路的启动命令体。带参数或带 stdin 时，值**从文件还原，绝不拼进这条命令**。
+///
+/// 为什么不能拼字符串（真机实测过）：
+/// - `su -c "..."` 之后再加位置参数，这台的 su 根本不透传（`$1/$@` 全空），拿不到 argv；
+/// - 把参数拼进引号里就是注入口 —— 试过一个含 `;` 的"参数"，分号后面那条命令被 root 执行了。
+///
+/// 模板本身是写死的，里面只出现已校验的文件名/日志名；`set --` 累积 argv 的写法
+/// （`while IFS= read -r a; do set -- "$@" "$a"; done < 文件`）在这台设备的 sh 上实测成立：
+/// `a b` 合成一个参数、`--tag=x;rm` 原样进 argv 且分号不被执行。
+pub fn hosted_run_cmd(name: &str, log: &str, carried: HostedCarried) -> String {
     debug_assert!(is_safe_hosted_name(name));
-    let inner = format!("cd {HOSTED_DIR}; nohup ./{name} >{log} 2>&1 & echo $!");
-    if root { su_wrap(&inner) } else { inner }
+    let args_file = hosted_args_file(name);
+    let stdin_file = hosted_stdin_file(name);
+    let restore = if carried.args {
+        // 注意：`while ... done < 文件` 不在子 shell 里跑，set -- 的结果才留得住
+        format!(r#"set --; while IFS= read -r a; do set -- "$@" "$a"; done < {args_file}; "#)
+    } else {
+        String::new()
+    };
+    let argv = if carried.args { r#""$@" "# } else { "" };
+    let stdin_redirect = if carried.stdin {
+        format!(r#"< {stdin_file} "#)
+    } else {
+        "< /dev/null ".to_string()
+    };
+    // 用完就地删：后台进程已经拿着打开的 fd，删文件不影响它；留在设备上就是垃圾
+    let cleanup = if carried.args || carried.stdin {
+        format!(r#"; rm -f {args_file} {stdin_file}"#)
+    } else {
+        String::new()
+    };
+    // ⚠️ 用 `;` 而非 `&&`：`&&` 优先级低于 `&`，会把整段复合式后台化，
+    //    `$!` 拿到的就是子 shell 的 pid 而不是二进制的。
+    format!(
+        r#"cd {HOSTED_DIR}; {restore}nohup ./{name} {argv}{stdin_redirect}>{log} 2>&1 & echo $!{cleanup}"#
+    )
+}
+
+/// root 支路这次要不要带参数文件 / stdin 文件
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HostedCarried {
+    pub args: bool,
+    pub stdin: bool,
+}
+
+/// 参数文件的字节：一行一个。
+///
+/// 单独抽出来是因为真机腿要拿**同一份**字节去 push，否则测试测的是我另敲一遍的写法。
+pub fn hosted_args_file_bytes(args: &[String]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for arg in args {
+        buf.extend_from_slice(arg.as_bytes());
+        buf.push(b'\n');
+    }
+    buf
+}
+
+/// root 支路的参数校验：这条路靠"一行一个参数"的文件还原，所以接不了换行与空字节。
+///
+/// 明确拒绝而不是转义：任何"把换行塞进单行协议再还原"的花活，出错时都会变成
+/// 目标进程收到一堆看不懂的参数，比一次失败难查得多。非 root 支路是数组直交 exec，
+/// 没有这个限制 —— 所以提示里要说清"换哪条路"。
+pub fn validate_carried_args(args: &[String]) -> Result<(), String> {
+    if args.len() > agent_protocol::MAX_HOSTED_ARGS {
+        return Err(format!(
+            "参数 {} 个，超过上限 {}",
+            args.len(),
+            agent_protocol::MAX_HOSTED_ARGS
+        ));
+    }
+    for arg in args {
+        if arg.len() > agent_protocol::MAX_HOSTED_ARG_LEN {
+            return Err(format!(
+                "单个参数最长 {} 字节，这里有一个 {} 字节",
+                agent_protocol::MAX_HOSTED_ARG_LEN,
+                arg.len()
+            ));
+        }
+        if arg.contains('\n') || arg.contains('\0') {
+            return Err("参数里有换行或空字节，Root 支路接不了（它按行还原 argv）；\
+                 取消 Root 走 Agent 直送可以，或去掉这类参数"
+                .to_string());
+        }
+    }
+    Ok(())
 }
 
 /// 托管进程监听端口信息（/proc/net/tcp|tcp6 行解析结果）。
@@ -1139,6 +1234,81 @@ mod tests {
         assert_eq!(resolve_adb_path(&cands, exists), Err(AdbError::NotFound));
     }
 
+    /// 第一层的核心安全断言：**参数值与 stdin 内容永远不出现在命令行里**，
+    /// 命令行只出现固定的文件路径。root 支路历史上就是栽在"把参数拼进 su -c 的引号里"
+    /// （实测含分号的参数会把分号后面的命令以 root 执行）。
+    #[test]
+    fn hosted_run_cmd_keeps_carried_values_out_of_the_command_line() {
+        let log = "/data/local/tmp/.toybox.run.log";
+        let plain = hosted_run_cmd("toybox", log, HostedCarried::default());
+        assert_eq!(
+            plain,
+            format!("cd /data/local/tmp; nohup ./toybox < /dev/null >{log} 2>&1 & echo $!")
+        );
+
+        let with_args = hosted_run_cmd(
+            "toybox",
+            "LOG",
+            HostedCarried {
+                args: true,
+                stdin: false,
+            },
+        );
+        assert!(
+            with_args.contains(
+                r#"set --; while IFS= read -r a; do set -- "$@" "$a"; done < /data/local/tmp/.toybox.args; "#
+            ),
+            "按行还原 argv 的模板不能改坏：{with_args}"
+        );
+        assert!(with_args.contains(r#"nohup ./toybox "$@" < /dev/null >LOG 2>&1 & echo $!"#));
+        assert!(with_args.contains("rm -f /data/local/tmp/.toybox.args"));
+
+        let with_stdin = hosted_run_cmd(
+            "toybox",
+            "LOG",
+            HostedCarried {
+                args: false,
+                stdin: true,
+            },
+        );
+        assert!(with_stdin.contains("nohup ./toybox < /data/local/tmp/.toybox.stdin >LOG"));
+        assert!(
+            !with_stdin.contains(r#""$@""#),
+            "没带参数就不该出现 argv 还原：{with_stdin}"
+        );
+
+        // su_wrap 用单引号包裹整段命令：模板里出现单引号会直接破坏包裹
+        for cmd in [&plain, &with_args, &with_stdin] {
+            assert!(!cmd.contains('\''), "模板含单引号会撞穿 su 包裹：{cmd}");
+        }
+    }
+
+    #[test]
+    fn carried_arg_limits_reject_explicitly_instead_of_silently() {
+        let many: Vec<String> = (0..agent_protocol::MAX_HOSTED_ARGS + 1)
+            .map(|i| i.to_string())
+            .collect();
+        assert!(
+            validate_carried_args(&many)
+                .unwrap_err()
+                .contains("超过上限")
+        );
+        let long = "x".repeat(agent_protocol::MAX_HOSTED_ARG_LEN + 1);
+        assert!(
+            validate_carried_args(&[long])
+                .unwrap_err()
+                .contains("单个参数最长")
+        );
+        assert!(
+            validate_carried_args(&["a\nb".into()])
+                .unwrap_err()
+                .contains("取消 Root 走 Agent"),
+            "拒的时候要说明该换哪条路，而不是只说不行"
+        );
+        // 恰恰是这些形状必须过得去：空格不拆开、分号不执行
+        assert!(validate_carried_args(&["--tag=x;id".into(), "a b".into(), "-l".into()]).is_ok());
+    }
+
     #[test]
     fn build_args_with_and_without_serial() {
         assert_eq!(
@@ -1493,12 +1663,16 @@ lrw-r--r-- 1 shell shell 21 2026-01-01 08:00 link -> /init\n";
     fn hosted_run_cmd_uses_semicolon_not_andand() {
         // 回归：&& 优先级低于 &，$! 会拿到子 shell 的 pid 而非二进制的
         let log = hosted_run_log("xhmfd1656-n");
-        let cmd = hosted_run_cmd("xhmfd1656-n", &log, false);
-        assert!(cmd.starts_with("cd /data/local/tmp; nohup ./xhmfd1656-n >"));
+        let cmd = hosted_run_cmd("xhmfd1656-n", &log, HostedCarried::default());
+        assert!(cmd.starts_with("cd /data/local/tmp; nohup ./xhmfd1656-n <"));
         assert!(cmd.ends_with("& echo $!"));
         assert!(!cmd.contains("&& nohup"), "禁用 && 连接：{cmd}");
+        assert!(
+            cmd.contains("< /dev/null"),
+            "没带启动输入时给 /dev/null：{cmd}"
+        );
         // root：整段单引号包裹（内层 & $! > 归 root shell 解释）
-        let root_cmd = hosted_run_cmd("xhmfd1656-n", &log, true);
+        let root_cmd = su_wrap(&cmd);
         assert!(root_cmd.starts_with("su -c 'cd /data/local/tmp;"));
         assert!(root_cmd.ends_with("echo $!'"));
         assert_eq!(root_cmd.matches('\'').count(), 2);

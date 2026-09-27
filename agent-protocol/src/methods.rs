@@ -29,6 +29,10 @@ pub mod method {
     pub const HOSTED_STATUS: &str = "hosted.status";
     pub const HOSTED_STOP: &str = "hosted.stop";
     pub const HOSTED_ADOPT: &str = "hosted.adopt";
+    /// 第二层：用一组参数把二进制起来一次，如实回报输出/退出/超时（不写运行表）
+    pub const HOSTED_PROBE: &str = "hosted.probe";
+    /// 第四层：向 Agent 亲自起、且还持有 stdin 句柄的进程持续写入
+    pub const HOSTED_WRITE: &str = "hosted.write";
     pub const PACKAGE_EXPORT_APK: &str = "package.export_apk";
     pub const PACKAGE_EXPORT_CLEAN: &str = "package.export_clean";
     pub const PACKAGE_DESCRIBE: &str = "package.describe";
@@ -738,6 +742,130 @@ pub struct FilesystemPreviewResult {
     pub detail: Option<String>,
 }
 
+/// 托管进程一次性 stdin 的上界（Agent 与 Desktop 两条支路共用同一个数）。
+///
+/// 必须两端一致：不一样就会出现"不勾 Root 能填、勾了反而被拒"这种没人能解释的不对称。
+/// 超限一律拒绝，**不截断** —— 截断等于让目标程序读到半句输入，比一次失败难查得多。
+pub const MAX_HOSTED_STDIN_BYTES: usize = 64 * 1024;
+/// root 支路用"一个参数一行"的文件还原 argv，所以参数个数与单参数长度都要有界；
+/// 含换行/空字节的参数这条路接不了（明确拒绝，不做转义魔法）。
+pub const MAX_HOSTED_ARGS: usize = 64;
+pub const MAX_HOSTED_ARG_LEN: usize = 512;
+
+/// 「探测帮助」单个候选的默认超时：超过就由 Agent 杀掉整个进程组。
+pub const HOSTED_PROBE_DEFAULT_TIMEOUT_MS: u64 = 4_000;
+/// 超时上限：给得再大也不许把一次探测变成"挂在设备上不退的服务"。
+pub const HOSTED_PROBE_MAX_TIMEOUT_MS: u64 = 20_000;
+/// 探测时每个流最多回传的字节数。
+///
+/// 截断只发生在**回传**，`stdout_bytes`/`stderr_bytes` 仍是进程真实写出的量——
+/// 界面必须能说清"后面还有多少没显示"，不能把截断显示成"它只输出了这些"。
+pub const MAX_HOSTED_PROBE_OUTPUT_BYTES: usize = 64 * 1024;
+/// 运行中单次持续输入的上限（跟一次性 stdin 同数量级，但这是"一句一句喂"）
+pub const MAX_HOSTED_WRITE_BYTES: usize = 64 * 1024;
+
+/// 托管进程的 stdin 现在能不能写。这个判断**只能来自设备侧**：
+/// 界面拿"我以为我起了它"来决定给不给输入框，就会出现一个吞字的假输入框。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedStdinMode {
+    /// 启动时没接管 stdin（给了 /dev/null）：永远输不进去
+    None,
+    /// Agent 持有写入端，可以持续输入
+    Open,
+    /// 一次性输入已写完并给出 EOF：再写就没了
+    Once,
+    /// 本来能写，但 Agent 重启后只剩记录、句柄已断（进程可能还在跑）
+    Lost,
+}
+
+impl HostedStdinMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Open => "open",
+            Self::Once => "once",
+            Self::Lost => "lost",
+        }
+    }
+}
+
+/// 第二层：拿一组参数把托管二进制起来一次，如实回报。
+///
+/// 候选参数（`-h`/`--help`/…）由桌面侧排好序逐条发过来，**Agent 不理解"帮助"这件事**：
+/// 它只负责"用这组 argv 起一次、看着它退、把事实带回来"。这样候选顺序以后要改、
+/// 要加自定义参数，都不用重刷设备端的 Agent。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct HostedProbeParams {
+    pub name: String,
+    /// 这一次用的完整 argv（含候选标志本身）；空数组=不带任何参数起一次
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 单候选超时（毫秒）。省略用默认，超过上限按上限取
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// 探测结果：只有设备上的客观事实，没有"这算不算帮助"的判断。
+///
+/// 为什么不猜：每个程序触发 help 后的反应差别太大（打完就退、打完不退、什么都不打、
+/// 直接进服务模式）。任何"按模板识别"的做法都会把误判当成结论。界面按事实分类，
+/// 原文一律保留给人自己看。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct HostedProbeResult {
+    /// 这次实际用的 argv（回显用）
+    pub args: Vec<String>,
+    /// false = 连进程都没起来（权限/格式/文件不存在），`detail` 带 errno
+    pub started: bool,
+    pub pid: u32,
+    /// 没退或没收到码时不占报文：界面不能把 null 当 0
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// 被信号终止时的信号号（11=SIGSEGV 这类：也是"有反应"，不是没反应）
+    /// 不是信号死的就不占报文
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// 到时间仍未退出，已由 Agent 终止
+    pub timed_out: bool,
+    pub killed: bool,
+    /// 终止后回读 `/proc` 仍在（不可中断睡眠之类）：必须让界面看见，不能装作清干净了
+    pub still_running: bool,
+    /// 非 UTF-8 输出按 lossy 转换：原文的字节数看 stdout_bytes
+    pub stdout: String,
+    pub stderr: String,
+    /// 截断**之前**进程真实写出的字节数
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    /// 回传文本是否被截断（true 时界面要说明"后面还有 N 字节没显示"）
+    pub truncated: bool,
+    pub elapsed_ms: u64,
+    /// 没有补充说明时不占报文
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// 第四层：向运行中的托管进程持续输入。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct HostedWriteParams {
+    pub handle: String,
+    pub text: String,
+    /// true = 写完这句就关闭 stdin（给出 EOF，相当于"输入结束"）
+    #[serde(default)]
+    pub close: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct HostedWriteResult {
+    pub record: HostedRunRecord,
+    pub bytes_written: u64,
+    /// 写完之后的真实状态：关闭成功后会从 open 变成 once
+    pub stdin_mode: HostedStdinMode,
+}
+
 /// AR7.2：托管二进制。Desktop 不再 `ls -l` + `file` + `nohup … & echo $!`，
 /// 生命周期与身份判定全在设备端完成。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -793,6 +921,19 @@ pub struct HostedRunRecord {
     pub start_time_ticks: u64,
     pub started_at_unix: u64,
     pub log_path: String,
+    /// 启动时带的参数数组（来自设备侧记录，不是前端记忆）。
+    ///
+    /// 为什么要进记录：端口被占、"换参数再起"这类判断全靠"当初那一条是怎么起的"；
+    /// 只存在界面上的话，软件一重启或换个窗口就没人知道了，界面上就会显示一个
+    /// "在跑但看不出用什么参数跑"的进程。root 支路靠 `hosted.adopt` 把它一起带进来。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// stdin 通道现状（决定界面上能不能给输入框）。
+    ///
+    /// 用 Option 是**有意的**：老版本 Agent 的记录里没有这个键，
+    /// "没告诉我"和"它确实没有 stdin"是两件事，前者只能显示成未知（同 AR8.3 那个教训）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_mode: Option<HostedStdinMode>,
     /// 由谁启动：Agent 只能以 shell 身份启动（root=true 的记录来自 Legacy 支路对账）
     pub root: bool,
     pub state: HostedRunState,
@@ -838,6 +979,21 @@ pub struct HostedStartParams {
     /// 参数数组直接交给 `exec`，不经过 shell；文件名与参数都不进任何解析上下文
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// 一次性 stdin：起进程后写进去然后关闭（EOF）。
+    ///
+    /// 只解决"起来问一句 y/n、要贴一行配置"这类；运行中持续输入是另一个能力
+    /// （要 `hosted.write`，且只有 Agent 亲自起、没重启过的进程才写进去）。
+    /// 上限见 Agent 侧 `MAX_STDIN_BYTES`：超限直接拒，不悄悄截断——
+    /// 截断后的 stdin 会让程序读到半句输入，比失败更难查。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_data: Option<String>,
+    /// 接管 stdin 并**保持打开**（第四层的持续输入通道）。
+    ///
+    /// 与 `stdin_data` 的区别：stdin_data 写完就 EOF，interactive_stdin 一直留着写入口。
+    /// 两者同时给时 stdin_data 先写、写完不关（照旧可继续输入）。
+    /// 只有 Agent 亲自起的进程才有这条通道，Agent 重启后句柄必断（记录里降级成 lost）。
+    #[serde(default)]
+    pub interactive_stdin: bool,
     /// 调用方要求以 root 启动：Agent 以 shell 身份运行时应显式拒绝（同 D026）
     #[serde(default)]
     pub root: bool,
@@ -860,6 +1016,13 @@ pub struct HostedAdoptParams {
     pub name: String,
     /// 启动命令回读的 pid（Legacy 的 `$!`）
     pub pid: u32,
+    /// 启动时用的参数数组，由桌面回读后登记。
+    ///
+    /// root 支路是 Legacy 起的（`su -c nohup …`），Agent 没见过那次 exec，
+    /// 不带进来记录就只剩一个 pid，界面上看不出"当初用什么参数跑的"——
+    /// 而"端口被占要不要换参数"这类判断全靠它。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
     /// 调用方声称的启动身份。**Agent 不采信**：属主按 `/proc/<pid>/status` 实测
     #[serde(default)]
     pub root: bool,
@@ -1467,6 +1630,8 @@ mod tests {
             start_time_ticks: 987654,
             started_at_unix: 1_760_000_000,
             log_path: "/data/local/tmp/.toybox.run.log".into(),
+            args: vec!["-l".into(), "a b".into()],
+            stdin_mode: Some(HostedStdinMode::Open),
             root: false,
             state: HostedRunState::Running,
             exit_code: None,
@@ -1475,12 +1640,39 @@ mod tests {
         let value = serde_json::to_value(&running).unwrap();
         assert_eq!(value["state"], "running");
         assert_eq!(value["start_time_ticks"], json!(987654));
+        // 参数是"那一条当初怎么起的"唯一的设备侧凭据：含空格的原样进数组，不靠引号魔法
+        assert_eq!(value["args"][0], "-l");
+        assert_eq!(value["args"][1], "a b");
         // 没有回收到的退出码不得出现字段，前端不能拿 null 当 0
         assert_eq!(value.get("exit_code"), None);
         assert_eq!(value.get("detail"), None);
         let parsed: HostedRunRecord = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.state, HostedRunState::Running);
         assert_eq!(parsed.exit_code, None);
+        assert_eq!(parsed.args, vec!["-l".to_string(), "a b".to_string()]);
+        assert_eq!(parsed.stdin_mode, Some(HostedStdinMode::Open));
+        // 空参数数组整个键省略：老记录不会因为新字段变长，前端也不会拿到 null
+        let bare = serde_json::to_value(HostedRunRecord {
+            args: Vec::new(),
+            stdin_mode: None,
+            ..running.clone()
+        })
+        .unwrap();
+        assert_eq!(bare.get("args"), None);
+        // stdin_mode：值是 snake_case，缺省时整个键省略。界面把 undefined 显示成
+        // "未知"、把 "none" 显示成"没有通道"——两句话不一样，序列化端也不许混。
+        assert_eq!(bare.get("stdin_mode"), None);
+        assert_eq!(
+            serde_json::to_value(HostedStdinMode::Lost).unwrap(),
+            json!("lost")
+        );
+        let from_wire: HostedRunRecord = serde_json::from_value(json!({
+            "handle": "h", "name": "toybox", "pid": 1, "start_time_ticks": 2,
+            "started_at_unix": 3, "log_path": "/l", "root": false,
+            "state": "running", "stdin_mode": "once"
+        }))
+        .unwrap();
+        assert_eq!(from_wire.stdin_mode, Some(HostedStdinMode::Once));
         assert_eq!(
             serde_json::to_value(HostedRunState::Unknown).unwrap(),
             json!("unknown")
@@ -1496,6 +1688,19 @@ mod tests {
         let value = serde_json::to_value(&params).unwrap();
         assert_eq!(value.get("args"), None, "空参数数组不占报文");
         assert_eq!(value["root"], json!(false));
+        assert_eq!(params.stdin_data, None);
+        assert_eq!(
+            value.get("stdin_data"),
+            None,
+            "没填启动输入时不占报文：调用方不传这个键也必须解得出来"
+        );
+        let with_stdin: HostedStartParams =
+            serde_json::from_value(json!({ "name": "toybox", "stdin_data": "y\n" })).unwrap();
+        assert_eq!(with_stdin.stdin_data.as_deref(), Some("y\n"));
+        // 驼峰写法在这里不被识别：等于悄悄没传，进程会拿到 /dev/null
+        let camel_stdin: HostedStartParams =
+            serde_json::from_value(json!({ "name": "toybox", "stdinData": "y" })).unwrap();
+        assert_eq!(camel_stdin.stdin_data, None);
 
         let listed = HostedListResult {
             dir: "/data/local/tmp".into(),
@@ -1701,6 +1906,16 @@ mod tests {
             !params.root,
             "root 缺省必须是 false：默认值写成 true 等于默认允许提权声称"
         );
+        assert!(params.args.is_empty());
+        // root 支路的参数只能由桌面回读后带进来：Agent 没见过那次 exec
+        let with_args: HostedAdoptParams = serde_json::from_value(json!({
+            "name": "auth-server", "pid": 3571, "args": ["-l", "127.0.0.1:27042"]
+        }))
+        .unwrap();
+        assert_eq!(
+            with_args.args,
+            vec!["-l".to_string(), "127.0.0.1:27042".to_string()]
+        );
         let camel: HostedAdoptParams =
             serde_json::from_value(json!({ "name": "x", "pid": 1, "rootClaim": true })).unwrap();
         assert!(!camel.root, "驼峰写法不被识别：会静默丢掉调用方的声称");
@@ -1721,6 +1936,78 @@ mod tests {
         // 缺 name/pid 必须直接报错，不能靠默认值凑出一个"pid 0 的记录"
         assert!(serde_json::from_value::<HostedAdoptParams>(json!({ "name": "x" })).is_err());
         assert!(serde_json::from_value::<HostedAdoptParams>(json!({ "pid": 1 })).is_err());
+    }
+
+    /// 第二层与第四层的报文形状：字段拼错会静默放宽守卫（同 D029 那类坑），
+    /// 而这两个 DTO 是**直接跨 IPC 给前端**的，没有第二套映射层。
+    #[test]
+    fn hosted_probe_and_write_wire_shape_is_snake_case() {
+        let params: HostedProbeParams =
+            serde_json::from_value(json!({ "name": "toybox", "args": ["-h"], "timeout_ms": 800 }))
+                .unwrap();
+        assert_eq!(params.timeout_ms, Some(800));
+        assert_eq!(params.args, vec!["-h".to_string()]);
+        let loose: HostedProbeParams = serde_json::from_value(json!({ "name": "toybox" })).unwrap();
+        assert!(
+            loose.args.is_empty(),
+            "不带参数也是合法形状：空 argv 起一次"
+        );
+        assert_eq!(
+            loose.timeout_ms, None,
+            "省略=由 Agent 取默认，而不是 0 毫秒"
+        );
+        let camel: HostedProbeParams =
+            serde_json::from_value(json!({ "name": "x", "timeoutMs": 800 })).unwrap();
+        assert_eq!(
+            camel.timeout_ms, None,
+            "驼峰写法不被识别：会静默变成默认超时"
+        );
+
+        let probe = HostedProbeResult {
+            args: vec!["--help".into()],
+            started: true,
+            pid: 77,
+            exit_code: Some(0),
+            signal: None,
+            timed_out: false,
+            killed: false,
+            still_running: true,
+            stdout: "Usage".into(),
+            stderr: String::new(),
+            stdout_bytes: 5_120,
+            stderr_bytes: 0,
+            truncated: true,
+            elapsed_ms: 12,
+            detail: None,
+        };
+        let value = serde_json::to_value(&probe).unwrap();
+        assert_eq!(value["still_running"], json!(true), "没杀干净必须看得见");
+        assert_eq!(
+            value["stdout_bytes"],
+            json!(5120),
+            "真实量与截断后的文本分开报"
+        );
+        assert_eq!(value["stderr_bytes"], json!(0));
+        assert_eq!(value["elapsed_ms"], json!(12));
+        assert_eq!(value["exit_code"], json!(0));
+        assert_eq!(value["truncated"], json!(true));
+        assert_eq!(value.get("detail"), None, "没有说明时不占报文");
+
+        let write: HostedWriteParams =
+            serde_json::from_value(json!({ "handle": "h1", "text": "y\n" })).unwrap();
+        assert!(
+            !write.close,
+            "close 缺省必须是 false：默认关掉输入通道等于擅自给 EOF"
+        );
+        assert_eq!(
+            serde_json::to_value(&write).unwrap()["close"],
+            json!(false),
+            "bool 要显式上线，前端才分得清 false 与没传"
+        );
+        assert!(
+            serde_json::from_value::<HostedWriteParams>(json!({ "text": "x" })).is_err(),
+            "缺 handle 不能凑出一个不知道写给谁的调用"
+        );
     }
 
     #[test]
@@ -1761,6 +2048,10 @@ mod tests {
             start_time_ticks: 987654,
             started_at_unix: 1_760_000_000,
             log_path: "/data/local/tmp/.toybox.run.log".into(),
+            args: vec!["-l".into(), "a b".into()],
+            // 故意留缺省：这条辅助函数代表"老版本 Agent 的记录"。
+            // 界面必须把"没告诉我"与"确实没有输入通道"当成两件事说
+            stdin_mode: None,
             root: false,
             state: HostedRunState::Running,
             exit_code: None,

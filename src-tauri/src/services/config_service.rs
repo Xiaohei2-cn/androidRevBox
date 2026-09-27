@@ -31,6 +31,15 @@ pub const KEY_JADX_MCP_PORT: &str = "app.tools.jadx_mcp_port";
 pub const KEY_LOCALE: &str = "app.settings.locale";
 /// Hook 脚本工作目录（P10 Frida 工作台）；空 = 未选择
 pub const KEY_HOOK_WORKDIR: &str = "app.hook.workdir";
+/// 翻译接口（UI-6 第二层的可选环节）。
+///
+/// ⚠️ `KEY_AI_API_KEY` 只存在桌面本机库里：不下发设备、不进 adb 命令行、不上日志、
+/// 不进 Git。界面读配置时只拿得到后 4 位（见 `ai_service::AiConfigView`）。
+pub const KEY_AI_BASE_URL: &str = "app.ai.base_url";
+/// ⚠️ 不在 ALLOWED_KEYS 里（见那张表的注释）：不许被 snapshot 整包带进前端。
+pub const KEY_AI_API_KEY: &str = "app.ai.api_key";
+pub const KEY_AI_MODEL: &str = "app.ai.model";
+pub const KEY_AI_ENABLED: &str = "app.ai.enabled";
 
 /// 界面语言白名单（与前端 i18n 词典文件一一对应；新增语种在此登记）
 pub const LOCALES: [&str; 5] = ["zh-CN", "en", "ru", "pt-BR", "ja"];
@@ -51,6 +60,32 @@ fn is_valid_opacity(v: &str) -> bool {
 }
 
 /// 布尔型设置：只认 "true"/"false" 两个字面量（跟前端 JSON 序列化口径一致）。
+/// 翻译接口地址：允许空（= 没配），非空必须是 https 或本机 http。
+///
+/// 这条校验和 `ai_service::validate_endpoint` 同一条规则，两处都要有：
+/// 存进去一个明文远端地址，等于把 key 裸发出去，不能等到发请求那一刻才拒。
+fn is_valid_ai_base_url(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return value.len() <= 512 && !value.chars().any(|c| c.is_ascii_whitespace());
+    }
+    let rest = lower.strip_prefix("http://").unwrap_or_default();
+    lower.starts_with("http://")
+        && (rest.starts_with("127.0.0.1")
+            || rest.starts_with("localhost")
+            || rest.starts_with("[::1]"))
+}
+
+/// 模型名：空或一段不带空白的短串（各家网关都按名字选模型，带空格一定是粘错了）
+fn is_valid_ai_model(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty() || (value.len() <= 120 && !value.chars().any(|c| c.is_ascii_whitespace()))
+}
+
 fn is_valid_bool(v: &str) -> bool {
     matches!(v, "true" | "false")
 }
@@ -101,6 +136,13 @@ const ALLOWED_KEYS: &[(&str, ValueValidator)] = &[
     (KEY_JADX_MCP_PORT, is_valid_port),
     (KEY_LOCALE, is_valid_locale),
     (KEY_HOOK_WORKDIR, is_valid_path),
+    // 翻译接口（UI-6 第二层）。这三个键的值都不敏感：地址、模型名、开关。
+    (KEY_AI_BASE_URL, is_valid_ai_base_url),
+    (KEY_AI_MODEL, is_valid_ai_model),
+    (KEY_AI_ENABLED, is_valid_bool),
+    // ⚠️ API key 故意**不进** `ALLOWED_KEYS`：`snapshot()` 就是靠这张表把配置
+    // 整包发给前端的，key 一旦进表就会被前端读到（更糟的是被顺手打进日志）。
+    // 它只能由 `ai_service` 自己按精确键名读写，对外只出后 4 位。
 ];
 
 #[derive(Clone)]
@@ -133,6 +175,24 @@ impl ConfigService {
         config_repo::set(&self.db, key, value)
     }
 
+    /// 写**敏感键**：绕过 `ALLOWED_KEYS`，但绝不允许被 `snapshot()` 带走。
+    ///
+    /// 为什么要单独开一条：这张白名单存在的意义就是"前端启动时能整包拉走"，
+    /// 而 API key 恰恰不能被整包拉走——它只能由 `ai_service` 按精确键名读写，
+    /// 对外只出后 4 位。用同一个 `set()` 写它反而会撞上这张表（撞不出语义差别，
+    /// 只会让人以为"这个键没注册"然后顺手把它加进表里，那才是真的漏）。
+    pub fn set_secret(&self, key: &str, value: &str) -> CoreResult<()> {
+        if key.trim().is_empty() {
+            return Err(CoreError::Internal("敏感键名不能为空".to_string()));
+        }
+        config_repo::set(&self.db, key, value)
+    }
+
+    /// 读敏感键；缺失返回 default。
+    pub fn get_secret(&self, key: &str, default: &str) -> CoreResult<String> {
+        Ok(config_repo::get(&self.db, key)?.unwrap_or_else(|| default.to_string()))
+    }
+
     /// 读全部白名单键（前端启动时拉取；缺失键不返回，由前端用默认值）。
     pub fn snapshot(&self) -> CoreResult<Vec<crate::models::config::AppSettingDto>> {
         let rows = config_repo::all(&self.db)?;
@@ -156,6 +216,51 @@ impl ConfigService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 纪律①的机械化：API key 绝不进 `snapshot()`。
+    ///
+    /// 前端启动时是**整包**拉配置的，所以这个键一旦被加进 `ALLOWED_KEYS`
+    /// 就等于把 key 交给 webview（以及任何顺手打印 settings 的地方）。
+    /// 这条测试故意写得像在"测试一个缺陷"：它守的是以后有人图省事把键加回表里。
+    #[test]
+    fn api_key_never_leaks_through_the_settings_snapshot() {
+        let service = ConfigService::new(Arc::new(Db::in_memory().unwrap()));
+        service
+            .set(KEY_AI_BASE_URL, "https://api.example.com/v1")
+            .expect("接口地址是普通键");
+        service
+            .set_secret(KEY_AI_API_KEY, "sk-should-never-appear-in-snapshot")
+            .expect("key 走 secret 通道");
+        let dumped = service
+            .snapshot()
+            .expect("snapshot 应可读")
+            .iter()
+            .map(|item| format!("{}={}", item.key, item.value))
+            .collect::<Vec<_>>()
+            .join(";");
+        assert!(
+            !dumped.contains("app.ai.api_key"),
+            "key 的键名都不该出现在整包配置里：{dumped}"
+        );
+        assert!(
+            !dumped.contains("sk-should-never-appear"),
+            "key 的本体更不该出现：{dumped}"
+        );
+        // 普通 set 走不通这个键：想整包读它就得显式用 get_secret
+        assert!(
+            service.set(KEY_AI_API_KEY, "x").is_err(),
+            "敏感键必须被白名单挡在 snapshot 之外"
+        );
+        assert!(service.get(KEY_AI_API_KEY, "").is_err(), "读也一样要显式");
+        assert_eq!(
+            service
+                .get_secret(KEY_AI_API_KEY, "")
+                .expect("secret 通道可读")
+                .len(),
+            "sk-should-never-appear-in-snapshot".len()
+        );
+    }
+
     use crate::db::Db;
 
     fn svc() -> ConfigService {

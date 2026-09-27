@@ -15,9 +15,9 @@ use agent_protocol::method::{
     ACTIVITY_FORCE_STOP, ACTIVITY_LAUNCH, DEVICE_INFO, DEVICE_ROOT_CHECK, FILESYSTEM_CHMOD,
     FILESYSTEM_LIST, FILESYSTEM_MKDIR, FILESYSTEM_PREVIEW, FILESYSTEM_REMOVE, FILESYSTEM_RENAME,
     FILESYSTEM_STAT, FRIDA_SERVER_START, FRIDA_SERVER_STATUS, FRIDA_SERVER_STOP, HOSTED_ADOPT,
-    HOSTED_CHMOD, HOSTED_LIST, HOSTED_START, HOSTED_STATUS, HOSTED_STOP, PACKAGE_LIST,
-    PACKAGE_NATIVE_LIB_DIR, PACKAGE_REPLACE_NATIVE_LIBRARY, PACKAGE_UNINSTALL, PROCESS_BY_PORT,
-    PROCESS_KILL, PROCESS_PORTS, PROCESS_PROC_READ,
+    HOSTED_CHMOD, HOSTED_LIST, HOSTED_PROBE, HOSTED_START, HOSTED_STATUS, HOSTED_STOP,
+    HOSTED_WRITE, PACKAGE_LIST, PACKAGE_NATIVE_LIB_DIR, PACKAGE_REPLACE_NATIVE_LIBRARY,
+    PACKAGE_UNINSTALL, PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS, PROCESS_PROC_READ,
 };
 use agent_protocol::{
     ActivityForceStopParams, ActivityLaunchParams, DeviceInfoParams, DeviceInfoResult,
@@ -28,9 +28,10 @@ use agent_protocol::{
     FilesystemStatParams, FilesystemStatResult, FridaServerStartParams, FridaServerStartResult,
     FridaServerStatusParams, FridaServerStatusResult, FridaServerStopParams, FridaServerStopResult,
     HostedAdoptParams, HostedAdoptResult, HostedBinaryInfo, HostedChmodParams, HostedChmodResult,
-    HostedListParams, HostedListResult, HostedRunRecord, HostedRunState, HostedStartParams,
-    HostedStartResult, HostedStatusParams, HostedStatusResult, HostedStopParams, HostedStopResult,
-    KillSignal, ListeningPort, PackageListParams, PackageListResult, PackageNativeLibDirParams,
+    HostedListParams, HostedListResult, HostedProbeParams, HostedProbeResult, HostedRunRecord,
+    HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams, HostedStatusResult,
+    HostedStopParams, HostedStopResult, HostedWriteParams, HostedWriteResult, KillSignal,
+    ListeningPort, PackageListParams, PackageListResult, PackageNativeLibDirParams,
     PackageNativeLibDirResult, PackageScope, PackageUninstallParams, PackageUninstallResult,
     PackageWriteResult, PortHoldingProcess, PreviewEncoding, ProcFile, ProcessByPortParams,
     ProcessByPortResult, ProcessKillParams, ProcessKillResult, ProcessPortsParams,
@@ -966,6 +967,97 @@ impl DeviceService {
 
     /// 托管运行表（Agent only）：稳定句柄 + pid + start time + 状态 + 退出码。
     /// 页面刷新或 Desktop 重启后仍能显示「谁真的在跑」，不再依赖前端本地状态。
+    /// 第二层：拿一组参数把托管二进制起来一次，只拿回**客观事实**。
+    ///
+    /// 候选参数（`-h`/`--help`/…）与"这算不算帮助"的分类都不在这里：桌面侧只管
+    /// 逐条问设备"这样跑会怎样"，Agent 也就永远不需要理解 help 的语义。
+    ///
+    /// 这条走 Agent 的写侧通道并要求 Agent 在线：它确实会在设备上起进程。
+    /// 身份总是 shell（Agent 没有 root，也不假装能提权）——必须 root 才起得来的东西
+    /// 会给出退出码与报错，那本身也是有用的事实，界面照实归类。
+    /// 探测不进运行表、不写记录，超时的候选由 Agent 连进程组一起杀掉。
+    pub async fn hosted_probe(
+        &self,
+        serial: &str,
+        name: &str,
+        args: &[String],
+        timeout_ms: Option<u64>,
+    ) -> CoreResult<HostedProbeResult> {
+        let params = HostedProbeParams {
+            name: name.to_owned(),
+            args: args.to_vec(),
+            timeout_ms,
+        };
+        // 单候选最长 20s（协议上限），RPC 侧留够余量再放宽一点：
+        // 这里超时只会让界面少一条候选结论，不该把设备侧的杀进程机会抢掉
+        let probe_timeout = std::time::Duration::from_secs(35);
+        self.require_agent_write_route(serial, HOSTED_PROBE)?;
+        let started = self
+            .android
+            .agent()
+            .request::<_, HostedProbeResult>(serial, HOSTED_PROBE, &params, probe_timeout)
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)));
+        audit_hosted_write(
+            serial,
+            HOSTED_PROBE,
+            name,
+            "agent",
+            &to_audit_summary(&started, |value| {
+                format!(
+                    "started={} exit={:?} signal={:?} timed_out={} still_running={} elapsed_ms={}",
+                    value.started,
+                    value.exit_code,
+                    value.signal,
+                    value.timed_out,
+                    value.still_running,
+                    value.elapsed_ms
+                )
+            }),
+        );
+        started
+    }
+
+    /// 第四层：向运行中的托管进程持续输入。
+    ///
+    /// 能力边界由设备侧说，不由界面猜：只有 Agent 亲自起、且 Agent 没重启过的进程
+    /// 才持有写入端。写不进去时 Agent 会带 `stdin_handle_gone` / `stdin_closed` 回来，
+    /// 界面据此把这条记录显示成"已失去输入通道"，而不是留一个吞字的假输入框。
+    pub async fn hosted_write(
+        &self,
+        serial: &str,
+        handle: &str,
+        text: &str,
+        close: bool,
+    ) -> CoreResult<HostedWriteResult> {
+        let params = HostedWriteParams {
+            handle: handle.to_owned(),
+            text: text.to_owned(),
+            close,
+        };
+        self.require_agent_write_route(serial, HOSTED_WRITE)?;
+        let wrote = self
+            .android
+            .agent()
+            .request::<_, HostedWriteResult>(serial, HOSTED_WRITE, &params, SHORT_CMD_TIMEOUT)
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)));
+        audit_hosted_write(
+            serial,
+            HOSTED_WRITE,
+            handle,
+            "agent",
+            &to_audit_summary(&wrote, |value| {
+                format!(
+                    "bytes={} stdin_mode={}",
+                    value.bytes_written,
+                    value.stdin_mode.as_str()
+                )
+            }),
+        );
+        wrote
+    }
+
     pub async fn hosted_runs(&self, serial: &str) -> CoreResult<Vec<HostedRunRecord>> {
         let route = self
             .android
@@ -1183,7 +1275,18 @@ impl DeviceService {
         serial: &str,
         name: &str,
         root: bool,
+        args: &[String],
+        stdin: Option<&str>,
+        interactive: bool,
     ) -> CoreResult<HostedRunView> {
+        // 持续输入这条路只有 Agent 起的过程走得通：su -c nohup 起来的进程 stdin 归谁
+        // 都不知道，勾了也不给——与其悄悄忽略，不如当场说清该换哪条路。
+        if root && interactive {
+            return Err(CoreError::InvalidInput(
+                "Root 支路没有输入通道（进程由 su 起，本工具不持有它的 stdin）。                 要运行中持续输入就取消 Root 走 Agent；一次性启动输入在 Root 支路照样可用"
+                    .to_string(),
+            ));
+        }
         // **启动前先查在不在跑**（用户要的口径）：不看一眼就 spawn 一个，端口被占时只会
         // 留下一条"启动后立即退出"，而真相是"它本来就在跑"。这里同时看两处：
         // 我们自己的运行表（有句柄，界面本来就显示运行中）与设备上的同名外部进程。
@@ -1198,14 +1301,17 @@ impl DeviceService {
             return Ok(view);
         }
         if root {
-            return self.hosted_run_as_root(serial, name).await;
+            return self.hosted_run_as_root(serial, name, args, stdin).await;
         }
         // AR7.2：非 root 启动走 Agent。Agent 侧用参数数组 exec，PID 与
         // `/proc/<pid>/stat` 的 start time 一起构成身份，记录落盘可跨重启对账；
         // 秒退复查改成按句柄取状态，不再靠 `sleep 0.3; kill -0` 加文件名反查。
         let params = HostedStartParams {
             name: name.to_owned(),
-            args: Vec::new(),
+            // 参数与 stdin 直交给 Agent：数组 exec，不进 shell，也就不需要转义纪律
+            args: args.to_vec(),
+            stdin_data: stdin.map(str::to_owned).filter(|t| !t.is_empty()),
+            interactive_stdin: interactive,
             root: false,
         };
         let started: CoreResult<HostedStartResult> = match self
@@ -1431,34 +1537,73 @@ impl DeviceService {
     /// `$!` 拿到的是子 shell pid 而非二进制 pid（kill/复查就全错了）；`;` 确保只有
     /// nohup 一段进后台，nohup exec 后 pid 即二进制 pid。整段经 su -c 单引号包裹：
     /// 外层 shell 不动 `&`/`$!`/重定向，由 root 内层 shell 解释（否则 su 只收到 `cd`）。
-    async fn hosted_run_as_root(&self, serial: &str, name: &str) -> CoreResult<HostedRunView> {
+    #[allow(clippy::too_many_arguments)]
+    async fn hosted_run_as_root(
+        &self,
+        serial: &str,
+        name: &str,
+        extra_args: &[String],
+        stdin: Option<&str>,
+    ) -> CoreResult<HostedRunView> {
         let root = true;
         if !adb::is_safe_hosted_name(name) {
-            return Err(CoreError::Internal(format!(
+            return Err(CoreError::InvalidInput(format!(
                 "文件名非法（仅允许字母数字与 _.-，且不以 . 开头）: {name}"
             )));
         }
+        if !extra_args.is_empty() {
+            adb::validate_carried_args(extra_args).map_err(CoreError::InvalidInput)?;
+        }
+        if stdin.is_some_and(|t| t.len() > agent_protocol::MAX_HOSTED_STDIN_BYTES) {
+            return Err(CoreError::InvalidInput(format!(
+                "启动输入超过 {} 字节上限；这里不截断，截断会让目标读到半句输入",
+                agent_protocol::MAX_HOSTED_STDIN_BYTES
+            )));
+        }
         let log = adb::hosted_run_log(name);
-        let run_cmd = adb::hosted_run_cmd(name, &log, root);
-        let args = adb::build_args(Some(serial), &adb::cmd_shell(&run_cmd));
-        let out = self.run_adb(&args).await?;
+        let carried = adb::HostedCarried {
+            args: !extra_args.is_empty(),
+            stdin: stdin.is_some_and(|t| !t.is_empty()),
+        };
+        // 先把参数/stdin 推到设备（adb push 传内容，不进任何解析上下文），再跑固定模板。
+        // 反过来做（先跑再推）会 races：nohup 起来时文件还没落盘。
+        if let Err(error) = self
+            .push_carried_files(serial, name, extra_args, stdin, carried)
+            .await
+        {
+            let _ = self.rm_carried_files(serial, name, carried).await;
+            return Err(error);
+        }
+        let run_cmd = adb::hosted_run_cmd(name, &log, carried);
+        let adb_args = adb::build_args(Some(serial), &adb::cmd_shell(&run_cmd));
+        let out = match self.run_adb(&adb_args).await {
+            Ok(out) => out,
+            Err(error) => {
+                let _ = self.rm_carried_files(serial, name, carried).await;
+                return Err(error);
+            }
+        };
         if out.exit_code != Some(0) {
             return Err(CoreError::Internal(format!(
                 "启动失败: {}",
                 out.stderr.trim()
             )));
         }
-        let pid = adb::parse_run_pid(&out.stdout).ok_or_else(|| {
-            CoreError::Internal(format!(
-                "未能解析启动 pid，输出: {}{}",
-                out.stdout.trim(),
-                if out.stderr.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("（stderr: {}）", out.stderr.trim())
-                }
-            ))
-        })?;
+        let pid = match adb::parse_run_pid(&out.stdout) {
+            Some(pid) => pid,
+            None => {
+                let _ = self.rm_carried_files(serial, name, carried).await;
+                return Err(CoreError::Internal(format!(
+                    "未能解析启动 pid，输出: {}{}",
+                    out.stdout.trim(),
+                    if out.stderr.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("（stderr: {}）", out.stderr.trim())
+                    }
+                )));
+            }
+        };
         // 存活复查（nohup 秒退场景）。root 启动的进程 shell 用户 kill -0 会
         // 得 EPERM 误判死亡，复查必须与启动同一身份。
         let check = {
@@ -1481,7 +1626,7 @@ impl DeviceService {
         }
         // AR7.7：root 支路的启动不经过 Agent，运行表里没有这条记录——不补登记的话，
         // 软件重启/切设备之后没人能证明"这是本工具起的"，它就只能显示成表外进程。
-        let (tracked, detail) = match self.hosted_adopt(serial, name, pid, root).await {
+        let (tracked, detail) = match self.hosted_adopt(serial, name, pid, extra_args, root).await {
             None => (true, None),
             Some(reason) => (
                 false,
@@ -1499,15 +1644,109 @@ impl DeviceService {
         })
     }
 
+    /// 把参数与 stdin 落成设备上的文件（内容不进命令行，见 `hosted_run_cmd` 的注释）。
+    async fn push_carried_files(
+        &self,
+        serial: &str,
+        name: &str,
+        args: &[String],
+        stdin: Option<&str>,
+        carried: adb::HostedCarried,
+    ) -> CoreResult<()> {
+        use std::io::Write as _;
+        let mut written: Vec<std::path::PathBuf> = Vec::new();
+        let result = async {
+            if carried.args {
+                let local = std::env::temp_dir().join(format!("{name}.args"));
+                let mut file = std::fs::File::create(&local).map_err(CoreError::Io)?;
+                // 一行一个参数：root 支路的模板按行还原成 argv（含空格/分号都不拆开、不执行）
+                file.write_all(&adb::hosted_args_file_bytes(args))
+                    .map_err(CoreError::Io)?;
+                written.push(local.clone());
+                self.adb_push_file(serial, &local, &adb::hosted_args_file(name))
+                    .await?;
+            }
+            if carried.stdin {
+                let local = std::env::temp_dir().join(format!("{name}.stdin"));
+                std::fs::write(&local, stdin.unwrap_or_default()).map_err(CoreError::Io)?;
+                written.push(local.clone());
+                self.adb_push_file(serial, &local, &adb::hosted_stdin_file(name))
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        for path in written {
+            let _ = std::fs::remove_file(path); // 宿主侧临时文件不留
+        }
+        result
+    }
+
+    async fn adb_push_file(
+        &self,
+        serial: &str,
+        local: &std::path::Path,
+        remote: &str,
+    ) -> CoreResult<()> {
+        let args = adb::build_args(
+            Some(serial),
+            &adb::cmd_push(&local.to_string_lossy(), remote),
+        );
+        let out = self.run_adb(&args).await?;
+        if out.exit_code != Some(0) {
+            return Err(CoreError::Internal(format!(
+                "推送 {remote} 失败: {}",
+                out.stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 清掉设备上的参数/stdin 文件。正常路径由命令体自己 `rm -f`；
+    /// 这里只兜"推成功了但没跑起来"的失败分支，不留垃圾在用户手机上。
+    async fn rm_carried_files(
+        &self,
+        serial: &str,
+        name: &str,
+        carried: adb::HostedCarried,
+    ) -> CoreResult<()> {
+        if !carried.args && !carried.stdin {
+            return Ok(());
+        }
+        let mut cmd = String::from("rm -f");
+        if carried.args {
+            cmd.push(' ');
+            cmd.push_str(&adb::hosted_args_file(name));
+        }
+        if carried.stdin {
+            cmd.push(' ');
+            cmd.push_str(&adb::hosted_stdin_file(name));
+        }
+        let args = adb::build_args(Some(serial), &adb::cmd_shell(&cmd));
+        // 收尾命令失败不改判主流程：文件内容都是我们自己写的，最多留两个隐藏文件
+        let _ = self.run_adb(&args).await?;
+        Ok(())
+    }
+
     /// AR7.7：把 Legacy 支路（尤其 `su -c nohup`）起的进程**认领**进 Agent 运行表。
     ///
     /// 返回 `None` = 登记成功；`Some(原因)` = 没登记上。后者**不能**推翻"已经启动成功"
     /// 这个事实（进程确实在跑），所以调用方只把它写进 detail，不报成失败。
     /// 认领成不成立由设备侧按 `/proc` 实证判（comm/argv0/属主/启动时刻），桌面说了不算。
-    async fn hosted_adopt(&self, serial: &str, name: &str, pid: u32, root: bool) -> Option<String> {
+    async fn hosted_adopt(
+        &self,
+        serial: &str,
+        name: &str,
+        pid: u32,
+        args: &[String],
+        root: bool,
+    ) -> Option<String> {
         let params = HostedAdoptParams {
             name: name.to_owned(),
             pid,
+            // 参数一并登记：root 支路是 Legacy 起的，Agent 没见过那次 exec，
+            // 不带进来记录就只剩 pid，界面上看不出"当初用什么参数跑的"
+            args: args.to_vec(),
             root,
         };
         match self.require_agent_write_route(serial, HOSTED_ADOPT) {
@@ -3156,6 +3395,7 @@ fn map_agent_hosted_binaries(binaries: &[HostedBinaryInfo]) -> Vec<adb::HostedBi
             size: i64::try_from(item.size).unwrap_or(i64::MAX),
             perms: item.mode_text.clone(),
             has_exec: item.has_exec,
+            mtime_unix: i64::try_from(item.mtime_unix).ok(),
             external_procs: item
                 .external_procs
                 .iter()
@@ -3653,9 +3893,25 @@ mod tests {
                 "/data/local/tmp/zz-tool: ELF 64-bit LSB pie executable\n",
             ),
         );
+        // 对照只比"两条腿都给得出的契约字段"。mtime 是 Agent 独有的：
+        // Legacy 的 `ls -l` 只有一个本地化日期串，猜成时间戳就等于拿猜测当版本指纹，
+        // 所以这里显式把它抹平后再逐项相等，并单独钉住"一边有一边没有"这个事实。
+        let comparable: Vec<adb::HostedBinary> = agent
+            .iter()
+            .cloned()
+            .map(|mut item| {
+                item.mtime_unix = None;
+                item
+            })
+            .collect();
         assert_eq!(
-            agent, legacy,
+            comparable, legacy,
             "映射必须与 Legacy 组合结果逐项相等（含按名排序）"
+        );
+        assert!(
+            agent.iter().all(|item| item.mtime_unix.is_some())
+                && legacy.iter().all(|item| item.mtime_unix.is_none()),
+            "mtime 必须是 Agent 有、Legacy 没有：界面靠它区分核对过与没核对"
         );
         assert_eq!(agent[0].name, "a with space", "带空格的文件名不能被切错列");
         assert_eq!(agent[0].perms, "-rwsr-xr-x", "setuid 位必须与 ls 一致");

@@ -134,8 +134,10 @@ async fn host_agent_full_lifecycle() {
         // AR8.4 加 package.replace_native_library、AR9.1 加 frida.server.*、
         // AR10.3 加 package.describe、AR7.4 加 filesystem 写侧四条、
         // 本轮加 process.proc_read（设备信息页按需读 /proc 详情）、
-        // AR7.7 加 hosted.adopt（把 root/Legacy 支路起的进程认领进运行表）：37 项能力。
-        assert_eq!(hello.capabilities.len(), 37);
+        // AR7.7 加 hosted.adopt（把 root/Legacy 支路起的进程认领进运行表）、
+        // UI-6 第二层加 hosted.probe（拿一组参数起来一次，只回报事实）、
+        // UI-6 第四层加 hosted.write（向自己起的进程持续输入）：39 项能力。
+        assert_eq!(hello.capabilities.len(), 39);
         // 新增的 Zygisk 单点查询：能力必须登记，且不允许由 Legacy ADB 冒充
         let describe = hello
             .capabilities
@@ -143,6 +145,18 @@ async fn host_agent_full_lifecycle() {
             .find(|capability| capability.method == agent_protocol::method::PACKAGE_DESCRIBE)
             .expect("package.describe 必须由 zygisk provider 宣告");
         assert_eq!(describe.provider, "zygisk");
+        // UI-6 的两条新能力也必须由 hosted provider 宣告，不能让别的后端冒充
+        for method in [
+            agent_protocol::method::HOSTED_PROBE,
+            agent_protocol::method::HOSTED_WRITE,
+        ] {
+            let declared = hello
+                .capabilities
+                .iter()
+                .find(|capability| capability.method == method)
+                .unwrap_or_else(|| panic!("{method} 必须登记进能力表"));
+            assert_eq!(declared.provider, "hosted", "{method} 归属写错");
+        }
         assert!(
             hello.capabilities.iter().any(|capability| capability.method
                 == agent_protocol::method::ACTIVITY_FOREGROUND

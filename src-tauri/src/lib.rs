@@ -28,6 +28,7 @@ use tauri::Manager;
 use crate::db::Db;
 use crate::services::agent_artifact::{AGENT_RESOURCE_ARM64, AgentArtifactResolver};
 use crate::services::agent_manager::AgentManager;
+use crate::services::ai_service;
 use crate::services::android_backend::{CapabilityRouter, default_legacy_capabilities};
 use crate::services::config_service::ConfigService;
 use crate::services::device_service::{AdbRunner, DeviceService, RealAdbRunner};
@@ -50,6 +51,8 @@ pub struct AppState {
     pub agent: Arc<AgentManager>,
     pub android: Arc<CapabilityRouter>,
     pub zygisk_applist: Arc<ZygiskApplistService>,
+    /// 翻译接口（只在本机发起，key 不出桌面）
+    pub ai: Arc<ai_service::AiService>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -96,6 +99,9 @@ pub fn run() {
             device.clone().start_watch();
             let zygisk_applist =
                 Arc::new(ZygiskApplistService::new(android.clone(), runner.clone()));
+
+            // 翻译服务：配置与调用都留在桌面，key 不下发设备（UI-6 第二层）
+            let ai = Arc::new(ai_service::AiService::new(config.clone()));
 
             // 4.5) EnvService：仪表盘环境/工具探测（P7），复用同一 adb runner
             let env = Arc::new(EnvService::new(
@@ -147,6 +153,7 @@ pub fn run() {
                 agent,
                 android,
                 zygisk_applist,
+                ai,
             });
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -188,7 +195,12 @@ pub fn run() {
             commands::device::device_binaries,
             commands::device::device_binary_su_check,
             commands::device::device_binary_chmod,
+            commands::ai::ai_config_get,
+            commands::ai::ai_config_set,
+            commands::ai::ai_translate,
+            commands::device::device_binary_probe,
             commands::device::device_binary_run,
+            commands::device::device_hosted_write,
             commands::device::device_binary_kill,
             commands::device::device_binary_ports,
             commands::device::device_proc_ports,

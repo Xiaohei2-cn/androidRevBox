@@ -185,6 +185,14 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
         Category::RootBranch,
         Some("候选③：模块 companion 提供跨 uid 特权读"),
     ),
+    // UI-6 第一层：root 支路的参数/stdin 走"落盘 + 固定模板按行还原"，
+    // 收尾那条 rm -f 也是 shell（正常路径由模板自己删，这里只兜"推成功但没跑起来"）
+    (
+        "src/services/device_service.rs",
+        "rm_carried_files",
+        Category::RootBranch,
+        Some("候选③：模块 companion 提供特权启动后，桌面不再自己拼这条"),
+    ),
 ];
 
 /// 期望的调用点总数（不是登记条目数：一个函数可能有 3 处调用）。
@@ -196,7 +204,7 @@ const EXPECTED_SITES_PER_CATEGORY: &[(Category, usize)] = &[
     // 固定提权脚本（先核身份再发信号），桌面侧那个 shell 调用点因此消失 —— AR12 少一项可删的
     // Legacy。这里跟着下调，是为了让"少一个回退点"也变成会被机器看见的事实，而不是悄悄发生。
     (Category::LegacyFallback, 8),
-    (Category::RootBranch, 4),
+    (Category::RootBranch, 5),
 ];
 
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {

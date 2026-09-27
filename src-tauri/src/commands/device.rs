@@ -4,8 +4,9 @@
 
 use agent_protocol::{
     FilesystemPreviewResult, FilesystemStatResult, FridaServerStartResult, FridaServerStatusResult,
-    FridaServerStopResult, HostedRunRecord, HostedStopResult, PackageUninstallResult,
-    PackageWriteResult, ProcFile, ProcessProcReadResult, ReplaceNativeLibraryResult,
+    FridaServerStopResult, HostedProbeResult, HostedRunRecord, HostedStopResult, HostedWriteResult,
+    PackageUninstallResult, PackageWriteResult, ProcFile, ProcessProcReadResult,
+    ReplaceNativeLibraryResult,
 };
 use serde::Deserialize;
 
@@ -198,10 +199,57 @@ pub async fn device_binary_run(
     serial: String,
     name: String,
     root: Option<bool>,
+    args: Option<Vec<String>>,
+    stdin_data: Option<String>,
+    interactive: Option<bool>,
 ) -> CoreResult<HostedRunView> {
     state
         .device
-        .hosted_run(&serial, &name, root.unwrap_or(false))
+        .hosted_run(
+            &serial,
+            &name,
+            root.unwrap_or(false),
+            &args.unwrap_or_default(),
+            stdin_data.as_deref(),
+            interactive.unwrap_or(false),
+        )
+        .await
+}
+
+/// 第二层：拿**一组参数**把托管二进制起来一次，只回报设备上的事实。
+///
+/// 界面上的「探测帮助」是逐条候选调它（一次一个候选），所以中断只要不再发下一条就行，
+/// 不需要额外的取消协议；每条候选的超时与杀进程组都在设备侧完成。
+/// 探测确实会在设备上起进程，因此按写操作对待：Agent 不在线就直接拒，不悄悄回退。
+#[tauri::command]
+pub async fn device_binary_probe(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    name: String,
+    args: Option<Vec<String>>,
+    timeout_ms: Option<u64>,
+) -> CoreResult<HostedProbeResult> {
+    state
+        .device
+        .hosted_probe(&serial, &name, &args.unwrap_or_default(), timeout_ms)
+        .await
+}
+
+/// 第四层：向运行中的托管进程持续输入；`close=true` 写完这句就给出 EOF。
+///
+/// 写不进去时设备侧会带 `stdin_handle_gone` / `stdin_closed` 回来，
+/// 界面据此显示"已失去输入通道"——不给一个看着能输、其实吞字的框。
+#[tauri::command]
+pub async fn device_hosted_write(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    handle: String,
+    text: String,
+    close: Option<bool>,
+) -> CoreResult<HostedWriteResult> {
+    state
+        .device
+        .hosted_write(&serial, &handle, &text, close.unwrap_or(false))
         .await
 }
 
