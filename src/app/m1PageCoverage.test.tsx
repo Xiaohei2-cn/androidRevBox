@@ -260,6 +260,33 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     await waitFor(() => expect(device.hostedRuns).toHaveBeenCalled());
     expect(await screen.findByText(/25265/)).toBeTruthy();
     expect(await screen.findByText("终止")).toBeTruthy();
+    // 关键：设备说"在跑"时「终止」必须是**可点**的。曾经 running 一个字段兼作两用
+    // （设备在跑 / 我的指令在途），于是按钮 disabled={row.running} 把在跑的行的终止
+    // 自己禁成灰色 —— 用户报的"发现托管进程在跑但停不掉"就是它。
+    expect(screen.getByTestId("kill-frida-server")).toBeEnabled();
+    expect(screen.queryByTestId("run-frida-server")).toBeNull(); // 在跑不该再给「执行」
+    // 真点一下：按钮必须是活的，按 handle 停止要真的被调用
+    device.hostedStop.mockResolvedValue({
+      record: {
+        handle: "0ecceabebed36d76",
+        name: "frida-server",
+        pid: 25265,
+        start_time_ticks: 22_981_210,
+        started_at_unix: 1_755_000_000,
+        log_path: "/data/local/tmp/.frida-server.run.log",
+        root: false,
+        state: "exited",
+        exit_code: 0,
+        detail: null,
+      },
+      outcome: "signaled",
+      identity_verified: true,
+      record_dropped: true,
+    });
+    fireEvent.click(screen.getByTestId("kill-frida-server"));
+    await waitFor(() =>
+      expect(device.hostedStop).toHaveBeenCalledWith("PIXEL-1", "0ecceabebed36d76", 25265),
+    );
     // 按 handle + start time 停止那段真实链路在 AR7.3 真机腿里验
     // （real_agent_hosted_lifecycle_handles_identity_and_reaping），
     // 页面测试不重复假装覆盖了它。

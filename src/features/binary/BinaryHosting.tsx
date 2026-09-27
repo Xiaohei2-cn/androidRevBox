@@ -49,7 +49,14 @@ interface HostedRow {
   /** Agent 运行表里的稳定句柄；有它才能按 handle + start time 停止（AR7.3） */
   handle: string | null;
   pid: number | null;
+  /** 设备侧运行表说它在跑（事实态，来自 hosted.list 的 runs，不是本地猜测） */
   running: boolean;
+  /**
+   * 我们正在发指令（启动/终止在途）。以前只有 running 一个字段，
+   * 于是"设备说它在跑"把「终止」按钮自己禁掉了 —— 用户报的正是这个：
+   * 发现托管进程在跑，但终止是灰的，永远停不掉。
+   */
+  busy: boolean;
   error: string | null;
   /** 启动时所用的 root 上下文：kill/后续操作必须同身份 */
   root: boolean;
@@ -169,7 +176,7 @@ export function BinaryHosting() {
             tracked: true,
           };
         }
-        if (!live && row.pid !== null && !row.tracked && !row.running) {
+        if (!live && row.pid !== null && !row.tracked && !row.busy) {
           /*
            * 这个 pid 只是桌面手里的一个数（Legacy 支路当场读到的 $!），而设备表里查不到
            * 对应的活记录 —— 它要么已经退了，要么压根没登记上。继续摆着就成了
@@ -179,8 +186,9 @@ export function BinaryHosting() {
           return { ...row, pid: null, tracked: false, ports: [] };
         }
         const last = mine[0];
-        if (last && last.state === "exited" && row.running) {
-          return { ...row, running: false, pid: last.pid };
+        if (last && last.state === "exited" && row.busy) {
+          // 刚点过启动，结果它秒退：收掉在途标记，别一直转圈
+          return { ...row, busy: false, running: false, pid: last.pid };
         }
         return row;
       });
@@ -194,6 +202,7 @@ export function BinaryHosting() {
           // 从设备运行表补进来的行：这条当然是设备认得的
           tracked: true,
           running: true,
+          busy: false,
           error: null,
           root: run.root,
           ports: [],
@@ -222,6 +231,7 @@ export function BinaryHosting() {
               pid: null,
               tracked: false,
               running: false,
+              busy: false,
               error: null,
               root: false,
               ports: [],
@@ -283,16 +293,18 @@ export function BinaryHosting() {
   };
 
   const run = async (row: HostedRow) => {
-    if (!deviceSerial || row.running) return;
+    // 只挡"在途请求"：绝不能拿 running（设备说它在跑）当守卫 —— 那正是上一轮把
+    // 「终止」按钮禁成灰色的同一个混淆。
+    if (!deviceSerial || row.busy) return;
     // 启动身份 = 点击瞬间的 Root 开关；写回本行，kill/复查永远同链路
     const asRoot = root;
-    patchRow(row.name, { running: true, error: null, root: asRoot });
+    patchRow(row.name, { busy: true, error: null, root: asRoot });
     try {
       const result = await deviceApi.binaryRun(deviceSerial, row.name, asRoot);
       if (!result.started) {
         // 启动前的检查拦下了：它本来就在跑。这里不报红、也不谎称"已启动"，
         // 而是刷新清单让「已在运行」显示出来，按钮随之变成「停止进程」。
-        patchRow(row.name, { running: false, error: null });
+        patchRow(row.name, { busy: false, error: null });
         setNotice(result.detail ?? t("adb.binary.alreadyRunning", { pids: String(result.pid) }));
         void refetch();
         return;
@@ -306,7 +318,8 @@ export function BinaryHosting() {
       patchRow(row.name, {
         pid,
         tracked: result.tracked,
-        running: false,
+        running: true,
+        busy: false,
         ports: [],
         error: null,
       });
@@ -318,7 +331,7 @@ export function BinaryHosting() {
       void loadPorts(row.name, pid, asRoot);
       window.setTimeout(() => void loadPorts(row.name, pid, asRoot), 3000);
     } catch (e) {
-      patchRow(row.name, { running: false, error: String((e as Error)?.message ?? e) });
+      patchRow(row.name, { busy: false, error: String((e as Error)?.message ?? e) });
     }
   };
 
@@ -350,8 +363,8 @@ export function BinaryHosting() {
   };
 
   const kill = async (row: HostedRow) => {
-    if (!deviceSerial || row.pid === null) return;
-    patchRow(row.name, { running: true, error: null });
+    if (!deviceSerial || row.pid === null || row.busy) return;
+    patchRow(row.name, { busy: true, error: null });
     try {
       if (row.handle && !row.root) {
         const stopped = await deviceApi.hostedStop(
@@ -364,6 +377,8 @@ export function BinaryHosting() {
           patchRow(row.name, {
             pid: null,
             running: false,
+            busy: false,
+            tracked: false,
             ports: [],
             error: t("adb.binary.stopUnverified", {
             name: row.name,
@@ -392,13 +407,14 @@ export function BinaryHosting() {
         handle: null,
         pid: null,
         running: false,
+        busy: false,
         ports: [],
         tracked: false,
         error: t("adb.binary.killed", { pid: row.pid }),
       });
       void refetchRuns();
     } catch (e) {
-      patchRow(row.name, { running: false, error: String((e as Error)?.message ?? e) });
+      patchRow(row.name, { busy: false, error: String((e as Error)?.message ?? e) });
     }
   };
 
@@ -561,11 +577,18 @@ export function BinaryHosting() {
                         <Button
                           size="sm"
                           variant="outline"
+                          data-testid={`kill-${row.name}`}
                           className="h-6 shrink-0 gap-1 px-2 text-destructive"
-                          disabled={row.running}
+                          // 在跑 ≠ 不能停：只有指令在途（转圈）时才禁，否则"发现托管进程在跑
+                          // 却停不掉"就是自相矛盾的灰色按钮（用户实测到的那个 bug）
+                          disabled={row.busy}
                           onClick={() => void kill(row)}
                         >
-                          <Square className="h-3 w-3" />
+                          {row.busy ? (
+                            <RefreshCw className="h-3 w-3 animate-spin" />
+                          ) : (
+                            <Square className="h-3 w-3" />
+                          )}
                           {t("adb.binary.kill")}
                         </Button>
                       ) : firstOutsider !== null ? (
@@ -595,14 +618,14 @@ export function BinaryHosting() {
                           variant="outline"
                           className="h-6 shrink-0 gap-1 px-2"
                           data-testid={`run-${row.name}`}
-                          disabled={row.running || bin?.hasExec === false}
+                          disabled={row.busy || bin?.hasExec === false}
                           onClick={(event) => {
                             event.stopPropagation();
                             void run(row);
                           }}
                         >
-                          {row.running ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />}
-                          {row.running ? t("adb.binary.starting") : t("adb.binary.execute")}
+                          {row.busy ? <RefreshCw className="h-3 w-3 animate-spin" /> : <Play className="h-3 w-3" />}
+                          {row.busy ? t("adb.binary.starting") : t("adb.binary.execute")}
                         </Button>
                       )}
                       {row.pid !== null && (
