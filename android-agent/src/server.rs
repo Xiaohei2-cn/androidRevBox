@@ -14,7 +14,16 @@ use tokio::task::JoinSet;
 
 use crate::router::Router;
 
-pub async fn serve_connection<S>(stream: S, router: Arc<Router>) -> std::io::Result<()>
+/// 服务一条连接。
+///
+/// `presence` 是**已鉴权客户端在场计数**的登记处（AR12.7）：只有 `system.hello` 通过之后
+/// 才算"有人在用"。握手失败或被拒的连接既不算在场、也不影响宽限期——
+/// 否则任何人拿 socket 连一下就能操纵 Agent 的死活。
+pub async fn serve_connection<S>(
+    stream: S,
+    router: Arc<Router>,
+    presence: Arc<crate::presence::ClientPresence>,
+) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -45,6 +54,9 @@ where
     if !authenticated {
         return Ok(());
     }
+    // 从这里到函数结束的**所有**出口（正常 EOF、读错误、被 abort）都必须释放在场登记，
+    // 所以用守卫而不是手写两次 decrement：漏一次就是 Agent 永不退场。
+    let _attendance = presence.attend();
 
     let mut active = JoinSet::new();
     loop {
@@ -165,6 +177,11 @@ mod tests {
     use crate::system_router;
 
     use super::*;
+    use crate::presence::ClientPresence;
+
+    fn presence() -> Arc<ClientPresence> {
+        Arc::new(ClientPresence::new())
+    }
 
     fn request(method: &str, params: serde_json::Value) -> RequestEnvelope {
         request_with_timeout(method, params, 1_000)
@@ -263,7 +280,7 @@ mod tests {
     #[tokio::test]
     async fn requires_authenticated_hello_before_other_methods() {
         let (mut client, server) = tokio::io::duplex(8 * 1024);
-        let task = tokio::spawn(serve_connection(server, router()));
+        let task = tokio::spawn(serve_connection(server, router(), presence()));
         write_message(
             &mut client,
             &request(SYSTEM_HEALTH, serde_json::json!(EmptyParams {})),
@@ -281,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn hello_then_health_share_one_connection() {
         let (mut client, server) = tokio::io::duplex(8 * 1024);
-        let task = tokio::spawn(serve_connection(server, router()));
+        let task = tokio::spawn(serve_connection(server, router(), presence()));
         authenticate(&mut client).await;
 
         write_message(
@@ -301,7 +318,11 @@ mod tests {
     #[tokio::test]
     async fn concurrent_requests_can_respond_out_of_order() {
         let (mut client, server) = tokio::io::duplex(8 * 1024);
-        let task = tokio::spawn(serve_connection(server, router_with_delay_provider()));
+        let task = tokio::spawn(serve_connection(
+            server,
+            router_with_delay_provider(),
+            presence(),
+        ));
         authenticate(&mut client).await;
 
         write_message(&mut client, &request("test.slow", serde_json::json!({}))).await;
@@ -318,7 +339,11 @@ mod tests {
     #[tokio::test]
     async fn provider_deadline_returns_structured_error() {
         let (mut client, server) = tokio::io::duplex(8 * 1024);
-        let task = tokio::spawn(serve_connection(server, router_with_delay_provider()));
+        let task = tokio::spawn(serve_connection(
+            server,
+            router_with_delay_provider(),
+            presence(),
+        ));
         authenticate(&mut client).await;
 
         write_message(
@@ -333,5 +358,47 @@ mod tests {
         assert_eq!(error.code, ErrorCode::DeadlineExceeded);
         drop(client);
         task.await.unwrap().unwrap();
+    }
+
+    /// **未鉴权的连接不算在场**（AR12.7 的边界）：否则任意进程连一下这个端口
+    /// 就能让 Agent 永远不退出，或者反过来把宽限期挤掉。
+    #[tokio::test]
+    async fn unauthenticated_connection_does_not_count_as_present() {
+        let (mut client, server) = tokio::io::duplex(8 * 1024);
+        let tracker = presence();
+        let task = tokio::spawn(serve_connection(server, router(), tracker.clone()));
+        write_message(
+            &mut client,
+            &request(
+                SYSTEM_HELLO,
+                serde_json::to_value(HelloParams::v1("wrong-token", "desktop-test")).unwrap(),
+            ),
+        )
+        .await;
+        let response: ResponseEnvelope = read_message(&mut client).await.unwrap();
+        assert!(matches!(response.payload, ResponsePayload::Failure { .. }));
+        drop(client);
+        task.await.unwrap().unwrap();
+        assert_eq!(tracker.live(), 0, "握手失败不该登记在场");
+    }
+
+    /// 鉴权成功 → 在场；客户端那条 socket 关掉（桌面被 kill 就是这个形状）→ 归零。
+    /// 这条就是"桌面进程死了之后 Agent 能自己走"的前提。
+    #[tokio::test]
+    async fn present_while_authenticated_and_gone_when_the_client_leaves() {
+        let (mut client, server) = tokio::io::duplex(8 * 1024);
+        let tracker = presence();
+        let task = tokio::spawn(serve_connection(server, router(), tracker.clone()));
+        authenticate(&mut client).await;
+        for _ in 0..40 {
+            if tracker.live() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(tracker.live(), 1, "已鉴权客户端必须算在场");
+        drop(client);
+        task.await.unwrap().unwrap();
+        assert_eq!(tracker.live(), 0, "客户端走了必须归零，否则 Agent 永不退场");
     }
 }

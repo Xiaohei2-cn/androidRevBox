@@ -156,6 +156,19 @@ pub fn run() {
 
             let pty = Arc::new(PtyService::new());
 
+            // 陈旧 adb forward 清扫（AR12.3 补齐 + AR12.7 配套）：adb server 比 App 活得久，
+            // 被 kill 掉的那一任留下的规则一直挂在 `adb forward --list` 里。启动时扫一次，
+            // 不阻塞 setup，也不因为"没扫干净"让任何流程失败。
+            {
+                let swept = agent.clone();
+                tauri::async_runtime::spawn(async move {
+                    let removed = swept.sweep_stale_forwards().await;
+                    if !removed.is_empty() {
+                        tracing::info!(count = removed.len(), rules = ?removed, "清掉了上一任桌面进程留下的 Agent 转发");
+                    }
+                });
+            }
+
             app.manage(AppState {
                 config: config.clone(),
                 log,
@@ -277,6 +290,17 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // 先放掉自己的 adb forward（AR12.7 配套）。不停 Agent：它会在宽限期后自己走，
+                // 桌面抢着 kill 它就把「重启工具」变成「打断正在分析的目标进程」。
+                // 退出路径上不能无限等：adb 卡住时给 2 s 预算，超时就放弃（规则留着，
+                // 下一次启动的清扫会收掉——那才是它的归宿）。
+                if let Some(state) = app.try_state::<AppState>() {
+                    let manager = state.agent.clone();
+                    let _ = tauri::async_runtime::block_on(tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        manager.release_forwards(),
+                    ));
+                }
                 // 插件 shutdown 先于动态库关闭（loaded 表随 state drop 也兜底）
                 if let Some(state) = app.try_state::<AppState>() {
                     state.plugins.unload_all();

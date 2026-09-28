@@ -16,6 +16,36 @@ const AGENT_REMOTE_PID: &str = "/data/local/tmp/app_reverse_tools_agent.pid";
 const AGENT_REMOTE_LOG: &str = "/data/local/tmp/app_reverse_tools_agent.log";
 const AGENT_REMOTE_ROLLBACK: &str = "/data/local/tmp/app_reverse_tools_agent.rollback";
 const AGENT_REMOTE_SESSION_PREFIX: &str = "/data/local/tmp/.app_reverse_tools_agent";
+/// 设备上 Agent 的**空闲宽限期**：最后一个已鉴权客户端消失多久之后，Agent 自己退场。
+///
+/// 为什么要有这条（AR12.7 / D088）：`is_running` 只能回答"有没有这个进程在跑"，
+/// 回答不了"有没有人在用"。于是桌面重启之后，新会话看到的永远是"别人在跑"（其实那是
+/// 上一任死掉的自己留下的），只能让人手点一次「重启并接管」。把这条事实交给唯一知道
+/// 它的 Agent 自己处理，桌面就不用在猜与误杀之间二选一。
+///
+/// **30 s 是两边共用的数字**：Agent 侧的默认值在 `android-agent/src/main.rs`
+/// （`DEFAULT_IDLE_EXIT_SECS`），桌面侧"看到有人在跑就多久回来看一眼"用的也是这个值 + 余量。
+/// 有一台测试专门盯着两处一致（`src-tauri/tests/agent_idle_exit_agreement.rs`）。
+///
+/// 为什么不取 10 s：一次正常的 App 重启（含重新起 adb forward）就可能几十秒，
+/// 太短会让 Agent 在重启中途退出，把 forward 那一头的会话一起打掉。
+pub const AGENT_IDLE_EXIT_SECS: u64 = 30;
+
+/// 真实测试里等 30 s 太久，允许用环境变量压短（**只影响测试**；默认值仍是上面的 30）。
+pub fn agent_idle_exit_secs() -> u64 {
+    std::env::var("APP_REVERSE_TOOLS_TEST_AGENT_IDLE_EXIT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(AGENT_IDLE_EXIT_SECS)
+}
+
+/// 自动连接看到"有人在跑"之后，多久回来看一眼。= 宽限期 + 15 s 余量
+/// （余量是给设备侧调度、adb 往返和 Agent 自己收尾留的；没有余量就会出现
+/// "我们回去看的那一刻它还没退"这种反复）。
+pub fn agent_takeover_recheck_delay() -> Duration {
+    Duration::from_secs(agent_idle_exit_secs() + 15)
+}
+
 const SHORT_TIMEOUT: Duration = Duration::from_secs(10);
 const PUSH_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -322,8 +352,11 @@ impl AgentBootstrap {
             return Err(error);
         }
 
+        // --idle-exit-secs：见 AGENT_IDLE_EXIT_SECS 的注释。不带上它，Agent 会按自己的
+        // 默认值活着，而桌面还在按"它到点会自己走"的假设安排复看时间——两边必须同源。
         let start_command = format!(
-            "nohup {AGENT_REMOTE_BINARY} --localabstract {AGENT_ABSTRACT_SOCKET} --auth-token-file {remote_token_path} >{AGENT_REMOTE_LOG} 2>&1 </dev/null & echo $! >{AGENT_REMOTE_PID}; chmod 600 {AGENT_REMOTE_LOG} {AGENT_REMOTE_PID}"
+            "nohup {AGENT_REMOTE_BINARY} --localabstract {AGENT_ABSTRACT_SOCKET} --auth-token-file {remote_token_path} --idle-exit-secs {} >{AGENT_REMOTE_LOG} 2>&1 </dev/null & echo $! >{AGENT_REMOTE_PID}; chmod 600 {AGENT_REMOTE_LOG} {AGENT_REMOTE_PID}",
+            agent_idle_exit_secs()
         );
         if let Err(error) = self
             .run_checked(
@@ -359,6 +392,75 @@ impl AgentBootstrap {
             AgentBootstrapError::InvalidForwardPort(output.stdout.trim().to_owned())
         })?;
         Ok((format!("tcp:{port}"), port))
+    }
+
+    /// 清掉**上一任桌面进程留下的** `adb forward` 规则（AR12.3 缺的那一半）。
+    ///
+    /// 现状是：每个会话只记得自己那一条（`session.forward`），进程被 kill 或崩溃时
+    /// 规则留在 adb server 里（adb server 活得比 App 久），于是一台机器上能积到 8 条
+    /// 指向同一 abstract socket 的规则。危害有两处：端口转发页把它们列成本设备的规则，
+    /// 以及规则数无上限地涨。
+    ///
+    /// `keep` 是**当前还活着的会话**持有的端口——启动时它为空，所以会清掉全部；
+    /// 这样"同时开两个实例"时后启动的那个会把前一个的转发打掉一次，
+    /// 前一个会按 transport loss 自己重连（这条代价写在文档 §10 与本轮记录里，不是秘密）。
+    /// 返回值是"被清掉的规则"，供调用方记日志/测试断言。
+    /// 清扫本身**不是关键路径**：adb 不可用、列不出来、删不掉都只记一条 warn，
+    /// 不能因为"没扫干净"就把设备连接或启动流程失败掉。
+    pub async fn sweep_agent_forwards(&self, keep: &[(String, u16)]) -> Vec<String> {
+        let environment = self.runner.environment().await;
+        let Some(path) = environment.path else {
+            return Vec::new();
+        };
+        let output = match self
+            .runner
+            .run(
+                &path,
+                &adb::build_args(None, &adb::cmd_forward_list()),
+                SHORT_TIMEOUT,
+            )
+            .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                tracing::warn!(error = %error, "列 adb forward 失败，跳过陈旧转发清扫");
+                return Vec::new();
+            }
+        };
+        let keep: std::collections::HashSet<(String, u16)> = keep.iter().cloned().collect();
+        let mut removed = Vec::new();
+        for (serial, local, remote) in adb::parse_forward_list(&output.stdout) {
+            if remote != format!("localabstract:{AGENT_ABSTRACT_SOCKET}") {
+                // 别人（frida、其它工具）的转发一概不碰
+                continue;
+            }
+            let port = local
+                .strip_prefix("tcp:")
+                .and_then(|v| v.parse::<u16>().ok());
+            if port.is_some_and(|port| keep.contains(&(serial.clone(), port))) {
+                continue;
+            }
+            let removed_rule = format!("{serial} {local}");
+            match self
+                .runner
+                .run(
+                    &path,
+                    &adb::build_args(Some(&serial), &adb::cmd_forward_remove(Some(&local))),
+                    SHORT_TIMEOUT,
+                )
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(serial, local, "清掉一条没有主人认领的 Agent 转发规则");
+                    removed.push(removed_rule);
+                }
+                Err(error) => {
+                    // 删不掉不算错（规则可能已经随 adbd 一起没了），但要知道它还在
+                    tracing::debug!(serial, local, error = %error, "陈旧转发删不掉（可能已随 adbd 消失）");
+                }
+            }
+        }
+        removed
     }
 
     pub async fn remove_forward(
@@ -655,6 +757,80 @@ mod tests {
             stderr: String::new(),
             exit_code: Some(0),
         }
+    }
+
+    /// 宽限期是**桌面传给 Agent** 的（Agent 侧默认值只是兜底）。这条腿钉住参数名：
+    /// 一旦被改，Agent 会静默按自己的默认值跑，而桌面还按老数字「回来看一眼」——
+    /// 那种错只表现为「还是要人手点一次接管」，没人会怀疑到参数名上。
+    #[tokio::test]
+    async fn start_passes_the_idle_exit_grace_to_the_agent() {
+        let runner = Arc::new(RecordingRunner::new(vec![
+            ok(""),
+            ok("1 file pushed"),
+            ok(""),
+            ok(""),
+            ok("4321"),
+        ]));
+        let bootstrap = AgentBootstrap::new(runner.clone());
+        bootstrap.start("SERIAL-1").await.unwrap();
+        let commands = runner.commands.lock().unwrap();
+        let script = commands
+            .iter()
+            .map(|args| args.join(" "))
+            .collect::<Vec<_>>()
+            .join(" ~ ");
+        let flag = format!("--idle-exit-secs {}", agent_idle_exit_secs());
+        assert!(
+            script.contains(&flag),
+            "起 Agent 的命令必须带上宽限期: {script}"
+        );
+    }
+
+    /// 陈旧转发清扫的边界：**只碰我们自己那条 abstract socket 的规则**，且不许动
+    /// 「当前会话还记着的那一条」。误删别人的转发（frida 等）是不可接受的越界。
+    #[tokio::test]
+    async fn sweep_only_removes_unclaimed_agent_socket_rules() {
+        let ours = format!("localabstract:{AGENT_ABSTRACT_SOCKET}");
+        let list = [
+            format!("SERIAL-1 tcp:5000 {ours}"),
+            format!("SERIAL-1 tcp:6000 {ours}"),
+            "SERIAL-1 tcp:7000 localabstract:somebody_elses".to_string(),
+            format!("OTHER-2 tcp:8000 {ours}"),
+        ]
+        .join("\n");
+        let runner = Arc::new(RecordingRunner::new(vec![
+            ok(&list),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]));
+        let bootstrap = AgentBootstrap::new(runner.clone());
+        // 6000 是当前会话自己的；5000 与另一台设备上的 8000 是无主残留
+        let removed = bootstrap
+            .sweep_agent_forwards(&[("SERIAL-1".to_string(), 6000)])
+            .await;
+        assert_eq!(
+            removed,
+            vec![
+                "SERIAL-1 tcp:5000".to_string(),
+                "OTHER-2 tcp:8000".to_string()
+            ],
+            "该清的是无主的 Agent 规则，一条不多一条不少: {removed:?}"
+        );
+        let commands = runner.commands.lock().unwrap();
+        let joined = commands
+            .iter()
+            .map(|args| args.join(" "))
+            .collect::<Vec<_>>()
+            .join(" ~ ");
+        assert!(joined.contains("--remove tcp:5000"), "{joined}");
+        assert!(joined.contains("--remove tcp:8000"), "{joined}");
+        assert!(
+            !joined.contains("--remove tcp:6000"),
+            "当前会话自己的转发不许被清掉: {joined}"
+        );
+        assert!(!joined.contains("tcp:7000"), "别人的转发一概不碰: {joined}");
+        assert!(!joined.contains("--remove-all"), "清扫必须逐条删: {joined}");
     }
 
     #[tokio::test]

@@ -2860,6 +2860,32 @@ impl DeviceService {
                 if let Err(error) = app.emit(evt.event, &evt) {
                     tracing::debug!(error = %error, "推送 Agent 自动连接事件失败");
                 }
+                // 「有人在跑，但不是本程序连的」这一支不能就此收尾（AR12.7 的配套）。
+                // 宽限期是 Agent 自己的存活策略：到点它自己走。所以这里**按同一个数字
+                // 回来看一眼**——那时孤儿 Agent 已经退场，探测会得到"装了没在跑"，
+                // 于是自动接上，不必人手点「重启并接管」。
+                // 数字两边共用 `agent_bootstrap::AGENT_IDLE_EXIT_SECS`（+ 余量），
+                // 有一台测试盯着它与 Agent 侧默认值一致。
+                if let Some(delay) = agent_recheck_delay_for(&run) {
+                    tracing::info!(
+                        serial,
+                        secs = delay.as_secs(),
+                        "有人在跑但不是本程序连的：等 Agent 的宽限期过了再回来看一眼"
+                    );
+                    tokio::time::sleep(delay).await;
+                    let second = service.auto_connect(&serial).await;
+                    tracing::info!(
+                        serial,
+                        outcome = ?second.outcome,
+                        decision = ?second.probe.decision,
+                        action = ?second.probe.action,
+                        "Agent 自动连接复看落点"
+                    );
+                    let evt = AppEvent::new(event_names::AGENT_AUTO, &second);
+                    if let Err(error) = app.emit(evt.event, &evt) {
+                        tracing::debug!(error = %error, "推送 Agent 自动连接事件失败");
+                    }
+                }
             });
         }
     }
@@ -2926,6 +2952,17 @@ fn plan_install_inputs(apks: &[String]) -> Result<InstallInputs, String> {
         (1, _) => Err(".apks 已经是完整的一套，不能和其它 APK 混选；请只选这个容器".to_owned()),
         (many, _) => Err(format!("一次只能装一个 .apks 容器，收到 {many} 个")),
     }
+}
+
+/// 「看到有人在跑」之后要不要延后复看、复看前等多久（AR12.7 的配套判断，纯函数）。
+///
+/// 只有 `explicit_takeover` 这一支需要：那是"设备上有个 Agent，但不是本程序连的"，
+/// 而现在 Agent 会在宽限期后自己退场，所以等同一个数字 + 余量再回来看一次就能自动接上。
+/// 其它动作（要授权、装不上、已连上、已在途）都不该排第二次探测——
+/// 尤其是 `blocked`：那是硬前置不满足，等多久都不会变，多探一次只是多骚扰设备。
+fn agent_recheck_delay_for(run: &crate::models::agent::AgentAutoRun) -> Option<Duration> {
+    (run.probe.action == crate::models::agent::AgentAutoAction::ExplicitTakeover)
+        .then(crate::adapters::agent_bootstrap::agent_takeover_recheck_delay)
 }
 
 /// Agent 不在时给界面的那一句话（第七十二轮从 `require_agent_route` 里抽成纯函数）。
@@ -3999,6 +4036,49 @@ mod tests {
     ///    却没写 label，界面就只剩一句废话）；② 必须给出那一个动作「安装并连接」；
     /// ③ 句子里不许有换行 + 缩进空格 —— 旧写法把源码缩进带进了界面，在
     /// 「安装并连接」后面断出一行空白，而没有任何测试会因此变红。
+    /// 「什么时候该自动回来看一眼」这条判断决定用户还要不要人手点一次「重启并接管」，
+    /// 所以它不能藏在 tokio::spawn 的闭包里。判据只有一条：只有 explicit_takeover 值得等。
+    #[test]
+    fn only_the_running_elsewhere_branch_schedules_a_recheck() {
+        use crate::models::agent::{AgentAutoAction, AgentAutoRun, AgentProbe, AgentProbeDecision};
+        let run_with = |action| AgentAutoRun {
+            serial: "S".into(),
+            outcome: crate::models::agent::AgentAutoOutcome::DeferredTakeover,
+            error: None,
+            probe: AgentProbe {
+                serial: "S".into(),
+                decision: AgentProbeDecision::RunningElsewhere,
+                action,
+                device_abi: Some("arm64-v8a".into()),
+                installed_sha256: None,
+                expected_sha256: None,
+                agent_running: true,
+                consent_granted: true,
+                auto_enabled: true,
+                detail: None,
+                probed_at: 0,
+            },
+        };
+        let delay = agent_recheck_delay_for(&run_with(AgentAutoAction::ExplicitTakeover))
+            .expect("有人在跑但不是本程序连的：必须安排一次复看");
+        assert!(
+            delay.as_secs() >= 30,
+            "复看必须晚于 Agent 自己的宽限期，否则回去看还是同一个答案: {delay:?}"
+        );
+        for action in [
+            AgentAutoAction::None,
+            AgentAutoAction::AskConsent,
+            AgentAutoAction::ConnectingAllowed,
+            AgentAutoAction::Blocked,
+        ] {
+            assert_eq!(
+                agent_recheck_delay_for(&run_with(action)),
+                None,
+                "{action:?} 不该排第二次探测（blocked 是硬前置不满足，等多久都不会变）"
+            );
+        }
+    }
+
     #[test]
     fn offline_guidance_names_the_action_without_stray_whitespace() {
         for method in [

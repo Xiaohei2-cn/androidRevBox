@@ -463,6 +463,57 @@ impl AgentManager {
         }
     }
 
+    /// 本进程当前**记在自己账上**的转发规则 `(serial, 本地端口)`。
+    /// 启动时它是空的，所以清扫会把所有指向 Agent abstract socket 的规则都当成无主物。
+    pub fn owned_forwards(&self) -> Vec<(String, u16)> {
+        self.sessions
+            .lock()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .filter_map(|(serial, session)| {
+                        let local = session.forward.lock().ok().and_then(|held| held.clone())?;
+                        let port = local.strip_prefix("tcp:")?.parse::<u16>().ok()?;
+                        Some((serial.clone(), port))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 扫掉上一任桌面进程留下的转发规则（AR12.3 缺的那一半）。见 `AgentBootstrap::sweep_agent_forwards`。
+    pub async fn sweep_stale_forwards(&self) -> Vec<String> {
+        let keep = self.owned_forwards();
+        self.bootstrap.sweep_agent_forwards(&keep).await
+    }
+
+    /// 进程退出前放掉自己那些转发规则。**不停 Agent**——AR12.7 之后 Agent 会在宽限期后
+    /// 自己退场，桌面抢着 kill 它反而会把"重启工具=打断正在跑的东西"这个坏行为带回来。
+    /// 返回放掉了几条。
+    pub async fn release_forwards(&self) -> usize {
+        let sessions: Vec<(String, Arc<DeviceSession>)> = match self.sessions.lock() {
+            Ok(guard) => guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            Err(_) => return 0,
+        };
+        let mut released = 0;
+        for (serial, session) in sessions {
+            let local = session
+                .forward
+                .lock()
+                .map(|mut held| held.take())
+                .ok()
+                .flatten();
+            let Some(local) = local else { continue };
+            match self.bootstrap.remove_forward(&serial, &local).await {
+                Ok(()) => released += 1,
+                Err(error) => {
+                    tracing::debug!(serial, local, error = %error, "退出时放掉转发失败（adb 可能已经先走）");
+                }
+            }
+        }
+        released
+    }
+
     pub fn status(&self, serial: &str) -> AgentSessionStatus {
         self.sessions
             .lock()
@@ -1362,6 +1413,223 @@ mod tests {
         assert_eq!(runner.count_command("--remove"), 1);
         assert!(manager.client("serial-a").is_none());
         server.abort();
+    }
+
+    /// AR12.7 / D088 的真机三条腿（共享同一次连接，所以合在一条里跑）：
+    /// ① 有已鉴权客户端在场时，Agent **不许**自己退场（跨过整个宽限期）；
+    /// ② 桌面真的没了（socket 关掉，等价进程被 kill）之后，Agent 在宽限期后**自己走**；
+    /// ③ 它带起来的孩子**不许被带走**——Agent 退场之后那个进程还在设备上活着。
+    ///
+    /// 判据全部取"我们自己起的那个 pid"与 `/proc`，**不用 `pidof`/`is_running`**：
+    /// 桌面上那个 App 也会起自己的 Agent，按进程名判会把别人的实例算成我们的
+    /// （第一版就是这么"假失败"的）。"活着"还要求状态不是 `Z`——只看 `/proc` 目录在不在，
+    /// 会被没人回收的僵尸骗过，于是③分不开"被带走"与"本来就退了"。
+    ///
+    /// **跑之前先退出桌面 App**：两个实例会抢同一个 Agent（互相 stop+start），
+    /// 那时这条腿会失败并打印 `other=` 那行，那是环境干扰而不是行为不对。
+    #[tokio::test]
+    #[ignore = "需要真机（先退出桌面 App）；AR12_TEST_SERIAL=<serial> APP_REVERSE_TOOLS_TEST_AGENT_IDLE_EXIT_SECS=8 cargo test -p app-reverse-tools --lib real_agent_idle_exit -- --ignored --nocapture"]
+    async fn real_agent_idle_exit_keeps_children_and_leaves_when_nobody_uses_it() {
+        use std::time::Instant;
+
+        use crate::adapters::adb;
+        use crate::adapters::agent_bootstrap::AGENT_PROCESS_NAME;
+        use agent_protocol::{HostedStartParams, HostedStartResult};
+
+        let Some(serial) = std::env::var("AR12_TEST_SERIAL")
+            .ok()
+            .filter(|v| !v.is_empty())
+        else {
+            eprintln!("[跳过] 本腿需要 AR12_TEST_SERIAL=<serial>");
+            return;
+        };
+        let grace_secs = crate::adapters::agent_bootstrap::agent_idle_exit_secs();
+        assert!(
+            grace_secs >= 4,
+            "请用 APP_REVERSE_TOOLS_TEST_AGENT_IDLE_EXIT_SECS=8 之类的值（太短会让①失去意义），当前 {grace_secs}"
+        );
+        let grace = Duration::from_secs(grace_secs);
+
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = Arc::new(AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config.clone(), None)),
+        ));
+        let adb_path = runner.environment().await.path.clone().expect("adb 可用");
+
+        /// 在设备上跑一句 shell 并拿 stdout。写成嵌套 async fn：
+        /// 闭包 + async 在这里只会把借用绕成一团，函数签名反而是最清楚的形态。
+        async fn sh(
+            runner: &Arc<dyn AdbRunner>,
+            adb_path: &str,
+            serial: &str,
+            script: &str,
+        ) -> String {
+            let output = runner
+                .run(
+                    adb_path,
+                    &adb::build_args(Some(serial), &adb::cmd_shell(script)),
+                    Duration::from_secs(20),
+                )
+                .await
+                .unwrap_or_default();
+            output.stdout
+        }
+
+        let child = "ar127-shell";
+        sh(
+            &runner,
+            &adb_path,
+            &serial,
+            &format!(
+                "cp /system/bin/sh /data/local/tmp/{child}; chmod 700 /data/local/tmp/{child}"
+            ),
+        )
+        .await;
+
+        manager
+            .connect_resolved(&serial)
+            .await
+            .expect("Agent 应能连上（真机）");
+        let client = manager.client(&serial).expect("已鉴权客户端");
+        let agent_pid: u32 = sh(
+            &runner,
+            &adb_path,
+            &serial,
+            "cat /data/local/tmp/app_reverse_tools_agent.pid 2>/dev/null",
+        )
+        .await
+        .trim()
+        .parse()
+        .expect("pid 文件里应是一个数字");
+        eprintln!("[ar12.7] 我们起的 Agent pid={agent_pid}");
+
+        let alive = |pid: u32| {
+            let runner = runner.clone();
+            let adb_path = adb_path.clone();
+            let serial = serial.clone();
+            async move {
+                let out = sh(
+                    &runner,
+                    &adb_path,
+                    &serial,
+                    &format!(
+                        "if [ ! -d /proc/{pid} ]; then echo gone; elif grep -q '^State:[[:space:]]*Z' /proc/{pid}/status 2>/dev/null; then echo zombie; else echo alive; fi"
+                    ),
+                )
+                .await;
+                out.trim() == "alive"
+            }
+        };
+        assert!(alive(agent_pid).await, "刚连上就该活着");
+
+        // ① 在场期间不许退场：跨过整个宽限期还活着、还问得到 health
+        let held = Instant::now();
+        while held.elapsed() < grace + Duration::from_secs(4) {
+            client
+                .health(Duration::from_secs(5))
+                .await
+                .expect("宽限期内有客户端在场，Agent 不许退场也不许掉线");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        assert!(
+            alive(agent_pid).await,
+            "①有客户端在场时 Agent 自己走了——正是 D063 要防的误杀"
+        );
+
+        // 起一个孩子（设备侧记录给的 pid 才算判据）
+        let started: HostedStartResult = client
+            .request(
+                agent_protocol::method::HOSTED_START,
+                &HostedStartParams {
+                    name: child.into(),
+                    args: vec!["-c".into(), "sleep 300".into()],
+                    stdin_data: None,
+                    interactive_stdin: false,
+                    root: false,
+                },
+                Duration::from_secs(15),
+            )
+            .await
+            .expect("hosted.start 应当成功");
+        let child_pid = started.record.pid;
+        eprintln!(
+            "[ar12.7] 孩子 pid={child_pid} handle={} log={}",
+            started.record.handle, started.record.log_path
+        );
+        // fixture 自检：孩子得真是活着的长驻进程，否则③测的是别的东西
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            alive(child_pid).await,
+            "样本没起来或起来就退，③的判据不成立（fixture 问题，不是 Agent 行为）"
+        );
+
+        // ② 模拟桌面死了：**必须让 socket 真关掉**。
+        //    `client.disconnect()` 只把在途请求判失败，manager 和我们手上还各握一份 Arc，
+        //    连接没断——第一版就是因为这个看到"Agent 不肯退"，其实它没错：还有人连着。
+        manager.device_disconnected(&serial).await;
+        drop(client);
+
+        let deadline = Instant::now() + grace + Duration::from_secs(25);
+        let mut others = String::new();
+        loop {
+            if !alive(agent_pid).await {
+                break;
+            }
+            others = sh(
+                &runner,
+                &adb_path,
+                &serial,
+                &format!(
+                    "for p in $(pidof {AGENT_PROCESS_NAME}); do [ \"$p\" = \"{agent_pid}\" ] || echo other=$p; done"
+                ),
+            )
+            .await;
+            assert!(
+                Instant::now() < deadline,
+                "②桌面走了之后我们那个 Agent 还在跑（宽限期 {grace_secs}s）。\
+                 先排环境：此刻设备上还有 {others:?} 在跑（有 other= 就说明桌面 App 抢了这个 Agent）"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        eprintln!("[ar12.7] Agent 在宽限期后自己退场了");
+
+        // ③ 孩子必须还活着
+        let probe = sh(
+            &runner,
+            &adb_path,
+            &serial,
+            &format!(
+                "if [ -d /proc/{child_pid} ]; then echo alive; else echo gone; fi; \
+                 grep '^State' /proc/{child_pid}/status 2>/dev/null; \
+                 readlink /proc/{child_pid}/exe 2>/dev/null; \
+                 cat /data/local/tmp/.{child}.run.log 2>/dev/null | head -3"
+            ),
+        )
+        .await;
+        let agent_log = sh(
+            &runner,
+            &adb_path,
+            &serial,
+            "tail -5 /data/local/tmp/app_reverse_tools_agent.log 2>/dev/null",
+        )
+        .await;
+        assert!(
+            probe.trim().starts_with("alive"),
+            "③Agent 退场后孩子不在了。先判环境再判代码：设备上现在还有              [{others}]；孩子侧探测={probe:?}；Agent 日志尾部=\n{agent_log}"
+        );
+        eprintln!("[ar12.7] 孩子仍在跑：{}", probe.replace('\n', " | "));
+
+        sh(
+            &runner,
+            &adb_path,
+            &serial,
+            &format!(
+                "kill {child_pid} 2>/dev/null; rm -f /data/local/tmp/{child} /data/local/tmp/.{child}.run.log"
+            ),
+        )
+        .await;
     }
 
     #[tokio::test]
