@@ -487,6 +487,16 @@ export function AgentSessionSection({ serial }: { serial: string }) {
   const auto = data?.autoProbe ?? null;
   const legacyFallbacks = data?.legacyFallbacks ?? [];
 
+  // 那一个动作的代价/授权说明（只有这两种动作需要说）
+  const actionNote =
+    auto?.action === "ask_consent"
+      ? t("devices.agent.consentNote")
+      : auto?.action === "explicit_takeover"
+        ? t("devices.agent.takeoverNote")
+        : null;
+  // blocked 的原因留在正文，其余移进诊断区；不因为界面变短就丢掉可查的东西
+  const devReason = auto?.action === "blocked" ? null : (auto?.detail ?? status?.lastError ?? null);
+
   // 后端自己会探（设备上线即探，AR12.5），探完推事件过来。没有这条的话，
   // 用户只能在"它还在装"和"装失败了"之间靠 10s 一次的轮询去猜。
   useEffect(() => {
@@ -553,17 +563,24 @@ export function AgentSessionSection({ serial }: { serial: string }) {
           data-testid="agent-purpose"
         >
           <p className="font-medium">{agentPurposeLine(t, auto)}</p>
-          {/* Agent 不在到底挡住什么：说功能名，不说"capability"也不说"回退次数" */}
-          <p className="mt-1 text-muted-foreground">{t("devices.agent.blockedFeatures")}</p>
-          {auto?.action === "ask_consent" && (
-            <p className="mt-1 text-muted-foreground">{t("devices.agent.consentNote")}</p>
-          )}
-          {auto?.action === "explicit_takeover" && (
-            <p className="mt-1 text-muted-foreground">{t("devices.agent.takeoverNote")}</p>
-          )}
-          {(auto?.detail ?? status?.lastError) && (
+          {/*
+            第二行只有一句：挡住哪些功能，后面直接接「点这一下会发生什么」。
+            第七十三轮按用户口径「结论条要更短」把原来堆着的三行小字压成一行——
+            它们讲的本来就是同一件事（少了它会怎样 + 这个动作的代价），拆成三段
+            反而让人抓不到重点。
+          */}
+          <p className="mt-1 text-muted-foreground">
+            {t("devices.agent.blockedFeatures")}
+            {actionNote ? `；${actionNote}` : ""}
+          </p>
+          {/*
+            原始 detail 只在 blocked 时留在正文：那时"为什么装不了"全靠它，
+            删掉正文就只剩一句空话。其余场景它要么和上面那句结论重复，要么是
+            内部文本 —— 一律移进下面的诊断折叠区，数据与审计一条没少。
+          */}
+          {auto?.action === "blocked" && auto.detail && (
             <p className="mt-1 break-all font-mono text-10px text-muted-foreground">
-              {String(auto?.detail ?? status?.lastError)}
+              {String(auto.detail)}
             </p>
           )}
           <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
@@ -668,6 +685,14 @@ export function AgentSessionSection({ serial }: { serial: string }) {
               </dd>
             </div>
           </dl>
+          {devReason && (
+            <div className="mt-1.5 flex min-w-0 items-start gap-2">
+              <span className="shrink-0 text-muted-foreground">{t("devices.agent.dev.reason")}</span>
+              <span className="break-all font-mono text-10px" data-testid="agent-dev-reason">
+                {String(devReason)}
+              </span>
+            </div>
+          )}
           {latestRoute && (
             <div className="mt-1.5 flex min-w-0 items-center gap-2">
               <span className="shrink-0 text-muted-foreground">{t("devices.agent.route")}</span>

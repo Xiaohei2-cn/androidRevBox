@@ -753,11 +753,17 @@ describe("设备页 Agent · 结论条在前，开发者诊断在后（第七十
     });
     renderPage(<AgentSessionSection serial="PIXEL-1" />);
     // 等的是那句只有数据到手才会出现的结论，不是等外壳（外壳在查询回来前就在了）
-    await screen.findByText("这台设备的 Agent 还没连上。");
+    await screen.findByText("Agent 还没连上。");
     const banner = screen.getByTestId("agent-purpose");
     // 挡住的是功能名，不是"capability 数"或"回退次数"
-    expect(banner.textContent).toContain("改权限、起停托管进程、终止进程");
+    expect(banner.textContent).toContain("权限、托管进程、终止进程、ROOT、SO 替换");
     expect(banner.textContent).toContain("这台只问一次");
+    /*
+      第七十三轮「结论条要更短」的机器化：正文只许有两句——一句结论 + 一句
+      "挡住什么/代价"（授权说明并进同一行）。以前这里是三到四段小字堆着，
+      用户抱怨"读不出重点"。行数一旦反弹，这条就会红。
+    */
+    expect(banner.querySelectorAll("p")).toHaveLength(2);
     fireEvent.click(within(banner).getByTestId("agent-connect-now"));
     await waitFor(() => expect(agentMocks.install).toHaveBeenCalledWith("PIXEL-1"));
   });
@@ -776,9 +782,16 @@ describe("设备页 Agent · 结论条在前，开发者诊断在后（第七十
       }),
     });
     renderPage(<AgentSessionSection serial="PIXEL-1" />);
-    await screen.findByText("设备上已有一个 Agent 在跑，但不是本程序连上的。");
+    await screen.findByText("有个 Agent 在跑，但不是本程序连的。");
     const banner = screen.getByTestId("agent-purpose");
-    expect(banner.textContent).toContain("托管进程和 frida-server 会一起断掉");
+    expect(banner.textContent).toContain("托管进程与 frida-server 会断");
+    // 结论与原始原因不再各写一遍（同一件事在卡片里出现两次就是"长"）：
+    // 正文只留结论，raw detail 进开发者诊断，数据没丢、但不再占正文。
+    expect(banner.textContent).not.toContain("设备上已有 Agent 在跑，但不是本程序连上的");
+    expect(screen.getByTestId("agent-dev-reason").textContent).toBe(
+      "设备上已有 Agent 在跑，但不是本程序连上的",
+    );
+    expect(banner.querySelectorAll("p")).toHaveLength(2);
     fireEvent.click(within(banner).getByTestId("agent-takeover"));
     await waitFor(() => expect(agentMocks.restart).toHaveBeenCalledWith("PIXEL-1"));
     expect(agentMocks.install).not.toHaveBeenCalled();
@@ -803,6 +816,7 @@ describe("设备页 Agent · 结论条在前，开发者诊断在后（第七十
     renderPage(<AgentSessionSection serial="PIXEL-1" />);
     await screen.findByText("本机 Agent 产物只提供 arm64-v8a，这台设备是 armeabi-v7a");
     const banner = screen.getByTestId("agent-purpose");
+    // blocked 是唯一的例外：那句"为什么装不了"就是内容本身，必须留在正文
     expect(banner.textContent).toContain("armeabi-v7a");
     expect(within(banner).queryByTestId("agent-connect-now")).toBeNull();
     expect(within(banner).queryByTestId("agent-takeover")).toBeNull();
