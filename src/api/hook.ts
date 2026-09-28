@@ -64,6 +64,13 @@ export const hookApi = {
   sessionStart(args: HookSessionStartArgs): Promise<string> {
     return invokeCommand<string>("hook_session_start", { args });
   },
+  /**
+   * 「保存日志」：把**用户在对话框里亲自选中的本机路径**交给桌面端写盘，返回落盘的字节数。
+   * 返回字节数而不是布尔：界面要说"存了 1.2 MB"，而不是让用户以为"成功=有内容"。
+   */
+  exportSave(path: string, content: string): Promise<number> {
+    return invokeCommand<number>("hook_export_save", { path, content });
+  },
 };
 
 // ===== runner NDJSON 行协议（§5.2）：纯解析，vitest 覆盖 =====

@@ -8,11 +8,18 @@ import { useAppNav } from "@/app/nav";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { stripAnsi } from "@/lib/ansi";
+import { hasNativeDialog, saveFile } from "@/api/dialog";
+import { hookApi } from "@/api/hook";
 import { AnsiText } from "@/components/ui/AnsiText";
 import type { ConsoleEvent, FridaFilter, SessionInfo, TaskState } from "./types";
 import {
+  buildConsoleExport,
   DEFAULT_FILTER,
+  EXPORT_FORMATS,
+  exportFileName,
   filterMatch,
+  formatBytes,
+  type ExportFormat,
   filterStorageKey,
   loadFilter,
   loadWrap,
@@ -161,7 +168,12 @@ export function FridaConsole({
         onGotoTasks={gotoTasks}
         onStop={running ? () => void taskApi.cancel(session.taskId) : undefined}
       />
-      <FilterBar filter={filter} onChange={setFilter} />
+      <FilterBar
+        filter={filter}
+        onChange={setFilter}
+        exportEvents={visible}
+        sessionName={session.name}
+      />
       <EventStream
         events={visible}
         rawMode={rawMode}
@@ -273,7 +285,18 @@ function SessionHeader({
 
 // ===== 过滤栏（§5.3-M1） =====
 
-function FilterBar({ filter, onChange }: { filter: FridaFilter; onChange: (f: FridaFilter) => void }) {
+function FilterBar({
+  filter,
+  onChange,
+  exportEvents,
+  sessionName,
+}: {
+  filter: FridaFilter;
+  onChange: (f: FridaFilter) => void;
+  /** **当前过滤后的**行：保存下来的必须就是屏幕上这些，不是全量 */
+  exportEvents: ConsoleEvent[];
+  sessionName: string;
+}) {
   const { t } = useI18n();
   const chips: { key: keyof FridaFilter; label: string }[] = [
     { key: "send", label: "send" },
@@ -320,7 +343,104 @@ function FilterBar({ filter, onChange }: { filter: FridaFilter; onChange: (f: Fr
           {t("hook.frida.clear")}
         </Button>
       )}
+      <ExportControl events={exportEvents} sessionName={sessionName} />
     </div>
+  );
+}
+
+const EXPORT_EXT: Record<ExportFormat, string> = { text: "log", jsonl: "jsonl", csv: "csv" };
+const EXPORT_LABEL: Record<ExportFormat, string[]> = {
+  text: ["hook.frida.exportFmtText"],
+  jsonl: ["hook.frida.exportFmtJsonl"],
+  csv: ["hook.frida.exportFmtCsv"],
+};
+
+
+/**
+ * 「保存日志」= 用户主动导出的那一下（第七十四轮）。
+ *
+ * 三条纪律写在这儿，别再变回去：
+ * 1. 存的永远是**过滤后的当前结果**（`events` 由调用方传 `visible`），这样"我先只看
+ *    sign= 再留底"是一步到位的，不用先全存再去别处筛；
+ * 2. 取消对话框**不是失败**，不许弹错误；浏览器预览里没原生对话框要照实说一句，
+ *    不能把"这里弹不了"说成"你取消了"；
+ * 3. 成功的话术用**落盘回来的字节数**（Rust 那边写完会回读自证），
+ *    不是"我调用过保存"。
+ */
+export function ExportControl({ events, sessionName }: { events: ConsoleEvent[]; sessionName: string }) {
+  const { t } = useI18n();
+  const [fmt, setFmt] = useState<ExportFormat>("text");
+  const [busy, setBusy] = useState(false);
+  const [outcome, setOutcome] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const run = async () => {
+    if (busy || events.length === 0) return;
+    setBusy(true);
+    setOutcome(null);
+    try {
+      const path = await saveFile({
+        title: t("hook.frida.exportDialog"),
+        defaultPath: exportFileName(sessionName, fmt),
+        filters: [
+          { name: t("hook.frida.export"), extensions: [EXPORT_EXT[fmt]] },
+          { name: t("hook.frida.exportAllFiles"), extensions: ["*"] },
+        ],
+      });
+      if (!path) {
+        // 用户取消（或这里根本弹不了原生对话框）：什么都不写，也不报失败
+        if (!hasNativeDialog()) {
+          setOutcome({ ok: false, text: t("hook.frida.exportDesktopOnly") });
+        }
+        return;
+      }
+      const bytes = await hookApi.exportSave(path, buildConsoleExport(events, fmt));
+      setOutcome({
+        ok: true,
+        text: t("hook.frida.exportSaved", { count: events.length, bytes: formatBytes(bytes) }),
+      });
+    } catch (e) {
+      setOutcome({ ok: false, text: t("hook.frida.exportFailed", { message: String((e as Error)?.message ?? e) }) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <select
+        aria-label={t("hook.frida.export")}
+        value={fmt}
+        onChange={(e) => setFmt(e.target.value as ExportFormat)}
+        className="h-6 rounded border border-input bg-transparent px-1 text-10px"
+        data-testid="frida-export-format"
+      >
+        {EXPORT_FORMATS.map((f) => (
+          <option key={f} value={f}>
+            {EXPORT_LABEL[f].map((k) => t(k)).join(" ")}
+          </option>
+        ))}
+      </select>
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-6 px-2 text-10px"
+        disabled={busy || events.length === 0}
+        title={events.length === 0 ? t("hook.frida.exportEmpty") : t("hook.frida.exportHint")}
+        onClick={() => void run()}
+        data-testid="frida-export"
+      >
+        {busy ? t("hook.frida.exportBusy") : t("hook.frida.export")}
+      </Button>
+      {outcome && (
+        <span
+          className={cn("min-w-0 truncate text-10px", outcome.ok ? "text-emerald-500" : "text-destructive")}
+          title={outcome.text}
+          data-testid="frida-export-outcome"
+        >
+          {outcome.text}
+        </span>
+      )}
+    </>
   );
 }
 

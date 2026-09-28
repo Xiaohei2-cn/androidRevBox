@@ -96,6 +96,75 @@ export function filterMatch(e: ConsoleEvent, f: FridaFilter): boolean {
  * 「自动换行」开关的持久化键（全局偏好，不按设备分：这是读法偏好，不是上下文）。
  * 关掉换行是为了看宽 hexdump 的列对齐 —— 折行会把一张表切成上下两截。
  */
+// ===== 「保存日志」= 用户主动导出的文本（第七十四轮） =====
+
+/**
+ * 导出格式。三种各解决一件事：
+ * - `text`：界面所见即所得的去色文本，给人读、给工单贴；
+ * - `jsonl`：**逐行原样**留底（含颜色转义与 NDJSON 原文），排查协议/回放用；
+ * - `csv`：要进表格软件筛的时候用。
+ */
+export type ExportFormat = "text" | "jsonl" | "csv";
+
+export const EXPORT_FORMATS: ExportFormat[] = ["text", "jsonl", "csv"];
+
+function pad(n: number, w = 2): string {
+  return String(n).padStart(w, "0");
+}
+
+/** `HH:mm:ss.SSS`（本地时区：日志要和用户在屏幕上看到的对得上） */
+function clock(ts: number): string {
+  const d = new Date(ts);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+}
+
+function csvCell(v: string): string {
+  // CSV 里唯一的坑是分隔符与引号：引号翻倍，含逗号/引号/换行就整段加引号
+  const quoted = /["\n\r,]/.test(v);
+  return quoted ? `"${v.replace(/"/g, '""')}"` : v;
+}
+
+/**
+ * 把**当前过滤后的**事件拼成导出文本。
+ *
+ * 顺序、时间戳、去色这三件事都必须在这儿一次做对：界面显示什么，保存下来就得是什么，
+ * 否则"留底"就成了新的怀疑对象（用户会拿文件去对界面，对不上就再不信了）。
+ * 纯函数、不碰 IO，是为了能被单测钉住——落盘那一步在 Rust 里另有自证。
+ */
+export function buildConsoleExport(events: ConsoleEvent[], fmt: ExportFormat): string {
+  const lines: string[] = [];
+  for (const e of events) {
+    const kind = e.evt.kind;
+    if (fmt === "jsonl") {
+      // 原样一行：那是设备/脚本真正发出来的东西，不做任何加工
+      lines.push(e.line);
+      continue;
+    }
+    const plain = stripAnsi(e.line);
+    if (fmt === "csv") {
+      lines.push([new Date(e.ts).toISOString(), e.stream, kind, csvCell(plain)].join(","));
+      continue;
+    }
+    lines.push(`${clock(e.ts)} [${e.stream}] ${plain}`);
+  }
+  if (fmt === "csv") return ["ts,stream,kind,text", ...lines].join("\n") + "\n";
+  return lines.join("\n") + (lines.length ? "\n" : "");
+}
+
+/**
+ * 默认文件名：拿会话的可读名（`attach com.x · hook.js`）打底，但**必须去掉路径分隔符**——
+ * 会话名里有 `/` 会让保存对话框落到一个不存在的目录里，那种"看着成功其实没写"最难查。
+ */
+export function exportFileName(sessionName: string, fmt: ExportFormat): string {
+  const safe = sessionName
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  const ext = fmt === "jsonl" ? "jsonl" : fmt === "csv" ? "csv" : "log";
+  return `${safe || "frida"}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.${ext}`;
+}
+
 export const WRAP_STORAGE_KEY = "app.frida.wrap";
 
 export function loadWrap(defaultValue = true): boolean {
@@ -141,3 +210,16 @@ export function saveFilter(key: string, f: FridaFilter): void {
 
 export const remoteSpec = (s: Pick<FridaSettings, "connMode" | "port">): string | undefined =>
   s.connMode === "remote" ? `127.0.0.1:${s.port.trim() || "27042"}` : undefined;
+
+/** 字节数说人话。导出成功后界面要报的是"1.2 MB"，不是 1258291 —— 后者用户只会当成 bug */
+export function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(v >= 10 ? 0 : 1)} ${units[i]}`;
+}

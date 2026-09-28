@@ -4,7 +4,7 @@
 //! 工作目录读写并入现有 config_get/config_set 白名单（app.hook.workdir）。
 
 use crate::AppState;
-use crate::core::error::CoreResult;
+use crate::core::error::{CoreError, CoreResult};
 use crate::services::hook_service::{HookSessionStartArgs, JsFileDto, PreflightDto};
 
 /// 扫工作目录一层 *.js（非递归、忽略符号链接、上限 500）。
@@ -50,4 +50,15 @@ pub async fn hook_session_start(
     args: HookSessionStartArgs,
 ) -> CoreResult<String> {
     state.hook.start_session(args).await
+}
+
+/// 把用户主动导出的文本写到**他自己在保存对话框里选的本机路径**（第七十四轮：控制台「保存日志」）。
+/// 只有用户点过一次「保存日志」并确认过路径才会走到这里，程序自己不会把脚本正文落到任何地方
+/// （重构文档 §3.7 那条"日志不得写脚本正文"约束管的是应用日志，不是用户主动导出）。
+/// 写盘是同步阻塞 IO，放 blocking 线程：单次上限 64 MiB，占着 tokio worker 是会看得见的卡。
+#[tauri::command]
+pub async fn hook_export_save(path: String, content: String) -> CoreResult<u64> {
+    tokio::task::spawn_blocking(move || crate::services::hook_service::save_export(&path, &content))
+        .await
+        .map_err(|error| CoreError::Internal(format!("保存任务被中断：{error}")))?
 }

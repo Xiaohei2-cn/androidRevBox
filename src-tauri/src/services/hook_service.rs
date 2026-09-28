@@ -472,8 +472,157 @@ fn scan_js_dir(dir: &Path) -> CoreResult<Vec<JsFileDto>> {
     Ok(out)
 }
 
+// ===== 用户主动导出的文本落本机盘（第七十四轮：控制台「保存日志」） =====
+//
+// 为什么写成模块级自由函数而不是 `HookService` 的方法：这条路径**不需要** AppHandle，
+// 而它需要被单测（路径把关与"写完回读自证"两条都必须能脱离 tauri 跑）。
+// 挂在方法上就得先造一个 AppHandle，那是把测试挡住，不是把逻辑藏好。
+
+/// 导出体积上限。导出的正文是脚本输出，几 GB 的内存 dump 真有人导；
+/// 那种文件既打不开也会把磁盘写满——**拒掉并把原因说清**比"写一半成功"诚实。
+const MAX_EXPORT_BYTES: usize = 64 * 1024 * 1024;
+
+/// 扩展名白名单。选择器里用户可能手打成 `.sh` / `.js`：工具不该因为"用户点了保存"
+/// 就往磁盘上放一个将来会被执行的东西。白名单只放文本类扩展名。
+const EXPORT_EXTENSIONS: &[&str] = &["log", "txt", "json", "jsonl", "csv", "md"];
+
+/// 纯函数：路径形状把关。判据只有三条，但每条都要能单测。
+fn validate_export_path(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("没有选定保存路径".into());
+    }
+    if trimmed.contains('\0') {
+        return Err("保存路径里含非法字符".into());
+    }
+    let candidate = Path::new(trimmed);
+    if !candidate.is_absolute() {
+        return Err(format!("保存路径必须是完整路径，收到：{trimmed}"));
+    }
+    let ext = candidate
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !EXPORT_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(format!(
+            "只支持保存为 {}，你把文件名写成了 .{ext}（保存对话框里改回扩展名）",
+            EXPORT_EXTENSIONS.join(" / ")
+        ));
+    }
+    Ok(candidate.to_path_buf())
+}
+
+/// 纯函数：体积把关（上限做成参数，测试才能用小数字跑到那条分支）。
+fn check_export_size(content_len: usize, cap: usize) -> Result<(), String> {
+    if content_len > cap {
+        return Err(format!(
+            "这份日志 {} 字节，超过单次保存上限 {} 字节；先用过滤条缩小范围，或分几次保存",
+            content_len, cap
+        ));
+    }
+    Ok(())
+}
+
+/// 把用户主动导出的文本写到他选的**本机**路径。
+///
+/// 判据是磁盘上真的有这份文件：写完**回读**比对字节数，对不上就报错——
+/// "我调用过 write"不是完成（UI-6 那条纪律的同一条口径）。
+/// 只在用户点了「保存日志」并在选择器里确认路径之后才被调用，
+/// 程序自己**不会**悄悄把脚本正文落到任何地方（见重构文档 §3.7）。
+pub fn save_export(path: &str, content: &str) -> CoreResult<u64> {
+    let target = validate_export_path(path).map_err(CoreError::InvalidInput)?;
+    check_export_size(content.len(), MAX_EXPORT_BYTES).map_err(CoreError::InvalidInput)?;
+    if let Some(parent) = target.parent() {
+        if !parent.exists() {
+            return Err(CoreError::InvalidInput(format!(
+                "目标目录已经不在了：{}",
+                parent.display()
+            )));
+        }
+    }
+    std::fs::write(&target, content.as_bytes())
+        .map_err(|error| CoreError::Internal(format!("写入 {} 失败：{error}", target.display())))?;
+    let written = std::fs::metadata(&target)
+        .map_err(|error| {
+            CoreError::Internal(format!(
+                "写完读不回来，不能确认文件真的存在（{}）：{error}",
+                target.display()
+            ))
+        })?
+        .len();
+    if written as usize != content.len() {
+        return Err(CoreError::Internal(format!(
+            "文件大小对不上：界面交给我的是 {} 字节，磁盘上是 {written} 字节",
+            content.len()
+        )));
+    }
+    tracing::info!(
+        path = %target.display(),
+        bytes = written,
+        "用户主动导出日志到本机（内容不进应用日志）"
+    );
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// 路径把关：这三条判据都得能脱离文件系统被钉住。
+    #[test]
+    fn export_path_rules_reject_relative_empty_nul_and_executable_extensions() {
+        assert!(validate_export_path("").is_err());
+        assert!(validate_export_path("   ").is_err());
+        assert!(validate_export_path("out/weird\u{0}.log").is_err());
+        // 相对路径：选择器不会给，但手拼/降级路径会给，必须拒
+        assert!(validate_export_path("logs/frida.log").is_err());
+        // 可执行扩展名：保存日志不该顺手往磁盘放一个将来会被执行的东西
+        assert!(validate_export_path("/tmp/frida.sh").is_err());
+        assert!(validate_export_path("/tmp/frida").is_err());
+        for ok in ["/tmp/a.log", "/tmp/a.TXT", "/tmp/a.jsonl", "/tmp/a.csv"] {
+            assert!(validate_export_path(ok).is_ok(), "{ok} 应当被接受");
+        }
+    }
+
+    #[test]
+    fn export_size_check_rejects_oversized_payload_before_touching_disk() {
+        // 上限做成参数就是为了这条腿能用小数字跑到拒绝分支
+        assert!(check_export_size(8, 8).is_ok());
+        let error = check_export_size(9, 8).unwrap_err();
+        assert!(
+            error.contains("9 字节") && error.contains("8 字节"),
+            "{error}"
+        );
+        assert!(
+            error.contains("过滤"),
+            "拒绝必须给出出路，不只是说太大了：{error}"
+        );
+    }
+
+    /// 写成功要有磁盘上的证据：回读到的字节数必须等于交过来的字节数。
+    #[test]
+    fn export_write_roundtrip_is_proved_by_reading_the_file_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("frida.log");
+        let content = "00000000  48 65 6c 6c 6f\n";
+        let written = save_export(&file.display().to_string(), content).unwrap();
+        assert_eq!(written as usize, content.len());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+    }
+
+    /// 目标目录没了（用户在别的窗口删了文件夹）：要说清是哪条路径，不能只回一个 os error。
+    #[test]
+    fn export_write_failure_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("already-gone").join("frida.log");
+        let error = save_export(&gone.display().to_string(), "x").unwrap_err();
+        assert!(
+            error.to_string().contains("already-gone"),
+            "错误里必须带上那条路径：{error}"
+        );
+        assert!(!gone.exists(), "失败时不该留下半个文件");
+    }
+
     use super::*;
 
     fn touch(dir: &Path, name: &str, content: &str) -> PathBuf {

@@ -258,7 +258,8 @@ pub fn run() {
             commands::plugins::plugins_set_enabled,
             commands::hook::hook_js_list,
             commands::hook::hook_preflight,
-            commands::hook::hook_session_start
+            commands::hook::hook_session_start,
+            commands::hook::hook_export_save
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
