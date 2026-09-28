@@ -36,7 +36,10 @@ export class TerminalSession {
 
   private detachExit: (() => void) | null = null;
 
-  private state: TerminalSessionState = { running: false, exitCode: null, cols: 0, rows: 0 };
+  private machineState: TerminalSessionState = { running: false, exitCode: null, cols: 0, rows: 0 };
+
+  /** xterm 挂过的那个元素：没挂过就一个字也画不出来（见 mount()） */
+  private hostElement: HTMLElement | null = null;
 
   constructor(
     private readonly bundle: TerminalBundle,
@@ -46,6 +49,37 @@ export class TerminalSession {
 
   get sessionId(): string | null {
     return this.id;
+  }
+
+  get state(): TerminalSessionState {
+    return { ...this.machineState };
+  }
+
+  /**
+   * 把这块终端挂到真实 DOM 元素上。
+   *
+   * 为什么单独一条腿、还要单独一条测试：xterm **必须** `open(element)` 之后才往 DOM 里画东西。
+   * FT0 那版页面只在测量容器宽高的时候碰过这个 div，从来没 open 过——于是真窗口里
+   * 「真终端」是一片黑，而 jsdom 的测试各自 `bundle.term.open(host)`，把这条漏掉的腿遮住了。
+   * 判据不写"看起来有元素"，写"open 真的被调用过且元素里有 xterm 自己的节点"。
+   */
+  get mounted(): boolean {
+    return this.hostElement !== null;
+  }
+
+  mount(host: HTMLElement): void {
+    if (this.disposed || this.hostElement === host) {
+      this.fit();
+      return;
+    }
+    if (this.hostElement) {
+      // 换宿主元素这件事我们**不支持**：xterm 的 DOM 挂在第一次 open 的那个元素里，
+      // 换容器只能关掉这个 tab 再新开一个。这里静默忽略，不留下"看起来挂上了"的第三种状态。
+      return;
+    }
+    this.hostElement = host;
+    this.bundle.term.open(host);
+    this.fit();
   }
 
   /** 键盘、粘贴、IME 全都从 onData 出来：那是 xterm 已经按模式编码好的字节，我们不补任何控制码。 */
@@ -79,6 +113,8 @@ export class TerminalSession {
       this.lastRows = opened.rows;
       this.detachExit = (await this.transport.onExit((exit) => {
         if (exit.id !== this.id) return;
+        // 进程自己走了就别再往那条 fd 上写字节：再写是"每个按键报一次错"的那种烦人故障
+        this.id = null;
         this.update({ running: false, exitCode: exit.exitCode ?? null });
       })) ?? null;
       this.update({ running: true, exitCode: null, cols: opened.cols, rows: opened.rows });
@@ -132,6 +168,7 @@ export class TerminalSession {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.hostElement = null;
     this.detachData?.();
     this.detachExit?.();
     const id = this.id;
@@ -150,7 +187,7 @@ export class TerminalSession {
   }
 
   private update(patch: Partial<TerminalSessionState>): void {
-    this.state = { ...this.state, ...patch };
-    this.events.onState?.({ ...this.state });
+    this.machineState = { ...this.machineState, ...patch };
+    this.events.onState?.({ ...this.machineState });
   }
 }

@@ -1,144 +1,210 @@
 /**
- * 真终端页（FT0.3 的最小闭环）：本机 PTY + xterm.js。
+ * 真终端页（FT1：分页与会话保活）。
  *
- * 这一页存在的意义就是"不再自己画终端"。组件里只做四件事：
- * 挂载/卸载、把键盘交给会话控制层、把容器尺寸变化交给控制层、把状态话说清楚。
- * 一个字节的转义处理都不在这里（那是 xterm 的事，见 `src/lib/terminal.ts` 那条铁律）。
+ * 组件只做四件事：把 tab 画出来、把每块屏挂到它自己的宿主 div 上、
+ * 把"量得到的尺寸"转成 fit、把用户意图转成会话表的调用。
+ * **一个字节都不在这里处理**（§4.1 那条铁律），会话的生死与状态在 `lib/terminalStore`。
+ *
+ * 三条不可回退的口径：
+ * 1. **新开一个不动之前的**：所有 tab 的终端实例都活着，非活动 tab 只是 `hidden`；
+ *    验收动作是"第 2 个跑长任务，切到第 1 个再切回来，输出没丢"。
+ * 2. **关运行中的会话要确认**：关 tab 会关掉 PTY，内核随即给前台进程组发 SIGHUP，不可逆。
+ * 3. **页面卸载收掉全部会话**（R-08）：不留活进程。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CircleStop, Play, RotateCcw } from "lucide-react";
+import { ChevronDown, ChevronUp, CircleStop, Plus, X } from "lucide-react";
 
-import { ptyApi, type PtyExit } from "@/api/pty";
+import { ptyApi } from "@/api/pty";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
-import { createTerminal } from "@/lib/terminal";
-import { TerminalSession } from "@/lib/terminalSession";
+import { MAX_TERMINAL_SESSIONS, TerminalSessionStore, type TerminalTab } from "@/lib/terminalStore";
 import "@xterm/xterm/css/xterm.css";
 
-interface SessionState {
-  running: boolean;
-  exitCode: number | null;
-  cols: number;
-  rows: number;
-}
+const DOT_CLASS: Record<TerminalTab["status"], string> = {
+  running: "bg-emerald-500",
+  starting: "bg-sky-400",
+  stopped: "bg-amber-500",
+  exited: "bg-muted-foreground/50",
+  failed: "bg-destructive",
+};
 
 export function TerminalPage() {
   const { t } = useI18n();
-  const hostRef = useRef<HTMLDivElement | null>(null);
-  const sessionRef = useRef<TerminalSession | null>(null);
+  const storeRef = useRef<TerminalSessionStore | null>(null);
+  const [tabs, setTabs] = useState<TerminalTab[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
   const [program, setProgram] = useState("");
   const [argsText, setArgsText] = useState("");
-  const [state, setState] = useState<SessionState>({ running: false, exitCode: null, cols: 0, rows: 0 });
-  const [error, setError] = useState<string | null>(null);
-  const [renderer, setRenderer] = useState<"webgl" | "dom" | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [pendingClose, setPendingClose] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<number | null>(null);
+  const hostsRef = useRef(new Map<string, HTMLDivElement>());
+  const refCbsRef = useRef(new Map<string, (el: HTMLDivElement | null) => void>());
 
-  // 起会话：终端实例挂在 store/refs 上，不随 render 重建（重建 = 丢缓冲区）
+  // 会话表**只创建一次**：每次 render 新建会把所有 xterm 实例连缓冲区一起丢掉，
+  // 那正是"切个 tab 输出就没了"的成因。
+  if (!storeRef.current) {
+    storeRef.current = new TerminalSessionStore({
+      transport: ptyApi,
+      onChange: () => setTabs(storeRef.current?.tabs() ?? []),
+    });
+  }
+  const store = storeRef.current;
+
   useEffect(() => {
-    let alive = true;
-    void ptyApi.defaultProgram()
-      .then((value) => alive && setProgram((current) => current || value))
-      .catch((reason) => alive && setError(String((reason as Error)?.message ?? reason)));
-    return () => {
-      alive = false;
-    };
+    void ptyApi
+      .defaultProgram()
+      .then((value) => setProgram((current) => current || value))
+      .catch((reason) => setNotice(String((reason as Error)?.message ?? reason)));
   }, []);
 
-  const start = useCallback(async () => {
-    const host = hostRef.current;
-    if (!host || busy) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const bundle = createTerminal({ cols: Math.max(20, Math.floor(host.clientWidth / 8) || 80), rows: Math.max(4, Math.floor(host.clientHeight / 16) || 24) });
-      setRenderer(bundle.renderer);
-      const session = new TerminalSession(bundle, ptyApi, {
-        onState: (next) => setState(next),
-        onError: (message) => setError(message),
-      });
-      session.attach();
-      sessionRef.current = session;
-      // 容器已经在页面上，先量一次再 open 之外补一次（xterm 需要元素在文档里才有尺寸）
-      requestAnimationFrame(() => session.fit());
-      const args = argsText.trim() ? argsText.trim().split(/\s+/) : [];
-      await session.start(program.trim(), args, null);
-    } catch (reason) {
-      setError(String((reason as Error)?.message ?? reason));
-    } finally {
-      setBusy(false);
-    }
-  }, [argsText, busy, program]);
-
-  const stop = useCallback(async () => {
-    setBusy(true);
-    try {
-      await sessionRef.current?.stop();
-    } finally {
-      setBusy(false);
-    }
-  }, []);
-
-  const restart = useCallback(async () => {
-    setBusy(true);
-    sessionRef.current?.dispose();
-    sessionRef.current = null;
-    setRenderer(null);
-    setState({ running: false, exitCode: null, cols: 0, rows: 0 });
-    setBusy(false);
-    await start();
-  }, [start]);
-
-  // 卸载 = 关掉会话：不留活进程（R-08）
+  // 离开页面 = 收掉全部会话（R-08）。**只在这一条路径上**批量关会话。
   useEffect(
     () => () => {
-      sessionRef.current?.dispose();
-      sessionRef.current = null;
+      storeRef.current?.disposeAll();
+      storeRef.current = null;
     },
     [],
   );
 
+  const active = useMemo(() => tabs.find((tab) => tab.id === activeId) ?? null, [tabs, activeId]);
+
   /**
-   * 尺寸跟着容器走。tab 被 `hidden` 时量到 0 —— 那时 `fit()` 返回 false 且**什么都不改**，
-   * 回到可见时 ResizeObserver 会因为尺寸从 0 变成有值再触发一次（R-03 的处置）。
+   * 每个 tab 一个**稳定身份**的 ref 回调：inline 箭头函数每次 render 都是新函数，
+   * React 会先以 null 调一次再以元素调一次，于是每次重渲染都要重新判断挂没挂上。
+   * 缓存起来就把这条噪音消掉（StrictMode 的 detach/attach 仍然要能扛，见会话表的 opened）。
    */
-  useEffect(() => {
-    const host = hostRef.current;
-    if (!host || typeof ResizeObserver === "undefined") return;
-    let frame = 0;
-    const observer = new ResizeObserver(() => {
-      cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => {
-        sessionRef.current?.fit();
-      });
+  const refFor = useCallback(
+    (id: string) => {
+      let cb = refCbsRef.current.get(id);
+      if (!cb) {
+        cb = (el: HTMLDivElement | null) => {
+          if (el) hostsRef.current.set(id, el);
+          else hostsRef.current.delete(id);
+          storeRef.current?.mount(id, el);
+        };
+        refCbsRef.current.set(id, cb);
+      }
+      return cb;
+    },
+    [],
+  );
+
+  const select = useCallback((id: string) => {
+    setActiveId(id);
+    setPendingClose(null);
+    // 切回来必须重新量一次：隐藏时量到 0，fit 什么都不改（R-03），
+    // "刚变可见"这一刻是唯一能把它对齐的机会（ResizeObserver 也会在这里补一次）
+    requestAnimationFrame(() => {
+      store.fit(id);
+      store.repaint(id);
+      store.focus(id);
     });
-    observer.observe(host);
-    return () => {
-      cancelAnimationFrame(frame);
-      observer.disconnect();
-    };
-  }, []);
+  }, [store]);
 
-  // 退出通知由控制层接；这里只兜住"界面在会话之外自己关掉"的情况
+  const createTab = useCallback(async () => {
+    setNotice(null);
+    const args = argsText.trim() ? argsText.trim().split(/\s+/) : [];
+    const created = await store.create({ program, args });
+    if (!created) return;
+    if (!created.ok) {
+      setNotice(
+        created.reason === "limit"
+          ? t("hook.terminal.limit", { max: created.max })
+          : t("hook.terminal.emptyProgram"),
+      );
+      return;
+    }
+    setActiveId(created.id);
+  }, [argsText, program, store, t]);
+
+  const closeTab = useCallback(
+    async (id: string) => {
+      const store2 = store;
+      if (pendingClose !== id) {
+        // 第一次点：只登记"待确认"。运行中的会话在这里就杀进程是不可接受的
+        const tab = store2.tabs().find((item) => item.id === id);
+        if (!tab || (tab.status !== "running" && tab.status !== "starting")) {
+          await finishClose(store2, id, setActiveId, setPendingClose, t);
+          return;
+        }
+        setPendingClose(id);
+        return;
+      }
+      await finishClose(store2, id, setActiveId, setPendingClose, t);
+    },
+    [pendingClose, store, t],
+  );
+
+  const stopActive = useCallback(async () => {
+    if (!active) return;
+    setNotice(null);
+    await store.stop(active.id);
+  }, [active, store]);
+
+  const search = useCallback(
+    (next: boolean) => {
+      if (!active || !query) return;
+      const bundle = store.bundle(active.id);
+      if (!bundle) return;
+      // **只下指令，不自己数命中**：命中数由 addon-search 的结果事件回来（下面的订阅），
+      // 自己按 findNext 的布尔值猜一个数，就是把"没有命中"和"命中 1 处"混成一件事
+      if (next) bundle.search.findNext(query);
+      else bundle.search.findPrevious(query);
+    },
+    [active, query, store],
+  );
+
+  const activeIdForSearch = active?.id ?? null;
   useEffect(() => {
-    let un: (() => void) | undefined;
-    void ptyApi
-      .onExit((exit: PtyExit) => {
-        if (sessionRef.current?.sessionId !== exit.id) return;
-        setState((prev) => ({ ...prev, running: false, exitCode: exit.exitCode }));
-      })
-      .then((dispose) => {
-        un = dispose;
-      })
-      .catch(() => undefined);
-    return () => un?.();
-  }, []);
+    if (!activeIdForSearch) {
+      setHits(null);
+      return undefined;
+    }
+    const bundle = store.bundle(activeIdForSearch);
+    if (!bundle) return undefined;
+    const disposable = bundle.search.onDidChangeResults((event) => setHits(event.resultCount));
+    return () => disposable.dispose();
+  }, [activeIdForSearch, store]);
 
-  const statusLine = useMemo(() => {
-    if (state.running) return t("hook.terminal.running", { cols: state.cols, rows: state.rows });
-    if (state.exitCode !== null) return t("hook.terminal.exited", { code: state.exitCode });
-    return t("hook.terminal.idle");
-  }, [state, t]);
+  // 尺寸跟着容器走：每个 tab 各看自己的宿主（隐藏的那个量到 0，不会改动它的尺寸）
+  useEffect(() => {
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      // 页面整体重新可见（Hook 子标签切走又切回）也走这里：尺寸一从 0 变成有值，
+    // 除了量一次尺寸还要补一次重绘，否则隐藏期间到达的字节就一直不进屏
+    hostsRef.current.forEach((el, id) => {
+      if (store.fit(id)) store.repaint(id);
+      else if (el.clientWidth > 0) store.repaint(id);
+    });
+    });
+    hostsRef.current.forEach((el) => observer.observe(el));
+    return () => observer.disconnect();
+  }, [store, tabs.length]);
+
+  const tabCount = tabs.length;
+  useEffect(() => {
+    if (tabCount === 0) setActiveId(null);
+    else if (!tabs.some((tab) => tab.id === activeId)) setActiveId(tabs[tabCount - 1].id);
+  }, [tabCount, tabs, activeId]);
+
+  const statusText = useMemo(() => {
+    if (!active) return t("hook.terminal.idle");
+    switch (active.status) {
+      case "running":
+        return t("hook.terminal.running", { cols: active.cols, rows: active.rows });
+      case "starting":
+        return t("hook.terminal.starting");
+      case "exited":
+        return t("hook.terminal.exited", { code: active.exitCode ?? "—" });
+      case "failed":
+        return active.error ?? t("hook.terminal.failed");
+      default:
+        return t("hook.terminal.stopped");
+    }
+  }, [active, t]);
 
   return (
     <section className="flex h-full min-h-0 flex-col gap-2 rounded-xl border border-border/70 bg-card p-2.5 text-xs">
@@ -157,35 +223,162 @@ export function TerminalPage() {
           placeholder={t("hook.terminal.argsPh")}
           data-testid="terminal-args"
         />
-        <Button size="sm" className="h-7 px-2" disabled={busy || !program.trim() || state.running} onClick={() => void start()} data-testid="terminal-start">
-          <Play className="h-3.5 w-3.5" />
-          {t("hook.terminal.start")}
+        <Button
+          size="sm"
+          className="h-7 px-2"
+          disabled={!program.trim() || tabCount >= MAX_TERMINAL_SESSIONS}
+          onClick={() => void createTab()}
+          data-testid="terminal-new"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          {t("hook.terminal.new")}
         </Button>
-        <Button size="sm" variant="outline" className="h-7 px-2" disabled={busy || !state.running} onClick={() => void stop()} data-testid="terminal-stop">
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 px-2"
+          disabled={active?.status !== "running"}
+          onClick={() => void stopActive()}
+          data-testid="terminal-stop"
+        >
           <CircleStop className="h-3.5 w-3.5" />
           {t("hook.terminal.stop")}
         </Button>
-        <Button size="sm" variant="ghost" className="h-7 px-2" disabled={busy} onClick={() => void restart()} data-testid="terminal-restart">
-          <RotateCcw className="h-3.5 w-3.5" />
-          {t("hook.terminal.restart")}
-        </Button>
-        <span className={cn("text-10px", state.running ? "text-emerald-500" : "text-muted-foreground")} data-testid="terminal-status">
-          {statusLine}
+        <span className={cn("text-10px", active?.status === "running" ? "text-emerald-500" : "text-muted-foreground")} data-testid="terminal-status">
+          {statusText}
         </span>
-        {/* 渲染器写出来不是装饰：webgl 起不来时"卡顿"和"空白"是两种完全不同的故障 */}
-        {renderer && <span className="text-10px text-muted-foreground">{t("hook.terminal.renderer", { kind: renderer })}</span>}
+        {tabCount > 0 && (
+          <span className="text-10px text-muted-foreground" data-testid="terminal-count">
+            {t("hook.terminal.count", { n: tabCount, max: MAX_TERMINAL_SESSIONS })}
+          </span>
+        )}
+        {active && (
+          <span className="text-10px text-muted-foreground">{t("hook.terminal.renderer", { kind: active.renderer })}</span>
+        )}
       </div>
+
+      {tabs.length > 0 && (
+        <div className="flex shrink-0 flex-wrap items-center gap-1" role="tablist" data-testid="terminal-tabs">
+          {tabs.map((tab) => (
+            <div
+              key={tab.id}
+              className={cn(
+                "flex items-center gap-1 rounded-t border border-b-0 border-border/60 px-2 py-1",
+                tab.id === activeId ? "bg-background font-medium" : "bg-muted/40 text-muted-foreground",
+              )}
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={tab.id === activeId}
+                className="flex items-center gap-1"
+                onClick={() => select(tab.id)}
+                data-testid={`terminal-tab-${tab.id}`}
+              >
+                <span
+                  className={cn("h-1.5 w-1.5 shrink-0 rounded-full", DOT_CLASS[tab.status])}
+                  data-testid={`terminal-dot-${tab.id}`}
+                />
+                <span className="max-w-[10rem] truncate">{tab.title}</span>
+              </button>
+              <button
+                type="button"
+                className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                onClick={() => void closeTab(tab.id)}
+                aria-label={t("hook.terminal.close")}
+                data-testid={`terminal-close-${tab.id}`}
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {pendingClose && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1" data-testid="terminal-confirm">
+          <span className="text-destructive">
+            {t("hook.terminal.confirmClose", { title: tabs.find((tab) => tab.id === pendingClose)?.title ?? pendingClose })}
+          </span>
+          <Button size="sm" variant="destructive" className="h-6 px-2" onClick={() => void closeTab(pendingClose)} data-testid="terminal-confirm-yes">
+            {t("hook.terminal.confirmYes")}
+          </Button>
+          <Button size="sm" variant="ghost" className="h-6 px-2" onClick={() => setPendingClose(null)} data-testid="terminal-confirm-no">
+            {t("hook.terminal.confirmNo")}
+          </Button>
+        </div>
+      )}
+
+      <div className="flex shrink-0 flex-wrap items-center gap-2">
+        <input
+          className="h-6 w-40 rounded border border-input bg-transparent px-2 font-mono"
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setHits(null);
+          }}
+          onKeyDown={(e) => {
+            if (e.key !== "Enter") return;
+            e.preventDefault();
+            search(!e.shiftKey);
+          }}
+          placeholder={t("hook.terminal.searchPh")}
+          disabled={!active}
+          data-testid="terminal-search"
+        />
+        <Button size="sm" variant="ghost" className="h-6 px-1" disabled={!active || !query} onClick={() => search(false)} aria-label={t("hook.terminal.searchPrev")} data-testid="terminal-search-prev">
+          <ChevronUp className="h-3.5 w-3.5" />
+        </Button>
+        <Button size="sm" variant="ghost" className="h-6 px-1" disabled={!active || !query} onClick={() => search(true)} aria-label={t("hook.terminal.searchNext")} data-testid="terminal-search-next">
+          <ChevronDown className="h-3.5 w-3.5" />
+        </Button>
+        {hits !== null && (
+          <span className="text-10px text-muted-foreground" data-testid="terminal-hits">
+            {hits > 0 ? t("hook.terminal.hits", { n: hits }) : t("hook.terminal.hitsNone")}
+          </span>
+        )}
+      </div>
+
       <p className="shrink-0 text-10px text-muted-foreground">{t("hook.terminal.hint")}</p>
-      {error && (
+      {notice && (
         <p className="shrink-0 break-all text-10px text-destructive" data-testid="terminal-error">
-          {error}
+          {notice}
         </p>
       )}
-      <div
-        ref={hostRef}
-        className="min-h-0 flex-1 overflow-hidden rounded border border-border/60 bg-black/85 p-1"
-        data-testid="terminal-host"
-      />
+
+      {/* 每块屏都有自己的宿主：非活动 tab 只是 hidden，实例与缓冲区一直活着（分页那条验收的根） */}
+      <div className="relative min-h-0 flex-1">
+        {tabs.map((tab) => (
+          <div
+            key={tab.id}
+            ref={refFor(tab.id)}
+            hidden={tab.id !== activeId}
+            className="absolute inset-0 overflow-hidden rounded border border-border/60 bg-black/85 p-1"
+            data-testid={tab.id === activeId ? "terminal-host" : `terminal-host-${tab.id}`}
+          />
+        ))}
+      </div>
     </section>
   );
+}
+
+/** 真的关一个 tab：关会话 + 把活动 tab 挪到它旁边的兄弟（关最后一个时挪到新的最后一个）。 */
+async function finishClose(
+  store: TerminalSessionStore,
+  id: string,
+  setActiveId: (id: string | null) => void,
+  setPendingClose: (id: string | null) => void,
+  t: (key: string, params?: Record<string, string | number>) => string,
+): Promise<void> {
+  const before = store.tabs();
+  const at = before.findIndex((tab) => tab.id === id);
+  const result = await store.close(id, { force: true });
+  setPendingClose(null);
+  if (!result.closed) {
+    // 走到这里说明会话表自己不同意关——把原因显示出来，不假装关掉了
+    return;
+  }
+  const neighbour = before[at + 1]?.id ?? before[at - 1]?.id ?? null;
+  setActiveId(neighbour);
+  void t;
 }
