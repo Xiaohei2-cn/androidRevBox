@@ -1,7 +1,7 @@
 /** Hook tab (P10 Frida session console + future capabilities) — English */
 export default {
   "hook.terminal.tab": "Terminal",
-  "hook.terminal.fridaPreset": "frida session",
+  "hook.terminal.loading": "Loading terminal…",  "hook.terminal.fridaPreset": "frida session",
   "hook.terminal.deviceShell": "Device shell",
   "hook.terminal.deviceNoAdb": "No usable adb found: the device shell is started with adb -s <serial> shell -tt. Set the adb path in Settings first.",
   "hook.terminal.deviceNoSerial": "No device is online, so there is no device shell to open.",

@@ -1,7 +1,7 @@
 /** Вкладка Hook (P10 консоль сессий Frida + будущие возможности) — русский */
 export default {
   "hook.terminal.tab": "Терминал",
-  "hook.terminal.fridaPreset": "сессия frida",
+  "hook.terminal.loading": "Загрузка терминала…",  "hook.terminal.fridaPreset": "сессия frida",
   "hook.terminal.deviceShell": "Shell устройства",
   "hook.terminal.deviceNoAdb": "Пригодный adb не найден: shell устройства запускается через adb -s <serial> shell -tt. Сначала укажите путь к adb в настройках.",
   "hook.terminal.deviceNoSerial": "Устройств онлайн нет — shell устройства открыть негде.",

@@ -1,7 +1,7 @@
 /** Aba Hook (P10 console de sessões Frida + recursos futuros) — português (Brasil) */
 export default {
   "hook.terminal.tab": "Terminal",
-  "hook.terminal.fridaPreset": "sessão frida",
+  "hook.terminal.loading": "Carregando o terminal…",  "hook.terminal.fridaPreset": "sessão frida",
   "hook.terminal.deviceShell": "Shell do dispositivo",
   "hook.terminal.deviceNoAdb": "Nenhum adb utilizável encontrado: o shell do dispositivo é iniciado com adb -s <serial> shell -tt. Defina o caminho do adb nas configurações.",
   "hook.terminal.deviceNoSerial": "Nenhum dispositivo online, então não há shell de dispositivo para abrir.",

@@ -1,7 +1,7 @@
 /** Hook 主标签（P10 frida 会话工作台 + 后续能力占位）——zh-CN 源语言 */
 export default {
   "hook.terminal.tab": "真终端",
-  "hook.terminal.fridaPreset": "frida 会话",
+  "hook.terminal.loading": "正在载入终端…",  "hook.terminal.fridaPreset": "frida 会话",
   "hook.terminal.deviceShell": "设备 shell",
   "hook.terminal.deviceNoAdb": "没找到可用的 adb：设备 shell 是靠 adb -s <序列号> shell -tt 起的，先去设置里配 adb 路径。",
   "hook.terminal.deviceNoSerial": "现在没有在线设备，开不了设备 shell。",
