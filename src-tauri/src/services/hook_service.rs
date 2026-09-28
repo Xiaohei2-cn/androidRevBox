@@ -15,7 +15,7 @@ use tauri::Manager;
 use crate::adapters::frida;
 use crate::core::error::{CoreError, CoreResult};
 use crate::services::config_service::{ConfigService, KEY_HOOK_WORKDIR, KEY_PYTHON_PATH};
-use crate::services::env_service::EnvService;
+use crate::services::env_service::{EnvService, FridaEnv};
 use crate::services::process_service::CommandSpec;
 use crate::services::task_service::TaskService;
 
@@ -52,6 +52,11 @@ pub struct PreflightDto {
     pub python_hint: Option<String>,
     /// 生效的 python 解释器（runner 用它；None = 未配置/不可用）
     pub python_path: Option<String>,
+    /// 结构化（轨道）会话的要求：**这个 Python 里必须有 frida 绑定包**（我们的 runner 走
+    /// `import frida`）。以前这里挂的是 `FridaEnv::installed`——那句是"frida 或 frida-tools
+    /// 任一即通过"，于是只装了 frida-tools 的机器前置显示绿灯、一点起会话就收到
+    /// `ModuleNotFoundError: frida`。终端里那条路（官方 REPL）要的是 frida-tools，
+    /// 它自己在真终端页判（`src/lib/fridaTerminal.ts`）：**两边分开判，谁缺谁说**（D091）。
     pub frida_ok: bool,
     pub frida_version: Option<String>,
     pub frida_hint: Option<String>,
@@ -141,6 +146,35 @@ pub struct HookService {
     app: tauri::AppHandle,
 }
 
+/// 结构化会话对 frida 环境的要求（纯函数，便于把四种组合都测到）：
+/// 返回 `(能不能用, 该显示的原因)`。
+///
+/// 四种组合里只有一种放行：**绑定包在**。另外三种各有自己的话：
+/// - 只有 frida-tools ⇒ 明说"只有 tools"，并点出**终端 REPL 不受这条影响**
+///   （不然她会把整个 frida 能力当成坏了，而那条路是真能跑的）；
+/// - 两个都没有 ⇒ 沿用 EnvService 那句原文（它已经在说 pip install frida-tools），不在这里改写；
+/// - Python 压根没就绪 ⇒ 也沿用原文那句（此时去谈装哪个包是误导）。
+fn frida_binding_requirement(env: &FridaEnv) -> (bool, Option<String>) {
+    if env.frida_version.is_some() {
+        return (true, None);
+    }
+    if env.python_ready && env.frida_tools_version.is_some() {
+        return (
+            false,
+            Some(
+                "这个 Python 里只有 frida-tools，没有 Python 绑定包：我们的 runner 走 `import frida`，装一下 frida（pip install frida）。真终端里的官方 REPL 不受这条影响。"
+                    .to_string(),
+            ),
+        );
+    }
+    (
+        false,
+        env.hint
+            .clone()
+            .or_else(|| Some("这个 Python 里没有 frida：pip install frida".to_string())),
+    )
+}
+
 impl HookService {
     pub fn new(
         config: std::sync::Arc<ConfigService>,
@@ -201,6 +235,7 @@ impl HookService {
             None => (None, None),
         };
         let runner = self.runner_path();
+        let binding = frida_binding_requirement(&frida_env);
         PreflightDto {
             adb_ok: adb.installed,
             adb_hint: if adb.installed {
@@ -211,9 +246,9 @@ impl HookService {
             python_ok: python.ready,
             python_hint: python.hint.clone(),
             python_path: python.path.clone(),
-            frida_ok: frida_env.installed,
+            frida_ok: binding.0,
             frida_version: frida_env.frida_version.clone(),
-            frida_hint: frida_env.hint.clone(),
+            frida_hint: binding.1,
             remote_ok,
             remote_hint,
             channel_ok: channel.checked.then_some(channel.ok),
@@ -567,6 +602,78 @@ pub fn save_export(path: &str, content: &str) -> CoreResult<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    fn frida_env(python_ready: bool, binding: Option<&str>, tools: Option<&str>) -> FridaEnv {
+        FridaEnv {
+            python_ready,
+            installed: binding.is_some() || tools.is_some(),
+            frida_version: binding.map(str::to_string),
+            frida_tools_version: tools.map(str::to_string),
+            hint: match (binding, tools) {
+                (Some(_), _) => None,
+                (None, Some(_)) => None,
+                (None, None) => Some(
+                    "该 Python 环境未安装 frida / frida-tools（pip install frida-tools）。".into(),
+                ),
+            },
+        }
+    }
+
+    /// 四种组合都钉住。**只有绑定包在**才放行结构化会话：今天那句"任一即通过"
+    /// 会在这台机器上显示绿灯，然后 runner 报 `ModuleNotFoundError: frida`。
+    #[test]
+    fn frida_requirement_for_structured_session_is_the_python_binding() {
+        // ① 绑定包在（不管 tools 在不在）⇒ 放行，且不给原因
+        assert!(frida_binding_requirement(&frida_env(true, Some("16.5.1"), None)).0);
+        let both = frida_binding_requirement(&frida_env(true, Some("16.5.1"), Some("12.5.3")));
+        assert_eq!((both.0, both.1.as_deref()), (true, None));
+
+        // ② 只有 frida-tools ⇒ 不许放行，并且要说清"缺的是绑定包"
+        let only_tools = frida_binding_requirement(&frida_env(true, None, Some("12.5.3")));
+        assert!(!only_tools.0, "只有 frida-tools 时结构化会话必须判不通过");
+        let reason = only_tools.1.expect("得给出原因，不能只亮红灯");
+        assert!(reason.contains("frida-tools"), "{reason}");
+        assert!(reason.contains("绑定包"), "{reason}");
+        // 顺带点明终端那条路没坏——否则她会把整个 frida 能力当成坏了
+        assert!(reason.contains("REPL"), "{reason}");
+
+        // ③ 两个都没有 ⇒ 沿用 EnvService 那句原文，不在这里改写它
+        let none = frida_binding_requirement(&frida_env(true, None, None));
+        assert!(!none.0);
+        assert_eq!(
+            none.1.as_deref(),
+            Some("该 Python 环境未安装 frida / frida-tools（pip install frida-tools）。")
+        );
+
+        // ④ Python 压根没就绪 ⇒ 也沿用原文那句（此时谈装哪个包是误导）
+        let no_python = frida_binding_requirement(&FridaEnv {
+            python_ready: false,
+            installed: false,
+            frida_version: None,
+            frida_tools_version: None,
+            hint: Some("Python 环境未就绪，无法检测 Frida。".into()),
+        });
+        assert!(!no_python.0);
+        assert_eq!(
+            no_python.1.as_deref(),
+            Some("Python 环境未就绪，无法检测 Frida。")
+        );
+    }
+
+    /// 这条扫描钉的是**调用点**：结构体的 ok 必须来自那个分开判断，
+    /// 一旦被改回 `frida_env.installed`（任一即通过），这里就会红。
+    #[test]
+    fn preflight_no_longer_uses_the_any_one_passes_aggregate() {
+        let source = include_str!("hook_service.rs");
+        let at = source
+            .find("frida_ok:")
+            .expect("preflight 里必须还在报这一项");
+        let line = source[at..].lines().next().unwrap_or_default();
+        assert!(
+            !line.contains("frida_env.installed"),
+            "frida_ok 又用回聚合位了：{line}"
+        );
+    }
 
     /// 路径把关：这三条判据都得能脱离文件系统被钉住。
     #[test]
