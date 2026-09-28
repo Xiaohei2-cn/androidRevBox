@@ -43,6 +43,52 @@ if (typeof window.matchMedia !== "function") {
   });
 }
 
+
+/*
+ * R-01 的代价：jsdom 没有 canvas，而 xterm 6 的核心在解析 CSS 颜色时会借 2D 上下文做一次
+ * fillStyle 往返归一化（`@xterm/xterm/src/common/Color.ts`）。没有这个桩，连"缓冲区里
+ * 有没有这个颜色"都测不了。
+ *
+ * 这个桩只做一件事：**存进去取得出来**。它不代表渲染正确 —— 像素那半归
+ * docs/frida_terminal_phases.md §5 的手工矩阵，别把这份测试当成"渲染测过了"。
+ */
+if (typeof window !== "undefined" && typeof window.HTMLCanvasElement !== "undefined") {
+  Object.defineProperty(window.HTMLCanvasElement.prototype, "getContext", {
+    configurable: true,
+    writable: true,
+    value(this: HTMLCanvasElement) {
+      const ctx: Record<string, unknown> = {
+        canvas: this,
+        fillStyle: "#000000",
+        strokeStyle: "#000000",
+        globalAlpha: 1,
+        globalCompositeOperation: "source-over",
+        font: "10px monospace",
+        textBaseline: "alphabetic",
+        measureText: (text: string) => ({
+          width: String(text).length * 6,
+          actualBoundingBoxAscent: 8,
+          actualBoundingBoxDescent: 2,
+        }),
+      };
+      for (const noop of [
+        "fillRect", "clearRect", "strokeRect", "fillText", "strokeText",
+        "save", "restore", "beginPath", "closePath", "moveTo", "lineTo",
+        "fill", "stroke", "clip", "arc", "drawImage", "putImageData", "translate", "scale",
+      ]) {
+        ctx[noop] = () => undefined;
+      }
+      ctx["createLinearGradient"] = () => ({ addColorStop: () => undefined });
+      ctx["getImageData"] = (_x: number, _y: number, w: number, h: number) => ({
+        data: new Uint8ClampedArray(Math.max(1, w * h * 4)),
+        width: w,
+        height: h,
+      });
+      return ctx;
+    },
+  });
+}
+
 // radix 组件在 jsdom 中依赖 ResizeObserver
 if (typeof globalThis.ResizeObserver !== "function") {
   globalThis.ResizeObserver = class ResizeObserver {

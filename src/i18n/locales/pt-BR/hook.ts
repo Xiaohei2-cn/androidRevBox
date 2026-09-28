@@ -1,5 +1,16 @@
 /** Aba Hook (P10 console de sessões Frida + recursos futuros) — português (Brasil) */
 export default {
+  "hook.terminal.tab": "Terminal",
+  "hook.terminal.programPh": "Programa a executar (padrão: $SHELL)",
+  "hook.terminal.argsPh": "argumentos (separados por espaço)",
+  "hook.terminal.start": "Iniciar",
+  "hook.terminal.stop": "Parar",
+  "hook.terminal.restart": "Recriar terminal",
+  "hook.terminal.running": "Sessão ativa {cols}×{rows}",
+  "hook.terminal.exited": "Encerrado ({code})",
+  "hook.terminal.idle": "Nenhuma sessão ainda",
+  "hook.terminal.renderer": "Renderizador: {kind}",
+  "hook.terminal.hint": "Terminal pseudo local: os comandos rodam neste computador, sem relação com o dispositivo. Escapes, cursor e tela alternativa ficam com o xterm.js — aqui nada é analisado.",
   "hook.frida.tab": "Frida",
   "hook.more.tab": "Mais",
   "hook.more.title": "Extensões de Hook",

@@ -1,5 +1,16 @@
 /** Вкладка Hook (P10 консоль сессий Frida + будущие возможности) — русский */
 export default {
+  "hook.terminal.tab": "Терминал",
+  "hook.terminal.programPh": "Программа (по умолчанию $SHELL)",
+  "hook.terminal.argsPh": "аргументы (через пробел)",
+  "hook.terminal.start": "Запустить",
+  "hook.terminal.stop": "Остановить",
+  "hook.terminal.restart": "Пересоздать терминал",
+  "hook.terminal.running": "Сессия активна {cols}×{rows}",
+  "hook.terminal.exited": "Завершена ({code})",
+  "hook.terminal.idle": "Сессии пока нет",
+  "hook.terminal.renderer": "Рендерер: {kind}",
+  "hook.terminal.hint": "Локальный псевдотерминал: команды идут на этом компьютере, не на устройстве. Экраны, курсор и альтернативный буфер полностью на xterm.js — здесь ничего не разбирается.",
   "hook.frida.tab": "Frida",
   "hook.more.tab": "Ещё",
   "hook.more.title": "Расширения Hook",

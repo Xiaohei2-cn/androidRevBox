@@ -1,5 +1,16 @@
 /** Hook tab (P10 Frida session console + future capabilities) — English */
 export default {
+  "hook.terminal.tab": "Terminal",
+  "hook.terminal.programPh": "Program to run (defaults to $SHELL)",
+  "hook.terminal.argsPh": "arguments (space-separated)",
+  "hook.terminal.start": "Start",
+  "hook.terminal.stop": "Stop",
+  "hook.terminal.restart": "Rebuild terminal",
+  "hook.terminal.running": "Session running {cols}×{rows}",
+  "hook.terminal.exited": "Exited ({code})",
+  "hook.terminal.idle": "No session yet",
+  "hook.terminal.renderer": "Renderer: {kind}",
+  "hook.terminal.hint": "Local pseudo-terminal: commands run on this computer, not on the device. Escape sequences, cursor and alternate screen are all handled by xterm.js — nothing is parsed here.",
   "hook.frida.tab": "Frida",
   "hook.more.tab": "More",
   "hook.more.title": "Hook Extensions",

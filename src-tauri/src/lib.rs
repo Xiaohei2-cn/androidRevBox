@@ -37,6 +37,7 @@ use crate::services::env_service::EnvService;
 use crate::services::hook_service::HookService;
 use crate::services::log_service::{self, LogService};
 use crate::services::plugin_service::PluginService;
+use crate::services::pty_service::PtyService;
 use crate::services::task_service::TaskService;
 use crate::services::zygisk_applist::ZygiskApplistService;
 
@@ -49,6 +50,8 @@ pub struct AppState {
     pub plugins: Arc<PluginService>,
     pub env: Arc<EnvService>,
     pub hook: Arc<HookService>,
+    /// 真终端会话（FT0.2）：本机 PTY 与它的原样字节流；一个桌面一个会话表
+    pub pty: Arc<PtyService>,
     pub agent: Arc<AgentManager>,
     pub android: Arc<CapabilityRouter>,
     /// 设备上线自动连接 Agent（AR12.5）：探测结论 + 一次性授权表都在这层
@@ -151,6 +154,8 @@ pub fn run() {
                 Err(e) => tracing::error!(error = %e, "插件扫描异常"),
             }
 
+            let pty = Arc::new(PtyService::new());
+
             app.manage(AppState {
                 config: config.clone(),
                 log,
@@ -159,6 +164,7 @@ pub fn run() {
                 plugins,
                 env,
                 hook,
+                pty,
                 agent,
                 android,
                 agent_auto,
@@ -259,7 +265,13 @@ pub fn run() {
             commands::hook::hook_js_list,
             commands::hook::hook_preflight,
             commands::hook::hook_session_start,
-            commands::hook::hook_export_save
+            commands::hook::hook_export_save,
+            commands::pty::pty_open,
+            commands::pty::pty_write,
+            commands::pty::pty_resize,
+            commands::pty::pty_close,
+            commands::pty::pty_count,
+            commands::pty::pty_default_program,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -1,5 +1,16 @@
 /** Hook 主标签（P10 frida 会话工作台 + 后续能力占位）——zh-CN 源语言 */
 export default {
+  "hook.terminal.tab": "真终端",
+  "hook.terminal.programPh": "要跑的程序（默认用本机 $SHELL）",
+  "hook.terminal.argsPh": "参数（空格分隔）",
+  "hook.terminal.start": "启动",
+  "hook.terminal.stop": "停止",
+  "hook.terminal.restart": "重建终端",
+  "hook.terminal.running": "会话在跑 {cols}×{rows}",
+  "hook.terminal.exited": "已退出（{code}）",
+  "hook.terminal.idle": "还没起会话",
+  "hook.terminal.renderer": "渲染器：{kind}",
+  "hook.terminal.hint": "本机伪终端：命令在这台电脑上执行，与手机无关。转义、光标、备用屏都交给 xterm.js 处理，这里不做任何解析。",
   "hook.frida.tab": "Frida",
   "hook.more.tab": "更多",
   "hook.more.title": "Hook 能力扩展",

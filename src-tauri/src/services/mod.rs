@@ -15,5 +15,6 @@ pub mod hook_service;
 pub mod log_service;
 pub mod plugin_service;
 pub mod process_service;
+pub mod pty_service;
 pub mod task_service;
 pub mod zygisk_applist;

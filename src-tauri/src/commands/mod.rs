@@ -7,6 +7,7 @@ pub mod device;
 pub mod env;
 pub mod hook;
 pub mod plugins;
+pub mod pty;
 pub mod system;
 pub mod task;
 pub mod window;

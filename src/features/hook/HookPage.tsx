@@ -2,6 +2,7 @@ import { SubTabs } from "@/components/nav/SubTabs";
 import { Placeholder } from "@/components/nav/Placeholder";
 import { PageHeader } from "@/components/ui/page-header";
 import { FridaPage } from "@/features/hook/frida/FridaPage";
+import { TerminalPage } from "@/features/terminal/TerminalPage";
 import { useI18n } from "@/i18n";
 
 /**
@@ -16,6 +17,9 @@ export function HookPage() {
         <SubTabs
           tabs={[
             { id: "frida", label: t("hook.frida.tab"), content: <FridaPage /> },
+            /* 真终端（FT0.3）：本机 PTY + xterm.js。它不是"另一个 frida 视图"，
+               而是给路 B（官方 frida 命令行）准备的同一块地基。 */
+            { id: "terminal", label: t("hook.terminal.tab"), content: <TerminalPage /> },
             {
               id: "more",
               label: t("hook.more.tab"),

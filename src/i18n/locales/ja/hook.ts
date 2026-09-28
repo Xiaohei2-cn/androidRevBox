@@ -1,5 +1,16 @@
 /** Hook タブ（P10 Frida セッションコンソール＋将来機能）— 日本語 */
 export default {
+  "hook.terminal.tab": "ターミナル",
+  "hook.terminal.programPh": "実行するプログラム（既定は本機の $SHELL）",
+  "hook.terminal.argsPh": "引数（空白区切り）",
+  "hook.terminal.start": "開始",
+  "hook.terminal.stop": "停止",
+  "hook.terminal.restart": "ターミナルを作り直す",
+  "hook.terminal.running": "セッション稼働中 {cols}×{rows}",
+  "hook.terminal.exited": "終了（{code}）",
+  "hook.terminal.idle": "まだセッションがありません",
+  "hook.terminal.renderer": "レンダラー：{kind}",
+  "hook.terminal.hint": "ローカル疑似端末：コマンドはこのPCで実行され、端末とは無関係です。エスケープ・カーソル・代替画面はすべて xterm.js が処理し、ここでは一切解析しません。",
   "hook.frida.tab": "Frida",
   "hook.more.tab": "その他",
   "hook.more.title": "Hook 拡張",
