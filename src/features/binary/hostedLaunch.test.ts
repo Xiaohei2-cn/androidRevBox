@@ -5,14 +5,13 @@ import {
   MAX_ARG_LEN,
   MAX_ARGS,
   argsProblem,
-  probeCategoryKey,
   classifyProbe,
+  judgeProbe,
   compareStamp,
   decodeStamp,
   drillVerdict,
   extractOptionCandidates,
   MAX_NEXT_LEVEL_PREFIXES,
-  describeProbeFacts,
   emptyLaunchPrefs,
   encodeStamp,
   loadLaunchPrefs,
@@ -96,18 +95,54 @@ describe("classifyProbe 只按设备事实分类", () => {
     expect(probeHasOutput(probe({ stdout: "", stdout_bytes: 4_096, truncated: true }))).toBe(true);
   });
 
-  it("分类键都在词典口径里（防止加了一类却没配文案）", () => {
-    expect(probeCategoryKey(probe({ timed_out: true }))).toMatch(/^adb\.binary\.probe\.cat/);
+  it("结论只回答有/没有：有输出的那条就是「有」", () => {
+    const hit = judgeProbe([
+      { candidate: "-h", result: probe({ stdout: "", stdout_bytes: 0 }) },
+      { candidate: "--help", result: probe({ stdout: "Usage: demo\n", stdout_bytes: 12 }) },
+    ]);
+    expect(hit.kind).toBe("help");
+    if (hit.kind === "help") {
+      expect(hit.text).toContain("Usage");
+      // 数字要能继续说清"完不完整、留没留东西"，所以原始回执跟着结论一起交出去
+      expect(hit.result.stdout_bytes).toBe(12);
+    }
   });
 
-  it("一句人话里要带得上耗时、码、字节数与截断", () => {
-    const text = describeProbeFacts(probe({ elapsed_ms: 4_000, timed_out: true, killed: true, truncated: true }));
-    expect(text).toContain("4000 ms");
-    expect(text).toContain("超时已杀");
-    expect(text).toContain("回传已截断");
-    expect(describeProbeFacts(probe({ started: false, detail: "not_found: 文件不存在" }))).toContain(
-      "无法执行",
-    );
+  it("只有 stderr 有内容也算「有」，并且就展示那份", () => {
+    const hit = judgeProbe([
+      {
+        candidate: "--help",
+        result: probe({ stdout: "", stdout_bytes: 0, stderr: "用法：demo [-h]", stderr_bytes: 20 }),
+      },
+    ]);
+    expect(hit.kind).toBe("help");
+    if (hit.kind === "help") expect(hit.text).toContain("用法：demo");
+  });
+
+  it("打完东西没退（被判超时杀掉）仍然是「有」——内容比姿态重要", () => {
+    const hit = judgeProbe([
+      { candidate: "--help", result: probe({ timed_out: true, killed: true, still_running: true }) },
+    ]);
+    expect(hit.kind).toBe("help");
+    if (hit.kind === "help") expect(hit.stillRunning).toBe(true);
+  });
+
+  it("一条内容都没有就是「没有」，并把能查到的原因带出来", () => {
+    expect(judgeProbe([{ candidate: "-h", result: probe({ stdout: "", stdout_bytes: 0 }) }])).toEqual({
+      kind: "none",
+      detail: undefined,
+    });
+    const refused = judgeProbe([
+      {
+        candidate: "-h",
+        result: probe({ started: false, stdout: "", stdout_bytes: 0, detail: "not_an_elf: 不是 ELF" }),
+      },
+    ]);
+    expect(refused.kind).toBe("none");
+    if (refused.kind === "none") expect(refused.detail).toContain("not_an_elf");
+    const failed = judgeProbe([{ candidate: "-h", error: "Agent 不在线" }]);
+    expect(failed.kind === "none" && failed.detail).toBe("Agent 不在线");
+    expect(judgeProbe([])).toEqual({ kind: "none", detail: undefined });
   });
 });
 

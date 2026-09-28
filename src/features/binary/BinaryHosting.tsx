@@ -43,13 +43,10 @@ import {
   HELP_CANDIDATES,
   PROBE_TIMEOUT_MS,
   argsProblem,
-  classifyProbe,
   drillVerdict,
-  describeProbeFacts,
   encodeStamp,
   loadLaunchPrefs,
   looksLikeMissingCommand,
-  probeCategoryKey,
   probeHasOutput,
   probePreflight,
   repeatedError,
@@ -60,6 +57,7 @@ import {
   compareStamp,
   decodeStamp,
   extractOptionCandidates,
+  judgeProbe,
   probeHiddenBytes,
   utf8Bytes,
   MAX_STDIN_BYTES,
@@ -175,6 +173,15 @@ interface ProbeNode {
    * `same` 必须明说——把同一份总帮助摆在 `-D` 底下，用户会以为那就是 `-D` 的说明。
    */
   verdict?: DrillVerdict;
+  /**
+   * 这一层结论的译文。
+   *
+   * 不按候选存：界面只给一个结论（有/没有），一份结论对应一份译文。
+   * 按候选存会让"翻的是哪一条"变成用户要操心的事。
+   */
+  translating?: boolean;
+  translated?: string;
+  translateNote?: string;
 }
 
 /** 一条候选的回执：要么有设备回传的事实，要么有这次调用本身的错误 */
@@ -245,18 +252,6 @@ const MAX_DRILL_CHIPS = 6;
  * 起始语言固定填英文：托管二进制的 help 文本几乎都是英文，
  * 让接口自己猜容易把"猜错源语言"当成"翻译坏了"。真要改，改这里而不是改界面文案。
  */
-/** 分类的颜色：绿=拿到东西了，黄=要留意，红=没起来。不额外暗示"这就是帮助" */
-function categoryTone(result?: HostedProbeResult): string {
-  if (!result) return "bg-red-500/10 text-red-500";
-  switch (classifyProbe(result)) {
-    case "output-exited":
-      return "bg-emerald-500/10 text-emerald-500";
-    case "unusable":
-      return "bg-red-500/10 text-red-500";
-    default:
-      return "bg-amber-500/10 text-amber-500";
-  }
-}
 
 const TRANSLATE_LANGS: Record<string, string> = {
   "zh-CN": "简体中文",
@@ -521,8 +516,9 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
           ],
         }));
         if (probeLooksLikeHelp(result)) {
+          // 命中即停，但不另弹提示：面板上的徽章就是结果，
+          // 再报一句"命中 -h"等于把用户不关心的过程又端回来一次
           patchNode(name, path, (node) => ({ ...node, running: false }));
-          setNotice(t("adb.binary.probeHit", { candidate }));
           return;
         }
       } catch (e) {
@@ -545,13 +541,12 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
         }
       }
     }
+    // 徽章自己会写"没有"，这里不再补一遍；只有九条候选报同一句话时才把它顶出来
+    // ——那是"哪里坏了"，不是探测结论
     patchNode(name, path, (node) => ({
       ...node,
       running: false,
-      banner: (() => {
-        const same = repeatedError(node.results.map((r) => r.error));
-        return same ?? t("adb.binary.probeNone");
-      })(),
+      banner: repeatedError(node.results.map((r) => r.error)) ?? undefined,
     }));
   };
 
@@ -707,56 +702,36 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
    * 且**翻完之后不再显示原文**（用户口径）：一份文本摆两份，读的人反而要自己核对
    * 哪份才是它说的。原文的字节数与退出码仍在事实行里，判据没被藏起来。
    */
-  const translateProbe = async (row: HostedRow, path: string[], candidate: string) => {
-    // 取"那一层"的节点：下钻之后的候选不在第一层里，写死 path.length===0 会让
-    // 第二层的翻译按钮按下去没反应（第一版就是这样）
-    const result = nodeAt(row.probe, path)?.results.find((r) => r.candidate === candidate)?.result;
-    const text = result ? stripAnsi(result.stdout.trim() ? result.stdout : result.stderr) : "";
-    if (!text) return;
-    const at = (node: ProbeNode): ProbeNode => ({
-      ...node,
-      results: node.results.map((r) =>
-        r.candidate === candidate ? { ...r, translating: true, translateNote: undefined } : r,
-      ),
-    });
-    patchNode(row.name, path, at);
+  /**
+   * 翻这一层的结论。
+   *
+   * 只翻"有内容的那一条流"（帮助常在 stdout、报错在 stderr），
+   * 而且翻完只留译文：同一份内容摆两份，读的人还得自己核对哪份算数。
+   */
+  const translateProbe = async (row: HostedRow, path: string[]) => {
+    const verdict = judgeProbe(nodeAt(row.probe, path)?.results ?? []);
+    const text = verdict.kind === "help" ? stripAnsi(verdict.text) : "";
+    if (!text.trim()) return;
+    const mark = (patch: Partial<ProbeNode>) =>
+      patchNode(row.name, path, (n) => ({ ...n, ...patch }));
+    mark({ translating: true, translateNote: undefined });
     try {
-      const out = await aiApi.translate(
-        text,
-        TRANSLATE_LANGS[locale] ?? "简体中文",
-        TRANSLATE_SOURCE,
-      );
-      patchNode(row.name, path, (node) => ({
-        ...node,
-        results: node.results.map((r) =>
-          r.candidate === candidate
-            ? {
-                ...r,
-                translating: false,
-                translated: out.text,
-                translateNote: out.sourceTruncated
-                  ? t("adb.binary.translateTruncated", { chars: String(out.sentChars) })
-                  : undefined,
-              }
-            : r,
-        ),
-      }));
+      const out = await aiApi.translate(text, TRANSLATE_LANGS[locale] ?? "简体中文", TRANSLATE_SOURCE);
+      mark({
+        translating: false,
+        translated: out.text,
+        translateNote: out.sourceTruncated
+          ? t("adb.binary.translateTruncated", { chars: String(out.sentChars) })
+          : undefined,
+      });
     } catch (e) {
-      // 翻译坏了不改判探测：留着原文并说一句为什么
-      patchNode(row.name, path, (node) => ({
-        ...node,
-        results: node.results.map((r) =>
-          r.candidate === candidate
-            ? {
-                ...r,
-                translating: false,
-                translateNote: t("adb.binary.translateFail", {
-                  detail: String((e as Error)?.message ?? e),
-                }),
-              }
-            : r,
-        ),
-      }));
+      // 翻译坏了不改判探测：结论与原文照旧，只多说一句为什么没译出来
+      mark({
+        translating: false,
+        translateNote: t("adb.binary.translateFail", {
+          detail: String((e as Error)?.message ?? e),
+        }),
+      });
     }
   };
 
@@ -1740,7 +1715,8 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                         onDrill={async (path, token, parentText) => {
                           await drillInto(row, path, token, parentText);
                         }}
-                        onTranslate={(path, candidate) => void translateProbe(row, path, candidate)}
+                        onTranslate={(path) => void translateProbe(row, path)}
+                        aiBaseUrl={aiConfig?.baseUrl ?? ""}
                         onConfig={() => gotoConfig("app.ai.base_url")}
                         onClose={(target) => patchRow(target, { probe: null })}
                         onReconnect={() => void reconnectAndRetry(row)}
@@ -1807,12 +1783,13 @@ function ProbeLevelView(props: {
   node: ProbeNode;
   aiEnabled: boolean;
   aiTail: string;
+  aiBaseUrl: string;
   targetLang: string;
   t: TranslateFn;
   onAbort: (path: string[]) => void;
   onRetry: (path: string[]) => void;
   onDrill: (path: string[], token: string, parentText: string) => void;
-  onTranslate: (path: string[], candidate: string) => void;
+  onTranslate: (path: string[]) => void;
   onConfig: () => void;
   onClose: (name: string) => void;
   canReconnect: boolean;
@@ -1822,6 +1799,8 @@ function ProbeLevelView(props: {
     name,
     node,
     aiEnabled,
+    aiBaseUrl,
+    aiTail,
     targetLang,
     t,
     onAbort,
@@ -1912,167 +1891,169 @@ function ProbeLevelView(props: {
               )}
             </div>
           )}
-          <div className="flex flex-wrap items-center gap-1.5 text-10px">
-            <span className="min-w-0 flex-1 text-muted-foreground">
-              {t("adb.binary.probeTried", { count: String(done) })}
-            </span>
-            {done < HELP_CANDIDATES.length && done > 0 && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-6 shrink-0 px-2"
-                data-testid={`probe-continue-${name}`}
-                onClick={() => void onRetry(path)}
-              >
-                {t("adb.binary.probeContinue")}
-              </Button>
-            )}
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-6 shrink-0 gap-1 px-1.5 text-muted-foreground"
-              data-testid={`probe-close-${name}`}
-              title={t("adb.binary.probeClose")}
-              onClick={() => onClose(name)}
-            >
-              <X className="h-3 w-3" />
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-6 shrink-0 gap-1 px-1.5 text-muted-foreground"
-              data-testid={`probe-config-${name}`}
-              title={t("adb.binary.translateGoConfig")}
-              onClick={onConfig}
-            >
-              <Settings2 className="h-3 w-3" />
-              {aiEnabled ? t("adb.binary.translateOn", { tail: props.aiTail }) : t("adb.binary.translateOff")}
-            </Button>
-          </div>
-          {depth === 0 && (
-            <p className="text-10px leading-relaxed text-muted-foreground">
-              {t("adb.binary.probeShellOnly")}
-            </p>
-          )}
-          <ul className="flex flex-col gap-1.5">
-            {node.results.map((item) => {
-              const showTranslation = Boolean(item.translated);
-              const streams: Array<["stdout" | "stderr", string]> = showTranslation
-                ? []
-                : [
-                    ["stdout", item.result ? stripAnsi(item.result.stdout) : ""],
-                    ["stderr", item.result ? stripAnsi(item.result.stderr) : ""],
-                  ];
-              const chips =
-                item.result && probeLooksLikeHelp(item.result) && depth < MAX_DRILL_DEPTH
-                  ? extractOptionCandidates(
-                      `${item.result.stdout}\n${item.result.stderr}`,
-                      [...HELP_CANDIDATES, ...path],
-                    ).slice(0, MAX_DRILL_CHIPS)
-                  : [];
-              return (
-                <li
-                  key={item.candidate}
-                  className="rounded-md border border-border/60 p-1.5"
-                  data-testid={`probe-item-${name}-${path.join("_")}-${item.candidate}`}
-                >
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <code className="shrink-0 rounded bg-muted px-1 font-mono text-10px">
-                      {[...path, item.candidate].join(" ")}
-                    </code>
-                    <span
-                      className={cn(
-                        "shrink-0 rounded px-1.5 py-0.5 text-10px",
-                        item.result ? categoryTone(item.result) : "bg-red-500/10 text-red-500",
-                      )}
-                    >
-                      {item.result ? t(probeCategoryKey(item.result)) : t("adb.binary.probeCallFail")}
-                    </span>
-                    <span className="min-w-0 flex-1 break-all text-10px text-muted-foreground">
-                      {item.result ? describeProbeFacts(item.result) : item.error}
-                    </span>
-                    {item.result && probeHasOutput(item.result) && (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-5 shrink-0 gap-1 px-1.5 text-10px"
-                        data-testid={`probe-translate-${name}-${item.candidate}`}
-                        disabled={item.translating}
-                        title={aiEnabled ? t("adb.binary.translateNotice", { url: "" }) : t("adb.binary.translateNeed")}
-                        onClick={() => (aiEnabled ? onTranslate(path, item.candidate) : onConfig())}
-                      >
-                        <Languages className="h-3 w-3" />
-                        {item.translating
-                          ? t("adb.binary.translating")
-                          : aiEnabled
-                            ? t("adb.binary.translate", { lang: targetLang })
-                            : t("adb.binary.translateGoConfig")}
-                      </Button>
+          {(() => {
+            const verdict = judgeProbe(node.results);
+            const help = verdict.kind === "help";
+            const text = help ? stripAnsi(verdict.text) : "";
+            // 下一层的入口只从这份**它自己打出来的文本**里取（声明位、排除带值的选项）
+            const chips =
+              help && depth < MAX_DRILL_DEPTH
+                ? extractOptionCandidates(text, [...HELP_CANDIDATES, ...path]).slice(
+                    0,
+                    MAX_DRILL_CHIPS,
+                  )
+                : [];
+            return (
+              <>
+                <div className="flex flex-wrap items-center gap-1.5 text-10px">
+                  {/* 一句话结论：有 / 没有。过程（试了哪几条、各是什么形状）不给用户看 */}
+                  <span
+                    className={cn(
+                      "shrink-0 rounded px-1.5 py-0.5",
+                      help
+                        ? "bg-emerald-500/10 text-emerald-500"
+                        : "bg-muted text-muted-foreground",
                     )}
-                  </div>
-                  {streams.map(
-                    ([stream, text]) =>
-                      text && (
-                        <div key={stream} className="mt-1">
-                          <p className="text-10px text-muted-foreground">{stream}</p>
-                          <pre className="path-selectable max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-1 font-mono text-10px">
-                            {text}
-                          </pre>
-                        </div>
-                      ),
+                    data-testid={`probe-outcome-${name}`}
+                  >
+                    {help ? t("adb.binary.probeFound") : t("adb.binary.probeNotFound")}
+                  </span>
+                  <span className="min-w-0 flex-1" />
+                  {done < HELP_CANDIDATES.length && done > 0 && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 shrink-0 px-2"
+                      data-testid={`probe-continue-${name}`}
+                      onClick={() => void onRetry(path)}
+                    >
+                      {t("adb.binary.probeContinue")}
+                    </Button>
                   )}
-                  {showTranslation && (
-                    <div className="mt-1">
-                      <p className="text-10px text-muted-foreground">
-                        {t("adb.binary.translated", { lang: targetLang })}
+                  {help && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 shrink-0 gap-1 px-1.5 text-10px"
+                      data-testid={`probe-translate-${name}`}
+                      disabled={node.translating}
+                      title={
+                        aiEnabled
+                          ? t("adb.binary.translateNotice", { url: aiBaseUrl })
+                          : t("adb.binary.translateGoConfig")
+                      }
+                      onClick={() => (aiEnabled ? onTranslate(path) : onConfig())}
+                    >
+                      <Languages className="h-3 w-3" />
+                      {node.translating
+                        ? t("adb.binary.translating")
+                        : aiEnabled
+                          ? node.translated
+                            ? t("adb.binary.translateAgain", { lang: targetLang })
+                            : t("adb.binary.translate", { lang: targetLang })
+                          : t("adb.binary.translateGoConfig")}
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 shrink-0 gap-1 px-1.5 text-muted-foreground"
+                    data-testid={`probe-config-${name}`}
+                    title={t("adb.binary.translateGoConfig")}
+                    onClick={onConfig}
+                  >
+                    <Settings2 className="h-3 w-3" />
+                    {aiEnabled
+                      ? t("adb.binary.translateOn", { tail: aiTail })
+                      : t("adb.binary.translateOff")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 shrink-0 px-1.5 text-muted-foreground"
+                    data-testid={`probe-close-${name}`}
+                    title={t("adb.binary.probeClose")}
+                    onClick={() => onClose(name)}
+                  >
+                    <X className="h-3 w-3" />
+                  </Button>
+                </div>
+                {help ? (
+                  <>
+                    <pre
+                      className="path-selectable max-h-72 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-1 font-mono text-10px"
+                      data-testid={`probe-text-${name}`}
+                    >
+                      {/* 有了译文就只留译文；判据（截断多少、有没有杀干净）另起一句 */}
+                      {node.translated ?? text}
+                    </pre>
+                    {verdict.kind === "help" && verdict.truncated && (
+                      <p className="text-10px text-amber-500" data-testid={`probe-truncated-${name}`}>
+                        {t("adb.binary.probeTruncated", {
+                          bytes: String(probeHiddenBytes(verdict.result)),
+                        })}
                       </p>
-                      <pre className="path-selectable max-h-60 overflow-auto whitespace-pre-wrap break-all rounded bg-muted/40 p-1 text-10px">
-                        {item.translated}
-                      </pre>
-                    </div>
-                  )}
-                  {item.result?.truncated && (
-                    <p className="mt-1 text-10px text-amber-500">
-                      {t("adb.binary.probeTruncated", { bytes: String(probeHiddenBytes(item.result)) })}
-                    </p>
-                  )}
-                  {item.result?.still_running && (
-                    <p className="mt-1 text-10px text-destructive">
-                      {t("adb.binary.probeStillRunning", { pid: String(item.result.pid) })}
-                    </p>
-                  )}
-                  {item.translateNote && (
-                    <p className="mt-1 break-all text-10px text-muted-foreground">{item.translateNote}</p>
-                  )}
-                  {chips.length > 0 && (
-                    <div className="mt-1 flex flex-wrap items-center gap-1" data-testid={`probe-chips-${name}-${item.candidate}`}>
-                      <span className="text-10px text-muted-foreground">
-                        {t("adb.binary.probeDrillHint", { candidate: item.candidate })}
-                      </span>
-                      {chips.map((token) => (
-                        <button
-                          key={token}
-                          type="button"
-                          className="shrink-0 rounded border border-input px-1 font-mono text-10px hover:bg-accent disabled:opacity-50"
-                          data-testid={`probe-drill-${name}-${item.candidate}-${token}`}
-                          disabled={Boolean(node.children[token]?.running)}
-                          title={t("adb.binary.probeDrillTip")}
-                          onClick={() =>
-                            void onDrill(
-                              path,
-                              token,
-                              item.result ? stripAnsi(`${item.result.stdout}\n${item.result.stderr}`) : "",
-                            )}
-                        >
-                          {token}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
+                    )}
+                    {verdict.kind === "help" && verdict.stillRunning && (
+                      <p className="text-10px text-destructive" data-testid={`probe-alive-${name}`}>
+                        {t("adb.binary.probeStillRunning", { pid: String(verdict.result.pid) })}
+                      </p>
+                    )}
+                    {node.translateNote && (
+                      <p className="break-all text-10px text-muted-foreground">
+                        {node.translateNote}
+                      </p>
+                    )}
+                    {chips.length > 0 && (
+                      <div
+                        className="flex flex-wrap items-center gap-1"
+                        data-testid={`probe-chips-${name}`}
+                      >
+                        <span className="text-10px text-muted-foreground">
+                          {t("adb.binary.probeDrillHint")}
+                        </span>
+                        {chips.map((token) => (
+                          <button
+                            key={token}
+                            type="button"
+                            className="shrink-0 rounded border border-input px-1 font-mono text-10px hover:bg-accent disabled:opacity-50"
+                            data-testid={`probe-drill-${name}-${token}`}
+                            disabled={Boolean(node.children[token]?.running)}
+                            title={t("adb.binary.probeDrillTip")}
+                            onClick={() => void onDrill(path, token, text)}
+                          >
+                            {token}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    {verdict.detail ? (
+                      <p
+                        className="break-all text-10px leading-relaxed text-muted-foreground"
+                        data-testid={`probe-detail-${name}`}
+                      >
+                        {verdict.detail}
+                      </p>
+                    ) : (
+                      depth === 0 && (
+                        <p className="text-10px leading-relaxed text-muted-foreground">
+                          {t("adb.binary.probeNotFoundHint")}
+                        </p>
+                      )
+                    )}
+                    {node.translateNote && (
+                      <p className="break-all text-10px text-muted-foreground">
+                        {node.translateNote}
+                      </p>
+                    )}
+                  </>
+                )}
+              </>
+            );
+          })()}
           {Object.entries(node.children).map(([token, child]) => (
             <ProbeLevelView
               key={token}

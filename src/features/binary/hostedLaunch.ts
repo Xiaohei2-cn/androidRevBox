@@ -2,7 +2,7 @@
  * 二进制托管的启动偏好与「探测帮助」纯逻辑（UI-6 第一/二层）。
  *
  * 单独立一个文件的原因：这一层里全是"以后要回头核对的判断"——候选顺序、
- * 按事实分类、版本指纹怎么比、参数超限怎么劝。放在组件里就只能靠手点验证，
+ * 有没有帮助的判据、版本指纹怎么比、参数超限怎么劝。放在组件里就只能靠手点验证，
  * 放在这里每条都能写成断言（见 hostedLaunch.test.ts）。
  */
 import type { HostedBinary, HostedProbeResult } from "@/api/device";
@@ -79,30 +79,51 @@ export function probeLooksLikeHelp(result: HostedProbeResult): boolean {
   return classifyProbe(result) === "output-exited";
 }
 
-/** 分类对应的 i18n 键（界面只按键取文案，不在这儿拼中文） */
-export const CATEGORY_KEYS: Record<ProbeCategory, string> = {
-  "output-exited": "adb.binary.probe.catOutputExited",
-  "output-hung": "adb.binary.probe.catOutputHung",
-  "silent-exited": "adb.binary.probe.catSilentExited",
-  "silent-hung": "adb.binary.probe.catSilentHung",
-  unusable: "adb.binary.probe.catUnusable",
-};
+/**
+ * 探测结论：**只回答"有 / 没有"**（用户口径：不关心是怎么探出来的）。
+ *
+ * `help` 里带上原文和两个必要的限定——内容被截断、进程没杀干净。它们不是过程信息，
+ * 而是"这份有没有、完不完整、设备上留没留东西"的一部分，藏起来就是说假话。
+ * `none` 附一句可操作的原因（比如文件根本起不来）：只有一个"没有"，用户不知道下一步。
+ */
+export type ProbeVerdict =
+  | {
+      kind: "help";
+      text: string;
+      truncated: boolean;
+      stillRunning: boolean;
+      /** 结论出自哪条候选的原始回执：截断多少、有没有杀干净，要说真实数字而不是重算一遍 */
+      result: HostedProbeResult;
+    }
+  | { kind: "none"; detail?: string };
 
-/** 一句人话把事实说全：耗时、码/信号、真实输出量 */
-export function describeProbeFacts(result: HostedProbeResult): string {
-  const bits: string[] = [`${result.elapsed_ms} ms`];
-  if (!result.started) return `无法执行 · ${result.detail ?? "原因未知"}`;
-  if (result.exit_code !== null && result.exit_code !== undefined) {
-    bits.push(`退出码 ${result.exit_code}`);
+/** 有内容就算"有"，其中"打完就自己退"的那条优先当作帮助 */
+export function judgeProbe(
+  rows: { candidate: string; result?: HostedProbeResult; error?: string }[],
+): ProbeVerdict {
+  const withOutput = rows.filter((r) => r.result && probeHasOutput(r.result));
+  const chosen =
+    withOutput.find((r) => r.result && probeLooksLikeHelp(r.result)) ?? withOutput[0];
+  if (chosen?.result) {
+    const result = chosen.result;
+    return {
+      kind: "help",
+      text: result.stdout.trim() ? result.stdout : result.stderr,
+      truncated: result.truncated,
+      stillRunning: result.still_running,
+      result,
+    };
   }
-  if (result.signal !== null && result.signal !== undefined) {
-    bits.push(`信号 ${result.signal}`);
+  // 一条内容都没有：分清"起不来"与"起来了但没打东西"，两句是不同的实话
+  const refused = rows.find((r) => r.result && !r.result.started);
+  if (refused?.result) {
+    return { kind: "none", detail: refused.result.detail ?? undefined };
   }
-  if (result.timed_out) bits.push(result.killed ? "超时已杀" : "超时未杀");
-  if (result.still_running) bits.push("仍在运行");
-  bits.push(`stdout ${result.stdout_bytes}B / stderr ${result.stderr_bytes}B`);
-  if (result.truncated) bits.push("回传已截断");
-  return bits.join(" · ");
+  const failed = rows.find((r) => r.error);
+  if (failed?.error) {
+    return { kind: "none", detail: failed.error };
+  }
+  return { kind: "none" };
 }
 
 /** 参数与 stdin 的本地预检上限：与协议里那两个数同值（后端与设备还会各拦一道） */
@@ -247,11 +268,6 @@ export function saveLaunchPrefs(serial: string, name: string, prefs: LaunchPrefs
   set(".stdin", prefs.stdinText);
   set(".interactive", prefs.interactive ? "1" : null);
   set(".stamp", prefs.stamp);
-}
-
-/** 直接拿分类的 i18n 键：界面与测试都走这一条，避免两边各写一遍查表逻辑 */
-export function probeCategoryKey(result: HostedProbeResult): string {
-  return CATEGORY_KEYS[classifyProbe(result)];
 }
 
 /**
