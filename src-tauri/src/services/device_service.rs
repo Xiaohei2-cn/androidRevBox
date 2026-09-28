@@ -445,6 +445,9 @@ pub struct DeviceService {
     /// 最近一次轮询到的设备快照（serial → state），watch diff 用
     known: Mutex<HashMap<String, String>>,
     watch_started: Mutex<bool>,
+    /// 设备上线时把 Agent 接回来（AR12.5）。`None` = 没接线（单测、集成测试、
+    /// 以及"关掉自动连接"以外的所有既有场景）：watch 一条 adb 都不会多发。
+    agent_auto: Mutex<Option<Arc<crate::services::agent_auto::AgentAutoService>>>,
 }
 
 /// 托管启动的结果视图（App 侧模型，不是协议 DTO：前端只关心"起没起、谁在跑"）。
@@ -495,7 +498,14 @@ impl DeviceService {
             app,
             known: Mutex::new(HashMap::new()),
             watch_started: Mutex::new(false),
+            agent_auto: Mutex::new(None),
         }
+    }
+
+    /// 接线（lib.rs setup 里调用，构造顺序要求它必须是 setter 而不是构造参数：
+    /// AgentAutoService 要 AgentManager，DeviceService 又要 AgentAutoService）。
+    pub fn set_agent_auto(&self, service: Arc<crate::services::agent_auto::AgentAutoService>) {
+        *self.agent_auto.lock().expect("agent auto lock") = Some(service);
     }
 
     /// 仪表盘：adb 环境状态
@@ -2919,12 +2929,17 @@ impl DeviceService {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let events = {
+        let (events, appeared) = {
             let mut known = self.known.lock().expect("known lock");
             let mut seen: HashSet<String> = HashSet::new();
             let mut events = Vec::new();
+            let mut appeared = Vec::new();
             for d in &devices {
                 let prev = known.get(&d.serial);
+                // "刚变成 device"（第一次看见它，或从 offline/unauthorized 回来）
+                if d.state == "device" && prev != Some(&d.state) {
+                    appeared.push(d.serial.clone());
+                }
                 if prev != Some(&d.state) {
                     events.push(DeviceChangedPayload {
                         serial: d.serial.clone(),
@@ -2952,7 +2967,7 @@ impl DeviceService {
                     last_seen: now,
                 });
             }
-            events
+            (events, appeared)
         };
         for event in &events {
             if !event.present || event.state != "device" {
@@ -2966,7 +2981,44 @@ impl DeviceService {
                 tracing::debug!(error = %e, "推送设备事件失败");
             }
         }
+        // AR12.5：设备一上线就把 Agent 往回接。放在设备事件之后——界面先知道
+        // "手机来了"，再知道"它的 Agent 探到了什么"，顺序反了就会出现设备卡还没
+        // 渲染、Agent 结论已经推过来的闪。
+        self.kick_agent_auto(appeared);
         Ok(events)
+    }
+
+    /// 后台把刚上线的设备各探一次，并按授权决定接不接 Agent（AR12.5）。
+    ///
+    /// 为什么是 spawn 而不是 await：watch 循环 3s 一轮，而探测要发 4 条 adb 命令、
+    /// 连接更可能到几十秒（推产物）。把它挂在轮询上，设备列表会跟着一起卡住。
+    /// 结果经 `agent://auto` 事件回界面，界面不靠猜。
+    fn kick_agent_auto(&self, serials: Vec<String>) {
+        if serials.is_empty() {
+            return;
+        }
+        let Some(service) = self.agent_auto.lock().expect("agent auto lock").clone() else {
+            // 没接线（单测与"自动连接从未启用"的部署）：一条 adb 都不多发
+            return;
+        };
+        for serial in serials {
+            let service = service.clone();
+            let app = self.app.clone();
+            tauri::async_runtime::spawn(async move {
+                let run = service.auto_connect(&serial).await;
+                tracing::info!(
+                    serial,
+                    outcome = ?run.outcome,
+                    decision = ?run.probe.decision,
+                    action = ?run.probe.action,
+                    "Agent 自动连接落点"
+                );
+                let evt = AppEvent::new(event_names::AGENT_AUTO, &run);
+                if let Err(error) = app.emit(evt.event, &evt) {
+                    tracing::debug!(error = %error, "推送 Agent 自动连接事件失败");
+                }
+            });
+        }
     }
 
     /// devices 表缓存最近一次已知设备（重启后 UI 可先显示历史）

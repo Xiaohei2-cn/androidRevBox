@@ -29,6 +29,9 @@ import { LOCALES, LOCALE_LABELS, useI18n } from "@/i18n";
 import type { Locale } from "@/i18n/dictionaries";
 import { cn } from "@/lib/utils";
 
+/** 与 Rust `config_service::KEY_AGENT_AUTO_CONNECT` 同一个键名（两处不能各写一份字面量） */
+const KEY_AGENT_AUTO_CONNECT = "app.agent.auto_connect";
+
 const THEME_OPTIONS: { value: ThemePref }[] = [
   { value: "light" },
   { value: "dark" },
@@ -273,6 +276,64 @@ function LanguageTab() {
 }
 
 /** 环境：ADB 路径 + 工具链（Python/Node/MCP 端口） */
+/** 自动连接开关（`app.agent.auto_connect`，默认开）。 */
+function AgentAutoConnectRow() {
+  const { t } = useI18n();
+  const queryClient = useQueryClient();
+  const { data: snapshot } = useQuery({
+    queryKey: ["config", "snapshot"],
+    queryFn: configApi.snapshot,
+    staleTime: 60_000,
+  });
+  const stored = snapshot?.find((row) => row.key === KEY_AGENT_AUTO_CONNECT)?.value;
+  // 缺键 = 默认开：和 Rust 侧 `get(KEY_AGENT_AUTO_CONNECT, "true")` 同一条默认值，
+  // 两处不一致就会出现"界面上看着关了、后端还在自动连"。
+  const enabled = stored !== "false";
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const toggle = async (next: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await configApi.set(KEY_AGENT_AUTO_CONNECT, String(next));
+      // 开关一翻，设备页那张卡的结论就该跟着变（探测缓存是后端持有的）
+      void queryClient.invalidateQueries({ queryKey: ["agent"] });
+      void queryClient.invalidateQueries({ queryKey: ["config", "snapshot"] });
+    } catch (e) {
+      setError(String((e as { message?: string }).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <label className="flex items-start gap-2 text-sm">
+        <input
+          type="checkbox"
+          className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary"
+          data-testid="setting-agent-auto"
+          checked={enabled}
+          disabled={busy}
+          onChange={(e) => void toggle(e.target.checked)}
+        />
+        <span className="min-w-0">
+          <span className="font-medium">{t("settings.agentAuto.label")}</span>
+          <span className="mt-0.5 block text-xs leading-relaxed text-muted-foreground">
+            {t("settings.agentAuto.hint")}
+          </span>
+        </span>
+      </label>
+      {error && (
+        <p className="break-all text-xs text-destructive" data-testid="setting-agent-auto-error">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function EnvironmentTab() {
   const { t } = useI18n();
   const queryClient = useQueryClient();
@@ -289,6 +350,20 @@ function EnvironmentTab() {
             void queryClient.invalidateQueries({ queryKey: ["adb"] });
             void queryClient.invalidateQueries({ queryKey: ["devices"] });
           }} />
+        </CardContent>
+      </Card>
+
+      {/*
+        自动连接 Agent（AR12.5）：用户问的是"为什么插了手机还要我点一下装 Agent"。
+        开关管的是"程序自己去做只读探测并按授权接回来"，所以这里必须说清两件
+        事：探测不写设备；第一次写入仍然要她在设备页点一次。
+      */}
+      <Card>
+        <CardHeader>
+          <CardTitle>{t("settings.agentAuto.label")}</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <AgentAutoConnectRow />
         </CardContent>
       </Card>
 

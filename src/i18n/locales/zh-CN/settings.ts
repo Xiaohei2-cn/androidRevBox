@@ -15,6 +15,9 @@ export default {
   "settings.opacity.hint":
     "调节窗口背景的不透明度。只是半透明着色，不会模糊背后的内容（WebKit 在透明窗口里模糊不到窗口外的东西，那条实现已删）。最低 20%，保证内容可读。",
 
+  "settings.agentAuto.label": "设备上线后自动连接 Agent",
+  "settings.agentAuto.hint":
+    "只读探测每次插线都会做；往设备写产物、起常驻进程这件事，第一次会在设备页请你点一次确认，之后同一台设备全自动。关掉它就只能手动连。",
   "settings.clickThrough.label": "透明区点击穿透",
   "settings.clickThrough.hint":
     "打开后只有一处把点击让给后面的 App：齿块**左边**那条透明留白（逐行）。tab 齿块整体、图标、tab 之间的缝隙、当前 tab、所有内容区一律接住 —— 点 tab 是基本操作，绝不能穿到后面去；窗口四边各 12px 永远保留拉伸抓住区。当前状态见下方实时读数。",

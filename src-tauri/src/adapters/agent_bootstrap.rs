@@ -9,6 +9,9 @@ use crate::services::device_service::{AdbRunOutput, AdbRunner};
 
 pub const AGENT_ABSTRACT_SOCKET: &str = "app_reverse_tools_agent_v1";
 pub const AGENT_REMOTE_BINARY: &str = "/data/local/tmp/app_reverse_tools_agent";
+/// 设备上 Agent 的进程名（`pidof` 用的那个 comm）。装机/停机/探测三条链路认的是同一个名字，
+/// 所以它必须是常量而不是散落的字面量——三份写法一旦分叉，"有没有在跑"和"要不要杀"就会对不上。
+pub const AGENT_PROCESS_NAME: &str = "app_reverse_tools_agent";
 const AGENT_REMOTE_PID: &str = "/data/local/tmp/app_reverse_tools_agent.pid";
 const AGENT_REMOTE_LOG: &str = "/data/local/tmp/app_reverse_tools_agent.log";
 const AGENT_REMOTE_ROLLBACK: &str = "/data/local/tmp/app_reverse_tools_agent.rollback";
@@ -87,7 +90,7 @@ pub struct AgentBootstrap {
 /// stop_agent_also_sweeps_by_exe_path_not_only_the_pid_file）。
 fn stop_agent_script() -> String {
     format!(
-        "if [ -f {AGENT_REMOTE_PID} ]; then pid=$(cat {AGENT_REMOTE_PID}); case \"$pid\" in ''|*[!0-9]*) ;; *) kill \"$pid\" 2>/dev/null || true; attempt=0; while kill -0 \"$pid\" 2>/dev/null && [ \"$attempt\" -lt 20 ]; do sleep 0.05; attempt=$((attempt + 1)); done; if kill -0 \"$pid\" 2>/dev/null; then kill -9 \"$pid\" 2>/dev/null || true; sleep 0.05; fi ;; esac; fi;              for p in $(pidof app_reverse_tools_agent 2>/dev/null); do if [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = \"{AGENT_REMOTE_BINARY}\" ]; then kill \"$p\" 2>/dev/null || true; fi; done;              attempt=0; while true; do left=; for p in $(pidof app_reverse_tools_agent 2>/dev/null); do if [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = \"{AGENT_REMOTE_BINARY}\" ]; then left=\"$left $p\"; fi; done; [ -z \"$left\" ] && break; [ \"$attempt\" -ge 20 ] && break; sleep 0.05; attempt=$((attempt + 1)); done;              for p in $(pidof app_reverse_tools_agent 2>/dev/null); do if [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = \"{AGENT_REMOTE_BINARY}\" ]; then kill -9 \"$p\" 2>/dev/null || true; fi; done; sleep 0.05; rm -f {AGENT_REMOTE_PID}"
+        "if [ -f {AGENT_REMOTE_PID} ]; then pid=$(cat {AGENT_REMOTE_PID}); case \"$pid\" in ''|*[!0-9]*) ;; *) kill \"$pid\" 2>/dev/null || true; attempt=0; while kill -0 \"$pid\" 2>/dev/null && [ \"$attempt\" -lt 20 ]; do sleep 0.05; attempt=$((attempt + 1)); done; if kill -0 \"$pid\" 2>/dev/null; then kill -9 \"$pid\" 2>/dev/null || true; sleep 0.05; fi ;; esac; fi;              for p in $(pidof {AGENT_PROCESS_NAME} 2>/dev/null); do if [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = \"{AGENT_REMOTE_BINARY}\" ]; then kill \"$p\" 2>/dev/null || true; fi; done;              attempt=0; while true; do left=; for p in $(pidof {AGENT_PROCESS_NAME} 2>/dev/null); do if [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = \"{AGENT_REMOTE_BINARY}\" ]; then left=\"$left $p\"; fi; done; [ -z \"$left\" ] && break; [ \"$attempt\" -ge 20 ] && break; sleep 0.05; attempt=$((attempt + 1)); done;              for p in $(pidof {AGENT_PROCESS_NAME} 2>/dev/null); do if [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = \"{AGENT_REMOTE_BINARY}\" ]; then kill -9 \"$p\" 2>/dev/null || true; fi; done; sleep 0.05; rm -f {AGENT_REMOTE_PID}"
     )
 }
 
@@ -124,6 +127,42 @@ impl AgentBootstrap {
             serial: serial.to_owned(),
             abi: output.stdout.trim().to_owned(),
         })
+    }
+
+    /// **只读**探测（AR12.5）：设备上那份 Agent 二进制的 sha256；文件不在 = `None`。
+    ///
+    /// 自动连接靠它决定"要不要推产物"，所以它必须和 `install_artifact` 里那句
+    ///  sha 比对是同一个来源——两处判据不同，就会出现"探测说没装、装机说不用推"。
+    pub async fn installed_sha256(
+        &self,
+        serial: &str,
+    ) -> Result<Option<String>, AgentBootstrapError> {
+        self.remote_sha256(serial, AGENT_REMOTE_BINARY).await
+    }
+
+    /// **只读**探测（AR12.5）：设备上现在有没有在跑的 Agent 进程。
+    ///
+    /// 身份判定和 `stop_agent_script` 用同一条规则（`pidof` 命中之后还要比
+    /// `/proc/<pid>/exe` 等于我们的产物路径）：只按进程名认，会把别人起的同名
+    /// 进程算成"我们的 Agent 活着"，自动连接于是错判成"不该接管"——反过来也
+    /// 不能松：那正是 D063 反对"顺手重启一下"的地方。
+    ///
+    /// 退出码固定补 `exit 0`：`pidof` 查无此进程时返回非零，而"没在跑"是正常答案，
+    /// 不是失败。设备上没有 `pidof`（极老 ROM）时按"没在跑"处理，交给后面的
+    /// 连接流程自己撞真实错误，不在这里猜。
+    pub async fn is_running(&self, serial: &str) -> Result<bool, AgentBootstrapError> {
+        let script = format!(
+            "for p in $(pidof {AGENT_PROCESS_NAME} 2>/dev/null); do if [ \"$(readlink /proc/$p/exe 2>/dev/null)\" = \"{AGENT_REMOTE_BINARY}\" ]; then echo running; fi; done; exit 0"
+        );
+        let output = self
+            .run_checked(
+                serial,
+                &adb::cmd_shell(&script),
+                SHORT_TIMEOUT,
+                "probe_agent_running",
+            )
+            .await?;
+        Ok(output.stdout.lines().any(|line| line.trim() == "running"))
     }
 
     pub async fn install_artifact(
@@ -539,7 +578,12 @@ mod tests {
         // **拿着旧令牌**的老实例，现场只剩一句看不懂的 "agent authentication failed"
         // （AR10.4 加自动重连腿时撞上）。所以"按 exe 路径兜一遍"不能丢。
         let script = stop_agent_script();
-        assert!(script.contains("pidof app_reverse_tools_agent"), "{script}");
+        // 断言的是**渲染出来**的那条命令，不是源码里的占位符——所以这里用同一个常量
+        // 现拼一个期望值：进程名哪天改了，这条腿跟着改，而不是悄悄对着旧名字一直绿。
+        assert!(
+            script.contains(&format!("pidof {AGENT_PROCESS_NAME}")),
+            "{script}"
+        );
         assert!(
             script.contains("/proc/$p/exe"),
             "必须核对可执行文件路径，光看进程名会误伤: {script}"

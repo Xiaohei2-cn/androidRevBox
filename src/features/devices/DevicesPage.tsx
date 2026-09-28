@@ -20,7 +20,7 @@ import {
   type WriteOutcome,
 } from "@/api/device";
 import { zygiskApi, type ZygiskAppItem, type ZygiskScope } from "@/api/zygisk";
-import { agentApi, type AgentSessionState } from "@/api/agent";
+import { agentApi, type AgentProbe, type AgentSessionState } from "@/api/agent";
 import { envApi } from "@/api/env";
 import { useAppNav } from "@/app/nav";
 import { useI18n } from "@/i18n";
@@ -442,8 +442,23 @@ function DeviceFullCard({ serial, transport }: { serial: string; transport: stri
   );
 }
 
-/* 导出以便 M1 页面回归渲染（内部仍按原样使用）。 */
 /* 导出供 M1 页面回归渲染使用；内部用法不变。 */
+
+/**
+ * Android Agent 会话区（设备卡里那一块）。
+ *
+ * 第七十轮按用户口径重排过一次，理由值得留在这里：这一块的旧版**读者是开发者**——
+ * 「ADB 回退次数 × 几条（agent_unavailable）」是 AR12.1 用来判断"Legacy 回退腿能不能删"
+ * 的内部证据，而用户问的是「我现在这个操作到底能不能成」。所以现在的层次是：
+ *
+ * 1. **一句结论 + 一个动作**：Agent 不在线时到底挡住了什么，点哪一下能好；
+ * 2. 能力计数（还能用多少）；
+ * 3. 版本/协议/Provider/回退计数/最近路由一起收进「开发者诊断」，
+ *    数据一条没少（后端仍发 `agent://auto`、审计仍计数），只是不再摆在正文里。
+ *
+ * 结论与按钮**不由前端推导**：`probe.action` 是后端 `decide()` 算的（AR12.5），
+ * 网页自己判一次就会出现"界面觉得该弹按钮、后端觉得不该动"的两套话。
+ */
 export function AgentSessionSection({ serial }: { serial: string }) {
   const { t } = useI18n();
   const queryClient = useQueryClient();
@@ -457,12 +472,42 @@ export function AgentSessionSection({ serial }: { serial: string }) {
   const refresh = () => void queryClient.invalidateQueries({ queryKey });
   const install = useMutation({ mutationFn: () => agentApi.install(serial), onSettled: refresh });
   const restart = useMutation({ mutationFn: () => agentApi.restart(serial), onSettled: refresh });
+  const probe = useMutation({
+    // 只读探测：push / chmod / kill / forward 一个都不会发生，所以这个按钮随便按
+    mutationFn: () => agentApi.probe(serial),
+    onSettled: refresh,
+  });
   const status = data?.status;
   const latestRoute = data?.routes?.[0];
   const state = status?.state ?? "disconnected";
+  const usable = state === "ready" || state === "degraded";
   const available = status?.capabilities.filter((capability) => capability.available).length ?? 0;
   const mutationError = install.error ?? restart.error;
-  const busy = install.isPending || restart.isPending;
+  const busy = install.isPending || restart.isPending || probe.isPending;
+  const auto = data?.autoProbe ?? null;
+  const legacyFallbacks = data?.legacyFallbacks ?? [];
+
+  // 后端自己会探（设备上线即探，AR12.5），探完推事件过来。没有这条的话，
+  // 用户只能在"它还在装"和"装失败了"之间靠 10s 一次的轮询去猜。
+  useEffect(() => {
+    let alive = true;
+    const unsubs: Array<() => void> = [];
+    // 订阅本身失败不能把这块卡炸掉：事件是"更快知道"的手段，不是数据来源
+    // （数据来源仍是 10s 一轮的 diagnostics）。
+    try {
+      agentApi
+        .onAutoChanged(() => alive && refresh())
+        .then((un) => (alive ? unsubs.push(un) : un()))
+        .catch(() => undefined);
+    } catch {
+      /* 忽略：没有事件通道时靠轮询兜底 */
+    }
+    return () => {
+      alive = false;
+      unsubs.forEach((un) => un());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serial]);
 
   return (
     <section className="mx-4 mt-4 border-t pt-3" data-testid={`agent-status-${serial}`}>
@@ -473,73 +518,204 @@ export function AgentSessionSection({ serial }: { serial: string }) {
           {t(`devices.agent.state.${state}`)}
         </span>
         <div className="ml-auto flex items-center gap-1.5">
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 px-2 text-xs"
-            disabled={busy}
-            onClick={() => (state === "disconnected" ? install.mutate() : restart.mutate())}
-          >
-            <RefreshCw className={cn("h-3.5 w-3.5", busy && "animate-spin")} />
-            {state === "disconnected" ? t("devices.agent.install") : t("devices.agent.restart")}
-          </Button>
+          {/*
+            连接/接管的主按钮在下面的"结论条"里（那里才有话可说）。这里只留
+            已就绪时的重启动作——避免出现两个都自称"点我修好"的按钮。
+          */}
+          {usable && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 px-2 text-xs"
+              disabled={busy}
+              onClick={() => restart.mutate()}
+            >
+              <RefreshCw className={cn("h-3.5 w-3.5", restart.isPending && "animate-spin")} />
+              {t("devices.agent.restart")}
+            </Button>
+          )}
         </div>
       </div>
-      {status && state !== "disconnected" && (
-        <dl className="mt-2 grid grid-cols-[90px_1fr] gap-y-1 text-xs sm:grid-cols-[90px_1fr_90px_1fr]">
-          <div className="contents">
-            <dt className="text-muted-foreground">{t("devices.agent.version")}</dt>
-            <dd className="font-mono">{status.agentVersion ?? "-"}</dd>
-          </div>
-          <div className="contents">
-            <dt className="text-muted-foreground">{t("devices.agent.protocol")}</dt>
-            <dd className="font-mono">{status.protocolVersion ?? "-"}</dd>
-          </div>
-          <div className="contents">
-            <dt className="text-muted-foreground">{t("devices.agent.providers")}</dt>
-            <dd>{status.providers.length}</dd>
-          </div>
-          <div className="contents">
-            <dt className="text-muted-foreground">{t("devices.agent.legacyFallbacks")}</dt>
-            {/* 计数为 0 才是"可以删回退腿"的证据；有数字就说明这台机仍在靠 ADB 兜底 */}
-            <dd
-              className={
-                (data?.legacyFallbacks?.length ?? 0) > 0
-                  ? "font-mono text-amber-500"
-                  : "font-mono text-muted-foreground"
-              }
-              data-testid="agent-legacy-fallbacks"
+
+      {/*
+        结论条要等数据到手再画：查询还没回来时 `status` 是 undefined、`state` 是
+        默认值 "disconnected"，那时弹一条"Agent 还没连上"是把"还不知道"说成
+        "坏消息"（测试里那次闪烁就是这个坑）。
+      */}
+      {status && !usable && (
+        <div
+          className={cn(
+            "mt-2 rounded border px-2 py-1.5 text-xs",
+            state === "incompatible"
+              ? "border-red-500/40 bg-red-500/10"
+              : "border-amber-500/40 bg-amber-500/10",
+          )}
+          data-testid="agent-purpose"
+        >
+          <p className="font-medium">{agentPurposeLine(t, auto)}</p>
+          {/* Agent 不在到底挡住什么：说功能名，不说"capability"也不说"回退次数" */}
+          <p className="mt-1 text-muted-foreground">{t("devices.agent.blockedFeatures")}</p>
+          {auto?.action === "ask_consent" && (
+            <p className="mt-1 text-muted-foreground">{t("devices.agent.consentNote")}</p>
+          )}
+          {auto?.action === "explicit_takeover" && (
+            <p className="mt-1 text-muted-foreground">{t("devices.agent.takeoverNote")}</p>
+          )}
+          {(auto?.detail ?? status?.lastError) && (
+            <p className="mt-1 break-all font-mono text-10px text-muted-foreground">
+              {String(auto?.detail ?? status?.lastError)}
+            </p>
+          )}
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            {auto?.action === "blocked" ? (
+              /*
+                装不了就是装不了（本机没产物、ABI 不支持、设备不在线）。这里不放
+                「安装并连接」：点了必然失败一次、转一圈 adb、再把同一条原因还给她——
+                那种按钮只是把错误做得更响。只留"重新探测"。
+              */
+              <></>
+            ) : auto?.action === "explicit_takeover" ? (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                disabled={busy}
+                onClick={() => restart.mutate()}
+                data-testid="agent-takeover"
+              >
+                <RefreshCw className={cn("h-3.5 w-3.5", restart.isPending && "animate-spin")} />
+                {t("devices.agent.takeover")}
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                className="h-7 px-2 text-xs"
+                disabled={busy}
+                onClick={() => install.mutate()}
+                data-testid="agent-connect-now"
+              >
+                <RefreshCw className={cn("h-3.5 w-3.5", install.isPending && "animate-spin")} />
+                {install.isPending
+                  ? t("devices.agent.purpose.connecting")
+                  : // 已授权的设备上"安装并连接"是句谎话：产物早就装过、授权也在表里，
+                    // 这次只是没连上。按钮要说"再试一次"。
+                    (auto?.action === "connecting_allowed"
+                      ? t("devices.agent.retry")
+                      : t("devices.agent.install"))}
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 px-2 text-xs"
+              disabled={busy}
+              onClick={() => probe.mutate()}
+              data-testid="agent-reprobe"
             >
-              {(data?.legacyFallbacks ?? []).length === 0
-                ? t("devices.agent.legacyFallbackNone")
-                : (data?.legacyFallbacks ?? [])
-                    .map((f) => `${f.method} × ${f.count}（${f.reason}）`)
-                    .join(" · ")}
-            </dd>
+              {t("devices.agent.reprobe")}
+            </Button>
           </div>
+        </div>
+      )}
+
+      {status && (
+        <dl className="mt-2 grid grid-cols-[90px_1fr] gap-y-1 text-xs sm:grid-cols-[90px_1fr_90px_1fr]">
           <div className="contents">
             <dt className="text-muted-foreground">{t("devices.agent.capabilities")}</dt>
             <dd>{available}/{status.capabilities.length}</dd>
           </div>
         </dl>
       )}
-      {latestRoute && (
-        <div className="mt-2 flex min-w-0 items-center gap-2 text-xs">
-          <span className="shrink-0 text-muted-foreground">{t("devices.agent.route")}</span>
-          <span className="truncate font-mono" title={latestRoute.method}>{latestRoute.method}</span>
-          <span className="shrink-0 text-muted-foreground">
-            {t(`devices.agent.backend.${latestRoute.backend}`)}
-            {latestRoute.fallbackReason ? ` (${latestRoute.fallbackReason})` : ""}
-          </span>
-        </div>
+
+      {/*
+        开发者诊断：AR12.1 的删除证据 + 会话身份。数据一条没少，只是从正文挪进
+        折叠区——用户不需要知道"hosted.list × 6（agent_unavailable）"是什么。
+      */}
+      {status && (
+        <details className="mt-2 text-xs" data-testid="agent-dev-diagnostics">
+          <summary className="cursor-pointer select-none text-muted-foreground">
+            {t("devices.agent.dev.title")}
+          </summary>
+          <p className="mt-1 text-10px text-muted-foreground">{t("devices.agent.dev.hint")}</p>
+          <dl className="mt-1.5 grid grid-cols-[90px_1fr] gap-y-1 sm:grid-cols-[90px_1fr_90px_1fr]">
+            <div className="contents">
+              <dt className="text-muted-foreground">{t("devices.agent.version")}</dt>
+              <dd className="font-mono">{status.agentVersion ?? "-"}</dd>
+            </div>
+            <div className="contents">
+              <dt className="text-muted-foreground">{t("devices.agent.protocol")}</dt>
+              <dd className="font-mono">{status.protocolVersion ?? "-"}</dd>
+            </div>
+            <div className="contents">
+              <dt className="text-muted-foreground">{t("devices.agent.providers")}</dt>
+              <dd>{status.providers.length}</dd>
+            </div>
+            <div className="contents">
+              <dt className="text-muted-foreground">{t("devices.agent.legacyFallbacks")}</dt>
+              {/* 计数为 0 才是"可以删回退腿"的证据；有数字就说明这台机仍在靠 ADB 兜底 */}
+              <dd
+                className={cn(
+                  "font-mono",
+                  legacyFallbacks.length > 0 ? "text-amber-500" : "text-muted-foreground",
+                )}
+                data-testid="agent-legacy-fallbacks"
+              >
+                {legacyFallbacks.length === 0
+                  ? t("devices.agent.legacyFallbackNone")
+                  : legacyFallbacks
+                      .map((f) => `${f.method} × ${f.count}（${f.reason}）`)
+                      .join(" · ")}
+              </dd>
+            </div>
+          </dl>
+          {latestRoute && (
+            <div className="mt-1.5 flex min-w-0 items-center gap-2">
+              <span className="shrink-0 text-muted-foreground">{t("devices.agent.route")}</span>
+              <span className="truncate font-mono" title={latestRoute.method}>{latestRoute.method}</span>
+              <span className="shrink-0 text-muted-foreground">
+                {t(`devices.agent.backend.${latestRoute.backend}`)}
+                {latestRoute.fallbackReason ? ` (${latestRoute.fallbackReason})` : ""}
+              </span>
+            </div>
+          )}
+        </details>
       )}
-      {(mutationError || status?.lastError || data?.healthError) && (
+
+      {(mutationError || status?.lastError) && usable && (
         <p className="mt-2 break-all text-xs text-destructive">
-          {String((mutationError as Error | undefined)?.message ?? status?.lastError ?? data?.healthError)}
+          {String((mutationError as Error | undefined)?.message ?? status?.lastError)}
         </p>
       )}
     </section>
   );
+}
+
+/**
+ * 结论那句文案：按后端给的 action 选，`decision` 只在不在线状态说不清时才补。
+ * 分支必须穷尽——加新的 action 而这里没接，界面会退回"未连接"这种没信息量的话，
+ * 用户看到的就又变成谜了。
+ */
+function agentPurposeLine(
+  t: (key: string) => string,
+  auto: AgentProbe | null,
+): string {
+  switch (auto?.action) {
+    case "ask_consent":
+      return t("devices.agent.purpose.askConsent");
+    case "connecting_allowed":
+      // 已授权但没连上：自动连接试过、失败了，这才是"再点一次"有意义的场景
+      return t("devices.agent.purpose.retryAllowed");
+    case "explicit_takeover":
+      return t("devices.agent.purpose.takeover");
+    case "blocked":
+      return t("devices.agent.purpose.blocked");
+    case "none":
+      // 后端认为没什么要用户决定的（多半是会话状态刚变、探测结论还是上一轮的）。
+      // 这里不铺 8 条"× 状态"的句子：那种文案除了把状态名再说一遍没有信息量。
+      return t("devices.agent.purpose.none");
+  }
+  // 还没探过（刚插上、或自动连接被关掉）：老实说"不知道"，不假装是"没装"
+  return auto ? t("devices.agent.purpose.probing") : t("devices.agent.purpose.notProbed");
 }
 
 const AGENT_STATE_CLASS: Record<AgentSessionState, string> = {

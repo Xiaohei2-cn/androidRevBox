@@ -2,6 +2,7 @@
 //! 阶段规划：P1 config/log → P2 task/process → P3 device → P4 plugin → P5 crypto → P6 插件中心 → P7 环境探测。
 
 pub mod agent_artifact;
+pub mod agent_auto;
 pub mod agent_client;
 pub mod agent_manager;
 pub mod ai_service;

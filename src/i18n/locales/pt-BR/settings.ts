@@ -15,6 +15,9 @@ export default {
   "settings.opacity.hint":
     "Define a opacidade do fundo da janela. É apenas um preenchimento translúcido — nada atrás da janela fica desfocado (o WebKit não desboca fora de uma janela transparente e essa implementação foi removida). Mínimo 20% para manter o conteúdo legível.",
 
+  "settings.agentAuto.label": "Conectar o Agent automaticamente quando um dispositivo aparece",
+  "settings.agentAuto.hint":
+    "A sondagem somente leitura roda a cada conexão de cabo; gravar o binário e manter um processo residente é confirmado uma vez na página de dispositivos — depois aquele dispositivo fica totalmente automático. Desligado, só resta conectar manualmente.",
   "settings.clickThrough.label": "Clicar através das áreas transparentes",
   "settings.clickThrough.hint":
     "Quando ativo, exatamente uma área entrega os cliques ao app de trás: a faixa transparente à ESQUERDA de cada aba. O corpo da aba, o ícone, os vãos entre abas, a aba ativa e toda a área de conteúdo continuam recebendo os cliques — clicar numa aba é operação básica e nunca deve atravessar. Os 12px externos de cada borda permanecem zona de redimensionamento. O estado atual aparece abaixo.",

@@ -31,8 +31,15 @@ pub fn config_get(
 }
 
 #[tauri::command]
-pub fn config_set(state: tauri::State<'_, AppState>, args: ConfigSetArgs) -> CoreResult<()> {
-    state.config.set(&args.key, &args.value)
+pub async fn config_set(state: tauri::State<'_, AppState>, args: ConfigSetArgs) -> CoreResult<()> {
+    state.config.set(&args.key, &args.value)?;
+    // AR12.5：自动连接开关一翻，**已经插着的那台**不该等到"下次插线"才生效。
+    // `reprobe()` 清掉 watch 的已知快照，下一轮轮询就把在线设备重新当成"刚上线"，
+    // 自动连接随即跟上——写入仍然受每台设备的一次性授权管，这里只是重新起探。
+    if args.key == crate::services::config_service::KEY_AGENT_AUTO_CONNECT {
+        state.device.reprobe().await;
+    }
+    Ok(())
 }
 
 /// 日志级别单独成命令：写入还要联动 LogService 的运行时重载。

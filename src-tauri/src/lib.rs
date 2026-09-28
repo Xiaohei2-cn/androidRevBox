@@ -27,6 +27,7 @@ use tauri::Manager;
 
 use crate::db::Db;
 use crate::services::agent_artifact::{AGENT_RESOURCE_ARM64, AgentArtifactResolver};
+use crate::services::agent_auto::AgentAutoService;
 use crate::services::agent_manager::AgentManager;
 use crate::services::ai_service;
 use crate::services::android_backend::{CapabilityRouter, default_legacy_capabilities};
@@ -50,6 +51,8 @@ pub struct AppState {
     pub hook: Arc<HookService>,
     pub agent: Arc<AgentManager>,
     pub android: Arc<CapabilityRouter>,
+    /// 设备上线自动连接 Agent（AR12.5）：探测结论 + 一次性授权表都在这层
+    pub agent_auto: Arc<AgentAutoService>,
     pub zygisk_applist: Arc<ZygiskApplistService>,
     /// 翻译接口（只在本机发起，key 不出桌面）
     pub ai: Arc<ai_service::AiService>,
@@ -89,6 +92,9 @@ pub fn run() {
                 runner.clone(),
                 default_legacy_capabilities(),
             ));
+            // AR12.5：自动连接。它要 AgentManager（探测/连接）与 ConfigService
+            // （总开关 + 每台设备的一次性授权），所以只能排在两者之后。
+            let agent_auto = Arc::new(AgentAutoService::new(agent.clone(), config.clone()));
             let device = Arc::new(DeviceService::new(
                 runner.clone(),
                 android.clone(),
@@ -96,6 +102,9 @@ pub fn run() {
                 db.clone(),
                 app.handle().clone(),
             ));
+            // 接线必须在 start_watch 之前：watch 一起来就会把当前在线的设备当成
+            // "刚上线"，晚一步接的话，第一次插线的自动连接就丢了。
+            device.set_agent_auto(agent_auto.clone());
             device.clone().start_watch();
             let zygisk_applist =
                 Arc::new(ZygiskApplistService::new(android.clone(), runner.clone()));
@@ -152,6 +161,7 @@ pub fn run() {
                 hook,
                 agent,
                 android,
+                agent_auto,
                 zygisk_applist,
                 ai,
             });
@@ -171,6 +181,7 @@ pub fn run() {
             commands::agent::agent_install,
             commands::agent::agent_restart,
             commands::agent::agent_diagnostics,
+            commands::agent::agent_probe,
             commands::config::config_snapshot,
             commands::config::config_get,
             commands::config::config_set,

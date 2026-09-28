@@ -15,6 +15,17 @@ pub const KEY_CLICK_THROUGH: &str = "app.settings.click_through";
 pub const KEY_ADB_PATH: &str = "app.adb.path";
 /// Android Agent binary 显式路径；空 = 环境变量/resource/workspace 自动发现
 pub const KEY_AGENT_PATH: &str = "app.agent.path";
+/// 设备上线后自动把 Agent 接起来（AR12.5 / D086）。
+///
+/// 默认开。这一层只管「探测 + 按授权装机/启动」，**写入设备那一步仍受
+/// `KEY_AGENT_CONSENT_SERIALS` 管**：D028 反对的是静默往设备写二进制，
+/// 不是反对自动。关掉它 = 回到「必须人去点一下安装并连接」的老手感。
+pub const KEY_AGENT_AUTO_CONNECT: &str = "app.agent.auto_connect";
+/// 已授权「这台设备可以装/起 Agent」的 serial 列表（逗号分隔，空 = 一台都没授权）。
+///
+/// 为什么不是一台设备一个键：`ALLOWED_KEYS` 是**固定白名单**，`snapshot()` 靠它整包
+/// 下发；动态键既进不了白名单，也没法被前端读到（更没法被设置页管理）。
+pub const KEY_AGENT_CONSENT_SERIALS: &str = "app.agent.consent_serials";
 /// 插件单次调用超时（毫秒，P6）；100–600000
 pub const KEY_PLUGIN_CALL_TIMEOUT_MS: &str = "app.plugins.call_timeout_ms";
 /// 插件输入/输出载荷上限（KB，P6）；1–65536
@@ -89,6 +100,27 @@ fn is_valid_ai_model(value: &str) -> bool {
 fn is_valid_bool(v: &str) -> bool {
     matches!(v, "true" | "false")
 }
+/// 已授权 serial 列表：逗号分隔、去空白后每段只允许 adb serial 的合法字符。
+///
+/// 为什么要校验到这个程度：这个串会被拿去和用户可控的设备 serial 做比对，
+/// 塞进换行/控制字符就等于给"配置值"开了一个注入面（长度上限同 `is_valid_path`）。
+fn is_valid_serial_list(value: &str) -> bool {
+    if value.len() >= 2000 || value.contains('\n') || value.contains('\0') {
+        return false;
+    }
+    // 空串是合法值（= 撤销全部授权）；不认它就没法把最后一台设备的授权收回。
+    if value.is_empty() {
+        return true;
+    }
+    value.split(',').all(|item| {
+        let item = item.trim();
+        !item.is_empty()
+            && item.len() <= 128
+            && item
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    })
+}
 
 fn is_valid_log_level(v: &str) -> bool {
     matches!(v, "trace" | "debug" | "info" | "warn" | "error")
@@ -128,6 +160,8 @@ const ALLOWED_KEYS: &[(&str, ValueValidator)] = &[
     (KEY_CLICK_THROUGH, is_valid_bool),
     (KEY_ADB_PATH, is_valid_path),
     (KEY_AGENT_PATH, is_valid_path),
+    (KEY_AGENT_AUTO_CONNECT, is_valid_bool),
+    (KEY_AGENT_CONSENT_SERIALS, is_valid_serial_list),
     (KEY_PLUGIN_CALL_TIMEOUT_MS, is_valid_timeout_ms),
     (KEY_PLUGIN_MAX_PAYLOAD_KB, is_valid_payload_kb),
     (KEY_PYTHON_PATH, is_valid_path),

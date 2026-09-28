@@ -84,7 +84,13 @@ vi.mock("@/api/dialog", () => ({
   pickFile: dialog.pickFile,
   pickDirectory: dialog.pickDirectory,
 }));
-const agentMocks = vi.hoisted(() => ({ diagnostics: vi.fn(), install: vi.fn(), restart: vi.fn() }));
+const agentMocks = vi.hoisted(() => ({
+  diagnostics: vi.fn(),
+  install: vi.fn(),
+  restart: vi.fn(),
+  probe: vi.fn(),
+  onAutoChanged: vi.fn(),
+}));
 vi.mock("@/api/agent", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/api/agent")>();
   return { ...actual, agentApi: { ...actual.agentApi, ...agentMocks } };
@@ -110,6 +116,10 @@ function renderPage(ui: React.ReactNode) {
 beforeEach(() => {
   Object.values(device).forEach((m) => m.mockReset());
   Object.values(task).forEach((m) => m.mockReset());
+  // Agent 那组 mock 也要每条用例重来：结论条的用例要断言"点接管时不该调 install"，
+  // 上一用例留下的调用记录会把它判成失败（第一版就是这么红的）。
+  Object.values(agentMocks).forEach((m) => m.mockReset());
+  agentMocks.onAutoChanged.mockResolvedValue(() => {});
   device.environment.mockResolvedValue({ installed: true, path: "/sdk/adb", source: "path_env" });
   device.list.mockResolvedValue([
     { serial: "PIXEL-1", state: "device", transport: "usb", model: "Pixel 6" },
@@ -643,7 +653,7 @@ describe("任务中心", () => {
   });
 });
 
-describe("设备页 Agent 诊断 · Legacy 回退计数（AR12 的删除依据）", () => {
+describe("设备页 Agent · 结论条在前，开发者诊断在后（第七十轮口径）", () => {
   const base = {
     status: {
       serial: "PIXEL-1",
@@ -662,7 +672,30 @@ describe("设备页 Agent 诊断 · Legacy 回退计数（AR12 的删除依据�
     health: null,
     healthError: null,
     routes: [],
+    // 自动连接的探测结论（AR12.5）：null = 还没探过，结论句会退回"这台还没探"
+    autoProbe: null,
   };
+
+  /** AR12.1 那份删除证据：一条都不能少，只是不再摆在正文 */
+  const FALLBACKS = [
+    { method: "package.list", reason: "agent_unavailable", count: 3, removalStage: "AR12.1 after AR5.5" },
+    { method: "device.info", reason: "unsupported_method", count: 1, removalStage: "AR12.1 after AR5.2" },
+  ];
+
+  const probeOf = (patch: Record<string, unknown>) => ({
+    serial: "PIXEL-1",
+    decision: "not_installed",
+    action: "ask_consent",
+    deviceAbi: "arm64-v8a",
+    installedSha256: null,
+    expectedSha256: "aa",
+    agentRunning: false,
+    consentGranted: false,
+    autoEnabled: true,
+    detail: null,
+    probedAt: 1,
+    ...patch,
+  });
 
   it("计数为 0 时明确写\"全部走 Agent\"（这才是可删回退的证据）", async () => {
     agentMocks.diagnostics.mockResolvedValue({ ...base, legacyFallbacks: [] });
@@ -672,27 +705,119 @@ describe("设备页 Agent 诊断 · Legacy 回退计数（AR12 的删除依据�
   });
 
   it("走过回退时按能力与原因分别显示次数", async () => {
-    agentMocks.diagnostics.mockResolvedValue({
-      ...base,
-      legacyFallbacks: [
-        {
-          method: "package.list",
-          reason: "agent_unavailable",
-          count: 3,
-          removalStage: "AR12.1 after AR5.5",
-        },
-        {
-          method: "device.info",
-          reason: "unsupported_method",
-          count: 1,
-          removalStage: "AR12.1 after AR5.2",
-        },
-      ],
-    });
+    agentMocks.diagnostics.mockResolvedValue({ ...base, legacyFallbacks: FALLBACKS });
     renderPage(<AgentSessionSection serial="PIXEL-1" />);
     const row = await screen.findByTestId("agent-legacy-fallbacks");
     expect(row.textContent).toContain("package.list × 3（agent_unavailable）");
     expect(row.textContent).toContain("device.info × 1（unsupported_method）");
+  });
+
+  /**
+   * 用户那句"这些我看不懂、也不该我读"的机械化：回退计数与最近路由必须待在
+   * `agent-dev-diagnostics` 这个折叠区**里面**。
+   * 断言写成"在 details 内"而不是"看不见"：AR12.1 的观察点必须留着，
+   * 挪走的是位置，不是数据。
+   */
+  it("回退计数与最近路由都在开发者诊断折叠区内", async () => {
+    agentMocks.diagnostics.mockResolvedValue({
+      ...base,
+      legacyFallbacks: FALLBACKS,
+      routes: [
+        {
+          serial: "PIXEL-1",
+          method: "hosted.list",
+          backend: "legacy_adb",
+          fallbackReason: "agent_unavailable",
+          agentVersion: "0.2.1",
+          protocolVersion: 1,
+          recordedAt: 1,
+        },
+      ],
+    });
+    renderPage(<AgentSessionSection serial="PIXEL-1" />);
+    const details = await screen.findByTestId("agent-dev-diagnostics");
+    expect(details.tagName).toBe("DETAILS");
+    expect(within(details).getByTestId("agent-legacy-fallbacks").textContent).toContain(
+      "package.list × 3",
+    );
+    expect(within(details).getByText("hosted.list")).toBeTruthy();
+    expect(within(details).getByText("Legacy ADB (agent_unavailable)")).toBeTruthy();
+  });
+
+  it("未连接且未授权：说清挡住了什么、只问一次，并把主按钮给出来", async () => {
+    agentMocks.diagnostics.mockResolvedValue({
+      ...base,
+      status: { ...base.status, state: "adb_online" },
+      legacyFallbacks: FALLBACKS,
+      autoProbe: probeOf({}),
+    });
+    renderPage(<AgentSessionSection serial="PIXEL-1" />);
+    // 等的是那句只有数据到手才会出现的结论，不是等外壳（外壳在查询回来前就在了）
+    await screen.findByText("这台设备的 Agent 还没连上。");
+    const banner = screen.getByTestId("agent-purpose");
+    // 挡住的是功能名，不是"capability 数"或"回退次数"
+    expect(banner.textContent).toContain("改权限、起停托管进程、终止进程");
+    expect(banner.textContent).toContain("这台只问一次");
+    fireEvent.click(within(banner).getByTestId("agent-connect-now"));
+    await waitFor(() => expect(agentMocks.install).toHaveBeenCalledWith("PIXEL-1"));
+  });
+
+  it("别人的 Agent 在跑：给「重启并接管」，并把代价写在按钮旁边", async () => {
+    agentMocks.diagnostics.mockResolvedValue({
+      ...base,
+      status: { ...base.status, state: "adb_online" },
+      autoProbe: probeOf({
+        decision: "running_elsewhere",
+        action: "explicit_takeover",
+        installedSha256: "aa",
+        agentRunning: true,
+        consentGranted: true,
+        detail: "设备上已有 Agent 在跑，但不是本程序连上的",
+      }),
+    });
+    renderPage(<AgentSessionSection serial="PIXEL-1" />);
+    await screen.findByText("设备上已有一个 Agent 在跑，但不是本程序连上的。");
+    const banner = screen.getByTestId("agent-purpose");
+    expect(banner.textContent).toContain("托管进程和 frida-server 会一起断掉");
+    fireEvent.click(within(banner).getByTestId("agent-takeover"));
+    await waitFor(() => expect(agentMocks.restart).toHaveBeenCalledWith("PIXEL-1"));
+    expect(agentMocks.install).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 装不了就别给"安装"按钮。这条钉的是上一版的自己：`blocked` 时也摆着
+   * 「安装并连接」，点下去转一圈 adb、再把同一条原因还给她。
+   */
+  it("装不了（ABI 不支持）：只给原因与重新探测，不给注定失败的按钮", async () => {
+    agentMocks.diagnostics.mockResolvedValue({
+      ...base,
+      status: { ...base.status, state: "disconnected" },
+      autoProbe: probeOf({
+        decision: "unsupported_abi",
+        action: "blocked",
+        deviceAbi: "armeabi-v7a",
+        detail: "本机 Agent 产物只提供 arm64-v8a，这台设备是 armeabi-v7a",
+      }),
+    });
+    agentMocks.probe.mockResolvedValue(probeOf({}));
+    renderPage(<AgentSessionSection serial="PIXEL-1" />);
+    await screen.findByText("本机 Agent 产物只提供 arm64-v8a，这台设备是 armeabi-v7a");
+    const banner = screen.getByTestId("agent-purpose");
+    expect(banner.textContent).toContain("armeabi-v7a");
+    expect(within(banner).queryByTestId("agent-connect-now")).toBeNull();
+    expect(within(banner).queryByTestId("agent-takeover")).toBeNull();
+    fireEvent.click(within(banner).getByTestId("agent-reprobe"));
+    await waitFor(() => expect(agentMocks.probe).toHaveBeenCalledWith("PIXEL-1"));
+  });
+
+  it("Agent 就绪时不弹结论条，正文只剩能力数", async () => {
+    agentMocks.diagnostics.mockResolvedValue({ ...base, legacyFallbacks: [] });
+    renderPage(<AgentSessionSection serial="PIXEL-1" />);
+    await screen.findByTestId("agent-legacy-fallbacks");
+    expect(screen.queryByTestId("agent-purpose")).toBeNull();
+    expect(screen.getByTestId("agent-status-PIXEL-1").textContent).toContain("就绪");
+    // 就绪 = 没什么要用户决定，结论条不该占地方
+    expect(screen.queryByTestId("agent-connect-now")).toBeNull();
   });
 });
 

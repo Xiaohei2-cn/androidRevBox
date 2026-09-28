@@ -72,6 +72,15 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
         None,
     ),
     (
+        // AR12.5 自动连接的只读探测：查"设备上有没有在跑的 Agent"。它不可迁移
+        // （Agent 没起来时没有别的通道可问），也不该被算成 Legacy 回退——它不产出
+        // 任何业务答案，只决定要不要动手，所以类别是 Bootstrap。
+        "src/adapters/agent_bootstrap.rs",
+        "is_running",
+        Category::Bootstrap,
+        None,
+    ),
+    (
         "src/adapters/agent_bootstrap.rs",
         "remove_remote_file",
         Category::Bootstrap,
@@ -197,7 +206,10 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
 
 /// 期望的调用点总数（不是登记条目数：一个函数可能有 3 处调用）。
 const EXPECTED_SITES_PER_CATEGORY: &[(Category, usize)] = &[
-    (Category::Bootstrap, 11),
+    // 11 → 12（AR12.5）：新增的是 `agent_bootstrap::is_running` 这条**只读**探测，
+    // 用来在动手之前问清"设备上有没有在跑的 Agent"。多一个 shell 调用点必须在这里
+    // 留一句话——和当年 AR7.6 少一个点要改数字是同一条纪律。
+    (Category::Bootstrap, 12),
     (Category::Transport, 5),
     (Category::RawTool, 2),
     // 8（原 9）：AR7.6 把 root 终止从 `adb shell su -c "kill -9 <pid>"` 改成走 Agent 的

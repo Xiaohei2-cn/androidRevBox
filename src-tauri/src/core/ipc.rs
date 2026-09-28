@@ -19,6 +19,10 @@ pub mod event_names {
     pub const DEVICE_CHANGED: &str = "device://changed";
     /// 插件生命周期（P4 启用）：payload = { pluginId, phase, version? }
     pub const PLUGIN_CHANGED: &str = "plugin://changed";
+    /// Agent 自动连接（AR12.5）：payload = { serial, outcome, probe, error }
+    /// 设备上线后桌面侧自己探了一次，结果必须能推给界面——否则用户只能靠
+    /// 10s 一次的轮询去猜"它到底在忙还是已经好了"。
+    pub const AGENT_AUTO: &str = "agent://auto";
 }
 
 /// 统一事件封装：event_name + timestamp(秒) + payload。

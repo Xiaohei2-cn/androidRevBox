@@ -15,6 +15,9 @@ export default {
   "settings.opacity.hint":
     "Sets how opaque the window background is. It is a translucent fill only — nothing behind the window gets blurred (WebKit cannot blur outside a transparent window, and that implementation was removed). Minimum 20% so content stays readable.",
 
+  "settings.agentAuto.label": "Connect the Agent automatically when a device appears",
+  "settings.agentAuto.hint":
+    "The read-only probe runs on every plug-in. Writing the binary and keeping a process running is confirmed once on the devices page; after that the same device is fully automatic. Turn this off and you are back to connecting by hand.",
   "settings.clickThrough.label": "Click through transparent areas",
   "settings.clickThrough.hint":
     "When on, exactly one area hands clicks to the app behind: the transparent gutter to the LEFT of each tab. The whole tab body, its icon, the gaps between tabs, the active tab and every content area keep the clicks — clicking a tab is a basic operation and must never fall through. The outer 12px on each window edge stays a resize grip. The live readout below shows the current state.",

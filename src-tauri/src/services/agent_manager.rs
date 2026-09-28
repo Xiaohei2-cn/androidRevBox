@@ -113,6 +113,19 @@ impl AgentManager {
         }
     }
 
+    /// 只读探测要直接问 bootstrap（AR12.5）：装了什么、有没有在跑。
+    ///
+    /// 为什么暴露整个 bootstrap 而不是加一堆转发方法：`AgentAutoService` 需要的
+    /// 是"和装机完全同一判据"的读数，转手多一层就会和 `install_artifact` 分叉。
+    pub fn bootstrap(&self) -> &Arc<AgentBootstrap> {
+        &self.bootstrap
+    }
+
+    /// 桌面侧本次会装哪一份产物（AR12.5 探测用：不装，只是先算出 sha256 做对照）。
+    pub fn artifacts(&self) -> &Arc<AgentArtifactResolver> {
+        &self.artifacts
+    }
+
     pub async fn connect_resolved(
         &self,
         serial: &str,
@@ -493,6 +506,9 @@ impl AgentManager {
                 health_error: Some("invalid device serial".into()),
                 legacy_fallbacks: Vec::new(),
                 routes: Vec::new(),
+                // 探测结论由 command 层从 AgentAutoService 的缓存里补（AR12.5）：
+                // 会话层自己不该去发 adb，那是自动连接那层的事。
+                auto_probe: None,
             };
         }
         let session = self.session_for(serial);
@@ -513,6 +529,9 @@ impl AgentManager {
                 health: None,
                 legacy_fallbacks: Vec::new(),
                 routes: Vec::new(),
+                // 探测结论由 command 层从 AgentAutoService 的缓存里补（AR12.5）：
+                // 会话层自己不该去发 adb，那是自动连接那层的事。
+                auto_probe: None,
             };
         };
         match client.health(REUSE_HEALTH_TIMEOUT).await {
@@ -522,6 +541,9 @@ impl AgentManager {
                 health_error: None,
                 legacy_fallbacks: Vec::new(),
                 routes: Vec::new(),
+                // 探测结论由 command 层从 AgentAutoService 的缓存里补（AR12.5）：
+                // 会话层自己不该去发 adb，那是自动连接那层的事。
+                auto_probe: None,
             },
             Err(error) => {
                 *session.client.lock().expect("agent client lock poisoned") = None;
@@ -532,6 +554,7 @@ impl AgentManager {
                     health_error: Some(error.to_string()),
                     legacy_fallbacks: Vec::new(),
                     routes: Vec::new(),
+                    auto_probe: None,
                 }
             }
         }
