@@ -1689,6 +1689,137 @@ mod tests {
 
     /// AR5.5 路由矩阵的只读腿：Agent `package.list` 必须在设备端解析完成，
     /// 并与 Legacy `pm list packages -3` 的集合一致（迁移期 shadow 对照的真机版本）。
+    /// AR12.1 删 `hosted.list` 回退腿**之前**必须存在的对照腿：
+    /// Agent 的 `hosted.list`（读文件头 magic）与 Legacy 的 `ls -l` + `file`（信设备端命令）
+    /// 必须在**同一台设备的同一个目录**上给出同一批 ELF。
+    ///
+    /// 为什么还要专门加这条：AR7.2 当年那次"19 条名字集合相等"是一次性手测，按 D087
+    /// 只能算"当时成立"，不能当常驻证据——删腿的依据必须是每次都能重跑的腿。
+    ///
+    /// 两侧**不是**完全等价，这条也不许把它断成等价：`runs` 与表外同名进程只有 Agent 看得见
+    /// （Legacy 只看文件，看不见进程）。所以断言只覆盖"文件那一层"，
+    /// 进程那一层单独断言"只有 Agent 给得出"，免得以后有人拿这条腿当"两侧一模一样"的凭据。
+    #[tokio::test]
+    #[ignore = "需要真机（先退出桌面 App，避免抢同一个 Agent）；AR12_TEST_SERIAL=<serial> cargo test -p app-reverse-tools --lib real_agent_hosted_list_matches_legacy -- --ignored --nocapture"]
+    async fn real_agent_hosted_list_matches_legacy() {
+        use crate::adapters::adb;
+        use agent_protocol::{HostedListParams, HostedListResult};
+
+        let Some(serial) = std::env::var("AR12_TEST_SERIAL")
+            .ok()
+            .filter(|value| !value.is_empty())
+        else {
+            eprintln!("[跳过] 本腿需要 AR12_TEST_SERIAL=<serial>");
+            return;
+        };
+
+        let config = Arc::new(ConfigService::new(Arc::new(Db::in_memory().unwrap())));
+        let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
+        let manager = AgentManager::new(
+            runner.clone(),
+            Arc::new(AgentArtifactResolver::new(config, None)),
+        );
+        manager
+            .connect_resolved(&serial)
+            .await
+            .expect("Agent 应能连上（真机）");
+        let client = manager.client(&serial).expect("已鉴权客户端");
+        let adb_path = runner.environment().await.path.clone().expect("adb 可用");
+
+        let sh = |script: String| {
+            let runner = runner.clone();
+            let adb_path = adb_path.clone();
+            let serial = serial.clone();
+            async move {
+                runner
+                    .run(
+                        &adb_path,
+                        &adb::build_args(Some(&serial), &adb::cmd_shell(&script)),
+                        Duration::from_secs(20),
+                    )
+                    .await
+                    .unwrap_or_default()
+            }
+        };
+
+        // fixture：目录必须是**真的**有 ELF 可比。空目录时两侧都空，"相等"照样绿——
+        // 那种绿什么都没证明，所以自己放一个副本进去，并在断言前确认它真的落地了。
+        let probe = "ar-hosted-probe-sh";
+        let probe_path = format!("{}/{}", adb::HOSTED_DIR, probe);
+        sh(format!(
+            "cp /system/bin/sh {probe_path}; chmod 755 {probe_path}"
+        ))
+        .await;
+        let ls_args = adb::build_args(Some(&serial), &adb::cmd_ls(adb::HOSTED_DIR));
+        let ls_out = runner
+            .run(&adb_path, &ls_args, Duration::from_secs(20))
+            .await
+            .expect("ls 应能跑（真机）");
+        assert!(
+            ls_out.stdout.contains(probe),
+            "fixture 没落地：托管目录里看不到 {probe_path}，这条腿测的是别的东西"
+        );
+
+        let file_out = sh(format!("file {}/*", adb::HOSTED_DIR)).await;
+
+        let agent = client
+            .request::<_, HostedListResult>(
+                agent_protocol::method::HOSTED_LIST,
+                &HostedListParams {},
+                Duration::from_secs(15),
+            )
+            .await
+            .expect("hosted.list 应成功");
+        let legacy: Vec<adb::HostedBinary> = adb::hosted_binaries(&ls_out.stdout, &file_out.stdout);
+
+        let agent_names: std::collections::BTreeSet<String> = agent
+            .binaries
+            .iter()
+            .map(|item| item.name.clone())
+            .collect();
+        let legacy_names: std::collections::BTreeSet<String> =
+            legacy.iter().map(|item| item.name.clone()).collect();
+        assert!(
+            agent_names.contains(probe),
+            "Agent 没把 {probe} 判成 ELF（fixture 明明在目录里）：{agent_names:?}"
+        );
+        assert_eq!(
+            agent_names, legacy_names,
+            "Agent 读文件头 magic 与 Legacy 信 `file` 命令的结果分叉了（左边 Agent，右边 Legacy）"
+        );
+        assert!(
+            !agent.truncated && agent.unreadable.is_empty(),
+            "列表被截断或有读不到的条目时，上面的相等断言不算数：truncated={}",
+            agent.truncated
+        );
+
+        // 文件那一层逐条对齐：owner 执行位与字节数
+        for item in &agent.binaries {
+            let Some(old) = legacy.iter().find(|entry| entry.name == item.name) else {
+                continue;
+            };
+            assert_eq!(
+                item.has_exec, old.has_exec,
+                "{} 的 owner 执行位两侧不一致：Agent mode={:o} mode_text={}，Legacy perms={}",
+                item.name, item.mode, item.mode_text, old.perms
+            );
+            assert_eq!(item.size as i64, old.size, "{} 的大小两侧不一致", item.name);
+            assert_eq!(item.path, old.path, "{} 的路径两侧不一致", item.name);
+        }
+
+        // 进程那一层只有 Agent 给得出，所以这条腿只断言"文件那一层相等"。
+        // 把两侧断成完全等价，就是拿假等价给删除背书。
+        eprintln!(
+            "[ar12.1] hosted.list 对照通过：Agent {} 条 / Legacy {} 条，runs={} 条（进程视角只有 Agent 有）",
+            agent.binaries.len(),
+            legacy.len(),
+            agent.runs.len()
+        );
+
+        sh(format!("rm -f {probe_path}")).await;
+        manager.disconnect(&serial).await.ok();
+    }
+
     #[tokio::test]
     #[ignore = "需要真机；AR4_TEST_SERIAL=<serial> cargo test -p app-reverse-tools real_agent_package_list_matches_legacy -- --ignored --nocapture"]
     async fn real_agent_package_list_matches_legacy() {
