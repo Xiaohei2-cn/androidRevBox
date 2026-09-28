@@ -12,14 +12,17 @@
  * 3. **页面卸载收掉全部会话**（R-08）：不留活进程。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, CircleStop, Plus, X } from "lucide-react";
+import { ChevronDown, ChevronUp, CircleStop, Download, Plus, X } from "lucide-react";
 
 import { envApi } from "@/api/env";
+import { hookApi } from "@/api/hook";
 import { ptyApi } from "@/api/pty";
+import { hasNativeDialog, saveFile } from "@/api/dialog";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 import { fridaReplLaunch } from "@/lib/fridaTerminal";
+import { collectTranscript, transcriptFileName, transcriptText } from "@/lib/terminalTranscript";
 import { MAX_TERMINAL_SESSIONS, TerminalSessionStore, type TerminalTab } from "@/lib/terminalStore";
 import "@xterm/xterm/css/xterm.css";
 
@@ -41,6 +44,8 @@ export function TerminalPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [hint, setHint] = useState<string | null>(null);
   const [presetBusy, setPresetBusy] = useState(false);
+  const [saveOutcome, setSaveOutcome] = useState<{ ok: boolean; text: string } | null>(null);
+  const [saving, setSaving] = useState(false);
   const [pendingClose, setPendingClose] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<number | null>(null);
@@ -182,6 +187,48 @@ export function TerminalPage() {
       setPresetBusy(false);
     }
   }, [t]);
+
+  /**
+   * 保存这块屏的正文（C-15 的终端那一半，D090 的口径）：**只有用户点过一次并确认路径才写**。
+   *
+   * 三条都是照着结构化控制台那条已经落地的口径对齐的：
+   * - 搜索框里有字 ⇒ 只存匹配的行（"存过滤后留在屏幕上的那些行"，不是原始字节流）；
+   * - 用户取消**不算失败**，也不写任何东西（连"桌面版才有的对话框"弹不出来时都说清）；
+   * - 写完报**字节数**（Rust 那边回读出来的），不是"已保存"三个字——那种话证明不了什么。
+   */
+  const saveActive = useCallback(async () => {
+    if (!active || saving) return;
+    const bundle = store.bundle(active.id);
+    if (!bundle) return;
+    setSaveOutcome(null);
+    const snapshot = collectTranscript(bundle.term, query);
+    if (snapshot.lines.length === 0) {
+      setSaveOutcome({ ok: false, text: query ? t("hook.terminal.saveNoHit", { query }) : t("hook.terminal.saveEmpty") });
+      return;
+    }
+    setSaving(true);
+    try {
+      const path = await saveFile({
+        title: t("hook.terminal.saveDialog"),
+        defaultPath: transcriptFileName(active.program),
+        filters: [{ name: t("hook.terminal.saveText"), extensions: ["txt"] }],
+      });
+      if (!path) {
+        // 取消：什么都不发生；只有"这环境根本弹不出对话框"才需要说一句
+        if (!hasNativeDialog()) setSaveOutcome({ ok: false, text: t("hook.terminal.saveDesktopOnly") });
+        return;
+      }
+      const bytes = await hookApi.exportSave(path, transcriptText(snapshot));
+      setSaveOutcome({
+        ok: true,
+        text: t("hook.terminal.saved", { lines: snapshot.lines.length, total: snapshot.totalLines, bytes }),
+      });
+    } catch (reason) {
+      setSaveOutcome({ ok: false, text: t("hook.terminal.saveFailed", { message: String((reason as Error)?.message ?? reason) }) });
+    } finally {
+      setSaving(false);
+    }
+  }, [active, query, saving, store, t]);
 
   const stopActive = useCallback(async () => {
     if (!active) return;
@@ -388,6 +435,27 @@ export function TerminalPage() {
         <Button size="sm" variant="ghost" className="h-6 px-1" disabled={!active || !query} onClick={() => search(true)} aria-label={t("hook.terminal.searchNext")} data-testid="terminal-search-next">
           <ChevronDown className="h-3.5 w-3.5" />
         </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-6 px-2 text-10px"
+          disabled={!active || saving}
+          title={query ? t("hook.terminal.saveFilteredHint", { query }) : t("hook.terminal.saveHint")}
+          onClick={() => void saveActive()}
+          data-testid="terminal-save"
+        >
+          <Download className="h-3 w-3" />
+          {saving ? t("hook.terminal.saving") : t("hook.terminal.save")}
+        </Button>
+        {saveOutcome && (
+          <span
+            className={cn("min-w-0 truncate text-10px", saveOutcome.ok ? "text-emerald-500" : "text-destructive")}
+            title={saveOutcome.text}
+            data-testid="terminal-save-outcome"
+          >
+            {saveOutcome.text}
+          </span>
+        )}
         {hits !== null && (
           <span className="text-10px text-muted-foreground" data-testid="terminal-hits">
             {hits > 0 ? t("hook.terminal.hits", { n: hits }) : t("hook.terminal.hitsNone")}

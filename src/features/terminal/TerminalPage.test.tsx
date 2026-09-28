@@ -43,6 +43,30 @@ const env: EnvProbe = {
   fridaCalls: 0,
 };
 
+/** 保存对话框与写盘命令的桩：D090 那三条口径（取消不算失败、写完报字节数、只存过滤后的）都靠它们 */
+const dialog = {
+  picked: "/tmp/terminal-zsh.txt" as string | null,
+  calls: 0,
+  saved: [] as Array<{ path: string; content: string }>,
+};
+
+vi.mock("@/api/dialog", () => ({
+  hasNativeDialog: () => true,
+  saveFile: vi.fn(async () => {
+    dialog.calls += 1;
+    return dialog.picked;
+  }),
+}));
+
+vi.mock("@/api/hook", () => ({
+  hookApi: {
+    exportSave: vi.fn(async (path: string, content: string) => {
+      dialog.saved.push({ path, content });
+      return new TextEncoder().encode(content).length;
+    }),
+  },
+}));
+
 vi.mock("@/api/env", () => ({
   envApi: {
     python: vi.fn(async () => env.python),
@@ -117,6 +141,9 @@ async function renderPage() {
 }
 
 beforeEach(() => {
+  dialog.picked = "/tmp/terminal-zsh.txt";
+  dialog.calls = 0;
+  dialog.saved.length = 0;
   env.python = { configured: true, ready: true, path: "/py/3.11/bin/python3", version: "Python 3.11.9", hint: null };
   env.frida = { pythonReady: true, installed: true, fridaVersion: "16.5.1", fridaToolsVersion: "12.5.3", hint: null };
   env.fridaCalls = 0;
@@ -289,6 +316,74 @@ describe("真终端页（FT1 分页）", () => {
     await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
     expect(env.fridaCalls).toBe(0);
     expect(screen.getByTestId("terminal-error").textContent).toContain("Python");
+  });
+
+  /**
+   * 「保存日志」在真终端里也能用（C-15 的终端那一半）。
+   * 判据不是"点了没报错"，而是**写出去的那段文本就是屏上那些行**、且界面报了字节数。
+   */
+  it("保存这块屏：写出去的是纯文本，报的是回读到的字节数", async () => {
+    const { container } = await renderPage();
+    const tab = await newTab(container);
+    fake.feeders.get("pty-1")?.(ENCODE.encode("hello\r\n\u001b[31mRED-VALUE\u001b[0m\r\n"));
+    await waitFor(() => expect(rowsOf(tab)).toContain("RED-VALUE"));
+
+    fireEvent.click(screen.getByTestId("terminal-save"));
+    await waitFor(() => expect(dialog.saved.length).toBe(1));
+    const written = dialog.saved[0].content;
+    expect(written).toContain("hello");
+    expect(written).toContain("RED-VALUE");
+    // 颜色是终端的语义，不是文件里的乱码：导出的必须是纯文本
+    expect(written.includes("\u001b")).toBe(false);
+    expect(screen.getByTestId("terminal-save-outcome").textContent).toContain("已存");
+    expect(screen.getByTestId("terminal-save-outcome").textContent).toContain("字节");
+  });
+
+  /** 「存过滤后的那些行」：搜索框里有字，就只写匹配的行（与控制台那条口径一致）。 */
+  it("搜索框里有过滤词时只存匹配的行", async () => {
+    const { container } = await renderPage();
+    await newTab(container);
+    fake.feeders
+      .get("pty-1")
+      ?.(ENCODE.encode("GET /a\r\nsign=deadbeef\r\nGET /b\r\n"));
+    await waitFor(() => expect(rowsOf(container)).toContain("sign=deadbeef"));
+    fireEvent.change(screen.getByTestId("terminal-search"), { target: { value: "sign=" } });
+
+    fireEvent.click(screen.getByTestId("terminal-save"));
+    await waitFor(() => expect(dialog.saved.length).toBe(1));
+    // 写出去的就是那一行，一个字的多余内容都没有
+    expect(dialog.saved[0].content).toBe("sign=deadbeef\n");
+    // 报的是"存了几行 / 屏上一共几行"，让她知道自己存的确实是被筛过的那部分
+    expect(screen.getByTestId("terminal-save-outcome").textContent).toContain("1/3");
+  });
+
+  /** 取消不是失败：什么都不写，也不弹一句红字。 */
+  it("用户在对话框里取消：不写文件、不报失败", async () => {
+    const { container } = await renderPage();
+    await newTab(container);
+    fake.feeders.get("pty-1")?.(ENCODE.encode("SOMETHING\r\n"));
+    await waitFor(() => expect(rowsOf(container)).toContain("SOMETHING"));
+    dialog.picked = null;
+
+    fireEvent.click(screen.getByTestId("terminal-save"));
+    await waitFor(() => expect(dialog.calls).toBe(1));
+    expect(dialog.saved).toEqual([]);
+    expect(screen.queryByTestId("terminal-save-outcome")).toBeNull();
+  });
+
+  /** 没有命中就什么都不写——连对话框都不该弹（省一次"选了路径却存出空文件"）。 */
+  it("过滤词没命中时不弹对话框，直接说清什么都没写", async () => {
+    const { container } = await renderPage();
+    await newTab(container);
+    fake.feeders.get("pty-1")?.(ENCODE.encode("GET /a\r\n"));
+    await waitFor(() => expect(rowsOf(container)).toContain("GET /a"));
+    fireEvent.change(screen.getByTestId("terminal-search"), { target: { value: "sign=" } });
+
+    fireEvent.click(screen.getByTestId("terminal-save"));
+    await waitFor(() => expect(screen.getByTestId("terminal-save-outcome")).toBeTruthy());
+    expect(dialog.calls).toBe(0);
+    expect(dialog.saved).toEqual([]);
+    expect(screen.getByTestId("terminal-save-outcome").textContent).toContain("sign=");
   });
 
   /** R-08：离开页面才是批量收摊的地方，三条活会话各关一次，一条不留。 */
