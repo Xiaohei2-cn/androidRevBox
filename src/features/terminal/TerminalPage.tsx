@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronUp, CircleStop, Download, Plus, X } from "lucide-react";
 
+import { deviceApi } from "@/api/device";
 import { envApi } from "@/api/env";
 import { hookApi } from "@/api/hook";
 import { ptyApi } from "@/api/pty";
@@ -21,6 +22,7 @@ import { hasNativeDialog, saveFile } from "@/api/dialog";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
+import { deviceShellLaunch } from "@/lib/deviceShell";
 import { fridaReplLaunch } from "@/lib/fridaTerminal";
 import { collectTranscript, transcriptFileName, transcriptText } from "@/lib/terminalTranscript";
 import { MAX_TERMINAL_SESSIONS, TerminalSessionStore, type TerminalTab } from "@/lib/terminalStore";
@@ -157,6 +159,48 @@ export function TerminalPage() {
    * 2. **不自动起会话**：官方 REPL 必须有目标（`-f 包名` / `-n 进程名` / PID），
    *    直接起只会让它打一句 usage 就退——把"还差一个目标"说给她，比给她一屏报错有用。
    */
+  /**
+   * 设备 shell 宿主（H-2，FT2）：**直接起一个会话**，不像 frida 预置那样只填命令。
+   *
+   * 差别的原因是"还缺不缺参数"：`adb -s <serial> shell -tt` 已经是一个完整可用的交互 shell，
+   * 而官方 REPL 必须有目标。实测过 `-tt` 下 Ctrl-C 能中断、改尺寸能传到远端
+   * （`stty size` 跟着变），所以这块屏不需要任何新的桌面通道——PTY 不关心跑的是谁。
+   */
+  const createDeviceShell = useCallback(async () => {
+    setNotice(null);
+    setHint(null);
+    setPresetBusy(true);
+    try {
+      const [env, devices] = await Promise.all([deviceApi.environment(), deviceApi.list(true)]);
+      const online = devices.filter((d) => d.state === "device");
+      const built = deviceShellLaunch(env.path, online[0]?.serial);
+      if (!built.ok) {
+        setNotice(built.block === "no-adb" ? t("hook.terminal.deviceNoAdb") : t("hook.terminal.deviceNoSerial"));
+        return;
+      }
+      const created = await store.create({
+        program: built.launch.program,
+        args: built.launch.args,
+        kind: "device",
+        title: built.launch.title,
+      });
+      if (!created.ok) {
+        setNotice(created.reason === "limit" ? t("hook.terminal.limit", { max: created.max }) : t("hook.terminal.emptyProgram"));
+        return;
+      }
+      setActiveId(created.id);
+      setHint(
+        online.length > 1
+          ? t("hook.terminal.deviceMulti", { serial: online[0].serial, count: online.length })
+          : t("hook.terminal.devicePicked", { serial: online[0].serial }),
+      );
+    } catch (reason) {
+      setNotice(String((reason as Error)?.message ?? reason));
+    } finally {
+      setPresetBusy(false);
+    }
+  }, [store, t]);
+
   const applyFridaPreset = useCallback(async () => {
     setNotice(null);
     setHint(null);
@@ -324,6 +368,17 @@ export function TerminalPage() {
         >
           <Plus className="h-3.5 w-3.5" />
           {t("hook.terminal.new")}
+        </Button>
+        {/* H-2：设备 shell 走同一条 PTY 通道，只是换个程序（实测见 lib/deviceShell 顶上那张表） */}
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 px-2"
+          disabled={presetBusy}
+          onClick={() => void createDeviceShell()}
+          data-testid="terminal-device-shell"
+        >
+          {t("hook.terminal.deviceShell")}
         </Button>
         {/* 路 B 的入口：把 REPL 的启动命令填进来（检查口径按会话类型分开，见 lib/fridaTerminal） */}
         <Button

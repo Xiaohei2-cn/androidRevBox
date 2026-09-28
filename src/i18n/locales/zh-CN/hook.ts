@@ -2,6 +2,11 @@
 export default {
   "hook.terminal.tab": "真终端",
   "hook.terminal.fridaPreset": "frida 会话",
+  "hook.terminal.deviceShell": "设备 shell",
+  "hook.terminal.deviceNoAdb": "没找到可用的 adb：设备 shell 是靠 adb -s <序列号> shell -tt 起的，先去设置里配 adb 路径。",
+  "hook.terminal.deviceNoSerial": "现在没有在线设备，开不了设备 shell。",
+  "hook.terminal.devicePicked": "设备 shell 起在 {serial}（adb -s … shell -tt）。Ctrl-C 能中断，拖宽窗口尺寸会传到远端。",
+  "hook.terminal.deviceMulti": "{count} 台在线，这次用的是第一台 {serial}；要连别的先关掉这个会话再点。",
   "hook.terminal.fridaPresetHint": "已填好 frida-tools {version} 的 REPL 启动命令。官方 REPL 还差一个目标：在参数里补 `-f 包名` 或 `-n 进程名`，再点「新建终端」。",
   "hook.terminal.fridaNoPython": "还没配好可用的 Python：REPL 是靠它用 -m 起模块的，先去设置里选一个解释器。",
   "hook.terminal.fridaNoTools": "这个 Python 里没装 frida-tools（frida_tools.repl 就在它里面）：{python} -m pip install frida-tools",

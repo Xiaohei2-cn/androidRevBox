@@ -23,8 +23,8 @@ export type TerminalTabStatus = "running" | "exited" | "stopped" | "starting" | 
 
 export interface TerminalTab {
   id: string;
-  /** 宿主：H-1 本机 PTY / H-2 设备 shell / H-3 Agent 托管（FT1 只有 H-1） */
-  kind: "local";
+  /** 宿主：H-1 本机 PTY(`local`) / H-2 设备 shell(`device`) / H-3 Agent 托管（还没做） */
+  kind: "local" | "device";
   title: string;
   program: string;
   ptyId: string | null;
@@ -40,6 +40,10 @@ export interface CreateTabInput {
   program: string;
   args: string[];
   cwd?: string | null;
+  /** 缺省 `local`；设备会话必须显式写 `device`（状态灯旁那句"在跑 80×24"对两种宿主含义不同） */
+  kind?: "local" | "device";
+  /** 显式标题（设备会话用 `adb shell @ <serial>`）；不给就取程序名 + 序号 */
+  title?: string;
 }
 
 /**
@@ -194,8 +198,8 @@ export class TerminalSessionStore {
     const entry: Entry = {
       tab: {
         id: `term-${this.seq}`,
-        kind: "local",
-        title: defaultTitle(program, this.seq),
+        kind: input.kind ?? "local",
+        title: input.title?.trim() || defaultTitle(program, this.seq),
         program,
         ptyId: null,
         status: "starting",

@@ -2,6 +2,11 @@
 export default {
   "hook.terminal.tab": "Терминал",
   "hook.terminal.fridaPreset": "сессия frida",
+  "hook.terminal.deviceShell": "Shell устройства",
+  "hook.terminal.deviceNoAdb": "Пригодный adb не найден: shell устройства запускается через adb -s <serial> shell -tt. Сначала укажите путь к adb в настройках.",
+  "hook.terminal.deviceNoSerial": "Устройств онлайн нет — shell устройства открыть негде.",
+  "hook.terminal.devicePicked": "Shell устройства запущен на {serial} (adb -s … shell -tt). Ctrl-C прерывает, а изменение ширины окна передается на устройство.",
+  "hook.terminal.deviceMulti": "Онлайн {count} устройств — взято первое, {serial}. Чтобы подключиться к другому, сначала закройте эту сессию.",
   "hook.terminal.fridaPresetHint": "Команда REPL для frida-tools {version} подставлена. Официальному REPL всё ещё нужен объект: добавьте `-f пакет` или `-n процесс` в аргументы, затем нажмите «Новый терминал».",
   "hook.terminal.fridaNoPython": "Не настроен пригодный Python: REPL запускается через него с -m. Сначала выберите интерпретатор в настройках.",
   "hook.terminal.fridaNoTools": "В этом Python не установлен frida-tools (frida_tools.repl находится там): {python} -m pip install frida-tools",

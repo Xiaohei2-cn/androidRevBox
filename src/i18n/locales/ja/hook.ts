@@ -2,6 +2,11 @@
 export default {
   "hook.terminal.tab": "ターミナル",
   "hook.terminal.fridaPreset": "frida セッション",
+  "hook.terminal.deviceShell": "デバイス shell",
+  "hook.terminal.deviceNoAdb": "使える adb が見つかりません：デバイス shell は adb -s <シリアル> shell -tt で起動します。まず設定で adb のパスを指定してください。",
+  "hook.terminal.deviceNoSerial": "オンラインのデバイスがないため、デバイス shell を開けません。",
+  "hook.terminal.devicePicked": "{serial} 上のデバイス shell を起動しました（adb -s … shell -tt）。Ctrl-C で割り込みでき、幅を変えるとサイズがデバイス側にも伝わります。",
+  "hook.terminal.deviceMulti": "{count} 台がオンラインです。今回は最初の {serial} を使いました。他につなぐにはこのセッションを閉じてから押してください。",
   "hook.terminal.fridaPresetHint": "frida-tools {version} の REPL 起動コマンドを入力しました。公式 REPL にはまだターゲットが必要です：引数に `-f パッケージ名` か `-n プロセス名` を足してから「新しいターミナル」を押してください。",
   "hook.terminal.fridaNoPython": "使える Python が未設定です：REPL はそれを使って -m で起動するため、まず設定でインタープリタを選んでください。",
   "hook.terminal.fridaNoTools": "この Python には frida-tools が導入されていません（frida_tools.repl はそちらに入っています）：{python} -m pip install frida-tools",

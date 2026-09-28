@@ -50,6 +50,19 @@ const dialog = {
   saved: [] as Array<{ path: string; content: string }>,
 };
 
+/** 设备与 adb 环境的可控桩（H-2 设备 shell 宿主要用它拿 adb 路径与在线设备列表） */
+const adb = {
+  env: { installed: true, path: "/sdk/platform-tools/adb" } as Record<string, unknown>,
+  devices: [{ serial: "18271FDF600FL4", state: "device", transport: "usb", model: "Pixel 6" }],
+};
+
+vi.mock("@/api/device", () => ({
+  deviceApi: {
+    environment: vi.fn(async () => adb.env),
+    list: vi.fn(async () => adb.devices),
+  },
+}));
+
 vi.mock("@/api/dialog", () => ({
   hasNativeDialog: () => true,
   saveFile: vi.fn(async () => {
@@ -141,6 +154,8 @@ async function renderPage() {
 }
 
 beforeEach(() => {
+  adb.env = { installed: true, path: "/sdk/platform-tools/adb" };
+  adb.devices = [{ serial: "18271FDF600FL4", state: "device", transport: "usb", model: "Pixel 6" }];
   dialog.picked = "/tmp/terminal-zsh.txt";
   dialog.calls = 0;
   dialog.saved.length = 0;
@@ -384,6 +399,61 @@ describe("真终端页（FT1 分页）", () => {
     expect(dialog.calls).toBe(0);
     expect(dialog.saved).toEqual([]);
     expect(screen.getByTestId("terminal-save-outcome").textContent).toContain("sign=");
+  });
+
+  /**
+   * H-2 设备 shell（FT2）：**直接起会话**，走的是同一条 PTY 通道，只是换个程序。
+   * 判据是传给 `pty_open` 的参数数组原样是 `adb -s <serial> shell -tt`——
+   * 少那个 `-tt` 就没有远端 PTY，Ctrl-C/行编辑/全屏程序全都不成立（真机实测见 lib/deviceShell）。
+   */
+  it("设备 shell 起的是 adb -s <serial> shell -tt", async () => {
+    await renderPage();
+    fireEvent.click(screen.getByTestId("terminal-device-shell"));
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
+    expect(fake.openArgs[0].program).toBe("/sdk/platform-tools/adb");
+    // 参数数组原样交给 PTY：少那个 `-tt` 就没有远端 PTY，中断/行编辑/全屏程序全都不成立
+    expect(vi.mocked(ptyApi.open).mock.calls[0][0].args).toEqual([
+      "-s",
+      "18271FDF600FL4",
+      "shell",
+      "-tt",
+    ]);
+    // 标题带序列号：多设备时用户得看得见这块屏连的是哪台
+    expect(screen.getByTestId("terminal-tabs").textContent).toContain("adb shell @ 600FL4");
+    expect(screen.getByTestId("terminal-hint").textContent).toContain("18271FDF600FL4");
+  });
+
+  /** 没设备就是开不了：不许起一条 `adb -s "" shell` 之类的空会话糊弄界面。 */
+  it("没有在线设备时拒绝起会话，并且一次 PTY 都不开", async () => {
+    adb.devices = [{ serial: "EMULATOR36X5X9X0", state: "offline", transport: "tcp", model: "" }];
+    await renderPage();
+    fireEvent.click(screen.getByTestId("terminal-device-shell"));
+    await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
+    expect(screen.getByTestId("terminal-error").textContent).toContain("没有在线设备");
+    expect(fake.openArgs).toEqual([]);
+  });
+
+  /** adb 没配好就直说去设置里配，不去 PATH 里猜一个 adb（猜出来的和检测到的可能不是一条）。 */
+  it("没配 adb 路径时报的是「去设置配 adb」", async () => {
+    adb.env = { installed: false, path: undefined };
+    await renderPage();
+    fireEvent.click(screen.getByTestId("terminal-device-shell"));
+    await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
+    expect(screen.getByTestId("terminal-error").textContent).toContain("设置");
+    expect(fake.openArgs).toEqual([]);
+  });
+
+  /** 多设备时必须说清用了哪一台——静默挑第一台是会让人误判"我在这台上操作"的那种错。 */
+  it("多台在线时说清用的是第一台、一共几台", async () => {
+    adb.devices = [
+      { serial: "AAA111", state: "device", transport: "usb", model: "" },
+      { serial: "BBB222", state: "device", transport: "usb", model: "" },
+    ];
+    await renderPage();
+    fireEvent.click(screen.getByTestId("terminal-device-shell"));
+    await waitFor(() => expect(screen.getByTestId("terminal-hint")).toBeTruthy());
+    expect(screen.getByTestId("terminal-hint").textContent).toContain("AAA111");
+    expect(screen.getByTestId("terminal-hint").textContent).toContain("2");
   });
 
   /** R-08：离开页面才是批量收摊的地方，三条活会话各关一次，一条不留。 */

@@ -163,8 +163,8 @@ export function DevicesPage() {
           content: (
             <TaskLaunchPanel
               label="命令"
-              placeholder="如：input text hello（回车执行，Ctrl+C 无法用，请点停止取消）"
-              note="ADB 原始会话：命令原样交给 adb shell，不经 Agent，也没有 typed 错误码。设备侧能力请改用各功能页。"
+              placeholder="如：input text hello（回车执行；要 Ctrl+C 就去真终端）"
+              note="ADB 原始会话（没有 PTY）：命令原样交给 adb shell，不经 Agent，也没有 typed 错误码。要交互式 shell（Ctrl-C 中断、top/vi 这类全屏程序）去 Hook → 真终端 → 设备 shell；设备侧结构化能力请改用各功能页。"
               disabled={!activeSerial}
               onRun={async (input) => {
                 if (!activeSerial || !input.trim()) return null;
