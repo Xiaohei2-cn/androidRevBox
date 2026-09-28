@@ -163,12 +163,8 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
         Category::LegacyFallback,
         Some("AR12.1 after AR6.2"),
     ),
-    (
-        "src/services/device_service.rs",
-        "pkg_lib_dir_legacy",
-        Category::LegacyFallback,
-        Some("AR12.1 after AR8.3"),
-    ),
+    // 第七十一轮：`pkg_lib_dir_legacy` 连同它的回退腿一起删掉了（AR12.1 取证已过）。
+    // 条目一起删是纪律要求 —— 登记与实现不能分叉；少一个调用点也必须在这里看得见。
     (
         "src/services/env_service.rs",
         "shell",
@@ -215,7 +211,7 @@ const EXPECTED_SITES_PER_CATEGORY: &[(Category, usize)] = &[
     // 8（原 9）：AR7.6 把 root 终止从 `adb shell su -c "kill -9 <pid>"` 改成走 Agent 的
     // 固定提权脚本（先核身份再发信号），桌面侧那个 shell 调用点因此消失 —— AR12 少一项可删的
     // Legacy。这里跟着下调，是为了让"少一个回退点"也变成会被机器看见的事实，而不是悄悄发生。
-    (Category::LegacyFallback, 8),
+    (Category::LegacyFallback, 7),
     (Category::RootBranch, 5),
 ];
 

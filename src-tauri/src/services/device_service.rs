@@ -615,73 +615,39 @@ impl DeviceService {
         Ok(info)
     }
 
-    /// 设备侧目录列表。AR7.1 起默认走 Agent `filesystem.list`：条目由设备端 `lstat`
-    /// 直接产出（type/mode/uid/gid/size/mtime/link target 全在），Desktop 不再解析
-    /// `ls -l` 文本；只读幂等，Agent 不可用时回退 Legacy（删除条件见能力表 AR12.1）。
+    /// 设备侧目录列表（Agent only）。第七十一轮按 AR12.1 删掉了 `ls -lA` 文本解析那条只读回退腿：
+    /// 取证是删之前的真机闸门报「9 项已迁移能力全部路由到 Agent，本次会话零 Legacy 回退」（删完这两条后它打印 7 项）；UI-8
+    /// 之后设备上线即自动接回 Agent，所以 agent_unavailable 这个触发源本身也缩掉了。
+    /// 顺带消失的一个坑：Legacy 对符号链接目录只吐链接自身那一行，旧解析把名字读成 `sdcard`，
+    /// 界面拼一层就成了不存在的 `/sdcard/sdcard`（看着像程序坏了，其实是假条目）。
     pub async fn list_files(&self, serial: &str, path: &str) -> CoreResult<Vec<FileEntry>> {
-        let route = self
+        // 空目录和「读不到」必须是两件事（§3.7）：Agent 不在就给一句能照着做的话，不给空列表
+        self.require_agent_route(serial, FILESYSTEM_LIST)?;
+        let result = self
             .android
-            .select(serial, FILESYSTEM_LIST, OperationKind::ReadOnlyIdempotent)
-            .map_err(CapabilityRouter::core_error)?;
-        if route.backend == AndroidBackendSource::LegacyAdb {
-            return self.list_files_legacy(serial, path).await;
+            .agent()
+            .request::<_, FilesystemListResult>(
+                serial,
+                FILESYSTEM_LIST,
+                &FilesystemListParams {
+                    path: path.to_owned(),
+                    include_hidden: true,
+                },
+                LIST_TIMEOUT,
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))?;
+        if !result.unreadable.is_empty() || result.truncated {
+            tracing::debug!(
+                serial,
+                path = %result.path,
+                method = FILESYSTEM_LIST,
+                unreadable = ?result.unreadable,
+                truncated = result.truncated,
+                "filesystem.list 有不可读或被截断的条目：空/短列表不等于空目录"
+            );
         }
-
-        // Legacy 用的是 `ls -lA`：含隐藏项、不含 `.`/`..`，Agent 侧必须同语义才可比
-        let params = FilesystemListParams {
-            path: path.to_owned(),
-            include_hidden: true,
-        };
-        let agent_request = self.android.agent().request::<_, FilesystemListResult>(
-            serial,
-            FILESYSTEM_LIST,
-            &params,
-            LIST_TIMEOUT,
-        );
-        let (agent_result, legacy_result) = if filesystem_shadow_enabled() {
-            let legacy = self.list_files_legacy(serial, path);
-            let (agent, legacy) = tokio::join!(agent_request, legacy);
-            (agent, Some(legacy))
-        } else {
-            (agent_request.await, None)
-        };
-
-        match agent_result {
-            Ok(result) => {
-                if !result.unreadable.is_empty() || result.truncated {
-                    tracing::debug!(
-                        serial,
-                        path = %result.path,
-                        method = FILESYSTEM_LIST,
-                        unreadable = ?result.unreadable,
-                        truncated = result.truncated,
-                        "filesystem.list 有不可读或被截断的条目：空/短列表不等于空目录"
-                    );
-                }
-                let entries = map_agent_file_entries(&result);
-                if let Some(Ok(legacy)) = legacy_result {
-                    log_filesystem_list_shadow_diff(serial, path, &entries, &legacy);
-                }
-                Ok(entries)
-            }
-            Err(error) => {
-                let fallback = self
-                    .android
-                    .fallback_after_agent_error(
-                        serial,
-                        FILESYSTEM_LIST,
-                        OperationKind::ReadOnlyIdempotent,
-                        &error,
-                    )
-                    .map_err(CapabilityRouter::core_error)?;
-                debug_assert_eq!(fallback.backend, AndroidBackendSource::LegacyAdb);
-                tracing::warn!(serial, path, "filesystem.list 回退 Legacy ADB");
-                match legacy_result {
-                    Some(result) => result,
-                    None => self.list_files_legacy(serial, path).await,
-                }
-            }
-        }
+        Ok(map_agent_file_entries(&result))
     }
 
     /// 单路径元数据（Agent only）：Legacy 侧没有等价能力（`ls -l` 文本不算），
@@ -741,20 +707,6 @@ impl DeviceService {
             )
             .await
             .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))
-    }
-
-    /// Legacy 目录列表（仅作回退）：`ls -lA` + 宿主侧按空格切列解析。
-    /// 文件名带空格只能靠「第 8 列之后全拼回去」猜，uid/gid 数值与 mtime 时间戳丢失。
-    async fn list_files_legacy(&self, serial: &str, path: &str) -> CoreResult<Vec<FileEntry>> {
-        let args = adb::build_args(Some(serial), &adb::cmd_ls(path));
-        let out = self.run_adb(&args).await?;
-        if out.exit_code != Some(0) {
-            return Err(CoreError::Internal(format!(
-                "ls 失败: {}",
-                out.stderr.trim()
-            )));
-        }
-        Ok(adb::parse_ls_listing(&out.stdout))
     }
 
     /// 第三方应用列表
@@ -1121,8 +1073,19 @@ impl DeviceService {
             crate::models::agent::AgentSessionState::Ready
                 | crate::models::agent::AgentSessionState::Degraded
         ) {
+            // 这句话是给界面读的：先说「什么做不了」，再说「点哪」；
+            // 方法名留在括号里供检索，不再顶在句子最前面当主语（用户的原话：
+            // 那些内部编号他读不懂，也不需要读懂）。
+            let label = match method {
+                FILESYSTEM_LIST => "列目录",
+                PACKAGE_NATIVE_LIB_DIR => "查 native lib 目录",
+                PROCESS_PROC_READ => "读 /proc 详情",
+                FRIDA_SERVER_STATUS => "查看 frida-server 状态",
+                _ => "这个操作",
+            };
             return Err(CoreError::AgentUnavailable(format!(
-                "{method} 只能由 Agent 提供（设备页 → 安装/连接 Agent）；这条能力没有 ADB 回退腿"
+                "{label}需要 Agent 在线：在设备页的 Android Agent 区点「安装并连接」
+                （{method} 已没有 ADB 回退腿，AR12.1 删除）"
             )));
         }
         Ok(())
@@ -1138,7 +1101,7 @@ impl DeviceService {
                 | crate::models::agent::AgentSessionState::Degraded
         ) {
             return Err(CoreError::AgentUnavailable(format!(
-                "{method} 需要 Agent 在线（设备页 → 安装/连接 Agent）；写操作不自动回退 adb shell"
+                "{method} 需要 Agent 在线（设备页 Android Agent → 安装并连接）；写操作不自动回退 adb shell"
             )));
         }
         let route = self
@@ -1873,14 +1836,14 @@ impl DeviceService {
         // "先核身份再发信号"的规矩，root 支路不该是例外）。
         // 写操作照旧不自动回退：Agent 不在线就明确报错（D028）。
         // 写操作要求 Agent 在线：这里不静默安装，也不回退 adb shell，
-        // 而是给可执行指引（设备页 → 安装/连接 Agent），避免用户以为进程已被杀。
+        // 而是给可执行指引（设备页 Android Agent → 安装并连接），避免用户以为进程已被杀。
         if !matches!(
             self.android.agent_status(serial).state,
             crate::models::agent::AgentSessionState::Ready
                 | crate::models::agent::AgentSessionState::Degraded
         ) {
             let error = CoreError::AgentUnavailable(
-                "终止进程需要 Agent 在线（设备页 → 安装/连接 Agent）；写操作不自动回退 adb shell"
+                "终止进程需要 Agent 在线（设备页 Android Agent → 安装并连接）；写操作不自动回退 adb shell"
                     .to_string(),
             );
             audit_process_kill(
@@ -2174,10 +2137,11 @@ impl DeviceService {
     }
 
     /// 查询包安装 lib 目录（SO 替换页只读预览）。AR8.3 起默认走 Agent
-    /// `package.native_lib_dir`：`dumpsys package` 在设备端解析，不再把几十 KB 文本
-    /// 拖回宿主；ABI 换算规则与 Legacy `lib_dir_for_abi` 一致，但 framework 包那种
-    /// 非 `<pkg>/lib/<abi>` 形态的目录不再当异常报错，而是按原值返回并标注来源。
-    /// 只读幂等，Agent 不可用时回退 Legacy（删除条件见能力表 AR12.1）。
+    /// `package.native_lib_dir`（Agent only）。第七十一轮按 AR12.1 删掉这条只读回退腿；取证同 list_files：
+    /// 真机腿逐包 × ABI 比对过，framework 包还会说明这目录不能按 ABI 换算。
+    /// 解析全在设备侧：`dumpsys package` 的几十 KB 文本不出设备，ABI 换算与
+    /// 非 `<pkg>/lib/<abi>` 形态（framework 包）由 Agent 回报来源与细节，桌面不拼字符串。
+    /// 参数形状仍在进设备之前拒掉：包名白名单 + ABI 只认 arm64/arm。
     pub async fn pkg_lib_dir(&self, serial: &str, pkg: &str, abi: &str) -> CoreResult<String> {
         if !adb::is_safe_pkg_name(pkg) {
             return Err(CoreError::Internal(format!("包名非法: {pkg}")));
@@ -2185,103 +2149,33 @@ impl DeviceService {
         if abi != "arm64" && abi != "arm" {
             return Err(CoreError::Internal(format!("ABI 仅支持 arm64/arm: {abi}")));
         }
-        let route = self
-            .android
-            .select(
-                serial,
-                PACKAGE_NATIVE_LIB_DIR,
-                OperationKind::ReadOnlyIdempotent,
-            )
-            .map_err(CapabilityRouter::core_error)?;
-        if route.backend == AndroidBackendSource::LegacyAdb {
-            return self.pkg_lib_dir_legacy(serial, pkg, abi).await;
-        }
-        let params = PackageNativeLibDirParams {
-            package: pkg.to_owned(),
-            abi: Some(abi.to_owned()),
-            user: None,
-        };
-        let agent_request = self
+        self.require_agent_route(serial, PACKAGE_NATIVE_LIB_DIR)?;
+        let result = self
             .android
             .agent()
             .request::<_, PackageNativeLibDirResult>(
                 serial,
                 PACKAGE_NATIVE_LIB_DIR,
-                &params,
+                &PackageNativeLibDirParams {
+                    package: pkg.to_owned(),
+                    abi: Some(abi.to_owned()),
+                    user: None,
+                },
                 LIST_TIMEOUT,
-            );
-        let (agent_result, legacy_result) = if native_lib_shadow_enabled() {
-            let legacy = self.pkg_lib_dir_legacy(serial, pkg, abi);
-            let (agent, legacy) = tokio::join!(agent_request, legacy);
-            (agent, Some(legacy))
-        } else {
-            (agent_request.await, None)
-        };
-        match agent_result {
-            Ok(result) => {
-                let dir = result.native_lib_dir.clone();
-                if let Some(Ok(legacy)) = legacy_result {
-                    if legacy != dir {
-                        tracing::warn!(
-                            serial,
-                            pkg,
-                            abi,
-                            method = PACKAGE_NATIVE_LIB_DIR,
-                            agent = %dir,
-                            legacy = %legacy,
-                            source = ?result.source,
-                            detail = ?result.detail,
-                            "Agent/Legacy native lib dir 不一致（Legacy 报错时这里是改进，不是缺陷）"
-                        );
-                    }
-                } else if let Some(Err(error)) = legacy_result {
-                    tracing::debug!(
-                        serial,
-                        pkg,
-                        abi,
-                        method = PACKAGE_NATIVE_LIB_DIR,
-                        legacy_error = %error,
-                        "Legacy 解析失败而 Agent 给出结果：framework 包属预期差异"
-                    );
-                }
-                Ok(dir)
-            }
-            Err(error) => {
-                let fallback = self
-                    .android
-                    .fallback_after_agent_error(
-                        serial,
-                        PACKAGE_NATIVE_LIB_DIR,
-                        OperationKind::ReadOnlyIdempotent,
-                        &error,
-                    )
-                    .map_err(CapabilityRouter::core_error)?;
-                debug_assert_eq!(fallback.backend, AndroidBackendSource::LegacyAdb);
-                tracing::warn!(serial, pkg, "package.native_lib_dir 回退 Legacy ADB");
-                match legacy_result {
-                    Some(result) => result,
-                    None => self.pkg_lib_dir_legacy(serial, pkg, abi).await,
-                }
-            }
-        }
-    }
-
-    /// Legacy 解析（仅作回退）：`dumpsys package` 全文回宿主 + 字符串找字段。
-    async fn pkg_lib_dir_legacy(&self, serial: &str, pkg: &str, abi: &str) -> CoreResult<String> {
-        let args = adb::build_args(
-            Some(serial),
-            &adb::cmd_shell(&format!("dumpsys package {pkg}")),
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))?;
+        tracing::debug!(
+            serial,
+            pkg,
+            abi,
+            method = PACKAGE_NATIVE_LIB_DIR,
+            dir = %result.native_lib_dir,
+            source = ?result.source,
+            detail = ?result.detail,
+            "native lib 目录由设备侧解析（framework 包按原值返回并标注来源）"
         );
-        let out = self.run_adb(&args).await?;
-        let legacy = crate::services::env_service::parse_legacy_native_lib(&out.stdout)
-            .ok_or_else(|| {
-                CoreError::Internal(format!(
-                    "未找到 {pkg} 的 legacyNativeLibraryDir（未安装？）"
-                ))
-            })?;
-        adb::lib_dir_for_abi(&legacy, abi).ok_or_else(|| {
-            CoreError::Internal(format!("lib 目录结构异常，无法按 ABI {abi} 解析: {legacy}"))
-        })
+        Ok(result.native_lib_dir)
     }
 
     /// AR8.4：SO 替换（免重打包）——主机侧修补好的 `.so` 交给 Agent 原子装进包的 native lib 目录。
@@ -3425,12 +3319,6 @@ fn root_shadow_enabled() -> bool {
         .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
 }
 
-/// AR8.3 native lib 目录的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。
-fn native_lib_shadow_enabled() -> bool {
-    !std::env::var("APP_REVERSE_TOOLS_NATIVE_LIB_SHADOW")
-        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
-}
-
 /// AR7.2 托管列表的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。
 fn hosted_shadow_enabled() -> bool {
     !std::env::var("APP_REVERSE_TOOLS_HOSTED_SHADOW")
@@ -3505,12 +3393,6 @@ fn log_hosted_list_shadow_diff(
     );
 }
 
-/// AR7.1 文件列表的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。
-fn filesystem_shadow_enabled() -> bool {
-    !std::env::var("APP_REVERSE_TOOLS_FILESYSTEM_SHADOW")
-        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
-}
-
 /// Agent `filesystem.list` → 前端既有 `FileEntry[]` 契约。
 /// 目录判定与 Legacy 一致：指向目录的符号链接仍算链接（`ls -l` 看首字符 `l`）。
 fn map_agent_file_entries(result: &FilesystemListResult) -> Vec<FileEntry> {
@@ -3545,60 +3427,6 @@ pub(crate) fn preview_text(preview: &FilesystemPreviewResult) -> String {
         // 协议保证二者必有其一；真出现空结果就返回空串，不编造内容
         _ => String::new(),
     }
-}
-
-/// Agent 与 Legacy 的目录项差异只写日志，不影响返回值（迁移期观测用）。
-/// 判据沿用 D024 的思路：按名字集合比较，逐项再比 is_dir/size/symlink/perms。
-fn log_filesystem_list_shadow_diff(
-    serial: &str,
-    path: &str,
-    agent: &[FileEntry],
-    legacy: &[FileEntry],
-) {
-    let agent_names: HashSet<&str> = agent.iter().map(|entry| entry.name.as_str()).collect();
-    let legacy_names: HashSet<&str> = legacy.iter().map(|entry| entry.name.as_str()).collect();
-    let only_agent: Vec<&str> = agent_names.difference(&legacy_names).copied().collect();
-    let only_legacy: Vec<&str> = legacy_names.difference(&agent_names).copied().collect();
-    let mut field_diffs: Vec<String> = Vec::new();
-    for legacy_entry in legacy {
-        let Some(agent_entry) = agent.iter().find(|entry| entry.name == legacy_entry.name) else {
-            continue;
-        };
-        if agent_entry.is_dir != legacy_entry.is_dir {
-            field_diffs.push(format!("{}:is_dir", legacy_entry.name));
-        }
-        if agent_entry.size != legacy_entry.size {
-            field_diffs.push(format!("{}:size", legacy_entry.name));
-        }
-        if agent_entry.symlink != legacy_entry.symlink {
-            field_diffs.push(format!("{}:symlink", legacy_entry.name));
-        }
-        // 权限串只在两侧都非空时比：Legacy 解析失败会给空串，那是对照方的缺陷不是差异
-        if !legacy_entry.perms.is_empty() && agent_entry.perms != legacy_entry.perms {
-            field_diffs.push(format!(
-                "{}:perms({}!={})",
-                legacy_entry.name, agent_entry.perms, legacy_entry.perms
-            ));
-        }
-    }
-    if only_agent.is_empty() && only_legacy.is_empty() && field_diffs.is_empty() {
-        tracing::debug!(
-            serial,
-            path,
-            method = FILESYSTEM_LIST,
-            "filesystem.list matched"
-        );
-        return;
-    }
-    tracing::warn!(
-        serial,
-        path,
-        method = FILESYSTEM_LIST,
-        agent_only = ?only_agent,
-        legacy_only = ?only_legacy,
-        field_diffs = ?field_diffs,
-        "Agent/Legacy filesystem.list shadow compare differed"
-    );
 }
 
 /// AR6.2 端口互查的 Agent/Legacy 对照开关（默认开，设 0/false/off 关闭）。
@@ -4003,44 +3831,6 @@ mod tests {
             symlink_target: symlink_target.map(str::to_string),
             readable: true,
         }
-    }
-
-    /// AR7.1 等价性：Agent 的结构化条目映射后必须与 Legacy `ls -lA` 解析结果同形，
-    /// 包括「指向目录的符号链接不算目录」这条 Legacy 也遵守的规则。
-    #[test]
-    fn agent_file_entries_match_legacy_parser_output() {
-        const RAW: &str = concat!(
-            "total 24\n",
-            "drwxrwx--x 2 root root 3452 2024-01-01 08:00 storage\n",
-            "-rw-rw---- 1 u0_a1 u0_a1 1024 2024-01-01 08:00 my file.txt\n",
-            "lrwxrwxrwx 1 root root 11 2024-01-01 08:00 init -> /init\n",
-        );
-        // Legacy 保留 `ls` 的输出顺序，Agent 侧固定按名字排序；顺序不是契约
-        // （shadow 判据是名字集合 + 逐项字段，见 log_filesystem_list_shadow_diff），
-        // 所以把对照方也排序后再比，免得把排序差异当成迁移缺陷。
-        let mut legacy = RAW
-            .lines()
-            .filter_map(adb::parse_ls_long)
-            .collect::<Vec<_>>();
-        legacy.sort_by(|a, b| a.name.cmp(&b.name));
-        let result = FilesystemListResult {
-            path: "/data/local/tmp".into(),
-            entries: vec![
-                file_stat("init", FileKind::Symlink, 0o777, 11, Some("/init")),
-                file_stat("my file.txt", FileKind::File, 0o660, 1024, None),
-                file_stat("storage", FileKind::Dir, 0o771, 3452, None),
-            ],
-            truncated: false,
-            unreadable: vec![],
-        };
-        let agent = map_agent_file_entries(&result);
-        assert_eq!(agent, legacy, "映射结果必须与 Legacy 解析逐项相等");
-        // 名字带空格、符号链接目标、目录判定这三处是 Legacy 文本解析最容易错的地方
-        assert_eq!(agent[1].name, "my file.txt");
-        assert_eq!(agent[0].symlink.as_deref(), Some("/init"));
-        assert!(!agent[0].is_dir, "指向文件的链接不是目录");
-        assert!(agent[2].is_dir);
-        assert_eq!(agent[2].perms, "drwxrwx--x");
     }
 
     #[test]

@@ -77,6 +77,9 @@ impl LegacyCapability {
 
 pub fn default_legacy_capabilities() -> Vec<LegacyCapability> {
     [
+        // 第七十一轮按 AR12.1 删掉两条只读回退腿（取证：真机闸门在 Pixel 6 上报「9 项已迁移
+        // 能力全部路由到 Agent，本次会话零 Legacy 回退」）。少一项也要在这里留一句话：
+        // `filesystem.list`（桌面不再解析 ls -lA）、`package.native_lib_dir`（dumpsys 解析全在设备侧）。
         (
             "device.root_check",
             "AR12.1 after AR9.1 and two stable phase regressions",
@@ -102,16 +105,8 @@ pub fn default_legacy_capabilities() -> Vec<LegacyCapability> {
             "AR12.1 after AR6.2 and two stable phase regressions",
         ),
         (
-            "filesystem.list",
-            "AR12.1 after AR7.1 and two stable phase regressions",
-        ),
-        (
             "hosted.list",
             "AR12.1 after AR7.2 and two stable phase regressions",
-        ),
-        (
-            "package.native_lib_dir",
-            "AR12.1 after AR8.3 and two stable phase regressions",
         ),
     ]
     .into_iter()
@@ -1015,6 +1010,66 @@ mod tests {
         assert!(capabilities.iter().all(|capability| {
             !capability.method.is_empty() && capability.removal_stage.starts_with("AR12.1 after AR")
         }));
+    }
+
+    /// 第七十一轮按 AR12.1 删掉两条只读回退腿之后，这张表必须**真的少两项**。
+    ///
+    /// 为什么单独钉一条：回退腿一旦被重新登记，`select()` 就又会给出一条 Legacy 决策，
+    /// 而那种改动通常是以「顺手加个兜底」的形式进来的。这条断言把"只剩 7 条"变成机器
+    /// 事实——要加回来的人必须先回答"为什么又需要它"。
+    #[test]
+    fn the_two_deleted_legs_stay_out_of_the_legacy_table() {
+        // owned String 而不是 &str：这张表是现造的，借来的切片会在断言之前失效
+        let methods: Vec<String> = default_legacy_capabilities()
+            .iter()
+            .map(|capability| capability.method.clone())
+            .collect();
+        assert_eq!(
+            methods.len(),
+            7,
+            "只读回退腿应当只剩 7 条（filesystem.list 与 package.native_lib_dir 已删）: {methods:?}"
+        );
+        assert!(
+            !methods.iter().any(|m| m == "filesystem.list"),
+            "ls -lA 文本解析不该再当回退腿"
+        );
+        assert!(
+            !methods.iter().any(|m| m == "package.native_lib_dir"),
+            "dumpsys 解析不该再当回退腿"
+        );
+        assert!(
+            default_legacy_capabilities()
+                .iter()
+                .all(|c| c.removal_stage.starts_with("AR12.1 after AR")),
+            "剩下的每条都得写着删除条件"
+        );
+    }
+
+    /// 这两条能力在 Agent 不在时必须**报错**：不悄悄退回 adb shell，也不许被算成一次回退。
+    ///
+    /// 后半句和 `rejected_mutating_calls_are_not_counted` 是同一条纪律 —— 没真的退回
+    /// 就不算，否则那行「ADB 回退次数」会说谎。
+    #[tokio::test]
+    async fn deleted_legs_fail_loudly_instead_of_falling_back() {
+        let runner = Arc::new(MockAdbRunner::new(true));
+        let router = CapabilityRouter::new(
+            manager(runner.clone()),
+            runner,
+            default_legacy_capabilities(),
+        );
+        for method in ["filesystem.list", "package.native_lib_dir"] {
+            let error = router
+                .select("serial-a", method, OperationKind::ReadOnlyIdempotent)
+                .expect_err("离线 Agent 不该给这两条能力放行");
+            assert!(
+                matches!(error, RouteError::AgentUnavailable { .. }),
+                "{method} 应当报「Agent 不可用」，实际 {error:?}"
+            );
+            assert!(
+                router.fallback_totals_for_serial("serial-a").is_empty(),
+                "被拒的调用不算一次回退"
+            );
+        }
     }
 
     #[tokio::test]

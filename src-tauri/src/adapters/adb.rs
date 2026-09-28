@@ -1005,25 +1005,6 @@ pub fn cmd_ls(path: &str) -> Vec<String> {
     vec!["shell".into(), format!("ls -lA {target}")]
 }
 
-/// 把一段 `ls -lA` 输出解析成条目列表，并丢掉名字里带 `/` 的行。
-///
-/// 目录条目的名字**不可能**含 `/`；出现带 `/` 的名字说明 ls 打印的不是目录内容而是
-/// 命令行参数本身（符号链接、单个文件、或设备上的怪形态），把它当条目会让界面拼出
-/// `/sdcard/sdcard` 这种不存在的路径。宁可少一条也不给一个假条目。
-pub fn parse_ls_listing(text: &str) -> Vec<FileEntry> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let Some(entry) = parse_ls_long(line) else {
-            continue;
-        };
-        if entry.name.contains('/') {
-            tracing::debug!(name = %entry.name, "ls 输出里这条不是目录条目，忽略");
-            continue;
-        }
-        out.push(entry);
-    }
-    out
-}
 pub fn cmd_cat_preview(path: &str, max_bytes: u64) -> Vec<String> {
     vec!["shell".into(), format!("head -c {max_bytes} {path}")]
 }
@@ -1384,29 +1365,6 @@ mod tests {
             ["shell", "ls -lA /storage/emulated/0/"]
         );
         assert_eq!(cmd_ls(""), ["shell", "ls -lA "]);
-    }
-
-    #[test]
-    fn parse_ls_listing_drops_the_symlink_self_line() {
-        // 真机上 `ls -lA /sdcard` 的原文（尾部不带斜杠时就是这个形状）
-        let text = "total 0\nlrw-r--r-- 1 root root 21 2009-01-01 08:00 /sdcard -> /storage/self/primary\n";
-        let entries = parse_ls_listing(text);
-        assert!(
-            entries.is_empty(),
-            "符号链接自身那一行不能变成条目，否则界面会拼出 /sdcard/sdcard: {entries:?}"
-        );
-
-        // 正常目录内容全部保留（含带空格的名字）
-        let dir = "total 2\ndrwxrws--- 2 u0_a251 media_rw 3452 2025-11-17 21:04 Alarms\n\
--rw-rw---- 1 u0_a251 media_rw 88 2026-02-12 17:54 .thumbcache_idx_001\n\
-lrw-r--r-- 1 shell shell 21 2026-01-01 08:00 link -> /init\n";
-        let entries = parse_ls_listing(dir);
-        assert_eq!(
-            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
-            vec!["Alarms", ".thumbcache_idx_001", "link"]
-        );
-        assert!(entries[0].is_dir && !entries[1].is_dir);
-        assert_eq!(entries[2].symlink.as_deref(), Some("/init"));
     }
 
     #[test]

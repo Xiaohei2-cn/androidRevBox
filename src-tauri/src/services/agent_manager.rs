@@ -6600,40 +6600,9 @@ mod tests {
             sdcard.entries.len()
         );
 
-        // ⑦b 同一条路径的 **Legacy 回退**也必须给同样的结果。
-        //     用户报的文件页问题就出在这里：Agent 不在时列表走 `ls -lA`，而
-        //     `ls -lA /sdcard` 只吐符号链接自身那一行，旧解析把它的名字读成
-        //     `/sdcard`，界面拼一层就成了不存在的 `/sdcard/sdcard`，
-        //     元数据与预览各报一句 not_found（看着像程序坏了，其实是假条目）。
-        let legacy_sdcard = runner
-            .run(
-                &adb_path,
-                &adb::build_args(Some(&serial), &adb::cmd_ls("/sdcard")),
-                Duration::from_secs(20),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            legacy_sdcard.exit_code,
-            Some(0),
-            "Legacy ls 应当能列 /sdcard: {}",
-            legacy_sdcard.stderr.trim()
-        );
-        let legacy_entries = adb::parse_ls_listing(&legacy_sdcard.stdout);
-        assert!(
-            !legacy_entries.is_empty(),
-            "Legacy 列表为空，说明这条回退路径已经不可用"
-        );
-        for entry in &legacy_entries {
-            assert!(
-                !entry.name.contains('/'),
-                "Legacy 条目名必须是纯文件名，拿到 {:?} 就会拼出不存在的路径",
-                entry.name
-            );
-        }
-        // `ls -lA` 恒含隐藏项，而上面那次请求是 include_hidden=false，所以这里再问一次
-        // "含隐藏项"的，才能与 Legacy 逐条对账（产品真正的列表路径 `list_files` 用的就是
-        // include_hidden=true，这条对账才代表界面上实际看到的东西）。
+        // ⑦b Legacy 的 `ls -lA` 对照随那条只读回退腿一起在第七十一轮删掉（AR12.1）。
+        //     留在这里的仍是**设备侧事实**，而且比对照更要紧：include_hidden 两个方向
+        //     各自成立，条目名绝不含 `/`（当年 `/sdcard/sdcard` 那个坑的判据）。
         let agent_all: FilesystemListResult = client
             .request(
                 FILESYSTEM_LIST,
@@ -6650,19 +6619,17 @@ mod tests {
             .iter()
             .map(|item| item.name.clone())
             .collect();
-        let mut legacy_names: Vec<String> = legacy_entries
-            .iter()
-            .map(|item| item.name.clone())
-            .collect();
         agent_names.sort();
-        legacy_names.sort();
-        assert_eq!(
-            agent_names, legacy_names,
-            "符号链接目录上 Agent 与 Legacy 必须同结论，否则有没有 Agent 会给出两套路径"
-        );
+        for name in &agent_names {
+            assert!(
+                !name.contains('/'),
+                "条目名必须是纯文件名，拿到 {:?} 就会拼出不存在的路径",
+                name
+            );
+        }
         assert!(
             agent_names.iter().any(|name| name.starts_with('.')),
-            "include_hidden=true 却没列出隐藏项，说明这条对账没覆盖到差异点"
+            "include_hidden=true 却没列出隐藏项：/sdcard 下至少有一个点开头的目录"
         );
         assert!(
             sdcard
@@ -6672,7 +6639,7 @@ mod tests {
             "include_hidden=false 却回了隐藏项"
         );
         eprintln!(
-            "[filesystem.list] /sdcard Agent 与 Legacy 同结论：{} 条（含隐藏项）",
+            "[filesystem.list] /sdcard 设备侧结论：{} 条（含隐藏项）",
             agent_names.len()
         );
     }
