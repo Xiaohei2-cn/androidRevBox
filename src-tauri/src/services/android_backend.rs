@@ -79,7 +79,9 @@ pub fn default_legacy_capabilities() -> Vec<LegacyCapability> {
     [
         // 第七十一轮按 AR12.1 删掉两条只读回退腿（取证：真机闸门在 Pixel 6 上报「9 项已迁移
         // 能力全部路由到 Agent，本次会话零 Legacy 回退」）。少一项也要在这里留一句话：
-        // `filesystem.list`（桌面不再解析 ls -lA）、`package.native_lib_dir`（dumpsys 解析全在设备侧）。
+        // `filesystem.list`（桌面不再解析 ls -lA）、`package.native_lib_dir`（dumpsys 解析全在设备侧）；
+        // 第七十二轮再删 `package.list`：`device_packages` 这个 command 在前端零调用点
+        // （应用列表页走 Zygisk 的 package.list_localized），兜底腿从来没服务过任何人。
         (
             "device.root_check",
             "AR12.1 after AR9.1 and two stable phase regressions",
@@ -87,10 +89,6 @@ pub fn default_legacy_capabilities() -> Vec<LegacyCapability> {
         (
             "device.info",
             "AR12.1 after AR5.2 and two stable phase regressions",
-        ),
-        (
-            "package.list",
-            "AR12.1 after AR5.5 and two stable phase regressions",
         ),
         (
             "activity.foreground",
@@ -674,7 +672,7 @@ mod tests {
         let router = CapabilityRouter::new(
             manager(runner.clone()),
             runner.clone(),
-            [LegacyCapability::new("package.list", "AR12.1 after AR5.5")],
+            [LegacyCapability::new("device.info", "AR12.1 after AR5.2")],
         );
         assert!(
             router.fallback_totals_for_serial("serial-a").is_empty(),
@@ -682,35 +680,27 @@ mod tests {
         );
         for _ in 0..3 {
             let decision = router
-                .select(
-                    "serial-a",
-                    "package.list",
-                    OperationKind::ReadOnlyIdempotent,
-                )
+                .select("serial-a", "device.info", OperationKind::ReadOnlyIdempotent)
                 .unwrap();
             assert_eq!(decision.backend, AndroidBackendSource::LegacyAdb);
         }
         let totals = router.fallback_totals_for_serial("serial-a");
         assert_eq!(totals.len(), 1, "同一能力同一原因该合成一条: {totals:?}");
-        assert_eq!(totals[0].method, "package.list");
+        assert_eq!(totals[0].method, "device.info");
         assert_eq!(totals[0].reason, "agent_unavailable");
         assert_eq!(totals[0].count, 3);
         assert_eq!(
             totals[0].removal_stage.as_deref(),
-            Some("AR12.1 after AR5.5"),
+            Some("AR12.1 after AR5.2"),
             "计数要自带删除条件，看的人不用再翻能力表"
         );
         // 换原因（Agent 在线但不支持该方法）另起一条，不与上面的混在一起
         let router2 = CapabilityRouter::new(
             manager(runner.clone()),
             runner.clone(),
-            [LegacyCapability::new("package.list", "AR12.1 after AR5.5")],
+            [LegacyCapability::new("device.info", "AR12.1 after AR5.2")],
         );
-        let _ = router2.select(
-            "serial-b",
-            "package.list",
-            OperationKind::ReadOnlyIdempotent,
-        );
+        let _ = router2.select("serial-b", "device.info", OperationKind::ReadOnlyIdempotent);
         assert_eq!(
             router2.fallback_totals_for_serial("serial-c").len(),
             0,
@@ -873,10 +863,12 @@ mod tests {
         ));
     }
 
-    /// AR5.5 矩阵腿：旧版 Agent 没有 package.list capability 时，只读列表允许回退 Legacy；
-    /// 而 package.list_localized（Zygisk 专属）不在 Legacy 能力表里，必须拒绝回退。
+    /// AR5.5 矩阵腿：旧版 Agent 缺 capability 时，**登记过的**只读腿才允许回退 Legacy；
+    /// 未登记的（package.list_localized 等 Zygisk 专属）必须拒绝。
+    /// 第七十二轮把示例能力从 `package.list` 换成 `device.info`——前者那条腿已按 AR12.1 删掉，
+    /// 拿它断言"允许回退"会变成和删除事实相反的宣传（这条断言本身就会红，正好当护栏）。
     #[test]
-    fn package_list_may_fall_back_but_localized_list_must_not() {
+    fn registered_read_only_legs_may_fall_back_but_unregistered_methods_must_not() {
         let runner: Arc<dyn AdbRunner> = Arc::new(MockAdbRunner::new(true));
         let router = CapabilityRouter::new(
             manager(runner.clone()),
@@ -887,9 +879,9 @@ mod tests {
         let decision = router
             .fallback_after_agent_error(
                 "serial-a",
-                agent_protocol::method::PACKAGE_LIST,
+                agent_protocol::method::DEVICE_INFO,
                 OperationKind::ReadOnlyIdempotent,
-                &AgentBackendError::UnsupportedMethod(agent_protocol::method::PACKAGE_LIST.into()),
+                &AgentBackendError::UnsupportedMethod(agent_protocol::method::DEVICE_INFO.into()),
             )
             .unwrap();
         assert_eq!(decision.backend, AndroidBackendSource::LegacyAdb);
@@ -899,6 +891,8 @@ mod tests {
         );
 
         for method in [
+            // 第七十二轮删掉的只读腿：即便 Agent 版本旧到不认识这个方法，也不许再退回 pm
+            agent_protocol::method::PACKAGE_LIST,
             agent_protocol::method::PACKAGE_LIST_LOCALIZED,
             agent_protocol::method::ZYGISK_STATUS,
             agent_protocol::method::PACKAGE_EXPORT_APK,
@@ -1012,11 +1006,12 @@ mod tests {
         }));
     }
 
-    /// 第七十一轮按 AR12.1 删掉两条只读回退腿之后，这张表必须**真的少两项**。
+    /// 第七十一、七十二轮按 AR12.1 删掉的只读回退腿，这张表必须**真的少它们**。
     ///
     /// 为什么单独钉一条：回退腿一旦被重新登记，`select()` 就又会给出一条 Legacy 决策，
-    /// 而那种改动通常是以「顺手加个兜底」的形式进来的。这条断言把"只剩 7 条"变成机器
+    /// 而那种改动通常是以「顺手加个兜底」的形式进来的。这条断言把"只剩几条"变成机器
     /// 事实——要加回来的人必须先回答"为什么又需要它"。
+    /// 删除一条腿时：把方法名加进 `DELETED_LEG_METHODS`、把期望条数减一，两处一起改。
     #[test]
     fn the_two_deleted_legs_stay_out_of_the_legacy_table() {
         // owned String 而不是 &str：这张表是现造的，借来的切片会在断言之前失效
@@ -1026,9 +1021,15 @@ mod tests {
             .collect();
         assert_eq!(
             methods.len(),
-            7,
-            "只读回退腿应当只剩 7 条（filesystem.list 与 package.native_lib_dir 已删）: {methods:?}"
+            6,
+            "只读回退腿应当只剩 6 条（已删：filesystem.list、package.native_lib_dir、package.list）: {methods:?}"
         );
+        for deleted in DELETED_LEG_METHODS {
+            assert!(
+                !methods.iter().any(|m| m == deleted),
+                "{deleted} 的回退腿已经删过，不该被重新登记回来"
+            );
+        }
         assert!(
             !methods.iter().any(|m| m == "filesystem.list"),
             "ls -lA 文本解析不该再当回退腿"
@@ -1036,6 +1037,10 @@ mod tests {
         assert!(
             !methods.iter().any(|m| m == "package.native_lib_dir"),
             "dumpsys 解析不该再当回退腿"
+        );
+        assert!(
+            !methods.iter().any(|m| m == "package.list"),
+            "pm list packages 不该再当回退腿（第七十二轮删：这条腿没有前端调用点）"
         );
         assert!(
             default_legacy_capabilities()
@@ -1049,6 +1054,11 @@ mod tests {
     ///
     /// 后半句和 `rejected_mutating_calls_are_not_counted` 是同一条纪律 —— 没真的退回
     /// 就不算，否则那行「ADB 回退次数」会说谎。
+    /// 已经按 AR12.1 删掉的只读回退腿。删一条就往上加一个名字，
+    /// 它同时驱动"不许重新登记"与"离线必须报错"两条机器断言。
+    const DELETED_LEG_METHODS: &[&str] =
+        &["filesystem.list", "package.native_lib_dir", "package.list"];
+
     #[tokio::test]
     async fn deleted_legs_fail_loudly_instead_of_falling_back() {
         let runner = Arc::new(MockAdbRunner::new(true));
@@ -1057,7 +1067,7 @@ mod tests {
             runner,
             default_legacy_capabilities(),
         );
-        for method in ["filesystem.list", "package.native_lib_dir"] {
+        for method in DELETED_LEG_METHODS {
             let error = router
                 .select("serial-a", method, OperationKind::ReadOnlyIdempotent)
                 .expect_err("离线 Agent 不该给这两条能力放行");

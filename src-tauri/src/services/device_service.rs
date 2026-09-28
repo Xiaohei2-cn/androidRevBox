@@ -709,73 +709,34 @@ impl DeviceService {
             .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))
     }
 
-    /// 第三方应用列表
-    /// 三方包列表（保持既有 command 语义）。AR5.5 起默认走 Agent `package.list`，
-    /// 解析在设备端完成；Agent 不可用或旧版 Agent 时才回退 Legacy ADB（只读幂等，
-    /// 删除条件见 Legacy 能力表）。
+    /// 三方包列表（保持既有 command 语义）。第七十二轮按 AR12.1 删掉了
+    /// `pm list packages -3` 这条只读回退腿。三条依据，按强弱排：
+    /// ① **调用面**：`device_packages` 这个 command 在前端**零调用点**（应用列表页走的是
+    ///    Zygisk 的 `package_list_localized`），所以这条"Agent 不在时兜底"的腿从来没有
+    ///    服务过任何人——日志里 `package.list` 的回退计数为 0 是**因为这个功能没有入口**，
+    ///    不是因为 Agent 一直在线。这条要照实说，不能当成"实测长期零回退"的证据。
+    /// ② **正确性对照**：常驻真机腿 `real_agent_package_list_matches_legacy` 断言 Agent
+    ///    与 adb 的三方包集合必须相等（不相等即迁移缺陷，会红）。
+    /// ③ **闸门**：删完复跑 `real_router`，Pixel 6 上报「6 项已迁移能力全部路由到 Agent，
+    ///    本次会话零 Legacy 回退」。
+    /// Agent 不在时这里给一句照着做就行的话，不再悄悄退回 adb shell。
     pub async fn list_packages(&self, serial: &str) -> CoreResult<Vec<String>> {
-        let route = self
+        self.require_agent_route(serial, PACKAGE_LIST)?;
+        let result = self
             .android
-            .select(serial, PACKAGE_LIST, OperationKind::ReadOnlyIdempotent)
-            .map_err(CapabilityRouter::core_error)?;
-        if route.backend == AndroidBackendSource::LegacyAdb {
-            return self.list_packages_legacy(serial).await;
-        }
-
-        let agent_request = self.android.agent().request::<_, PackageListResult>(
-            serial,
-            PACKAGE_LIST,
-            &PackageListParams {
-                scope: PackageScope::User,
-                include_disabled: false,
-            },
-            LIST_TIMEOUT,
-        );
-        let (agent_result, legacy_result) = if package_list_shadow_enabled() {
-            let legacy = self.list_packages_legacy(serial);
-            let (agent, legacy) = tokio::join!(agent_request, legacy);
-            (agent, Some(legacy))
-        } else {
-            (agent_request.await, None)
-        };
-
-        match agent_result {
-            Ok(result) => {
-                let names = package_names(&result);
-                if let Some(Ok(legacy)) = legacy_result {
-                    log_package_list_shadow_diff(serial, &names, &legacy);
-                }
-                Ok(names)
-            }
-            Err(error) => {
-                let fallback = self
-                    .android
-                    .fallback_after_agent_error(
-                        serial,
-                        PACKAGE_LIST,
-                        OperationKind::ReadOnlyIdempotent,
-                        &error,
-                    )
-                    .map_err(CapabilityRouter::core_error)?;
-                debug_assert_eq!(fallback.backend, AndroidBackendSource::LegacyAdb);
-                match legacy_result {
-                    Some(result) => result,
-                    None => self.list_packages_legacy(serial).await,
-                }
-            }
-        }
-    }
-
-    async fn list_packages_legacy(&self, serial: &str) -> CoreResult<Vec<String>> {
-        let args = adb::build_args(Some(serial), &adb::cmd_list_packages(true));
-        let out = self.run_adb(&args).await?;
-        if out.exit_code != Some(0) {
-            return Err(CoreError::Internal(format!(
-                "pm list packages 失败: {}",
-                out.stderr.trim()
-            )));
-        }
-        Ok(adb::parse_packages(&out.stdout))
+            .agent()
+            .request::<_, PackageListResult>(
+                serial,
+                PACKAGE_LIST,
+                &PackageListParams {
+                    scope: PackageScope::User,
+                    include_disabled: false,
+                },
+                LIST_TIMEOUT,
+            )
+            .await
+            .map_err(|error| CapabilityRouter::core_error(RouteError::AgentFailure(error)))?;
+        Ok(package_names(&result))
     }
 
     /// 设备 wlan0 IPv4：`adb -s <serial> shell ip addr show wlan0`
@@ -1064,29 +1025,17 @@ impl DeviceService {
         Ok(adb::hosted_binaries(&ls_out.stdout, &file_out.stdout))
     }
 
-    /// 只有 Agent 实现、没有 Legacy 对照的能力（AR9.1 的 frida.server.*）：
-    /// 离线路径必须给出「设备页 → 安装/连接 Agent」这种可执行的下一步，
-    /// 不能退化成一个空结果——空状态会被读成「frida-server 没在跑」。
+    /// 只有 Agent 实现、没有 Legacy 对照的能力（AR9.1 的 frida.server.*），以及
+    /// 按 AR12.1 删掉回退腿的能力：离线路径必须给出「设备页 → 安装并连接」这种
+    /// 可执行的下一步，不能退化成一个空结果——空状态会被读成「那里没有东西」。
+    /// 文案本体是纯函数 `agent_offline_guidance`，改字必须过测试。
     fn require_agent_route(&self, serial: &str, method: &str) -> CoreResult<()> {
         if !matches!(
             self.android.agent_status(serial).state,
             crate::models::agent::AgentSessionState::Ready
                 | crate::models::agent::AgentSessionState::Degraded
         ) {
-            // 这句话是给界面读的：先说「什么做不了」，再说「点哪」；
-            // 方法名留在括号里供检索，不再顶在句子最前面当主语（用户的原话：
-            // 那些内部编号他读不懂，也不需要读懂）。
-            let label = match method {
-                FILESYSTEM_LIST => "列目录",
-                PACKAGE_NATIVE_LIB_DIR => "查 native lib 目录",
-                PROCESS_PROC_READ => "读 /proc 详情",
-                FRIDA_SERVER_STATUS => "查看 frida-server 状态",
-                _ => "这个操作",
-            };
-            return Err(CoreError::AgentUnavailable(format!(
-                "{label}需要 Agent 在线：在设备页的 Android Agent 区点「安装并连接」
-                （{method} 已没有 ADB 回退腿，AR12.1 删除）"
-            )));
+            return Err(CoreError::AgentUnavailable(agent_offline_guidance(method)));
         }
         Ok(())
     }
@@ -2979,6 +2928,27 @@ fn plan_install_inputs(apks: &[String]) -> Result<InstallInputs, String> {
     }
 }
 
+/// Agent 不在时给界面的那一句话（第七十二轮从 `require_agent_route` 里抽成纯函数）。
+///
+/// 规矩没变，还是 UI-7 收敛时定下的顺序：**先说什么做不了，再说点哪**，
+/// 方法名退到括号里供检索——那些内部编号用户读不懂，也不需要读懂。
+/// 抽出来是因为这句文案此前只在真机上"看着像对的"：换行加 16 个空格会让界面
+/// 在「安装并连接」后面断出一行空白，而没有任何测试会因此变红。
+fn agent_offline_guidance(method: &str) -> String {
+    let label = match method {
+        FILESYSTEM_LIST => "列目录",
+        PACKAGE_LIST => "列三方应用",
+        PACKAGE_NATIVE_LIB_DIR => "查 native lib 目录",
+        PROCESS_PROC_READ => "读 /proc 详情",
+        FRIDA_SERVER_STATUS => "查看 frida-server 状态",
+        _ => "这个操作",
+    };
+    format!(
+        "{label}需要 Agent 在线：在设备页的 Android Agent 区点「安装并连接」 \
+         （{method} 已没有 ADB 回退腿，AR12.1 删除）"
+    )
+}
+
 fn map_agent_device_info(serial: &str, result: DeviceInfoResult) -> DeviceInfo {
     DeviceInfo {
         model: result.model.unwrap_or_default(),
@@ -2993,40 +2963,12 @@ fn map_agent_device_info(serial: &str, result: DeviceInfoResult) -> DeviceInfo {
     }
 }
 
-fn package_list_shadow_enabled() -> bool {
-    !std::env::var("APP_REVERSE_TOOLS_PACKAGE_LIST_SHADOW")
-        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
-}
-
 fn package_names(result: &PackageListResult) -> Vec<String> {
     result
         .items
         .iter()
         .map(|item| item.package_name.clone())
         .collect()
-}
-
-/// Agent 与 Legacy 的三方包集合差异只写日志，不影响返回值（迁移期观测用）。
-fn log_package_list_shadow_diff(serial: &str, agent: &[String], legacy: &[String]) {
-    let agent_set: std::collections::HashSet<&str> = agent.iter().map(String::as_str).collect();
-    let legacy_set: std::collections::HashSet<&str> = legacy.iter().map(String::as_str).collect();
-    let only_agent: Vec<&str> = agent_set.difference(&legacy_set).copied().collect();
-    let only_legacy: Vec<&str> = legacy_set.difference(&agent_set).copied().collect();
-    if only_agent.is_empty() && only_legacy.is_empty() {
-        tracing::debug!(
-            serial,
-            method = PACKAGE_LIST,
-            "Agent/Legacy package list matched"
-        );
-    } else {
-        tracing::warn!(
-            serial,
-            method = PACKAGE_LIST,
-            agent_only = ?only_agent,
-            legacy_only = ?only_legacy,
-            "Agent/Legacy package list shadow compare differed"
-        );
-    }
 }
 
 /// 写操作结果转审计字符串：成功时带上调用方最关心的证据，失败时保留结构化错误文本。
@@ -4050,6 +3992,46 @@ mod tests {
             .unwrap();
         assert_eq!(missing.exit_code, Some(-1));
         assert_eq!(missing.stderr, "mock: unmatched args");
+    }
+
+    /// 第七十二轮把离线文案抽成纯函数，这条腿钉住三件事：
+    /// ① 每个删过回退腿的能力都得有**看得懂的说法**（落到兜底"这个操作"= 有人删了腿
+    ///    却没写 label，界面就只剩一句废话）；② 必须给出那一个动作「安装并连接」；
+    /// ③ 句子里不许有换行 + 缩进空格 —— 旧写法把源码缩进带进了界面，在
+    /// 「安装并连接」后面断出一行空白，而没有任何测试会因此变红。
+    #[test]
+    fn offline_guidance_names_the_action_without_stray_whitespace() {
+        for method in [
+            FILESYSTEM_LIST,
+            PACKAGE_LIST,
+            PACKAGE_NATIVE_LIB_DIR,
+            PROCESS_PROC_READ,
+            FRIDA_SERVER_STATUS,
+        ] {
+            let text = agent_offline_guidance(method);
+            assert!(
+                text.contains("安装并连接"),
+                "{method} 的离线指引必须给出那一个动作: {text}"
+            );
+            assert!(
+                text.contains(method),
+                "{method} 的方法名要留在句子里供检索: {text}"
+            );
+            assert!(
+                !text.contains('\n') && !text.contains("  "),
+                "{method} 的指引被源码缩进污染了: {text:?}"
+            );
+            assert!(
+                !text.contains("这个操作"),
+                "{method} 该有自己的说法，不能落到兜底: {text}"
+            );
+        }
+        // 兜底分支也不能是空话一条：未知方法照样说清"要 Agent + 点哪"
+        let unknown = agent_offline_guidance("device.unknown_capability");
+        assert!(
+            unknown.contains("这个操作") && unknown.contains("安装并连接"),
+            "{unknown}"
+        );
     }
 
     #[test]
