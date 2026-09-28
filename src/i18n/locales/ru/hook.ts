@@ -1,6 +1,10 @@
 /** Вкладка Hook (P10 консоль сессий Frida + будущие возможности) — русский */
 export default {
   "hook.terminal.tab": "Терминал",
+  "hook.terminal.fridaPreset": "сессия frida",
+  "hook.terminal.fridaPresetHint": "Команда REPL для frida-tools {version} подставлена. Официальному REPL всё ещё нужен объект: добавьте `-f пакет` или `-n процесс` в аргументы, затем нажмите «Новый терминал».",
+  "hook.terminal.fridaNoPython": "Не настроен пригодный Python: REPL запускается через него с -m. Сначала выберите интерпретатор в настройках.",
+  "hook.terminal.fridaNoTools": "В этом Python не установлен frida-tools (frida_tools.repl находится там): {python} -m pip install frida-tools",
   "hook.terminal.new": "Новый терминал",
   "hook.terminal.count": "сессий: {n} из {max}",
   "hook.terminal.limit": "Одновременно не больше {max} терминалов — сначала закройте один (закрытие убьёт процесс)",

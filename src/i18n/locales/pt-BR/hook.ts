@@ -1,6 +1,10 @@
 /** Aba Hook (P10 console de sessões Frida + recursos futuros) — português (Brasil) */
 export default {
   "hook.terminal.tab": "Terminal",
+  "hook.terminal.fridaPreset": "sessão frida",
+  "hook.terminal.fridaPresetHint": "Comando do REPL para frida-tools {version} preenchido. O REPL oficial ainda precisa de um alvo: adicione `-f pacote` ou `-n processo` nos argumentos e então clique em Novo terminal.",
+  "hook.terminal.fridaNoPython": "Nenhum Python utilizável configurado: o REPL é iniciado por ele com -m. Escolha primeiro um interpretador nas configurações.",
+  "hook.terminal.fridaNoTools": "Este Python não tem frida-tools instalado (o frida_tools.repl fica lá): {python} -m pip install frida-tools",
   "hook.terminal.new": "Novo terminal",
   "hook.terminal.count": "{n} de {max} sessões",
   "hook.terminal.limit": "No máximo {max} sessões de terminal ao mesmo tempo — feche uma primeiro (fechar mata o processo)",

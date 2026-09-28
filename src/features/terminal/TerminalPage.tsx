@@ -14,10 +14,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronUp, CircleStop, Plus, X } from "lucide-react";
 
+import { envApi } from "@/api/env";
 import { ptyApi } from "@/api/pty";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
+import { fridaReplLaunch } from "@/lib/fridaTerminal";
 import { MAX_TERMINAL_SESSIONS, TerminalSessionStore, type TerminalTab } from "@/lib/terminalStore";
 import "@xterm/xterm/css/xterm.css";
 
@@ -37,6 +39,8 @@ export function TerminalPage() {
   const [program, setProgram] = useState("");
   const [argsText, setArgsText] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
+  const [hint, setHint] = useState<string | null>(null);
+  const [presetBusy, setPresetBusy] = useState(false);
   const [pendingClose, setPendingClose] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<number | null>(null);
@@ -138,6 +142,47 @@ export function TerminalPage() {
     [pendingClose, store, t],
   );
 
+  /**
+   * frida 会话预置（FT3 路 B 的第一步）：把启动命令填成 `<配置的 python> -m frida_tools.repl`。
+   *
+   * 两件事是刻意的：
+   * 1. **按会话类型分开要求**——终端里的 REPL 只认 `frida-tools`（模块在它里面），
+   *    不再沿用那句"frida 或 frida-tools 任一即通过"：那种机器上今天会被放行，
+   *    然后在终端里报 Python 的 `No module named frida_tools`。
+   * 2. **不自动起会话**：官方 REPL 必须有目标（`-f 包名` / `-n 进程名` / PID），
+   *    直接起只会让它打一句 usage 就退——把"还差一个目标"说给她，比给她一屏报错有用。
+   */
+  const applyFridaPreset = useCallback(async () => {
+    setNotice(null);
+    setHint(null);
+    setPresetBusy(true);
+    try {
+      // **每次都重新探**：她很可能就是刚 `pip install frida-tools` 回来点这个按钮，
+      // 缓存会把"已经装好了"说成"没装"，那是我们自己造的假现场
+      const python = await envApi.python();
+      // 探测本身有剪枝：Python 没就绪时前端根本不该去问 frida（问了也是白问）
+      const frida = python.ready ? await envApi.frida() : null;
+      const launch = fridaReplLaunch(python, frida);
+      if (!launch.ok) {
+        setNotice(
+          launch.block === "no-python"
+            ? t("hook.terminal.fridaNoPython")
+            // 走到 no-frida-tools 这一支时 python.path 必然有值（否则前一条就判掉了），
+            // 这个 ?? 只是为了让类型闭得上，不是第二条判断
+            : t("hook.terminal.fridaNoTools", { python: python.path ?? "python" }),
+        );
+        return;
+      }
+      setProgram(launch.program);
+      setArgsText(launch.args.join(" "));
+      setHint(t("hook.terminal.fridaPresetHint", { version: launch.toolsVersion }));
+    } catch (reason) {
+      setNotice(String((reason as Error)?.message ?? reason));
+    } finally {
+      setPresetBusy(false);
+    }
+  }, [t]);
+
   const stopActive = useCallback(async () => {
     if (!active) return;
     setNotice(null);
@@ -232,6 +277,17 @@ export function TerminalPage() {
         >
           <Plus className="h-3.5 w-3.5" />
           {t("hook.terminal.new")}
+        </Button>
+        {/* 路 B 的入口：把 REPL 的启动命令填进来（检查口径按会话类型分开，见 lib/fridaTerminal） */}
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 px-2"
+          disabled={presetBusy}
+          onClick={() => void applyFridaPreset()}
+          data-testid="terminal-frida-preset"
+        >
+          {t("hook.terminal.fridaPreset")}
         </Button>
         <Button
           size="sm"
@@ -339,6 +395,11 @@ export function TerminalPage() {
         )}
       </div>
 
+      {hint && (
+        <p className="shrink-0 text-10px text-emerald-500" data-testid="terminal-hint">
+          {hint}
+        </p>
+      )}
       <p className="shrink-0 text-10px text-muted-foreground">{t("hook.terminal.hint")}</p>
       {notice && (
         <p className="shrink-0 break-all text-10px text-destructive" data-testid="terminal-error">

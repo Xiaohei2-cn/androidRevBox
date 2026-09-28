@@ -1,6 +1,10 @@
 /** Hook タブ（P10 Frida セッションコンソール＋将来機能）— 日本語 */
 export default {
   "hook.terminal.tab": "ターミナル",
+  "hook.terminal.fridaPreset": "frida セッション",
+  "hook.terminal.fridaPresetHint": "frida-tools {version} の REPL 起動コマンドを入力しました。公式 REPL にはまだターゲットが必要です：引数に `-f パッケージ名` か `-n プロセス名` を足してから「新しいターミナル」を押してください。",
+  "hook.terminal.fridaNoPython": "使える Python が未設定です：REPL はそれを使って -m で起動するため、まず設定でインタープリタを選んでください。",
+  "hook.terminal.fridaNoTools": "この Python には frida-tools が導入されていません（frida_tools.repl はそちらに入っています）：{python} -m pip install frida-tools",
   "hook.terminal.new": "新しいターミナル",
   "hook.terminal.count": "セッション {n}/{max}",
   "hook.terminal.limit": "ターミナルは同時に最大 {max} までです。先に一つ閉じてください（閉じるとプロセスも終了します）",

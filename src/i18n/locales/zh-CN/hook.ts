@@ -1,6 +1,10 @@
 /** Hook 主标签（P10 frida 会话工作台 + 后续能力占位）——zh-CN 源语言 */
 export default {
   "hook.terminal.tab": "真终端",
+  "hook.terminal.fridaPreset": "frida 会话",
+  "hook.terminal.fridaPresetHint": "已填好 frida-tools {version} 的 REPL 启动命令。官方 REPL 还差一个目标：在参数里补 `-f 包名` 或 `-n 进程名`，再点「新建终端」。",
+  "hook.terminal.fridaNoPython": "还没配好可用的 Python：REPL 是靠它用 -m 起模块的，先去设置里选一个解释器。",
+  "hook.terminal.fridaNoTools": "这个 Python 里没装 frida-tools（frida_tools.repl 就在它里面）：{python} -m pip install frida-tools",
   "hook.terminal.new": "新建终端",
   "hook.terminal.count": "{n}/{max} 个会话",
   "hook.terminal.limit": "同时最多 {max} 个终端会话，先关掉一个再开（关掉会杀掉它的进程）",

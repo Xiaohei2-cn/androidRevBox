@@ -1,6 +1,10 @@
 /** Hook tab (P10 Frida session console + future capabilities) — English */
 export default {
   "hook.terminal.tab": "Terminal",
+  "hook.terminal.fridaPreset": "frida session",
+  "hook.terminal.fridaPresetHint": "Filled in the REPL command for frida-tools {version}. The official REPL still needs a target: add `-f <package>` or `-n <process>` to the arguments, then press New terminal.",
+  "hook.terminal.fridaNoPython": "No usable Python configured: the REPL is started through it with -m. Pick an interpreter in Settings first.",
+  "hook.terminal.fridaNoTools": "This Python has no frida-tools installed (frida_tools.repl lives there): {python} -m pip install frida-tools",
   "hook.terminal.new": "New terminal",
   "hook.terminal.count": "{n} of {max} sessions",
   "hook.terminal.limit": "Up to {max} terminal sessions at once — close one first (closing kills its process)",

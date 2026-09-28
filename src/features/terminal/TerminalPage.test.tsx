@@ -29,6 +29,30 @@ const fake: Fake = {
   exits: [],
 };
 
+/** 环境探测的可控桩：每轮改 `env.python/env.frida` 就能演"刚 pip install 完"那种现场 */
+interface EnvProbe {
+  python: PythonEnv;
+  frida: FridaEnv;
+  fridaCalls: number;
+}
+
+/** 显式标注类型：不标的话 TS 会把 `path` 推成 `string`，于是"没配好 Python"那轮没法写 null */
+const env: EnvProbe = {
+  python: { configured: true, ready: true, path: "/py/3.11/bin/python3", version: "Python 3.11.9", hint: null },
+  frida: { pythonReady: true, installed: true, fridaVersion: "16.5.1", fridaToolsVersion: "12.5.3", hint: null },
+  fridaCalls: 0,
+};
+
+vi.mock("@/api/env", () => ({
+  envApi: {
+    python: vi.fn(async () => env.python),
+    frida: vi.fn(async () => {
+      env.fridaCalls += 1;
+      return env.frida;
+    }),
+  },
+}));
+
 vi.mock("@/api/pty", () => ({
   ptyApi: {
     defaultProgram: vi.fn(async () => "/bin/zsh"),
@@ -53,6 +77,7 @@ vi.mock("@/api/pty", () => ({
 }));
 
 import { ptyApi } from "@/api/pty";
+import type { FridaEnv, PythonEnv } from "@/api/env";
 
 const ENCODE = new TextEncoder();
 
@@ -92,6 +117,9 @@ async function renderPage() {
 }
 
 beforeEach(() => {
+  env.python = { configured: true, ready: true, path: "/py/3.11/bin/python3", version: "Python 3.11.9", hint: null };
+  env.frida = { pythonReady: true, installed: true, fridaVersion: "16.5.1", fridaToolsVersion: "12.5.3", hint: null };
+  env.fridaCalls = 0;
   fake.openArgs.length = 0;
   fake.writes.length = 0;
   fake.closes.length = 0;
@@ -215,6 +243,52 @@ describe("真终端页（FT1 分页）", () => {
     expect(screen.getByTestId("terminal-status").textContent).toContain("会话已停止");
     expect(tab.textContent).toContain("KEEP-ME");
     expect(hostsOf(container).length).toBe(1);
+  });
+
+  /**
+   * 路 B 的预置（FT3 第一步）：填命令，**不替她把会话起起来**——
+   * 官方 REPL 还缺一个目标，直接起只会换来一屏 usage。
+   */
+  it("点 frida 会话预置：填好解释器与模块，但不自己起会话", async () => {
+    const { container } = await renderPage();
+    fireEvent.click(screen.getByTestId("terminal-frida-preset"));
+    await waitFor(() => expect(screen.getByTestId("terminal-program")).toHaveValue("/py/3.11/bin/python3"));
+    expect(screen.getByTestId("terminal-args")).toHaveValue("-m frida_tools.repl");
+    expect(screen.getByTestId("terminal-hint").textContent).toContain("frida-tools 12.5.3");
+    // 没点「新建终端」之前一条 PTY 都不许起
+    expect(fake.openArgs).toEqual([]);
+
+    // 她把目标补在参数里，然后点新建：起的正是那条解释器
+    fireEvent.change(screen.getByTestId("terminal-args"), { target: { value: "-m frida_tools.repl -f com.example.app" } });
+    await newTab(container);
+    expect(fake.openArgs[0]).toEqual({
+      program: "/py/3.11/bin/python3",
+      cols: expect.any(Number),
+      rows: expect.any(Number),
+    });
+    expect(fake.openArgs[0].cols).toBeGreaterThan(0);
+  });
+
+  /** D091 的落点：绑定包在、frida-tools 不在 ⇒ 说清缺哪个，而不是起一个报 No module 的会话。 */
+  it("只装了 frida 绑定包时预置会拒绝并说明缺 frida-tools", async () => {
+    env.frida = { ...env.frida, fridaToolsVersion: null, installed: true };
+    await renderPage();
+    fireEvent.click(screen.getByTestId("terminal-frida-preset"));
+    await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
+    expect(screen.getByTestId("terminal-error").textContent).toContain("frida-tools");
+    // 原本的默认程序与参数不许被动过：她可能正准备开一个普通 shell
+    expect(screen.getByTestId("terminal-program")).toHaveValue("/bin/zsh");
+    expect(fake.openArgs).toEqual([]);
+  });
+
+  /** 探测的剪枝不许被预置绕过：Python 没就绪时不该去问 frida（问了也问不出东西）。 */
+  it("Python 没配好时不去探 frida，直接说先去设置选解释器", async () => {
+    env.python = { configured: false, ready: false, path: null, version: null, hint: null };
+    await renderPage();
+    fireEvent.click(screen.getByTestId("terminal-frida-preset"));
+    await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
+    expect(env.fridaCalls).toBe(0);
+    expect(screen.getByTestId("terminal-error").textContent).toContain("Python");
   });
 
   /** R-08：离开页面才是批量收摊的地方，三条活会话各关一次，一条不留。 */
