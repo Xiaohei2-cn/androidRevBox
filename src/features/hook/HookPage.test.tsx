@@ -149,7 +149,7 @@ describe("Hook 页：frida 右侧那块就是真终端", () => {
     expect(screen.getByTestId("frida-terminal-view").hasAttribute("hidden")).toBe(false);
     // 一块屏要真正"挂上"才有 xterm 自己的节点（起会话前这里连元素都没有，那是正常的空面板）
     // 等的是**懒加载的那块面板本身**：不等到它就点，测的是"点了个不存在的按钮"
-    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeTruthy());
+    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
     fireEvent.click(screen.getByTestId("terminal-new"));
     await waitFor(() => expect(screen.getByTestId("terminal-host")).toBeTruthy());
     await waitFor(() =>
@@ -160,7 +160,7 @@ describe("Hook 页：frida 右侧那块就是真终端", () => {
   /** 切视图只改 hidden：**卸载 = disposeAll = 杀掉她正在跑的会话**，那是不可接受的。 */
   it("切到轨道视图时终端容器还在 DOM 里（不卸载、不杀会话）", async () => {
     renderHook();
-    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeTruthy());
+    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
     fireEvent.click(screen.getByTestId("terminal-new"));
     await waitFor(() => expect(screen.getByTestId("terminal-tabs")).toBeTruthy());
 
@@ -192,5 +192,27 @@ describe("Hook 页：frida 右侧那块就是真终端", () => {
     });
     // 默认视图下不该再去起我们自己的 runner 任务（两条路各管各的会话类型）
     expect(vi.mocked(hookApi.sessionStart)).not.toHaveBeenCalled();
+  });
+
+  /**
+   * **A 区显示"frida-server 没在跑"也绝不许拦住起会话**（第八十六轮的教训，钉住我自己别再犯）。
+   *
+   * 我加过这道拦截，然后被自己的检查证伪了：server 明明在跑，但 `ps -A -o comm` 里
+   * 搜不到 "frida"（它以 `unix:abstract=/frida-<uuid>` 的形式出现，shell 与 root 两种查法都空）
+   * ⇒ 按进程名探活的检查必然假阴性 ⇒ 它把用户的正常路径挡在门外，还附一句又长又错的话。
+   * 所以这条断言钉的是"不许拦"，不是"拦得对"：真连不上该由 frida 自己在屏上说。
+   */
+  it("探测说 frida-server 没跑也不拦：照样把 REPL 起起来", async () => {
+    device.serverRunning = false;
+    renderHook();
+    await waitFor(() => expect(screen.getByText("hook.js")).toBeTruthy());
+    await waitFor(() =>
+      expect((screen.getByTestId("frida-device") as HTMLSelectElement).value).toBe("18271FDF600FL4"),
+    );
+    fireEvent.doubleClick(screen.getByText("hook.js"));
+    await waitFor(() => expect(pty.openArgs.length).toBe(1));
+    expect(pty.openArgs[0].args).toContain("-F");
+    // 也不许顺手写一句错误出来
+    expect(screen.queryByTestId("terminal-error")).toBeNull();
   });
 });

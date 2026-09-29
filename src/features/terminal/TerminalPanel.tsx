@@ -42,13 +42,14 @@ import "@xterm/xterm/css/xterm.css";
 function fridaBlockText(
   block: FridaSessionBlock,
   t: (key: string, params?: Record<string, string | number>) => string,
+  pythonPath?: string | null,
 ): string {
   switch (block) {
     case "no-python":
       return t("hook.terminal.fridaNoPython");
     case "no-frida-tools":
-      // 走到这一支时 python.path 必然有值（否则前一条就判掉了）；传 "" 只是让类型闭得上
-      return t("hook.terminal.fridaNoTools", { python: "" });
+      // 带上解释器路径：她要的就是能直接抄走的那条安装命令
+      return t("hook.terminal.fridaNoTools", { python: pythonPath || "python" });
     case "no-device":
       return t("hook.terminal.fridaNoDevice");
     case "no-script":
@@ -248,25 +249,12 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
       setHint(null);
       setPresetBusy(true);
       try {
-        // **起 REPL 之前先问一句 frida-server 在不在跑**（USB 模式且选了设备时才问得到）。
-        // 这不是多余的手续：server 没跑时官方 frida 只会打一句 "Unable to get frontmost
-        // application …" 就退出，界面上看就是"点了没反应 / 屏上一片空"——第八十六轮用户
-        // 撞到的正是这个，而我上一轮把原有前置检查链绕过去了，所以这条必须补回来。
-        // 探不到/探失败一律当作"不知道"放行：不知道不等于没有，拦住正常路径更糟。
-        const serial = request.settings.connMode === "usb" ? request.settings.deviceSerial?.trim() : "";
-        if (serial) {
-          const server = await deviceApi.fridaServerStatus(serial).catch(() => null);
-          if (server && !server.running) {
-            setNotice(t("hook.terminal.fridaNoServer"));
-            return;
-          }
-        }
         const python = await envApi.python();
         // 探测本身有剪枝：Python 没就绪时不该去问 frida（问了也问不出东西）
         const frida = python.ready ? await envApi.frida() : null;
         const planned = planFridaSession(python, frida, request.settings, request.scriptPath);
         if (!planned.ok) {
-          setNotice(fridaBlockText(planned.block, t));
+          setNotice(fridaBlockText(planned.block, t, python.path));
           return;
         }
         const created = await store.create({
