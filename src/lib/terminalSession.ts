@@ -96,7 +96,7 @@ export class TerminalSession {
     try {
       this.bundle.term.open(host);
     } catch (error) {
-      this.events.onError?.(`挂载终端失败：${String((error as Error)?.message ?? error)}`);
+      this.reportFailure(`挂载终端失败：${String((error as Error)?.message ?? error)}`);
       return;
     }
     this.fitSafely();
@@ -107,7 +107,7 @@ export class TerminalSession {
     try {
       return this.fit();
     } catch (error) {
-      this.events.onError?.(`量终端尺寸时异常：${String((error as Error)?.message ?? error)}`);
+      this.reportFailure(`量终端尺寸时异常：${String((error as Error)?.message ?? error)}`);
       return false;
     }
   }
@@ -123,13 +123,16 @@ export class TerminalSession {
 
   async start(program: string, args: string[], cwd: string | null): Promise<void> {
     if (this.id) return;
-    // 起会话前先按界面量一次尺寸：量不到（隐藏）就用当前 cols/rows，绝不传 0（R-03）
-    const proposed = this.safeMeasure() ?? {
-      cols: this.bundle.term.cols,
-      rows: this.bundle.term.rows,
-    };
-    this.bundle.term.resize(proposed.cols, proposed.rows);
+    // **整段都在 try 里**：量尺寸与 resize 都不许把"起进程"这件事带走。
+    // 第八十九~九十轮的现场就是这个形状：真实 webview 里刚挂上时量尺寸会**抛异常**
+    // （jsdom 没有排版，只会返回 undefined ⇒ 测试永远撞不到），异常一逃，`pty_open` 就没调过，
+    // 而调用方是个不等待的 void ⇒ 变成没人接的 rejection，界面上一个字都不留。
     try {
+      const proposed = this.safeMeasure() ?? {
+        cols: this.bundle.term.cols,
+        rows: this.bundle.term.rows,
+      };
+      this.bundle.term.resize(proposed.cols, proposed.rows);
       const opened = await this.transport.open({
         program,
         args,
@@ -149,8 +152,22 @@ export class TerminalSession {
       })) ?? null;
       this.update({ running: true, exitCode: null, cols: opened.cols, rows: opened.rows });
     } catch (error) {
-      this.events.onError?.(String((error as Error)?.message ?? error));
+      this.reportFailure(`起会话失败：${String((error as Error)?.message ?? error)}`);
     }
+  }
+
+  /**
+   * 出错要说两遍：**屏里一行**（这是终端的 dbg 输出，用户按她的口径就该在这儿看）
+   * + **一次 onError**（标签状态与错误区要能标成失败）。
+   * 只报后者，就会出现"点了没反应、什么提示都没有"。
+   */
+  private reportFailure(message: string): void {
+    try {
+      this.bundle.term.write(`\r\n[本工具] ${message}\r\n`);
+    } catch {
+      /* 屏本身都写不动时，至少还有 onError */
+    }
+    this.events.onError?.(message);
   }
 
   /** 设备/子进程回来的原始字节直接喂 xterm：**不解码、不按行切、不补换行**。 */
@@ -163,7 +180,7 @@ export class TerminalSession {
     try {
       return measureFit(this.bundle);
     } catch (error) {
-      this.events.onError?.(`量终端尺寸时异常：${String((error as Error)?.message ?? error)}`);
+      this.reportFailure(`量终端尺寸时异常：${String((error as Error)?.message ?? error)}`);
       return null;
     }
   }
@@ -222,7 +239,8 @@ export class TerminalSession {
     try {
       await this.transport.write(this.id, ENCODER.encode(data));
     } catch (error) {
-      this.events.onError?.(String((error as Error)?.message ?? error));
+      // 进程已经没了的时候按键写入必失败：说"写不进去"，别谎称"起会话失败"
+      this.reportFailure(`写入失败：${String((error as Error)?.message ?? error)}`);
     }
   }
 

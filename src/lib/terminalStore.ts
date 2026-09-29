@@ -148,7 +148,13 @@ export class TerminalSessionStore {
     }
     // 挂上才量得到尺寸；量完这一趟，才轮到把进程起来。
     // 放在 try 外面：挂载失败时上面已经把原因报出去了，这里若状态已不是 starting 会自己跳过。
-    if (entry.tab.status === "starting") void this.begin(entry);
+    if (entry.tab.status === "starting") {
+      // **不能 `void`**：不等待的 promise 一旦 reject，就是没人接的异常 ——
+      // 用户侧表现为"点了没反应"。这里显式收下并写进屏里。
+      this.begin(entry).catch((error) => {
+        this.onSessionError(entry, `起会话时异常：${String((error as Error)?.message ?? error)}`);
+      });
+    }
   }
 
   /** 界面尺寸变了/重新可见了：量一次，量不到就什么都不改（R-03）。 */
@@ -267,6 +273,7 @@ export class TerminalSessionStore {
     // 先起再改要再吃一次 SIGWINCH，中间的输出就按错宽度换行了
     entry.session.fit();
     await entry.session.start(entry.tab.program, entry.args, entry.cwd);
+    // 起不来时 session 自己已经报过（屏里一行 + onError），这里只负责别把异常抛回调用方
     // 起进程这期间用户可能已经把 tab 关掉了：那时 entry 已不在表里，写回状态没有意义
     if (!this.entries.includes(entry)) return;
     this.syncFromSession(entry);

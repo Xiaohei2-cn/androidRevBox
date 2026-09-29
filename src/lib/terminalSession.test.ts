@@ -108,6 +108,52 @@ describe("终端会话控制层", () => {
     session.dispose();
   });
 
+  /**
+   * 真实 webview 里刚挂上时量尺寸会**抛异常**（jsdom 没有排版，只会返回 undefined，
+   * 所以下面这条只能手工造那个异常）。它一逃出去，`pty_open` 就永远不会被调用，
+   * 而调用方是不等待的 void ⇒ "点了没反应、什么提示都没有"（用户连报两轮的现场）。
+   */
+  it("量尺寸抛异常也要照常起进程，并在屏里留下一句话", async () => {
+    const { bundle } = mountSession(20, 5);
+    bundle.fit.proposeDimensions = () => {
+      throw new TypeError("Cannot read properties of undefined (reading 'css')");
+    };
+    const session = new TerminalSession(bundle, fake.transport);
+    session.attach();
+    await session.start("/bin/sh", [], null);
+    // 起进程这件事没被量尺寸拖死
+    expect(fake.calls.some((call) => call.kind === "open")).toBe(true);
+    // xterm 的 write 是异步解析的：等一拍再读缓冲区（否则测的是解析时机，不是"有没有说话"）
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    // 而且它在屏里说了话（不是只抛给控制台）。判据读缓冲区整屏文本：
+    // 20 列的屏会把这句长消息**折成几行**，所以不能按"同一行里同时含两个词"去断言。
+    const buffer = bundle.term.buffer.active;
+    const screen: string[] = [];
+    for (let index = 0; index < buffer.length; index += 1) {
+      screen.push(buffer.getLine(index)?.translateToString(true) ?? "");
+    }
+    // 屏宽只有 20 列 ⇒ 这句话必然折行。**断言不能跟着排版走**：把换行拼回去再找整句。
+    const text = screen.join("").replace(/\s+/g, " ");
+    expect(text).toContain("[本工具]");
+    expect(text).toContain("量终端尺寸时异常");
+    expect(text).toContain("Cannot read properties of undefined");
+    session.dispose();
+  });
+
+  /** 键盘写入失败要说"写入失败"，不许谎称"起会话失败"。 */
+  it("进程没了再敲字，报的是写入失败", async () => {
+    const { bundle } = mountSession();
+    const session = new TerminalSession(bundle, fake.transport);
+    session.attach();
+    await session.start("/bin/sh", [], null);
+    fake.fireExit({ id: "pty-1", exitCode: 0, signal: null });
+    bundle.term.input("ls\n");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // 已经收摊的会话不该再往 fd 上写：一条写入调用都不该有
+    expect(fake.calls.some((call) => call.kind === "write")).toBe(false);
+    session.dispose();
+  });
+
   it("量不到尺寸时不许把 0 传给 tty（R-03）", async () => {
     const { bundle } = mountSession();
     const session = new TerminalSession(bundle, fake.transport);
