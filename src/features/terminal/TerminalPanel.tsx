@@ -482,7 +482,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
     if (!active) return t("hook.terminal.idle");
     switch (active.status) {
       case "running":
-        return t("hook.terminal.running", { cols: active.cols, rows: active.rows });
+        return t("hook.terminal.running");
       case "starting":
         return t("hook.terminal.starting");
       case "exited":
@@ -557,6 +557,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
                 ? "break-all text-destructive"
                 : "text-muted-foreground",
           )}
+          title={active ? `${active.cols}×${active.rows} · ${active.renderer}` : undefined}
           data-testid="terminal-status">
           {statusText}
         </span>
@@ -565,9 +566,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
             {t("hook.terminal.count", { n: tabCount, max: MAX_TERMINAL_SESSIONS })}
           </span>
         )}
-        {active && (
-          <span className="text-10px text-muted-foreground">{t("hook.terminal.renderer", { kind: active.renderer })}</span>
-        )}
+
       </div>
 
       {tabs.length > 0 && (
