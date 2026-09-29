@@ -30,6 +30,8 @@ export interface TerminalTab {
   ptyId: string | null;
   status: TerminalTabStatus;
   exitCode: number | null;
+  /** 没有退出码时的信号名（`null` = 不知道/没给）。见 `syncFromSession` 里那条区分 */
+  exitSignal: string | null;
   error: string | null;
   cols: number;
   rows: number;
@@ -67,6 +69,8 @@ interface Entry {
   /** `begin()` 只许进一次：StrictMode 会把 ref 回调 detach/attach 各来一遍，
    * 没有这道闸就会真的开出两条 PTY（第二条没人关，就是个活进程） */
   beginning: boolean;
+  /** **我们自己**调过 stop()：这是"已停止"与"死了但没退出码"唯一的分别 */
+  stopRequested: boolean;
   args: string[];
   cwd: string | null;
 }
@@ -175,6 +179,7 @@ export class TerminalSessionStore {
   async stop(id: string): Promise<void> {
     const entry = this.entries.find((item) => item.tab.id === id);
     if (!entry) return;
+    entry.stopRequested = true;
     await entry.session.stop();
     // 状态由会话回报驱动：stop() 之后 running=false 且没有退出码 ⇒ "stopped"（我们关的）
     this.syncFromSession(entry);
@@ -204,6 +209,7 @@ export class TerminalSessionStore {
         ptyId: null,
         status: "starting",
         exitCode: null,
+        exitSignal: null,
         error: null,
         cols: bundle.term.cols,
         rows: bundle.term.rows,
@@ -215,6 +221,7 @@ export class TerminalSessionStore {
       }),
       bundle,
       beginning: false,
+      stopRequested: false,
       args: input.args,
       cwd: input.cwd ?? null,
     };
@@ -263,12 +270,18 @@ export class TerminalSessionStore {
       return;
     }
     if (entry.tab.status !== "running" && entry.tab.status !== "starting") return;
+    entry.tab.exitCode = state.exitCode;
+    entry.tab.exitSignal = entry.session.exitSignal;
     if (state.exitCode !== null) {
       entry.tab.status = "exited";
-      entry.tab.exitCode = state.exitCode;
-    } else {
-      entry.tab.status = "stopped";
+      return;
     }
+    /**
+     * 没有退出码的两种情况以前被混成一句"会话已停止"（橙色灯），把一次异常死亡说成
+     * 是用户自己关的——第八十六轮排查空白屏时就在这里被带偏过一次。
+     * 现在只有**我们自己调过 stop()** 才叫"已停止"，其余一律算"已退出"并尽量带上信号名。
+     */
+    entry.tab.status = entry.stopRequested ? "stopped" : "exited";
   }
 
   private onSessionState(entry: Entry): void {

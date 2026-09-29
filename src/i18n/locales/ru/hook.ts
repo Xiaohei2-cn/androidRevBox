@@ -10,6 +10,7 @@ export default {
   "hook.terminal.fridaNoTools": "В этом Python не установлен frida-tools (frida_tools.repl находится там): {python} -m pip install frida-tools",
   "hook.terminal.fridaNoScript": "Скрипт не выбран — сессия не запустится: REPL без загруженного скрипта выглядит живым, но ничего не цепляет.",
   "hook.terminal.fridaNoDevice": "Устройство не выбрано: выберите его в списке на панели A (при одном онлайн оно выбирается само). Сессия frida не откатывается к -U: это «любой USB», и сессия открылась бы на устройстве, которое вы не выбирали.",
+  "hook.terminal.fridaNoServer": "На устройстве не запущен frida-server, поэтому REPL выйдет сразу (он напечатает «Unable to get frontmost application»). Сначала запустите frida-server (страница «Устройства» / настройки Hook), затем снова нажмите на скрипт.",
   "hook.terminal.fridaNoPackage": "Режиму Spawn нужно имя пакета: в официальном frida нет «spawn текущего приложения».",
   "hook.terminal.fridaStarted": "Официальный REPL frida запущен (frida-tools {version}). Печатайте выражения и функции из своего скрипта — это уже поведение самого frida.",
   "hook.terminal.new": "Новый терминал",

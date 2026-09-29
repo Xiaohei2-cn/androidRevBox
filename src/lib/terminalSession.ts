@@ -41,6 +41,12 @@ export class TerminalSession {
   /** xterm 挂过的那个元素：没挂过就一个字也画不出来（见 mount()） */
   private hostElement: HTMLElement | null = null;
 
+  /**
+   * 退出时的信号名（如果设备/系统给了）。**"没有退出码"分两种**：
+   * 我们自己关的（该说"已停止"），和被信号杀掉的（那是一次异常死亡，不能说成用户关的）。
+   */
+  private signal: string | null = null;
+
   constructor(
     private readonly bundle: TerminalBundle,
     private readonly transport: PtyTransport,
@@ -53,6 +59,11 @@ export class TerminalSession {
 
   get state(): TerminalSessionState {
     return { ...this.machineState };
+  }
+
+  /** 见 `signal` 字段：会话表要靠它区分"已停止"与"被信号杀掉"。 */
+  get exitSignal(): string | null {
+    return this.signal;
   }
 
   /**

@@ -17,6 +17,9 @@ import { HookPage } from "./HookPage";
 import { I18nProvider } from "@/i18n/I18nProvider";
 import { hookApi } from "@/api/hook";
 
+/** 设备上 frida-server 的探活结果（起 REPL 前的前置检查读它） */
+const device = { serverRunning: true };
+
 const pty = {
   openArgs: [] as Array<{ program: string; args: string[] }>,
   feeders: new Map<string, (bytes: Uint8Array) => void>(),
@@ -78,7 +81,11 @@ vi.mock("@/api/device", () => ({
   deviceApi: {
     environment: vi.fn(async () => ({ installed: true, path: "/sdk/adb" })),
     list: vi.fn(async () => [{ serial: "18271FDF600FL4", state: "device", transport: "usb", model: "Pixel 6" }]),
-    fridaServerStatus: vi.fn(async () => ({ state: "stopped" })),
+    fridaServerStatus: vi.fn(async () => ({
+      state: device.serverRunning ? "running" : "stopped",
+      running: device.serverRunning,
+      pid: device.serverRunning ? 4242 : undefined,
+    })),
   },
 }));
 
@@ -121,6 +128,7 @@ function renderHook() {
 }
 
 beforeEach(() => {
+  device.serverRunning = true;
   pty.openArgs.length = 0;
   pty.feeders.clear();
   vi.mocked(hookApi.sessionStart).mockClear();

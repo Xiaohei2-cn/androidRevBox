@@ -10,6 +10,7 @@ export default {
   "hook.terminal.fridaNoTools": "这个 Python 里没装 frida-tools（frida_tools.repl 就在它里面）：{python} -m pip install frida-tools",
   "hook.terminal.fridaNoScript": "没选脚本就不起会话：没加载脚本的 REPL 看着在跑、其实什么都不钩，那种假成功最难查。",
   "hook.terminal.fridaNoDevice": "还没选定设备：在 A 区的设备下拉里选一台（只有一台在线时会自动选好）。frida 会话不用 `-U` 兜底——那是「随便哪台 USB」，多设备时会把会话开到你没选的那台上。",
+  "hook.terminal.fridaNoServer": "设备上的 frida-server 没在跑，REPL 起来也只会立刻退出（它会打一句「Unable to get frontmost application」）。先到 设备页 / Hook 设置里把 frida-server 启动，再点脚本。",
   "hook.terminal.fridaNoPackage": "Spawn 模式要先填包名：官方 frida 没有「spawn 当前前台」这种用法。",
   "hook.terminal.fridaStarted": "官方 frida REPL 已起（frida-tools {version}）。在屏上敲表达式或你脚本里的函数，就是 frida 自己的手感。",
   "hook.terminal.new": "新建终端",

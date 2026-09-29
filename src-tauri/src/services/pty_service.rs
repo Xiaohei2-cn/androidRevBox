@@ -160,10 +160,18 @@ impl PtyService {
             cmd.cwd(cwd);
         }
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|error| CoreError::Internal(format!("起不了 {program}：{error}")))?;
+        let child = pair.slave.spawn_command(cmd).map_err(|error| {
+            // 这条以前**只回给界面、不留日志**，于是"点了没反应"在日志里完全不存在，
+            // 用户和我们都只能靠猜（第八十六轮就是这么绕了一圈）。参数一起记：
+            // 排这类问题缺的恰恰是"到底用哪条命令起的"。路径不是脚本正文，不违反 §3.7。
+            tracing::warn!(
+                program = %program,
+                args = ?args.args,
+                error = %error,
+                "本机 PTY 起不来：子进程没 exec 成功"
+            );
+            CoreError::Internal(format!("起不了 {program}：{error}"))
+        })?;
         let id = format!("pty-{}", self.next.fetch_add(1, Ordering::Relaxed));
         let pid = child.process_id();
         let child: Arc<Mutex<Box<dyn Child + Send + Sync>>> = Arc::new(Mutex::new(child));
@@ -411,6 +419,65 @@ mod tests {
             .map(|guard| String::from_utf8_lossy(guard.as_slice()).to_string())
             .unwrap_or_default();
         panic!("等不到 {needle:?}，实际收到：{text:?}");
+    }
+
+    /// 路 B 的常驻真机腿：**用配置里那条解释器把官方 frida REPL 起在真 PTY 里，
+    /// 屏上必须出现 frida 自己的 banner**（`Frida <版本>`）。
+    ///
+    /// 为什么值得常驻：第八十六轮排查"点了脚本屏上空白"时，CLI 手跑是通的、界面却是空的，
+    /// 中间没有一条日志能证明 `pty_open` 到底成没成——这条腿一跑就把"传输链路"和"界面装配"
+    /// 这两段分开了，不用再靠猜。解释器与脚本走环境变量注入（不读用户配置、不写死路径）。
+    #[test]
+    #[ignore = "需要真机与已配置的 Python：FRIDA_DIAG_PY=<python> FRIDA_DIAG_JS=<脚本> [FRIDA_DIAG_SER=<serial>] cargo test -p app-reverse-tools --lib pty_starts_official_frida_repl -- --ignored --nocapture"]
+    fn pty_starts_official_frida_repl_and_the_banner_reaches_the_screen() {
+        let Ok(py) = std::env::var("FRIDA_DIAG_PY") else {
+            eprintln!("[跳过] 本腿需要 FRIDA_DIAG_PY=<配置里那条解释器>");
+            return;
+        };
+        let Ok(js) = std::env::var("FRIDA_DIAG_JS") else {
+            eprintln!("[跳过] 本腿需要 FRIDA_DIAG_JS=<脚本绝对路径>");
+            return;
+        };
+        let ser = std::env::var("FRIDA_DIAG_SER").unwrap_or_else(|_| "18271FDF600FL4".into());
+        let service = PtyService::new();
+        let (bytes, sink) = collect_sink();
+        let opened = service
+            .open(
+                PtyOpenArgs {
+                    program: py.clone(),
+                    args: vec![
+                        "-m".into(),
+                        "frida_tools.repl".into(),
+                        "-D".into(),
+                        ser.clone(),
+                        "-F".into(),
+                        "-l".into(),
+                        js.clone(),
+                    ],
+                    cwd: None,
+                    cols: 80,
+                    rows: 24,
+                },
+                sink,
+                noop_exit(),
+            )
+            .unwrap_or_else(|error| panic!("pty_open 直接失败：{error:?}"));
+        println!(
+            "[frida-leg] pty 起来了 id={} pid={:?}",
+            opened.id, opened.pid
+        );
+        // frida 的 banner 是启动后立刻打的（实测 0.2 s），给 6 s 是留给"连设备 + 装载脚本"
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        let text = String::from_utf8_lossy(&bytes.lock().unwrap()).to_string();
+        // 判据要的是"frida 自己说话了"，不是"我们收到了些字节"
+        assert!(
+            text.contains("Frida"),
+            "官方 frida 的 banner 没出现，实际收到 {} 字节：{text:?}",
+            text.len()
+        );
+        println!("[diag] 收到 {} 字节，banner 已到屏", text.len());
+        assert_eq!(service.len(), 1, "会话表里应当还剩这一条（没被谁悄悄关掉）");
+        service.close(&opened.id).unwrap();
     }
 
     /// 默认程序必须是"本机说的"，不是猜的：`SHELL=/bin/dash` 时必须回 `/bin/dash`。

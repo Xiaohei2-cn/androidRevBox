@@ -60,6 +60,8 @@ vi.mock("@/api/device", () => ({
   deviceApi: {
     environment: vi.fn(async () => adb.env),
     list: vi.fn(async () => adb.devices),
+    // 起 REPL 前置检查要问它：默认"在跑"，让每条 frida 测试都能走到起会话那一步
+    fridaServerStatus: vi.fn(async () => ({ state: "running", running: true, pid: 4242 })),
   },
 }));
 

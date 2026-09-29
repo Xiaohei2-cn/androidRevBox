@@ -248,6 +248,19 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
       setHint(null);
       setPresetBusy(true);
       try {
+        // **起 REPL 之前先问一句 frida-server 在不在跑**（USB 模式且选了设备时才问得到）。
+        // 这不是多余的手续：server 没跑时官方 frida 只会打一句 "Unable to get frontmost
+        // application …" 就退出，界面上看就是"点了没反应 / 屏上一片空"——第八十六轮用户
+        // 撞到的正是这个，而我上一轮把原有前置检查链绕过去了，所以这条必须补回来。
+        // 探不到/探失败一律当作"不知道"放行：不知道不等于没有，拦住正常路径更糟。
+        const serial = request.settings.connMode === "usb" ? request.settings.deviceSerial?.trim() : "";
+        if (serial) {
+          const server = await deviceApi.fridaServerStatus(serial).catch(() => null);
+          if (server && !server.running) {
+            setNotice(t("hook.terminal.fridaNoServer"));
+            return;
+          }
+        }
         const python = await envApi.python();
         // 探测本身有剪枝：Python 没就绪时不该去问 frida（问了也问不出东西）
         const frida = python.ready ? await envApi.frida() : null;
@@ -395,7 +408,10 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
       case "starting":
         return t("hook.terminal.starting");
       case "exited":
-        return t("hook.terminal.exited", { code: active.exitCode ?? "—" });
+        // 有码报码；没码但有信号就报信号；两个都没有就明说"不知道"，不假装修辞成"已停止"
+        return t("hook.terminal.exited", {
+          code: active.exitCode ?? (active.exitSignal ? `信号 ${active.exitSignal}` : "无退出码"),
+        });
       case "failed":
         return active.error ?? t("hook.terminal.failed");
       default:
@@ -452,7 +468,18 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
           <CircleStop className="h-3.5 w-3.5" />
           {t("hook.terminal.stop")}
         </Button>
-        <span className={cn("text-10px", active?.status === "running" ? "text-emerald-500" : "text-muted-foreground")} data-testid="terminal-status">
+        <span
+          className={cn(
+            "min-w-0 text-10px",
+            active?.status === "running"
+              ? "text-emerald-500"
+              : // 起不来时必须显眼：以前它和"会话在跑 80×24"共用一句灰小字，
+                // 结果用户报"点了没反应"而界面上其实写过原因，只是没人看得见
+                active?.status === "failed"
+                ? "break-all text-destructive"
+                : "text-muted-foreground",
+          )}
+          data-testid="terminal-status">
           {statusText}
         </span>
         {tabCount > 0 && (
