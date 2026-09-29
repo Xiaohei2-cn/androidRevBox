@@ -14,6 +14,17 @@ interface Call {
   detail: string;
 }
 
+/** 整屏文本（去掉尾部填充空格）：断言按内容，不跟着行号与折行走 */
+function screenText(bundle: ReturnType<typeof createTerminal>): string {
+  const buffer = bundle.term.buffer.active;
+  const lines: string[] = [];
+  for (let index = 0; index < buffer.length; index += 1) {
+    lines.push(buffer.getLine(index)?.translateToString(true) ?? "");
+  }
+  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return lines.join("\n");
+}
+
 function fakeTransport() {
   const calls: Call[] = [];
   let onData: ((bytes: Uint8Array) => void) | null = null;
@@ -89,8 +100,11 @@ describe("终端会话控制层", () => {
     session.feed(中.slice(0, 1));
     session.feed(中.slice(1));
     await new Promise((r) => setTimeout(r, 30));
-    const line = bundle.term.buffer.active.getLine(0)?.translateToString(true) ?? "";
-    expect(line.trim()).toBe("中");
+    // 这条要证的只是**字节保真**：拼回来的必须是那个字，且不出现半个字节被解码成的替换符。
+    // 屏里还有工具自己写的行（起进程进度），所以按内容判、不比整屏行数。
+    const text = screenText(bundle);
+    expect(text).toContain("中");
+    expect(text).not.toContain("\uFFFD");
     session.dispose();
   });
 

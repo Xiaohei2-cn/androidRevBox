@@ -127,6 +127,11 @@ export class TerminalSession {
     // 第八十九~九十轮的现场就是这个形状：真实 webview 里刚挂上时量尺寸会**抛异常**
     // （jsdom 没有排版，只会返回 undefined ⇒ 测试永远撞不到），异常一逃，`pty_open` 就没调过，
     // 而调用方是个不等待的 void ⇒ 变成没人接的 rejection，界面上一个字都不留。
+    // **走到这里就说明"挂上屏"成功了**：把这一步也写进屏里。
+    // 用户的现场是"只有那行 `> 命令`、什么都没说、日志里也没有 pty_open"——
+    // 那行命令是建 tab 时就盖下去的章，证明不了后面任何一步；有这一行才能二分：
+    // 只看见 `> 命令` = 根本没走到起进程；看见本行 = 已经交给系统，问题在 IPC/子进程侧。
+    this.note("正在交给系统起进程…");
     try {
       const proposed = this.safeMeasure() ?? {
         cols: this.bundle.term.cols,
@@ -157,16 +162,25 @@ export class TerminalSession {
   }
 
   /**
+   * 往屏里写一行工具自己的话（调试信息属于终端，不属于界面 chrome）。
+   * 行首不额外补 \r\n：调用点要么在自建命令行之后，要么自己带换行，
+   * 否则一次报错就在屏里多一行空白，导出的日志也跟着变胖。
+   */
+  private note(message: string): void {
+    try {
+      this.bundle.term.write(`[本工具] ${message}\r\n`);
+    } catch {
+      /* 屏写不动就算了，不该因此再抛一次 */
+    }
+  }
+
+  /**
    * 出错要说两遍：**屏里一行**（这是终端的 dbg 输出，用户按她的口径就该在这儿看）
    * + **一次 onError**（标签状态与错误区要能标成失败）。
    * 只报后者，就会出现"点了没反应、什么提示都没有"。
    */
   private reportFailure(message: string): void {
-    try {
-      this.bundle.term.write(`\r\n[本工具] ${message}\r\n`);
-    } catch {
-      /* 屏本身都写不动时，至少还有 onError */
-    }
+    this.note(message);
     this.events.onError?.(message);
   }
 

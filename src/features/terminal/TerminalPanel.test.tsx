@@ -459,8 +459,8 @@ describe("真终端页（FT1 分页）", () => {
     await waitFor(() => expect(dialog.saved.length).toBe(1));
     // 写出去的就是那一行，一个字的多余内容都没有
     expect(dialog.saved[0].content).toBe("sign=deadbeef\n");
-    // 报的是"存了几行 / 屏上一共几行"，让她知道自己存的确实是被筛过的那部分
-    expect(screen.getByTestId("terminal-save-outcome").textContent).toContain("1/3");
+    // 报的是"存了几行 / 屏上一共几行"（分母含工具自己写的行，所以只断言格式与分子）
+    expect(screen.getByTestId("terminal-save-outcome").textContent).toMatch(/已存 1\/\d+ 行/);
   });
 
   /** 取消不是失败：什么都不写，也不弹一句红字。 */
