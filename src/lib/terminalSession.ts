@@ -89,8 +89,27 @@ export class TerminalSession {
       return;
     }
     this.hostElement = host;
-    this.bundle.term.open(host);
-    this.fit();
+    // open 与 fit 分开兜：fit 里那些"容器还没尺寸/度量算不出来"的异常**不许连带把起进程挡掉**。
+    // 第八十八轮的现场就是这样：屏上写出了要跑的命令（说明 open 成功了），
+    // 但子进程根本没起、日志里一条 pty_open 都没有、界面上也没有任何错误 ——
+    // 因为异常只去了 devtools 控制台，那是用户永远看不到的地方。
+    try {
+      this.bundle.term.open(host);
+    } catch (error) {
+      this.events.onError?.(`挂载终端失败：${String((error as Error)?.message ?? error)}`);
+      return;
+    }
+    this.fitSafely();
+  }
+
+  /** 量尺寸失败不是错误（隐藏容器本来就量不到），但**抛异常**是另一回事：要让它说话。 */
+  private fitSafely(): boolean {
+    try {
+      return this.fit();
+    } catch (error) {
+      this.events.onError?.(`量终端尺寸时异常：${String((error as Error)?.message ?? error)}`);
+      return false;
+    }
   }
 
   /** 键盘、粘贴、IME 全都从 onData 出来：那是 xterm 已经按模式编码好的字节，我们不补任何控制码。 */
@@ -105,7 +124,7 @@ export class TerminalSession {
   async start(program: string, args: string[], cwd: string | null): Promise<void> {
     if (this.id) return;
     // 起会话前先按界面量一次尺寸：量不到（隐藏）就用当前 cols/rows，绝不传 0（R-03）
-    const proposed = measureFit(this.bundle) ?? {
+    const proposed = this.safeMeasure() ?? {
       cols: this.bundle.term.cols,
       rows: this.bundle.term.rows,
     };
@@ -137,6 +156,16 @@ export class TerminalSession {
   /** 设备/子进程回来的原始字节直接喂 xterm：**不解码、不按行切、不补换行**。 */
   feed(bytes: Uint8Array): void {
     this.bundle.term.write(bytes);
+  }
+
+  /** 量尺寸：抛异常一律降级成"量不到"（返回 null），因为它不是致命错误。 */
+  private safeMeasure(): { cols: number; rows: number } | null {
+    try {
+      return measureFit(this.bundle);
+    } catch (error) {
+      this.events.onError?.(`量终端尺寸时异常：${String((error as Error)?.message ?? error)}`);
+      return null;
+    }
   }
 
   /**

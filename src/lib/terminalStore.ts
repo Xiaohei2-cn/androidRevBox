@@ -136,8 +136,15 @@ export class TerminalSessionStore {
       return;
     }
     // "挂没挂过"只有会话自己知道（`session.mount` 里那一个守卫），这里不再记第二份
-    entry.session.mount(host);
-    // 挂上才量得到尺寸；量完这一趟，才轮到把进程起来
+    try {
+      entry.session.mount(host);
+    } catch (error) {
+      // 挂载抛异常也**不能吞**：以前它会顺着 React 的 ref 回调跑到控制台，
+      // 于是屏上有字（open 成功了）、进程却没起、界面上一句错误都没有
+      this.onSessionError(entry, `挂载终端时异常：${String((error as Error)?.message ?? error)}`);
+    }
+    // 挂上才量得到尺寸；量完这一趟，才轮到把进程起来。
+    // 放在 try 外面：挂载失败时上面已经把原因报出去了，这里若状态已不是 starting 会自己跳过。
     if (entry.tab.status === "starting") void this.begin(entry);
   }
 

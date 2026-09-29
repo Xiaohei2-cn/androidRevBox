@@ -348,6 +348,29 @@ describe("真终端页（FT1 分页）", () => {
   });
 
   /**
+   * 看门狗不许被"重渲染"清零：上一轮我就是这么写废它的
+   * （界面上有多个 react-query 在轮询，任何一次 setState 都会把 setTimeout 清掉）。
+   * 判据：故意在挂着卡住的会话之后再渲染一次，2 秒后仍然要报告。
+   */
+  it("卡住的会话即使中途重渲染，也照样报「会话没起起来」", async () => {
+    vi.mocked(ptyApi.open).mockImplementationOnce((args) => {
+      fake.openArgs.push({ program: args.program, cols: args.cols, rows: args.rows });
+      return new Promise(() => undefined);
+    });
+    const view = renderPanel({ scriptPath: "/hooks/hook.js", settings: fridaSettings(), nonce: 1 });
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
+    // 中途来一次重渲染（模拟 react-query 轮询回来的 setState）
+    view.rerender(
+      <I18nProvider>
+        <TerminalPanel fridaLaunch={{ scriptPath: "/hooks/hook.js", settings: fridaSettings(), nonce: 1 }} />
+      </I18nProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("terminal-error").textContent).toContain("会话没起起来"), {
+      timeout: 4000,
+    });
+  }, 9000);
+
+  /**
    * 黑屏不许是"零信息"：起会话那一刻就把**要跑的命令**写在屏上。
    * 第八十七轮的现场是"点完脚本一片黑、什么提示都没有、日志里连 pty_open 都没有"，
    * 那种情况下用户能做的只有猜；现在这块屏自己会说出它打算干什么。

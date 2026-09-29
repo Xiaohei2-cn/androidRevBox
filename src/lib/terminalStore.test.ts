@@ -299,6 +299,37 @@ describe("终端会话表（FT1）", () => {
     store.disposeAll();
   });
 
+  /**
+   * 挂载时抛异常**必须变成界面能看见的失败**。
+   *
+   * 这条钉的是第八十八轮那一类现场：`term.open()` 已经完成（所以屏上写出了我们盖的那行命令），
+   * 紧接着挂载路径上抛了一下 —— 异常顺着 React 的 ref 回调只去控制台，
+   * 于是"有字、没进程、没报错、日志里也什么都没有"，谁都没法查。
+   */
+  it("挂载抛异常时报成失败，而不是安静地什么都不做", async () => {
+    const api = fakeTransport();
+    const store = new TerminalSessionStore({
+      transport: api.transport,
+      onChange: () => undefined,
+      makeBundle: (options) => {
+        const fake = fakeBundle(options.cols, options.rows);
+        (fake.open as ReturnType<typeof vi.fn>).mockImplementation(() => {
+          throw new Error("容器尺寸算不出来");
+        });
+        return fake.bundle;
+      },
+    });
+    const created = await store.create({ program: "/bin/zsh", args: [] });
+    store.mount(created.ok ? created.id : "", document.createElement("div"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const tab = store.tabs()[0];
+    expect(tab.status).toBe("failed");
+    expect(tab.error).toContain("容器尺寸算不出来");
+    // 报错了也不许偷偷起一条"没人看着"的进程
+    expect(api.transport.open).not.toHaveBeenCalled();
+  });
+
   /** 快照必须是"值"：调用方拿到内部对象的话，React 的比较与保活就都不算了。 */
   it("tabs() 给的是快照，改不动内部状态", async () => {
     const { store } = await opened();

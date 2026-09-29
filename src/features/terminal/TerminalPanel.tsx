@@ -59,6 +59,9 @@ function fridaBlockText(
   }
 }
 
+/** 卡住多久算"该说话了"：真机实测正常路径是 0.2 秒级（PTY 起来 + 首屏字节到屏），2 秒已经很宽 */
+const STALL_REPORT_MS = 2000;
+
 const DOT_CLASS: Record<TerminalTab["status"], string> = {
   running: "bg-emerald-500",
   starting: "bg-sky-400",
@@ -192,16 +195,38 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
    * 2 秒已经很宽；而本轮的原则就是**不许再出现"黑屏 + 零提示 + 日志里什么都没有"**——
    * 用户不该对着一块不表态的屏猜，我们也不该靠她截图来定位。
    */
+  /**
+   * 卡在"starting"超过 2 秒就主动报告。
+   *
+   * 计时器**按 tab id 存外面**，不进 effect 依赖：本项目的界面上有多个 react-query 在轮询
+   * （前台应用约 5 秒一次，设备列表等更频繁），任何重渲染都会让 `tabs`/`t` 换身份；
+   * 如果把 setTimeout 放在这种 effect 的清理里，一次重渲染就把 2 秒计时清零 ——
+   * 我上一轮就是这么写出一个"卡住也永远不报"的看门狗的（先记着：护栏要能测，不然等于没有）。
+   */
+  const stallTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   useEffect(() => {
-    const stuck = tabs.find((tab) => tab.status === "starting");
-    if (!stuck) return undefined;
-    const timer = setTimeout(() => {
-      const now = store.tabs().find((tab) => tab.id === stuck.id);
-      if (now?.status === "starting") {
-        setNotice(t("hook.terminal.stalled", { id: stuck.id, program: now.program }));
+    const timers = stallTimersRef.current;
+    const starting = tabs.filter((tab) => tab.status === "starting");
+    // 已经不在 starting 的：撤掉它的计时器（正常路径 0.2 秒级就会走到 running/失败）
+    timers.forEach((timer, id) => {
+      if (!starting.some((tab) => tab.id === id)) {
+        clearTimeout(timer);
+        timers.delete(id);
       }
-    }, 2000);
-    return () => clearTimeout(timer);
+    });
+    for (const tab of starting) {
+      if (timers.has(tab.id)) continue;
+      timers.set(
+        tab.id,
+        setTimeout(() => {
+          timers.delete(tab.id);
+          const now = storeRef.current?.tabs().find((item) => item.id === tab.id);
+          if (now?.status === "starting") {
+            setNotice(t("hook.terminal.stalled", { program: now.program }));
+          }
+        }, STALL_REPORT_MS),
+      );
+    }
   }, [store, t, tabs]);
 
   const createTab = useCallback(async () => {
