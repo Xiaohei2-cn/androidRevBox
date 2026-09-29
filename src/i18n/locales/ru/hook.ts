@@ -12,6 +12,7 @@ export default {
   "hook.terminal.fridaNoDevice": "Сначала выберите устройство слева",
   "hook.terminal.fridaNoPackage": "Spawn нужно имя пакета",
   "hook.terminal.fridaStarted": "Официальный REPL frida запущен (frida-tools {version})",
+  "hook.terminal.stalled": "Сессия не запустилась ({program}): терминал не подключился или процесс не exec-нулся — пришлите эту строку разработчику",
   "hook.terminal.new": "Новый терминал",
   "hook.terminal.count": "сессий: {n} из {max}",
   "hook.terminal.limit": "Не больше {max} сессий — сначала закройте одну",

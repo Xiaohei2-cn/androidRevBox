@@ -12,6 +12,7 @@ export default {
   "hook.terminal.fridaNoDevice": "Pick a device on the left first",
   "hook.terminal.fridaNoPackage": "Spawn needs a package name first",
   "hook.terminal.fridaStarted": "Official frida REPL started (frida-tools {version})",
+  "hook.terminal.stalled": "Session never started ({program}): the terminal didn't attach or the child never exec'd — screenshot this line for the developer",
   "hook.terminal.new": "New terminal",
   "hook.terminal.count": "{n} of {max} sessions",
   "hook.terminal.limit": "At most {max} sessions — close one first",

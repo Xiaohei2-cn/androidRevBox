@@ -12,6 +12,7 @@ export default {
   "hook.terminal.fridaNoDevice": "左でデバイスを選んでください",
   "hook.terminal.fridaNoPackage": "Spawn にはパッケージ名が必要です",
   "hook.terminal.fridaStarted": "公式 frida REPL を起動しました（frida-tools {version}）",
+  "hook.terminal.stalled": "セッションが起動しません（{program}）：ターミナル未接続か、子プロセスが exec されていません。この行を開発者へ",
   "hook.terminal.new": "新しいターミナル",
   "hook.terminal.count": "セッション {n}/{max}",
   "hook.terminal.limit": "会話は最大 {max}、先に一つ閉じてください",

@@ -347,6 +347,35 @@ describe("真终端页（FT1 分页）", () => {
     await waitFor(() => expect(fake.openArgs.length).toBe(2));
   });
 
+  /**
+   * 黑屏不许是"零信息"：起会话那一刻就把**要跑的命令**写在屏上。
+   * 第八十七轮的现场是"点完脚本一片黑、什么提示都没有、日志里连 pty_open 都没有"，
+   * 那种情况下用户能做的只有猜；现在这块屏自己会说出它打算干什么。
+   */
+  it("屏上先写出要跑的那条命令（不是等着看黑屏）", async () => {
+    const { container } = renderPanel({ scriptPath: "/hooks/hook.js", settings: fridaSettings(), nonce: 1 });
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
+    await waitFor(() => expect(rowsOf(container)).toContain("> /py/3.11/bin/python3"));
+    expect(rowsOf(container)).toContain("-m frida_tools.repl");
+  });
+
+  /**
+   * 卡在"正在起"必须自己说出来。判据是**红色提示出现**，不是"我们等了一会儿没看到输出"——
+   * 后者正是这轮之前用户面对的状态。
+   */
+  it("pty 一直不返回时，2 秒内报告「会话没起起来」", async () => {
+    // 先照常登记这一次调用，再让 promise 永远不返回：这就是"pty 卡住不回来"的形状
+    vi.mocked(ptyApi.open).mockImplementationOnce((args) => {
+      fake.openArgs.push({ program: args.program, cols: args.cols, rows: args.rows });
+      return new Promise(() => undefined);
+    });
+    renderPanel({ scriptPath: "/hooks/hook.js", settings: fridaSettings(), nonce: 1 });
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
+    await waitFor(() => expect(screen.getByTestId("terminal-error").textContent).toContain("会话没起起来"), {
+      timeout: 4000,
+    });
+  });
+
   /** D091 的落点：绑定包在、frida-tools 不在 ⇒ 说清缺哪个，而不是起一个报 No module 的会话。 */
   it("只装了 frida 绑定包时拒绝起会话，并说明缺的是 frida-tools", async () => {
     env.frida = { ...env.frida, fridaToolsVersion: null, installed: true };

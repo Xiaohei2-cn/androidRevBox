@@ -12,6 +12,7 @@ export default {
   "hook.terminal.fridaNoDevice": "先在左边选一台设备",
   "hook.terminal.fridaNoPackage": "Spawn 要先填包名",
   "hook.terminal.fridaStarted": "已起官方 frida REPL（frida-tools {version}）",
+  "hook.terminal.stalled": "会话没起起来（{program}）：终端没挂上或子进程没 exec，把这行截给开发者",
   "hook.terminal.new": "新建终端",
   "hook.terminal.count": "{n}/{max} 个会话",
   "hook.terminal.limit": "最多 {max} 个会话，先关一个再开",

@@ -111,6 +111,11 @@ export class TerminalSessionStore {
     return this.entries.map((entry) => ({ ...entry.tab }));
   }
 
+  /** 表是不是已经被 disposeAll() 收掉：面板靠它决定"要不要重建一张新表"（见 TerminalPanel 的 ensureStore）。 */
+  get isDisposed(): boolean {
+    return this.disposed;
+  }
+
   count(): number {
     return this.entries.length;
   }

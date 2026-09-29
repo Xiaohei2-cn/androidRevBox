@@ -77,6 +77,19 @@ export interface FridaLaunchRequest {
   nonce: number;
 }
 
+/**
+ * 把"这块屏要跑什么"先写进屏幕里。
+ *
+ * 理由不是装饰：第八十七轮的现场是"点了脚本，屏上一片黑，什么提示都没有"，
+ * 而日志里连一条 `pty_open` 都没有 ⇒ 我们俩只能靠猜。**一块不该说话的屏，至少要把它打算干什么写在自己脸上。**
+ * 命令里只有路径与参数，没有脚本正文（§3.7 那条纪律管的是应用日志，这里也不是日志）。
+ */
+function stampCommand(store: TerminalSessionStore, id: string, program: string, args: string[]) {
+  // **这里不许出现转义字面量**（本项目的护栏一正盯着这个）：想要"淡一点"是审美，
+  // 想要"屏上必须有一行我们写的话"是诊断能力。前者可以让步，后者不行。
+  store.bundle(id)?.term.write(`> ${program} ${args.join(" ")}\r\n`);
+}
+
 interface TerminalPanelProps {
   fridaLaunch?: FridaLaunchRequest | null;
 }
@@ -99,15 +112,25 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
   const hostsRef = useRef(new Map<string, HTMLDivElement>());
   const refCbsRef = useRef(new Map<string, (el: HTMLDivElement | null) => void>());
 
-  // 会话表**只创建一次**：每次 render 新建会把所有 xterm 实例连缓冲区一起丢掉，
-  // 那正是"切个 tab 输出就没了"的成因。
-  if (!storeRef.current) {
-    storeRef.current = new TerminalSessionStore({
+  /**
+   * 会话表**一张表用到底**（每次 render 新建会把所有 xterm 实例连缓冲区一起丢掉，那正是
+   * "切个 tab 输出就没了"的成因）；但它同时必须**能被重建**：
+   * React StrictMode 在开发模式下会 mount→cleanup→mount，cleanup 里我们按 R-08 把会话全收了，
+   * 如果之后还拿那个**已废弃的旧表**去 create()，表现就是"点了没反应"——
+   * 而这次"屏上一片黑、什么提示都没有"的现场，与此同形。
+   */
+  const ensureStore = () => {
+    const current = storeRef.current;
+    if (current && !current.isDisposed) return current;
+    // onChange 闭包里引用 next 本身是安全的：它只在表发生变动后才被调用
+    const next = new TerminalSessionStore({
       transport: ptyApi,
-      onChange: () => setTabs(storeRef.current?.tabs() ?? []),
+      onChange: () => setTabs(next.tabs()),
     });
-  }
-  const store = storeRef.current;
+    storeRef.current = next;
+    return next;
+  };
+  const store = ensureStore();
 
   useEffect(() => {
     void ptyApi
@@ -119,8 +142,9 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
   // 离开页面 = 收掉全部会话（R-08）。**只在这一条路径上**批量关会话。
   useEffect(
     () => () => {
+      // 收摊：一条活进程都不留（R-08）。**不把 ref 置空**：下一次动作会看到 isDisposed 并重建一张表，
+      // 而置空会让"用旧表 create"与"用新表渲染"同时存在（StrictMode 的假卸载就是这个形状）
       storeRef.current?.disposeAll();
-      storeRef.current = null;
     },
     [],
   );
@@ -139,7 +163,8 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
         cb = (el: HTMLDivElement | null) => {
           if (el) hostsRef.current.set(id, el);
           else hostsRef.current.delete(id);
-          storeRef.current?.mount(id, el);
+          // 挂必须是"当前这张表"的挂：动作与挂载分家时，就会出现"tab 有了、进程没起"
+          if (el) ensureStore().mount(id, el);
         };
         refCbsRef.current.set(id, cb);
       }
@@ -159,6 +184,25 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
       store.focus(id);
     });
   }, [store]);
+
+  /**
+   * 起会话卡在"starting"超过 2 秒就**主动说话**。
+   *
+   * 时间常量这么定：真机实测正常路径是 0.2 秒级（PTY 起来 + frida banner 到屏），
+   * 2 秒已经很宽；而本轮的原则就是**不许再出现"黑屏 + 零提示 + 日志里什么都没有"**——
+   * 用户不该对着一块不表态的屏猜，我们也不该靠她截图来定位。
+   */
+  useEffect(() => {
+    const stuck = tabs.find((tab) => tab.status === "starting");
+    if (!stuck) return undefined;
+    const timer = setTimeout(() => {
+      const now = store.tabs().find((tab) => tab.id === stuck.id);
+      if (now?.status === "starting") {
+        setNotice(t("hook.terminal.stalled", { id: stuck.id, program: now.program }));
+      }
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [store, t, tabs]);
 
   const createTab = useCallback(async () => {
     setNotice(null);
@@ -272,6 +316,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
           return;
         }
         setActiveId(created.id);
+        stampCommand(store, created.id, planned.plan.program, planned.plan.args);
         setHint(t("hook.terminal.fridaStarted", { version: planned.plan.toolsVersion }));
       } catch (reason) {
         setNotice(String((reason as Error)?.message ?? reason));
