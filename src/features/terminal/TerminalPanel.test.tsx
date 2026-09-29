@@ -134,11 +134,9 @@ function hostsOf(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>("[data-testid^='terminal-host']"));
 }
 
-async function newTab(container: HTMLElement, program?: string): Promise<HTMLElement> {
+/** ➕ 就是新建（命令输入框按用户要求撤了：要跑别的，直接在那块屏里敲） */
+async function newTab(container: HTMLElement, _program?: string): Promise<HTMLElement> {
   const before = hostsOf(container).length;
-  if (program) {
-    fireEvent.change(screen.getByTestId("terminal-program"), { target: { value: program } });
-  }
   fireEvent.click(screen.getByTestId("terminal-new"));
   await waitFor(() => expect(hostsOf(container).length).toBe(before + 1));
   await waitFor(() => expect(fake.openArgs.length).toBe(before + 1));
@@ -162,13 +160,23 @@ function renderPanel(request: { scriptPath: string; settings: ReturnType<typeof 
   );
 }
 
+/** 设备宿主：同一个面板，只是 ➕ 起 `adb -s … shell -tt`（设备 shell 与终端/结构化同级） */
+function renderDevicePanel() {
+  return render(
+    <I18nProvider>
+      <TerminalPanel host="device" />
+    </I18nProvider>,
+  );
+}
+
 async function renderPage() {
   const view = render(
     <I18nProvider>
       <TerminalPanel />
     </I18nProvider>,
   );
-  await waitFor(() => expect(screen.getByTestId("terminal-program")).toHaveValue("/bin/zsh"));
+  // 默认程序是异步问桌面要的：等到 ➕ 可用，才等于"这轮渲染真的能新建"
+  await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
   return view;
 }
 
@@ -254,7 +262,7 @@ describe("真终端页（FT1 分页）", () => {
     const { container } = await renderPage();
     await newTab(container);
     const chip = () => screen.getByTestId("terminal-chip-term-1");
-    expect(chip().textContent).toContain("zsh 1");
+    expect(chip().textContent).toContain("会话 1");
 
     fireEvent.contextMenu(chip());
     await waitFor(() => expect(screen.getByTestId("terminal-tab-menu")).toBeTruthy());
@@ -265,7 +273,7 @@ describe("真终端页（FT1 分页）", () => {
     fireEvent.change(input, { target: { value: "   " } });
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(screen.queryByTestId("terminal-rename-input")).toBeNull());
-    expect(chip().textContent).toContain("zsh 1");
+    expect(chip().textContent).toContain("会话 1");
 
     fireEvent.contextMenu(chip());
     fireEvent.click(screen.getByTestId("terminal-menu-rename"));
@@ -277,37 +285,31 @@ describe("真终端页（FT1 分页）", () => {
     expect(chip().getAttribute("title")).toContain("会话在跑");
   });
 
-  /** tab 条上的计数：开第二个会话要看到 2/8（她认可的唯一数字） */
-  it("tab 条上显示当前会话数与上限", async () => {
+  /** tab 默认显示「会话 N」（序号来自会话表，句子来自词典），旁边不再挂 1/8 */
+  it("tab 默认显示「会话 1」「会话 2」，界面上不再有 1/8", async () => {
     const { container } = await renderPage();
     await newTab(container);
-    expect(screen.getByTestId("terminal-count").textContent).toBe("1/8");
+    expect(screen.getByTestId("terminal-chip-term-1").textContent).toContain("会话 1");
+    expect(screen.queryByTestId("terminal-count")).toBeNull();
     await newTab(container);
-    expect(screen.getByTestId("terminal-count").textContent).toBe("2/8");
+    expect(screen.getByTestId("terminal-chip-term-2").textContent).toContain("会话 2");
   });
 
-  /** 关一个运行中的会话 = 杀进程：第一次点只登记"待确认"，什么都不许杀。 */
-  it("关运行中的 tab 先要确认，确认后只杀它那一个", async () => {
+  /**
+   * ✕ 一个动作做完两件事：**先停止再关闭**（用户规格，两步确认按她要求撤了）。
+   * 判据是 PTY 被关**恰好一次**（不重复 close）、这块 tab 消失、别的会话不受影响——
+   * 也就没有"界面没了、进程还在"的僵尸。
+   */
+  it("✕ 一次就停止并关闭，只关它那一个", async () => {
     const { container } = await renderPage();
-    await newTab(container, "/bin/zsh");
-    await newTab(container, "/bin/sh");
+    await newTab(container);
+    await newTab(container);
 
     fireEvent.click(screen.getByTestId("terminal-close-term-1"));
-    await waitFor(() => expect(screen.getByTestId("terminal-confirm")).toBeTruthy());
-    expect(fake.closes).toEqual([]);
-    expect(screen.getByTestId("terminal-confirm").textContent).toContain("zsh 1");
-
-    // 取消就什么都不发生
-    fireEvent.click(screen.getByTestId("terminal-confirm-no"));
-    await waitFor(() => expect(screen.queryByTestId("terminal-confirm")).toBeNull());
-    expect(fake.closes).toEqual([]);
-
-    fireEvent.click(screen.getByTestId("terminal-close-term-1"));
-    fireEvent.click(screen.getByTestId("terminal-confirm-yes"));
     await waitFor(() => expect(fake.closes).toEqual(["pty-1"]));
-    // 另一个会话不受影响：还在表里、还在跑
-    expect(hostsOf(container).length).toBe(1);
+    await waitFor(() => expect(screen.getAllByTestId(/^terminal-chip-/)).toHaveLength(1));
     expect(screen.getByTestId("terminal-dot-term-2").className).toContain("bg-emerald-500");
+    expect(screen.queryByTestId("terminal-confirm")).toBeNull();
   });
 
   /** 已退出的会话没什么可确认，直接关（也别对着已经没了的 pty 再 close 一次）。 */
@@ -320,7 +322,9 @@ describe("真终端页（FT1 分页）", () => {
     );
 
     fireEvent.click(screen.getByTestId("terminal-close-term-1"));
-    await waitFor(() => expect(screen.queryByTestId("terminal-tabs")).toBeNull());
+    // 关到 0 个：tab 条本身还在（➕ 得留着），但一颗 chip 都没有
+    await waitFor(() => expect(screen.queryAllByTestId(/^terminal-chip-/)).toHaveLength(0));
+    expect(screen.getByTestId("terminal-new")).toBeEnabled();
     expect(fake.closes).toEqual([]);
   });
 
@@ -330,25 +334,11 @@ describe("真终端页（FT1 分页）", () => {
     for (let index = 0; index < 8; index += 1) {
       await newTab(container);
     }
+    // 到顶：➕ 自己变不可用（不靠一句提示），且**一个已有会话都不许被静默关掉**
     expect(screen.getByTestId("terminal-new")).toBeDisabled();
-    expect(screen.getByTestId("terminal-count").textContent).toContain("8/8");
+    expect(screen.queryByTestId("terminal-count")).toBeNull();
     expect(fake.closes).toEqual([]);
-  });
-
-  /** 停止只杀掉进程，那块屏还要留着继续滚（与"关闭 tab"是两件事）。 */
-  it("停止留下这块屏，关闭才收掉它", async () => {
-    const { container } = await renderPage();
-    const tab = await newTab(container);
-    fake.feeders.get("pty-1")?.(ENCODE.encode("KEEP-ME\n"));
-    await waitFor(() => expect(tab.textContent).toContain("KEEP-ME"));
-
-    fireEvent.click(screen.getByTestId("terminal-stop"));
-    await waitFor(() => expect(fake.closes).toEqual(["pty-1"]));
-    expect(screen.getByTestId("terminal-tabs").textContent).toContain("zsh 1");
-    // 停止之后状态仍要能查到（悬停），只是不再占界面
-    expect(document.querySelector('[data-testid^="terminal-chip-"]')?.getAttribute("title")).toContain("会话已停止");
-    expect(tab.textContent).toContain("KEEP-ME");
-    expect(hostsOf(container).length).toBe(1);
+    expect(screen.getAllByTestId(/^terminal-chip-/)).toHaveLength(8);
   });
 
   /**
@@ -364,7 +354,9 @@ describe("真终端页（FT1 分页）", () => {
       args: ["-m", "frida_tools.repl", "-D", "18271FDF600FL4", "-F", "-l", "/hooks/hook.js"],
     });
     // tab 标题带目标与脚本：多块屏并存时她得知道哪块连的是哪个
-    expect(screen.getByTestId("terminal-tabs").textContent).toContain("attach 自动前台 · hook.js");
+    // 默认名就是「会话 N」；命令行（含 -l 脚本路径）在悬停里，界面不再印一遍
+    expect(screen.getByTestId("terminal-chip-term-1").textContent).toContain("会话 1");
+    expect(screen.getByTestId("terminal-chip-term-1").getAttribute("title")).toContain("-l /hooks/hook.js");
   });
 
   /**
@@ -543,8 +535,9 @@ describe("真终端页（FT1 分页）", () => {
    * 少那个 `-tt` 就没有远端 PTY，Ctrl-C/行编辑/全屏程序全都不成立（真机实测见 lib/deviceShell）。
    */
   it("设备 shell 起的是 adb -s <serial> shell -tt", async () => {
-    await renderPage();
-    fireEvent.click(screen.getByTestId("terminal-device-shell"));
+    renderDevicePanel();
+    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("terminal-new"));
     await waitFor(() => expect(fake.openArgs.length).toBe(1));
     expect(fake.openArgs[0].program).toBe("/sdk/platform-tools/adb");
     // 参数数组原样交给 PTY：少那个 `-tt` 就没有远端 PTY，中断/行编辑/全屏程序全都不成立
@@ -554,16 +547,18 @@ describe("真终端页（FT1 分页）", () => {
       "shell",
       "-tt",
     ]);
-    // 序列号写进 tab 标题（那是终端自己的信息），界面 chrome 上不另说一句
-    expect(screen.getByTestId("terminal-tabs").textContent).toContain("adb shell @ 600FL4");
+    // 默认名仍是「会话 N」；跑的是什么放在悬停提示里（要查的时候拿得到，不占界面）
+    expect(screen.getByTestId("terminal-chip-term-1").textContent).toContain("会话 1");
+    expect(screen.getByTestId("terminal-chip-term-1").getAttribute("title")).toContain("/sdk/platform-tools/adb");
     expect(screen.queryByTestId("terminal-hint")).toBeNull();
   });
 
   /** 没设备就是开不了：不许起一条 `adb -s "" shell` 之类的空会话糊弄界面。 */
   it("没有在线设备时拒绝起会话，并且一次 PTY 都不开", async () => {
     adb.devices = [{ serial: "EMULATOR36X5X9X0", state: "offline", transport: "tcp", model: "" }];
-    await renderPage();
-    fireEvent.click(screen.getByTestId("terminal-device-shell"));
+    renderDevicePanel();
+    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("terminal-new"));
     await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
     expect(screen.getByTestId("terminal-error").textContent).toContain("没有在线设备");
     expect(fake.openArgs).toEqual([]);
@@ -572,8 +567,9 @@ describe("真终端页（FT1 分页）", () => {
   /** adb 没配好就直说去设置里配，不去 PATH 里猜一个 adb（猜出来的和检测到的可能不是一条）。 */
   it("没配 adb 路径时报的是「去设置配 adb」", async () => {
     adb.env = { installed: false, path: undefined };
-    await renderPage();
-    fireEvent.click(screen.getByTestId("terminal-device-shell"));
+    renderDevicePanel();
+    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("terminal-new"));
     await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
     expect(screen.getByTestId("terminal-error").textContent).toContain("设置");
     expect(fake.openArgs).toEqual([]);
@@ -589,11 +585,12 @@ describe("真终端页（FT1 分页）", () => {
       { serial: "AAA111", state: "device", transport: "usb", model: "" },
       { serial: "BBB222", state: "device", transport: "usb", model: "" },
     ];
-    await renderPage();
-    fireEvent.click(screen.getByTestId("terminal-device-shell"));
+    renderDevicePanel();
+    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("terminal-new"));
     await waitFor(() => expect(fake.openArgs.length).toBe(1));
     expect(vi.mocked(ptyApi.open).mock.calls[0][0].args).toEqual(["-s", "AAA111", "shell", "-tt"]);
-    expect(screen.getByTestId("terminal-tabs").textContent).toContain("AAA111");
+    expect(screen.getByTestId("terminal-chip-term-1").getAttribute("title")).toContain("-s AAA111");
     expect(screen.queryByTestId("terminal-hint")).toBeNull();
   });
 
@@ -650,7 +647,7 @@ describe("真终端页（FT1 分页）", () => {
         <TerminalPanel />
       </I18nProvider>,
     );
-    await waitFor(() => expect(screen.getByTestId("terminal-program")).toHaveValue("/bin/zsh"));
+    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
     await newTab(view.container);
     await newTab(view.container);
     await newTab(view.container);

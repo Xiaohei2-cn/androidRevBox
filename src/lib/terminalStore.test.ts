@@ -112,7 +112,9 @@ describe("终端会话表（FT1）", () => {
 
     expect(store.count()).toBe(3);
     expect(api.transport.close).not.toHaveBeenCalled();
-    expect(store.tabs().map((tab) => tab.title)).toEqual(["zsh 1", "sh 2", "top 3"]);
+    // 标题不存句子（五语会分叉）：默认只有序号，界面按语言渲染「会话 N」
+    expect(store.tabs().map((tab) => tab.title)).toEqual([null, null, null]);
+    expect(store.tabs().map((tab) => tab.index)).toEqual([1, 2, 3]);
     // 三条各自一条真会话，id 不重复
     const ptyIds = store.tabs().map((tab) => tab.ptyId);
     expect(new Set(ptyIds).size).toBe(3);

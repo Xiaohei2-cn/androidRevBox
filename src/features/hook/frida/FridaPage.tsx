@@ -27,7 +27,14 @@ const TerminalPanel = lazy(() =>
  *
  * 切视图只改 `hidden`，**绝不卸载**：卸载等于 disposeAll，会把她的 REPL 会话连同进程一起杀掉。
  */
-type ConsoleView = "terminal" | "tracks";
+/**
+ * 三个入口同级（用户要求）：
+ * - `terminal`：本机宿主（➕ 起 $SHELL；点左侧脚本 = 在这里起官方 frida REPL）
+ * - `device`：**同一个面板**，只是 ➕ 起的是 `adb -s … shell -tt`
+ * - `tracks`：我们的结构化事件视图
+ * 设备 shell 不做成第二块面板：两块面板会把会话切成两半，切来切去等于把进程杀掉。
+ */
+type ConsoleView = "terminal" | "device" | "tracks";
 
 const DEFAULT_SETTINGS: FridaSettings = {
   deviceSerial: null,
@@ -139,7 +146,7 @@ export function FridaPage() {
       {/* C 会话控制台：右侧 2/3，通高。两个视图都一直挂着，切换只改 hidden（卸载=杀会话） */}
       <div className="col-start-2 row-start-1 col-span-2 row-span-3 flex min-h-0 min-w-0 flex-col gap-2">
         <div className="flex shrink-0 items-center gap-1 text-10px" role="group" aria-label={t("hook.frida.consoleView")}>
-          {(["terminal", "tracks"] as const).map((key) => (
+          {(["terminal", "device", "tracks"] as const).map((key) => (
             <button
               key={key}
               type="button"
@@ -153,11 +160,18 @@ export function FridaPage() {
               }`}
               data-testid={`frida-view-${key}`}
             >
-              {t(key === "terminal" ? "hook.frida.viewTerminal" : "hook.frida.viewTracks")}
+              {t(
+                key === "terminal"
+                  ? "hook.frida.viewTerminal"
+                  : key === "device"
+                    ? "hook.terminal.deviceShell"
+                    : "hook.frida.viewTracks",
+              )}
             </button>
           ))}
         </div>
-        <div className="min-h-0 flex-1" hidden={view !== "terminal"} data-testid="frida-terminal-view">
+        {/* 本机与设备共用这一块屏：换宿主只改 ➕ 起什么，绝不重载面板（重载=杀会话） */}
+        <div className="min-h-0 flex-1" hidden={view === "tracks"} data-testid="frida-terminal-view">
           <Suspense
             fallback={
               <div className="p-3 text-10px text-muted-foreground" data-testid="terminal-loading">
@@ -165,7 +179,7 @@ export function FridaPage() {
               </div>
             }
           >
-            <TerminalPanel fridaLaunch={launch} />
+            <TerminalPanel fridaLaunch={launch} host={view === "device" ? "device" : "local"} />
           </Suspense>
         </div>
         <div className="min-h-0 flex-1" hidden={view !== "tracks"} data-testid="frida-tracks-view">

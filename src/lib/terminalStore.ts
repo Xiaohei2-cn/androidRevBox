@@ -25,8 +25,14 @@ export interface TerminalTab {
   id: string;
   /** 宿主：H-1 本机 PTY(`local`) / H-2 设备 shell(`device`) / 官方 frida REPL(`frida`) */
   kind: "local" | "device" | "frida";
-  title: string;
+  /** 用户改过的名字；**没改过就是 null**，界面按序号显示「会话 N」
+   * （本地化文案归词典，表里不存句子——否则五语就得分叉） */
+  title: string | null;
+  /** 第几个会话（从 1 开始），界面上"会话 1 / 会话 2"就是它 */
+  index: number;
+  /** 这块屏跑的是什么 + 参数：悬停与菜单"复制当前路径"都要用 */
   program: string;
+  args: string[];
   ptyId: string | null;
   status: TerminalTabStatus;
   exitCode: number | null;
@@ -164,6 +170,29 @@ export class TerminalSessionStore {
     return entry.session.fit();
   }
 
+  /** 选区文本（菜单"复制"用）。没有选区返回空串，由调用方去说"没选中东西" */
+  selection(id: string): string {
+    const entry = this.entries.find((item) => item.tab.id === id);
+    if (!entry?.session.mounted) return "";
+    try {
+      return entry.bundle.term.getSelection();
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * 粘贴。**必须走 `term.paste()`** 而不是直接写字节：
+   * 那样 xterm 才会按程序的 bracketed paste 模式（C-07）包上 ESC[200~/201~，
+   * 多行粘贴也不会被当成"连按回车执行"。
+   */
+  paste(id: string, text: string): boolean {
+    const entry = this.entries.find((item) => item.tab.id === id);
+    if (!entry?.session.mounted) return false;
+    entry.bundle.term.paste(text);
+    return true;
+  }
+
   focus(id: string): void {
     const entry = this.entries.find((item) => item.tab.id === id);
     if (entry?.session.mounted) entry.bundle.term.focus();
@@ -185,8 +214,7 @@ export class TerminalSessionStore {
 
   /**
    * 改 tab 标题（右键菜单里的"重命名"）。
-   * 空串与纯空白一律拒绝：标题清空会让用户认不出这块屏连的是什么，
-   * 那比留着默认名更糟。超长截断而不是拒绝——用户不会为 40 字以外的事负责。
+   * 空串与纯空白一律拒绝（清空后这块屏就没名字了，比默认名更糟）；超长截断而不是拒绝。
    */
   rename(id: string, title: string): boolean {
     const entry = this.entries.find((item) => item.tab.id === id);
@@ -194,6 +222,7 @@ export class TerminalSessionStore {
     const trimmed = title.trim();
     if (!trimmed) return false;
     entry.tab.title = trimmed.slice(0, 40);
+
     this.deps.onChange();
     return true;
   }
@@ -240,8 +269,11 @@ export class TerminalSessionStore {
       tab: {
         id: `term-${this.seq}`,
         kind: input.kind ?? "local",
-        title: input.title?.trim() || defaultTitle(program, this.seq),
+        // 默认**不给句子**：只给序号，名字由界面按语言渲染（"会话 1"）。
+        title: null,
+        index: this.seq,
         program,
+        args: input.args,
         ptyId: null,
         status: "starting",
         exitCode: null,
@@ -340,9 +372,4 @@ export class TerminalSessionStore {
     entry.tab.status = "failed";
     this.deps.onChange();
   }
-}
-
-function defaultTitle(program: string, index: number): string {
-  const tail = program.split("/").filter(Boolean).pop() ?? program;
-  return `${tail} ${index}`;
 }

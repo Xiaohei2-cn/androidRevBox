@@ -168,6 +168,11 @@ describe("Hook 页：frida 右侧那块就是真终端", () => {
     fireEvent.click(screen.getByTestId("terminal-new"));
     await waitFor(() => expect(screen.getByTestId("terminal-tabs")).toBeTruthy());
 
+    // 设备 shell 与终端/结构化同级：切到它**不换面板**（换面板等于把会话杀掉）
+    fireEvent.click(screen.getByTestId("frida-view-device"));
+    expect(screen.getByTestId("frida-terminal-view").hasAttribute("hidden")).toBe(false);
+    expect(screen.getByTestId("terminal-new")).toBeTruthy();
+
     fireEvent.click(screen.getByTestId("frida-view-tracks"));
     await waitFor(() => expect(screen.getByTestId("frida-tracks-view").hasAttribute("hidden")).toBe(false));
     expect(screen.getByTestId("frida-terminal-view").hasAttribute("hidden")).toBe(true);
