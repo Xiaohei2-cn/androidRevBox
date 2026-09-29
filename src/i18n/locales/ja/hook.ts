@@ -96,6 +96,9 @@ export default {
   "hook.frida.pickDirHint": "選択後、そのディレクトリ直下の *.js がここに表示されます。各行の「起動」でセッションを開始",
   "hook.frida.empty": "このディレクトリに *.js スクリプトはありません",
   "hook.frida.startHint": "ダブルクリックで現在の設定によりセッション開始",
+  "hook.frida.metaPath": "パス",
+  "hook.frida.metaSize": "サイズ",
+  "hook.frida.metaMtime": "更新日時",
 
   "hook.frida.consoleIdle": "セッションコンソール：左でスクリプトを選んで起動すると、出力が send / log / error に分かれて表示されます",
   "hook.frida.rowCount": "行 {shown}/{total}",

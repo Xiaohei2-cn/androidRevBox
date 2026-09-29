@@ -96,6 +96,9 @@ export default {
   "hook.frida.pickDirHint": "After choosing a folder, *.js files in it are listed here; press “Start” on a row to open a session",
   "hook.frida.empty": "No *.js scripts in this folder",
   "hook.frida.startHint": "Double-click to start a session with current settings",
+  "hook.frida.metaPath": "Path",
+  "hook.frida.metaSize": "Size",
+  "hook.frida.metaMtime": "Modified",
 
   "hook.frida.consoleIdle": "Session console: pick a script on the left and start it; output renders as send / log / error tracks",
   "hook.frida.rowCount": "rows {shown}/{total}",

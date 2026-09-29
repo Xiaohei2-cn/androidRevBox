@@ -96,6 +96,9 @@ export default {
   "hook.frida.pickDirHint": "Após escolher, os *.js da pasta aparecem aqui; “Iniciar” em uma linha abre a sessão",
   "hook.frida.empty": "Nenhum script *.js nesta pasta",
   "hook.frida.startHint": "Clique duplo para iniciar a sessão com as configurações atuais",
+  "hook.frida.metaPath": "Caminho",
+  "hook.frida.metaSize": "Tamanho",
+  "hook.frida.metaMtime": "Modificado",
 
   "hook.frida.consoleIdle": "Console da sessão: escolha um script à esquerda e inicie; a saída é dividida em send / log / error",
   "hook.frida.rowCount": "linhas {shown}/{total}",

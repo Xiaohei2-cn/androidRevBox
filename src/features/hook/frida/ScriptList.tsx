@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { FolderOpen, Play, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { configApi } from "@/api/config";
 import { hookApi, type JsFileDto } from "@/api/hook";
 import { pickDirectory } from "@/api/dialog";
@@ -27,6 +28,9 @@ export function formatMtime(sec: number): string {
  * 区域 B · 脚本区（左下 2/9，§4）：工作目录（配置键持久化）+ 一层 *.js 列表。
  * 每项「启动」= 以当前 A 区设置 + 该脚本开会话；双击同义（托管页习惯一致）。
  * 不做编辑/新建/删除（非目标）。
+ *
+ * 显示口径（第九十二轮）：一行只有脚本名（名字吃满整行，放不下折到第二行），
+ * 大小 / 修改时间 / 完整路径收进 hover 气泡——见 {@link ScriptMeta}。
  */
 export function ScriptList({
   running,
@@ -122,34 +126,47 @@ export function ScriptList({
         ) : items.length === 0 ? (
           <p className="pt-6 text-center text-11px text-muted-foreground">{t("hook.frida.empty")}</p>
         ) : (
+          /**
+           * 行内只留脚本名（用户反馈：名字才是她要选的，大小与时间不是）。
+           * 名字吃满整行、放不下就先折到第二行；大小 / 修改时间 / 完整路径
+           * 收进 hover 气泡（Radix Tooltip，全局 Provider 200ms 延迟）。
+           */
           items.map((f) => (
-            <div
-              key={f.name}
-              className="group flex cursor-pointer items-center gap-1.5 rounded border bg-transparent px-1.5 py-1 hover:bg-muted/40"
-              onDoubleClick={() => !running && onStart(f)}
-              title={t("hook.frida.startHint")}
-            >
-              <span className="path-selectable min-w-0 flex-1 truncate font-mono" title={f.path}>
-                {f.name}
-              </span>
-              <span className="shrink-0 text-10px text-muted-foreground">{formatSize(f.size)}</span>
-              <span className="hidden shrink-0 text-10px text-muted-foreground sm:inline">
-                {formatMtime(f.mtime)}
-              </span>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-5 shrink-0 gap-0.5 px-1 text-10px opacity-0 group-hover:opacity-100"
-                disabled={running}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onStart(f);
-                }}
+            <Tooltip key={f.name}>
+              <TooltipTrigger asChild>
+                <div
+                  className="group flex cursor-pointer items-center gap-1.5 rounded border bg-transparent px-1.5 py-1 hover:bg-muted/40"
+                  onDoubleClick={() => !running && onStart(f)}
+                  data-testid={`script-row-${f.name}`}
+                >
+                  <span className="path-selectable line-clamp-2 min-w-0 flex-1 break-all font-mono leading-snug">
+                    {f.name}
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-5 shrink-0 gap-0.5 px-1 text-10px opacity-0 group-hover:opacity-100"
+                    disabled={running}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onStart(f);
+                    }}
+                  >
+                    <Play className="h-2.5 w-2.5" />
+                    {t("hook.frida.launch")}
+                  </Button>
+                </div>
+              </TooltipTrigger>
+              <TooltipContent
+                side="right"
+                align="start"
+                sideOffset={8}
+                className="max-w-[min(26rem,55vw)] text-left"
+                data-testid={`script-meta-${f.name}`}
               >
-                <Play className="h-2.5 w-2.5" />
-                {t("hook.frida.launch")}
-              </Button>
-            </div>
+                <ScriptMeta file={f} />
+              </TooltipContent>
+            </Tooltip>
           ))
         )}
       </div>
@@ -157,5 +174,32 @@ export function ScriptList({
         <p className="shrink-0 break-all text-11px text-destructive">{notice}</p>
       )}
     </section>
+  );
+}
+
+/**
+ * hover 气泡的内容（从行里收回来的那几样）：完整名字 + 路径 + 大小 + 修改时间，
+ * 末尾留一句双击语义（原来挂在 title 上，现在跟着气泡走）。
+ *
+ * 单独成组件有两个原因：① 行与气泡共用一份 t()；② jsdom 没有排版，Radix 浮层一挂载
+ * 就要 ~14 s（@floating-ui 在 jsdom 里把 getComputedStyle 当循环用），
+ * 所以「气泡里到底写了什么」必须能绕开浮层直接渲染来测——那是可信的判据，
+ * 「气泡会不会弹」归真机手工矩阵（docs/frida_terminal_phases.md §5）。
+ */
+export function ScriptMeta({ file }: { file: JsFileDto }) {
+  const { t } = useI18n();
+  return (
+    <div className="flex flex-col gap-1">
+      <p className="break-all font-mono">{file.name}</p>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 text-10px text-muted-foreground">
+        <dt>{t("hook.frida.metaPath")}</dt>
+        <dd className="break-all font-mono">{file.path}</dd>
+        <dt>{t("hook.frida.metaSize")}</dt>
+        <dd className="tabular-nums">{formatSize(file.size)}</dd>
+        <dt>{t("hook.frida.metaMtime")}</dt>
+        <dd className="tabular-nums">{formatMtime(file.mtime)}</dd>
+      </dl>
+      <p className="text-10px text-muted-foreground">{t("hook.frida.startHint")}</p>
+    </div>
   );
 }

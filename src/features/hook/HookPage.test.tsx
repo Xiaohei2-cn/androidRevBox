@@ -13,6 +13,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { HookPage } from "./HookPage";
 import { I18nProvider } from "@/i18n/I18nProvider";
 import { hookApi } from "@/api/hook";
@@ -118,12 +119,15 @@ vi.mock("@/api/task", () => ({
 
 function renderHook() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  // TooltipProvider 是 AppProviders 给全局的（B 区脚本条的气泡要用），测试自己补上
   return render(
-    <QueryClientProvider client={qc}>
-      <I18nProvider>
-        <HookPage />
-      </I18nProvider>
-    </QueryClientProvider>,
+    <TooltipProvider delayDuration={0}>
+      <QueryClientProvider client={qc}>
+        <I18nProvider>
+          <HookPage />
+        </I18nProvider>
+      </QueryClientProvider>
+    </TooltipProvider>,
   );
 }
 

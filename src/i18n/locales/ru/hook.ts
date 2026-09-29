@@ -96,6 +96,9 @@ export default {
   "hook.frida.pickDirHint": "После выбора в этой папке показываются *.js; «Запуск» в строке открывает сессию",
   "hook.frida.empty": "В папке нет *.js скриптов",
   "hook.frida.startHint": "Двойной клик — запуск сессии с текущими настройками",
+  "hook.frida.metaPath": "Путь",
+  "hook.frida.metaSize": "Размер",
+  "hook.frida.metaMtime": "Изменён",
 
   "hook.frida.consoleIdle": "Консоль сессии: выберите скрипт слева и запустите — вывод разделится на send / log / error",
   "hook.frida.rowCount": "строк {shown}/{total}",

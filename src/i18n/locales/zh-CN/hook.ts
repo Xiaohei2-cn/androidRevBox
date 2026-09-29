@@ -96,6 +96,9 @@ export default {
   "hook.frida.pickDirHint": "选择工作目录后，该目录一层的 *.js 会列在这里；点击条目的「启动」即开会话",
   "hook.frida.empty": "目录下没有 *.js 脚本",
   "hook.frida.startHint": "双击以当前设置启动会话",
+  "hook.frida.metaPath": "路径",
+  "hook.frida.metaSize": "大小",
+  "hook.frida.metaMtime": "修改时间",
 
   "hook.frida.consoleIdle": "会话控制台：在左侧选择脚本并启动，会话输出将按 send / log / error 分轨呈现",
   "hook.frida.rowCount": "行 {shown}/{total}",
