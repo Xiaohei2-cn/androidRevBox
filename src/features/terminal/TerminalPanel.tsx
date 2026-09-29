@@ -131,12 +131,15 @@ function stampCommand(store: TerminalSessionStore, id: string, program: string, 
 
 interface TerminalPanelProps {
   fridaLaunch?: FridaLaunchRequest | null;
-  /** ➕ 起什么：本机 shell 还是设备 shell（用户要求设备 shell 与"终端/结构化"同级，
-   *  所以它是**同一个面板的宿主选择**，不再是一个按钮——两块面板会把会话切成两半） */
-  host?: "local" | "device";
+  /**
+   * 外部那个「设备 shell」入口点一次 = **独立开一个新设备会话**（nonce 变了才开）。
+   * 之前我把它做成"面板的宿主模式"，结果点它只是换了 ➕ 的口味，还得再点一次才出现会话——
+   * 用户明确纠正：设备 shell 与终端各自独立，每个会话都是自己的 shell 会话，跟当前那块屏不发生关系。
+   */
+  deviceLaunch?: { nonce: number } | null;
 }
 
-export function TerminalPanel({ fridaLaunch, host = "local" }: TerminalPanelProps) {
+export function TerminalPanel({ fridaLaunch, deviceLaunch }: TerminalPanelProps) {
   const { t } = useI18n();
   const storeRef = useRef<TerminalSessionStore | null>(null);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
@@ -313,10 +316,6 @@ export function TerminalPanel({ fridaLaunch, host = "local" }: TerminalPanelProp
    */
   const createNew = useCallback(async () => {
     setNotice(null);
-    if (host === "device") {
-      await createDeviceShell();
-      return;
-    }
     const created = await ensureStore().create({ program: defaultProgram, args: [] });
     if (!created.ok) {
       setNotice(createBlockText(created, t));
@@ -324,7 +323,7 @@ export function TerminalPanel({ fridaLaunch, host = "local" }: TerminalPanelProp
     }
     setActiveId(created.id);
     ensureStore().focus(created.id);
-  }, [createDeviceShell, defaultProgram, ensureStore, host, t]);
+  }, [defaultProgram, ensureStore, t]);
 
   /**
    * 关一个 tab = **先停止再关闭**。
@@ -442,6 +441,15 @@ export function TerminalPanel({ fridaLaunch, host = "local" }: TerminalPanelProp
     lastNonceRef.current = fridaLaunch.nonce;
     void launchFrida(fridaLaunch);
   }, [fridaLaunch, launchFrida]);
+
+  // 设备会话：每次点「设备 shell」都是**独立的一个新会话**，与当前那块屏无关
+  const lastDeviceNonceRef = useRef<number | null>(null);
+  useEffect(() => {
+    // nonce 必须是**正数**：0 表示"从没点过"，不能被当成第一次点击
+    if (!deviceLaunch || deviceLaunch.nonce <= 0 || deviceLaunch.nonce === lastDeviceNonceRef.current) return;
+    lastDeviceNonceRef.current = deviceLaunch.nonce;
+    void createDeviceShell();
+  }, [createDeviceShell, deviceLaunch]);
 
   /**
    * 保存这块屏的正文（C-15 的终端那一半，D090 的口径）：**只有用户点过一次并确认路径才写**。

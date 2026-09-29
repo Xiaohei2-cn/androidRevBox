@@ -160,11 +160,11 @@ function renderPanel(request: { scriptPath: string; settings: ReturnType<typeof 
   );
 }
 
-/** 设备宿主：同一个面板，只是 ➕ 起 `adb -s … shell -tt`（设备 shell 与终端/结构化同级） */
-function renderDevicePanel() {
+/** 「设备 shell」是一个动作：nonce 每变一次，面板就该**独立多开一个设备会话** */
+function renderDevicePanel(nonce = 1) {
   return render(
     <I18nProvider>
-      <TerminalPanel host="device" />
+      <TerminalPanel deviceLaunch={{ nonce }} />
     </I18nProvider>,
   );
 }
@@ -536,8 +536,7 @@ describe("真终端页（FT1 分页）", () => {
    */
   it("设备 shell 起的是 adb -s <serial> shell -tt", async () => {
     renderDevicePanel();
-    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
-    fireEvent.click(screen.getByTestId("terminal-new"));
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
     await waitFor(() => expect(fake.openArgs.length).toBe(1));
     expect(fake.openArgs[0].program).toBe("/sdk/platform-tools/adb");
     // 参数数组原样交给 PTY：少那个 `-tt` 就没有远端 PTY，中断/行编辑/全屏程序全都不成立
@@ -580,12 +579,45 @@ describe("真终端页（FT1 分页）", () => {
     );
   });
 
+  /**
+   * 「设备 shell」是动作，不是模式：
+   * ① 面板刚挂上时**不能凭空开一个会话**（nonce=0 被当成"点过一次"就是上一版的真 bug）；
+   * ② 每点一次独立多一块屏，第二块不会去动第一块。
+   */
+  it("点两次设备 shell 得到两个独立会话，挂载时一个都不开", async () => {
+    // 故意用 {nonce: 0}——上一版 frida 页就是这么传的（useState(0) 初值），
+    // 面板把它当成"点了一次"，一进页面就凭空开一个设备会话。这条断言必须抓住那个形状。
+    const view = render(
+      <I18nProvider>
+        <TerminalPanel deviceLaunch={{ nonce: 0 }} />
+      </I18nProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(fake.openArgs).toEqual([]);
+
+    view.rerender(
+      <I18nProvider>
+        <TerminalPanel deviceLaunch={{ nonce: 1 }} />
+      </I18nProvider>,
+    );
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
+    view.rerender(
+      <I18nProvider>
+        <TerminalPanel deviceLaunch={{ nonce: 2 }} />
+      </I18nProvider>,
+    );
+    await waitFor(() => expect(fake.openArgs.length).toBe(2));
+    expect(screen.getAllByTestId(/^terminal-chip-/)).toHaveLength(2);
+    // 两块屏各自一条 pty：id 必须不同（同一块屏不可能共享一条会话）
+    expect(vi.mocked(ptyApi.open).mock.calls.length).toBe(2);
+    void view;
+  });
+
   /** 没设备就是开不了：不许起一条 `adb -s "" shell` 之类的空会话糊弄界面。 */
   it("没有在线设备时拒绝起会话，并且一次 PTY 都不开", async () => {
     adb.devices = [{ serial: "EMULATOR36X5X9X0", state: "offline", transport: "tcp", model: "" }];
     renderDevicePanel();
-    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
-    fireEvent.click(screen.getByTestId("terminal-new"));
     await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
     expect(screen.getByTestId("terminal-error").textContent).toContain("没有在线设备");
     expect(fake.openArgs).toEqual([]);
@@ -595,8 +627,6 @@ describe("真终端页（FT1 分页）", () => {
   it("没配 adb 路径时报的是「去设置配 adb」", async () => {
     adb.env = { installed: false, path: undefined };
     renderDevicePanel();
-    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
-    fireEvent.click(screen.getByTestId("terminal-new"));
     await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
     expect(screen.getByTestId("terminal-error").textContent).toContain("设置");
     expect(fake.openArgs).toEqual([]);
@@ -613,8 +643,7 @@ describe("真终端页（FT1 分页）", () => {
       { serial: "BBB222", state: "device", transport: "usb", model: "" },
     ];
     renderDevicePanel();
-    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
-    fireEvent.click(screen.getByTestId("terminal-new"));
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
     await waitFor(() => expect(fake.openArgs.length).toBe(1));
     expect(vi.mocked(ptyApi.open).mock.calls[0][0].args).toEqual(["-s", "AAA111", "shell", "-tt"]);
     expect(screen.getByTestId("terminal-chip-term-1").getAttribute("title")).toContain("-s AAA111");
