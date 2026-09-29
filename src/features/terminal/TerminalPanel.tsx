@@ -1,5 +1,9 @@
 /**
- * 真终端页（FT1：分页与会话保活）。
+ * 真终端面板（FT1 分页 + FT3 路 B）：**这一块就是 frida 会话的控制台**。
+ *
+ * 位置口径（第八十四轮，用户明确纠正过的地方）：它在 **frida 页右侧那一整块屏**上，
+ * 不是另开的一个子标签——左边 A 区设置、B 区脚本，点脚本 = 在这里起一个官方 frida REPL。
+ * 面板自己只管"几块屏、谁在跑、什么时候才许杀进程"，会话状态在 `lib/terminalStore`。
  *
  * 组件只做四件事：把 tab 画出来、把每块屏挂到它自己的宿主 div 上、
  * 把"量得到的尺寸"转成 fit、把用户意图转成会话表的调用。
@@ -22,11 +26,37 @@ import { hasNativeDialog, saveFile } from "@/api/dialog";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
+import type { FridaSettings } from "@/features/hook/frida/types";
 import { deviceShellLaunch } from "@/lib/deviceShell";
-import { fridaReplLaunch } from "@/lib/fridaTerminal";
+import { planFridaSession, type FridaSessionBlock } from "@/lib/fridaSession";
 import { collectTranscript, transcriptFileName, transcriptText } from "@/lib/terminalTranscript";
 import { MAX_TERMINAL_SESSIONS, TerminalSessionStore, type TerminalTab } from "@/lib/terminalStore";
 import "@xterm/xterm/css/xterm.css";
+
+/**
+ * frida 会话起不来的四种原因 → 界面文案。
+ *
+ * 一个个写成 `t("…")` 字面量，而不是"码 → 键名"的映射表：`scripts/i18n-check.mjs` 只认
+ * `t("…")` 这种形状，映射表里的键名打错了闸门不会红（第八十四轮差点埋下这一颗）。
+ */
+function fridaBlockText(
+  block: FridaSessionBlock,
+  t: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  switch (block) {
+    case "no-python":
+      return t("hook.terminal.fridaNoPython");
+    case "no-frida-tools":
+      // 走到这一支时 python.path 必然有值（否则前一条就判掉了）；传 "" 只是让类型闭得上
+      return t("hook.terminal.fridaNoTools", { python: "" });
+    case "no-device":
+      return t("hook.terminal.fridaNoDevice");
+    case "no-script":
+      return t("hook.terminal.fridaNoScript");
+    case "spawn-needs-package":
+      return t("hook.terminal.fridaNoPackage");
+  }
+}
 
 const DOT_CLASS: Record<TerminalTab["status"], string> = {
   running: "bg-emerald-500",
@@ -36,7 +66,21 @@ const DOT_CLASS: Record<TerminalTab["status"], string> = {
   failed: "bg-destructive",
 };
 
-export function TerminalPage() {
+/**
+ * 外部（B 区点脚本）发起的一次 frida 会话请求。
+ * 设置是**按下那一刻的快照**：会话起来之后她再改目标，不该搅动已经在跑的会话。
+ */
+export interface FridaLaunchRequest {
+  scriptPath: string;
+  settings: FridaSettings;
+  nonce: number;
+}
+
+interface TerminalPanelProps {
+  fridaLaunch?: FridaLaunchRequest | null;
+}
+
+export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
   const { t } = useI18n();
   const storeRef = useRef<TerminalSessionStore | null>(null);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
@@ -150,16 +194,6 @@ export function TerminalPage() {
   );
 
   /**
-   * frida 会话预置（FT3 路 B 的第一步）：把启动命令填成 `<配置的 python> -m frida_tools.repl`。
-   *
-   * 两件事是刻意的：
-   * 1. **按会话类型分开要求**——终端里的 REPL 只认 `frida-tools`（模块在它里面），
-   *    不再沿用那句"frida 或 frida-tools 任一即通过"：那种机器上今天会被放行，
-   *    然后在终端里报 Python 的 `No module named frida_tools`。
-   * 2. **不自动起会话**：官方 REPL 必须有目标（`-f 包名` / `-n 进程名` / PID），
-   *    直接起只会让它打一句 usage 就退——把"还差一个目标"说给她，比给她一屏报错有用。
-   */
-  /**
    * 设备 shell 宿主（H-2，FT2）：**直接起一个会话**，不像 frida 预置那样只填命令。
    *
    * 差别的原因是"还缺不缺参数"：`adb -s <serial> shell -tt` 已经是一个完整可用的交互 shell，
@@ -201,36 +235,63 @@ export function TerminalPage() {
     }
   }, [store, t]);
 
-  const applyFridaPreset = useCallback(async () => {
-    setNotice(null);
-    setHint(null);
-    setPresetBusy(true);
-    try {
-      // **每次都重新探**：她很可能就是刚 `pip install frida-tools` 回来点这个按钮，
-      // 缓存会把"已经装好了"说成"没装"，那是我们自己造的假现场
-      const python = await envApi.python();
-      // 探测本身有剪枝：Python 没就绪时前端根本不该去问 frida（问了也是白问）
-      const frida = python.ready ? await envApi.frida() : null;
-      const launch = fridaReplLaunch(python, frida);
-      if (!launch.ok) {
-        setNotice(
-          launch.block === "no-python"
-            ? t("hook.terminal.fridaNoPython")
-            // 走到 no-frida-tools 这一支时 python.path 必然有值（否则前一条就判掉了），
-            // 这个 ?? 只是为了让类型闭得上，不是第二条判断
-            : t("hook.terminal.fridaNoTools", { python: python.path ?? "python" }),
-        );
-        return;
+  /**
+   * 起一个**官方 frida REPL** 会话（FT3 路 B）。这里不自己拼参数：
+   * 环境够不够、连哪台、跑哪个脚本，全在 `lib/fridaSession` 一处判（每种形状都有测试钉着）。
+   *
+   * 每次都重新探环境、不缓存：她很可能就是刚 `pip install frida-tools` 回来点脚本，
+   * 缓存会把"已经装好了"说成"没装"——那是我们自己造的假现场。
+   */
+  const launchFrida = useCallback(
+    async (request: FridaLaunchRequest) => {
+      setNotice(null);
+      setHint(null);
+      setPresetBusy(true);
+      try {
+        const python = await envApi.python();
+        // 探测本身有剪枝：Python 没就绪时不该去问 frida（问了也问不出东西）
+        const frida = python.ready ? await envApi.frida() : null;
+        const planned = planFridaSession(python, frida, request.settings, request.scriptPath);
+        if (!planned.ok) {
+          setNotice(fridaBlockText(planned.block, t));
+          return;
+        }
+        const created = await store.create({
+          program: planned.plan.program,
+          args: planned.plan.args,
+          kind: "frida",
+          title: planned.plan.title,
+        });
+        if (!created.ok) {
+          setNotice(
+            created.reason === "limit"
+              ? t("hook.terminal.limit", { max: created.max })
+              : t("hook.terminal.emptyProgram"),
+          );
+          return;
+        }
+        setActiveId(created.id);
+        setHint(t("hook.terminal.fridaStarted", { version: planned.plan.toolsVersion }));
+      } catch (reason) {
+        setNotice(String((reason as Error)?.message ?? reason));
+      } finally {
+        setPresetBusy(false);
       }
-      setProgram(launch.program);
-      setArgsText(launch.args.join(" "));
-      setHint(t("hook.terminal.fridaPresetHint", { version: launch.toolsVersion }));
-    } catch (reason) {
-      setNotice(String((reason as Error)?.message ?? reason));
-    } finally {
-      setPresetBusy(false);
-    }
-  }, [t]);
+    },
+    [store, t],
+  );
+
+  /**
+   * B 区点一次脚本 = nonce 变一次 = 起一块新屏。
+   * 只认 nonce，不认"请求对象在不在"：连着点同一个脚本也要能再起一次，
+   * 而对象比较会让 React 每次重渲染都误判成新请求（那是真会多开一个进程的 bug）。
+   */
+  const lastNonceRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!fridaLaunch || fridaLaunch.nonce === lastNonceRef.current) return;
+    lastNonceRef.current = fridaLaunch.nonce;
+    void launchFrida(fridaLaunch);
+  }, [fridaLaunch, launchFrida]);
 
   /**
    * 保存这块屏的正文（C-15 的终端那一半，D090 的口径）：**只有用户点过一次并确认路径才写**。
@@ -380,17 +441,6 @@ export function TerminalPage() {
         >
           {t("hook.terminal.deviceShell")}
         </Button>
-        {/* 路 B 的入口：把 REPL 的启动命令填进来（检查口径按会话类型分开，见 lib/fridaTerminal） */}
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-7 px-2"
-          disabled={presetBusy}
-          onClick={() => void applyFridaPreset()}
-          data-testid="terminal-frida-preset"
-        >
-          {t("hook.terminal.fridaPreset")}
-        </Button>
         <Button
           size="sm"
           variant="outline"
@@ -530,6 +580,13 @@ export function TerminalPage() {
         </p>
       )}
 
+      {tabCount === 0 && (
+        // 空态要说清这块屏能起什么：这个位置现在是 frida 的控制台，
+        // 点左侧脚本起的是官方 frida；这两个按钮是另外两种会话
+        <div className="shrink-0 rounded border border-border/60 bg-muted/20 px-2 py-1.5 text-10px text-muted-foreground" data-testid="terminal-empty">
+          {t("hook.terminal.empty")}
+        </div>
+      )}
       {/* 每块屏都有自己的宿主：非活动 tab 只是 hidden，实例与缓冲区一直活着（分页那条验收的根） */}
       <div className="relative min-h-0 flex-1">
         {tabs.map((tab) => (

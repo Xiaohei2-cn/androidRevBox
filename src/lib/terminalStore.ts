@@ -23,8 +23,8 @@ export type TerminalTabStatus = "running" | "exited" | "stopped" | "starting" | 
 
 export interface TerminalTab {
   id: string;
-  /** 宿主：H-1 本机 PTY(`local`) / H-2 设备 shell(`device`) / H-3 Agent 托管（还没做） */
-  kind: "local" | "device";
+  /** 宿主：H-1 本机 PTY(`local`) / H-2 设备 shell(`device`) / 官方 frida REPL(`frida`) */
+  kind: "local" | "device" | "frida";
   title: string;
   program: string;
   ptyId: string | null;
@@ -40,8 +40,8 @@ export interface CreateTabInput {
   program: string;
   args: string[];
   cwd?: string | null;
-  /** 缺省 `local`；设备会话必须显式写 `device`（状态灯旁那句"在跑 80×24"对两种宿主含义不同） */
-  kind?: "local" | "device";
+  /** 缺省 `local`；设备/frida 会话必须显式写（状态灯旁那句"在跑 80×24"对不同宿主含义不同） */
+  kind?: "local" | "device" | "frida";
   /** 显式标题（设备会话用 `adb shell @ <serial>`）；不给就取程序名 + 序号 */
   title?: string;
 }

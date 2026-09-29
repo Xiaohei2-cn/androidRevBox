@@ -99,6 +99,7 @@ export function SettingsPanel({
         ) : (
           <select
             className="h-6 w-full min-w-0 rounded border border-input bg-transparent px-1 font-mono"
+            data-testid="frida-device"
             value={settings.deviceSerial ?? ""}
             onChange={(e) => onChange({ deviceSerial: e.target.value })}
           >

@@ -9,7 +9,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { I18nProvider } from "@/i18n/I18nProvider";
-import { TerminalPage } from "./TerminalPage";
+import { TerminalPanel } from "./TerminalPanel";
 
 import type { PtyExit } from "@/api/pty";
 
@@ -143,10 +143,27 @@ async function newTab(container: HTMLElement, program?: string): Promise<HTMLEle
   return hostsOf(container)[before];
 }
 
+const fridaSettings = () => ({
+  deviceSerial: "18271FDF600FL4",
+  connMode: "usb" as const,
+  port: "27042",
+  runMode: "attach" as const,
+  target: "",
+});
+
+/** 带 frida 请求渲染面板（B 区点脚本 = 传一个新 nonce 进来） */
+function renderPanel(request: { scriptPath: string; settings: ReturnType<typeof fridaSettings>; nonce: number }) {
+  return render(
+    <I18nProvider>
+      <TerminalPanel fridaLaunch={request} />
+    </I18nProvider>,
+  );
+}
+
 async function renderPage() {
   const view = render(
     <I18nProvider>
-      <TerminalPage />
+      <TerminalPanel />
     </I18nProvider>,
   );
   await waitFor(() => expect(screen.getByTestId("terminal-program")).toHaveValue("/bin/zsh"));
@@ -288,51 +305,71 @@ describe("真终端页（FT1 分页）", () => {
   });
 
   /**
-   * 路 B 的预置（FT3 第一步）：填命令，**不替她把会话起起来**——
-   * 官方 REPL 还缺一个目标，直接起只会换来一屏 usage。
+   * 路 B 的落点（第八十四轮，用户纠正之后）：**B 区点脚本 = 在这块屏上起官方 frida REPL**。
+   * 判据是传给 PTY 的参数数组原样是 `-m frida_tools.repl -D <序列号> -F -l <绝对路径>`——
+   * 少一个形状就不是"在跑官方 frida"，而是我们又一次自己发挥了。
    */
-  it("点 frida 会话预置：填好解释器与模块，但不自己起会话", async () => {
-    const { container } = await renderPage();
-    fireEvent.click(screen.getByTestId("terminal-frida-preset"));
-    await waitFor(() => expect(screen.getByTestId("terminal-program")).toHaveValue("/py/3.11/bin/python3"));
-    expect(screen.getByTestId("terminal-args")).toHaveValue("-m frida_tools.repl");
-    expect(screen.getByTestId("terminal-hint").textContent).toContain("frida-tools 12.5.3");
-    // 没点「新建终端」之前一条 PTY 都不许起
-    expect(fake.openArgs).toEqual([]);
-
-    // 她把目标补在参数里，然后点新建：起的正是那条解释器
-    fireEvent.change(screen.getByTestId("terminal-args"), { target: { value: "-m frida_tools.repl -f com.example.app" } });
-    await newTab(container);
-    expect(fake.openArgs[0]).toEqual({
+  it("收到 frida 会话请求就起官方 REPL，参数原样交给 PTY", async () => {
+    renderPanel({ scriptPath: "/hooks/hook.js", settings: fridaSettings(), nonce: 1 });
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
+    expect(vi.mocked(ptyApi.open).mock.calls[0][0]).toMatchObject({
       program: "/py/3.11/bin/python3",
-      cols: expect.any(Number),
-      rows: expect.any(Number),
+      args: ["-m", "frida_tools.repl", "-D", "18271FDF600FL4", "-F", "-l", "/hooks/hook.js"],
     });
-    expect(fake.openArgs[0].cols).toBeGreaterThan(0);
+    // tab 标题带目标与脚本：多块屏并存时她得知道哪块连的是哪个
+    expect(screen.getByTestId("terminal-tabs").textContent).toContain("attach 自动前台 · hook.js");
+  });
+
+  /**
+   * 只认 nonce：**同一个请求对象被 React 重新渲染一次，绝不能再开一条 PTY**——
+   * 那是真多一个进程、真多一个 attach。所以这里用"重新渲染同一份请求"来验。
+   */
+  it("同一个 nonce 重复渲染只起一条会话", async () => {
+    const request = { scriptPath: "/hooks/a.js", settings: fridaSettings(), nonce: 7 };
+    const view = renderPanel(request);
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
+    view.rerender(
+      <I18nProvider>
+        <TerminalPanel fridaLaunch={{ ...request, settings: { ...request.settings } }} />
+      </I18nProvider>,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(fake.openArgs.length).toBe(1);
+
+    // nonce 变了才再起一块屏（点同一个脚本第二次也要能再起）
+    view.rerender(
+      <I18nProvider>
+        <TerminalPanel fridaLaunch={{ ...request, nonce: 8 }} />
+      </I18nProvider>,
+    );
+    await waitFor(() => expect(fake.openArgs.length).toBe(2));
   });
 
   /** D091 的落点：绑定包在、frida-tools 不在 ⇒ 说清缺哪个，而不是起一个报 No module 的会话。 */
-  it("只装了 frida 绑定包时预置会拒绝并说明缺 frida-tools", async () => {
+  it("只装了 frida 绑定包时拒绝起会话，并说明缺的是 frida-tools", async () => {
     env.frida = { ...env.frida, fridaToolsVersion: null, installed: true };
-    await renderPage();
-    fireEvent.click(screen.getByTestId("terminal-frida-preset"));
+    renderPanel({ scriptPath: "/hooks/hook.js", settings: fridaSettings(), nonce: 1 });
     await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
     expect(screen.getByTestId("terminal-error").textContent).toContain("frida-tools");
-    // 原本的默认程序与参数不许被动过：她可能正准备开一个普通 shell
-    expect(screen.getByTestId("terminal-program")).toHaveValue("/bin/zsh");
     expect(fake.openArgs).toEqual([]);
   });
 
-  /** 探测的剪枝不许被预置绕过：Python 没就绪时不该去问 frida（问了也问不出东西）。 */
+  /** 探测的剪枝不能被绕过：Python 没就绪时不该去问 frida（问了也问不出东西）。 */
   it("Python 没配好时不去探 frida，直接说先去设置选解释器", async () => {
     env.python = { configured: false, ready: false, path: null, version: null, hint: null };
-    await renderPage();
-    fireEvent.click(screen.getByTestId("terminal-frida-preset"));
+    renderPanel({ scriptPath: "/hooks/hook.js", settings: fridaSettings(), nonce: 1 });
     await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
     expect(env.fridaCalls).toBe(0);
-    expect(screen.getByTestId("terminal-error").textContent).toContain("Python");
+    expect(fake.openArgs).toEqual([]);
   });
 
+  /** 没脚本不起会话：**"没加载脚本的 REPL"看着在跑、什么都不钩**，是最难查的假成功。 */
+  it("脚本路径为空时不起会话", async () => {
+    renderPanel({ scriptPath: "   ", settings: fridaSettings(), nonce: 1 });
+    await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
+    expect(screen.getByTestId("terminal-error").textContent).toContain("脚本");
+    expect(fake.openArgs).toEqual([]);
+  });
   /**
    * 「保存日志」在真终端里也能用（C-15 的终端那一半）。
    * 判据不是"点了没报错"，而是**写出去的那段文本就是屏上那些行**、且界面报了字节数。
@@ -460,7 +497,7 @@ describe("真终端页（FT1 分页）", () => {
   it("离开页面把所有会话都关掉", async () => {
     const view = render(
       <I18nProvider>
-        <TerminalPage />
+        <TerminalPanel />
       </I18nProvider>,
     );
     await waitFor(() => expect(screen.getByTestId("terminal-program")).toHaveValue("/bin/zsh"));

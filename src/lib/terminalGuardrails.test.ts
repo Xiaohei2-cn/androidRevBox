@@ -117,12 +117,12 @@ describe("护栏一：生产代码不许新增 ANSI/VT 解析", () => {
           "src/lib/terminalStore.ts",
           "src/lib/terminalTranscript.ts",
           "src/lib/deviceShell.ts",
-          "src/lib/fridaTerminal.ts",
+          "src/lib/fridaSession.ts",
         ].includes(rel),
     );
-    // 6 个 lib + 1 个页面：这条断言钉的是"清单别偷偷变空"，
+    // 5 个 lib + 1 个面板：这条断言钉的是"清单别偷偷变空"，
     // 空了就等于上面那个 for 循环什么都没检查（护栏自己失效比没有护栏更糟）
-    expect(terminalSide.length).toBeGreaterThanOrEqual(7);
+    expect(terminalSide.length).toBeGreaterThanOrEqual(6);
     for (const rel of terminalSide) {
       expect(signaturesOf(rel), `${rel} 里出现了自研解析`).toEqual([]);
     }

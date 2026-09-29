@@ -1,12 +1,33 @@
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { taskApi } from "@/api/task";
 import { hookApi, type JsFileDto } from "@/api/hook";
 import { useI18n } from "@/i18n";
 import { SettingsPanel } from "./SettingsPanel";
 import { ScriptList } from "./ScriptList";
 import { FridaConsole } from "./FridaConsole";
+import type { FridaLaunchRequest } from "@/features/terminal/TerminalPanel";
 import { fridaSessionLabel, type FridaSettings, type SessionInfo } from "./types";
 import { remoteSpec } from "./types";
+
+/**
+ * 右侧那块屏的真终端实现（xterm + 本机 PTY）。
+ *
+ * 懒加载是**有意的**：xterm 家族 min 后约 823 kB，不该在软件一打开就进主块
+ * （第八十三轮实测：主 JS 1,275.87 → 751.94 kB）。放在这里而不是单独子标签，
+ * 是因为它就是 frida 控制台本身，不是另一个地方。
+ */
+const TerminalPanel = lazy(() =>
+  import("@/features/terminal/TerminalPanel").then((m) => ({ default: m.TerminalPanel })),
+);
+
+/**
+ * C 区的两种看法（同一个页面里的两个视图，**都必须一直挂着**）：
+ * - `terminal`：官方 frida REPL 跑在真终端里（默认，也是本轮的落点）；
+ * - `tracks`：我们自己的 NDJSON 三轨控制台（结构化事件、JSON 树；D091 里降级为"另一种会话类型"）。
+ *
+ * 切视图只改 `hidden`，**绝不卸载**：卸载等于 disposeAll，会把她的 REPL 会话连同进程一起杀掉。
+ */
+type ConsoleView = "terminal" | "tracks";
 
 const DEFAULT_SETTINGS: FridaSettings = {
   deviceSerial: null,
@@ -26,6 +47,9 @@ export function FridaPage() {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [focusScriptsTick, setFocusScriptsTick] = useState(0);
+  const [view, setView] = useState<ConsoleView>("terminal");
+  const [launch, setLaunch] = useState<FridaLaunchRequest | null>(null);
+  const nonceRef = useRef(0);
 
   const onChange = useCallback(
     (patch: Partial<FridaSettings>) => setSettings((s) => ({ ...s, ...patch })),
@@ -34,6 +58,17 @@ export function FridaPage() {
 
   const start = useCallback(
     async (script: JsFileDto) => {
+      /**
+       * 默认视图下，点脚本 = 在右侧真终端里起**官方 frida REPL**（路 B）。
+       * 参数的形状、环境要求、"没脚本不起会话"都在 `lib/fridaSession`，这里只负责把
+       * 脚本绝对路径（B 区给的 `path`）和 A 区当时的设置快照交出去——设置快照这点很重要：
+       * 会话起来之后她再改目标，不该把已经跑着的会话搅了。
+       */
+      if (view === "terminal") {
+        nonceRef.current += 1;
+        setLaunch({ scriptPath: script.path, settings: { ...settings }, nonce: nonceRef.current });
+        return;
+      }
       if (session) return;
       setError(null);
       try {
@@ -58,7 +93,7 @@ export function FridaPage() {
         setError(String((e as Error)?.message ?? e));
       }
     },
-    [session, settings],
+    [session, settings, view],
   );
 
   const stop = useCallback(() => {
@@ -101,20 +136,49 @@ export function FridaPage() {
       >
         <ScriptList running={!!session} onStart={(s) => void start(s)} />
       </div>
-      {/* C 会话控制台：右侧 2/3，通高 */}
-      <div className="col-start-2 row-start-1 col-span-2 row-span-3 min-h-0 min-w-0">
-        {session ? (
-          <FridaConsole session={session} onStopped={onStopped} />
-        ) : (
-          <div className="flex h-full flex-col items-center justify-center gap-2 rounded-xl border border-border/70 bg-card shadow-card/50 text-xs text-muted-foreground">
-            <p className="max-w-xs text-center leading-relaxed">{t("hook.frida.consoleIdle")}</p>
-            {error && (
-              <p className="max-w-md break-all rounded border border-destructive/50 bg-destructive/10 px-2 py-1 text-center text-destructive">
-                {error}
-              </p>
-            )}
-          </div>
-        )}
+      {/* C 会话控制台：右侧 2/3，通高。两个视图都一直挂着，切换只改 hidden（卸载=杀会话） */}
+      <div className="col-start-2 row-start-1 col-span-2 row-span-3 flex min-h-0 min-w-0 flex-col gap-2">
+        <div className="flex shrink-0 items-center gap-1 text-10px" role="group" aria-label={t("hook.frida.consoleView")}>
+          {(["terminal", "tracks"] as const).map((key) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setView(key)}
+              aria-pressed={view === key}
+              className={`rounded px-2 py-0.5 ${
+                view === key ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50"
+              }`}
+              data-testid={`frida-view-${key}`}
+            >
+              {t(key === "terminal" ? "hook.frida.viewTerminal" : "hook.frida.viewTracks")}
+            </button>
+          ))}
+        </div>
+        <div className="min-h-0 flex-1" hidden={view !== "terminal"} data-testid="frida-terminal-view">
+          <Suspense
+            fallback={
+              <div className="p-3 text-10px text-muted-foreground" data-testid="terminal-loading">
+                {t("hook.terminal.loading")}
+              </div>
+            }
+          >
+            <TerminalPanel fridaLaunch={launch} />
+          </Suspense>
+        </div>
+        <div className="min-h-0 flex-1" hidden={view !== "tracks"} data-testid="frida-tracks-view">
+          {session ? (
+            <FridaConsole session={session} onStopped={onStopped} />
+          ) : (
+            <div className="flex h-full flex-col items-center justify-center gap-2 rounded-xl border border-border/70 bg-card shadow-card/50 text-xs text-muted-foreground">
+              <p className="max-w-xs text-center leading-relaxed">{t("hook.frida.consoleIdle")}</p>
+              {error && (
+                <p className="max-w-md break-all rounded border border-destructive/50 bg-destructive/10 px-2 py-1 text-center text-destructive">
+                  {error}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
