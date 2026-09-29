@@ -203,6 +203,18 @@ describe("终端会话表（FT1）", () => {
     expect(store.count()).toBe(1);
   });
 
+  /** rename：改名要能改到真值，空/纯空白要拒绝（清空的标题比长标题更糟） */
+  it("rename 改标题，空名字被拒", async () => {
+    const first = await opened();
+    const { store, id } = first;
+    expect(store.rename(id, "  签名抓取  ")).toBe(true);
+    expect(store.tabs()[0].title).toBe("签名抓取");
+    expect(store.rename(id, "   ")).toBe(false);
+    expect(store.tabs()[0].title).toBe("签名抓取");
+    // 不存在的 tab 不该假装成功（vitest 的 toBe 不收第二个参数，提示写在 expect 上）
+    expect(store.rename("term-999", "x"), "不存在的 tab 不该假装成功").toBe(false);
+  });
+
   /** 关运行中的会话 = 内核给前台进程组发 SIGHUP，不可逆。没确认什么都不许杀。 */
   it("运行中的 tab 不确认就不杀，确认了只杀它那一个", async () => {
     const first = await opened();

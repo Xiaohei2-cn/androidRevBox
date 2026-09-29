@@ -147,8 +147,9 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
    * React StrictMode 在开发模式下会 mount→cleanup→mount，cleanup 里我们按 R-08 把会话全收了，
    * 如果之后还拿那个**已废弃的旧表**去 create()，表现就是"点了没反应"——
    * 而这次"屏上一片黑、什么提示都没有"的现场，与此同形。
+   * 只碰 ref 与 setTabs ⇒ 身份稳定，动作回调可以放心依赖它。
    */
-  const ensureStore = () => {
+  const ensureStore = useCallback(() => {
     const current = storeRef.current;
     if (current && !current.isDisposed) return current;
     // onChange 闭包里引用 next 本身是安全的：它只在表发生变动后才被调用
@@ -158,7 +159,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
     });
     storeRef.current = next;
     return next;
-  };
+  }, []);
   // **这里不再抓一张表当变量**：动作全部在调用时 `ensureStore()` 现取。
   // 渲染期抓的那一张会被 StrictMode 的假卸载 dispose 掉，之后的点击全打在废表上 ——
   // 第八十九轮用户看到的"先说要跑什么程序"就是这么来的（那其实是"表被收了"，
@@ -202,7 +203,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
       }
       return cb;
     },
-    [],
+    [ensureStore],
   );
 
   const select = useCallback((id: string) => {
@@ -216,7 +217,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
       live.repaint(id);
       live.focus(id);
     });
-  }, []);
+  }, [ensureStore]);
 
   /**
    * 起会话卡在"starting"超过 2 秒就**主动说话**。
@@ -257,7 +258,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
         }, STALL_REPORT_MS),
       );
     }
-  }, [t, tabs]);
+  }, [ensureStore, t, tabs]);
 
   const createTab = useCallback(async () => {
     setNotice(null);
@@ -269,7 +270,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
       return;
     }
     setActiveId(created.id);
-  }, [argsText, program, t]);
+  }, [argsText, ensureStore, program, t]);
 
   const closeTab = useCallback(
     async (id: string) => {
@@ -286,7 +287,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
       }
       await finishClose(store2, id, setActiveId, setPendingClose, t);
     },
-    [pendingClose, t],
+    [ensureStore, pendingClose, t],
   );
 
   /**
@@ -323,7 +324,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
     } finally {
       setPresetBusy(false);
     }
-  }, [t]);
+  }, [ensureStore, t]);
 
   /**
    * 起一个**官方 frida REPL** 会话（FT3 路 B）。这里不自己拼参数：
@@ -368,7 +369,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
         setPresetBusy(false);
       }
     },
-    [t],
+    [ensureStore, t],
   );
 
   /**
@@ -423,13 +424,13 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
     } finally {
       setSaving(false);
     }
-  }, [active, query, saving, t]);
+  }, [active, ensureStore, query, saving, t]);
 
   const stopActive = useCallback(async () => {
     if (!active) return;
     setNotice(null);
     await ensureStore().stop(active.id);
-  }, [active]);
+  }, [active, ensureStore]);
 
   const search = useCallback(
     (next: boolean) => {
@@ -441,7 +442,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
       if (next) bundle.search.findNext(query);
       else bundle.search.findPrevious(query);
     },
-    [active, query],
+    [active, ensureStore, query],
   );
 
   const activeIdForSearch = active?.id ?? null;
@@ -454,7 +455,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
     if (!bundle) return undefined;
     const disposable = bundle.search.onDidChangeResults((event) => setHits(event.resultCount));
     return () => disposable.dispose();
-  }, [activeIdForSearch]);
+  }, [activeIdForSearch, ensureStore]);
 
   // 尺寸跟着容器走：每个 tab 各看自己的宿主（隐藏的那个量到 0，不会改动它的尺寸）
   useEffect(() => {
@@ -470,7 +471,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
     });
     hostsRef.current.forEach((el) => observer.observe(el));
     return () => observer.disconnect();
-  }, [tabs.length]);
+  }, [ensureStore, tabs.length]);
 
   const tabCount = tabs.length;
   useEffect(() => {
@@ -478,24 +479,62 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
     else if (!tabs.some((tab) => tab.id === activeId)) setActiveId(tabs[tabCount - 1].id);
   }, [tabCount, tabs, activeId]);
 
-  const statusText = useMemo(() => {
-    if (!active) return t("hook.terminal.idle");
-    switch (active.status) {
-      case "running":
-        return t("hook.terminal.running");
-      case "starting":
-        return t("hook.terminal.starting");
-      case "exited":
-        // 有码报码；没码但有信号就报信号；两个都没有就明说"不知道"，不假装修辞成"已停止"
-        return t("hook.terminal.exited", {
-          code: active.exitCode ?? (active.exitSignal ? `信号 ${active.exitSignal}` : "无退出码"),
-        });
-      case "failed":
-        return active.error ?? t("hook.terminal.failed");
-      default:
-        return t("hook.terminal.stopped");
-    }
-  }, [active, t]);
+  const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+
+  const startRename = useCallback((id: string) => {
+    setMenu(null);
+    setEditingId(id);
+  }, []);
+
+  const commitRename = useCallback(
+    (id: string, value: string) => {
+      setEditingId(null);
+      // 空串会被会话表拒绝（标题清空后没人认得出这块屏连的是什么），这里静默保留原名
+      ensureStore().rename(id, value);
+    },
+    [ensureStore],
+  );
+
+  // 菜单开着时，点别处或按 Esc 都要收起来——固定定位的小菜单不自己关闭就是拦住下一笔操作
+  useEffect(() => {
+    if (!menu) return undefined;
+    const dismiss = () => setMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenu(null);
+    };
+    window.addEventListener("mousedown", dismiss);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", dismiss);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [menu]);
+
+  /**
+   * tab 的悬停提示：状态 + 尺寸 + 渲染器。
+   * 这些信息从界面上撤下来了（用户：把"会话在跑"那部分去掉），但排查时还得拿得到。
+   */
+  const tabHint = (tab: TerminalTab): string => {
+    const state = (() => {
+      switch (tab.status) {
+        case "running":
+          return t("hook.terminal.running");
+        case "starting":
+          return t("hook.terminal.starting");
+        case "exited":
+          // 有码报码；没码有信号报信号；两个都没有就明说不知道——不许假称"已停止"
+          return t("hook.terminal.exited", {
+            code: tab.exitCode ?? (tab.exitSignal ? `信号 ${tab.exitSignal}` : "无退出码"),
+          });
+        case "failed":
+          return tab.error ?? t("hook.terminal.failed");
+        default:
+          return t("hook.terminal.stopped");
+      }
+    })();
+    return `${state} · ${tab.cols}×${tab.rows} · ${tab.renderer}`;
+  };
 
   return (
     <section className="flex h-full min-h-0 flex-col gap-2 rounded-xl border border-border/70 bg-card p-2.5 text-xs">
@@ -546,26 +585,8 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
           <CircleStop className="h-3.5 w-3.5" />
           {t("hook.terminal.stop")}
         </Button>
-        <span
-          className={cn(
-            "min-w-0 text-10px",
-            active?.status === "running"
-              ? "text-emerald-500"
-              : // 起不来时必须显眼：以前它和"会话在跑 80×24"共用一句灰小字，
-                // 结果用户报"点了没反应"而界面上其实写过原因，只是没人看得见
-                active?.status === "failed"
-                ? "break-all text-destructive"
-                : "text-muted-foreground",
-          )}
-          title={active ? `${active.cols}×${active.rows} · ${active.renderer}` : undefined}
-          data-testid="terminal-status">
-          {statusText}
-        </span>
-        {tabCount > 0 && (
-          <span className="text-10px text-muted-foreground" data-testid="terminal-count">
-            {t("hook.terminal.count", { n: tabCount, max: MAX_TERMINAL_SESSIONS })}
-          </span>
-        )}
+        {/* 这里不放"会话在跑"：状态由每个 tab 的指示灯表示，细节在悬停里。
+            失败仍然有字——那条走红色错误区（notice），不是常驻状态行 */}
 
       </div>
 
@@ -578,21 +599,45 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
                 "flex items-center gap-1 rounded-t border border-b-0 border-border/60 px-2 py-1",
                 tab.id === activeId ? "bg-background font-medium" : "bg-muted/40 text-muted-foreground",
               )}
+              title={tabHint(tab)}
+              data-testid={`terminal-chip-${tab.id}`}
+              onContextMenu={(e) => {
+                // 右键 = 这块屏的本地菜单（重命名 / 关闭）。不用 window.prompt：
+                // WKWebView 里它根本不弹，用户会遇到"右键没反应"
+                e.preventDefault();
+                setMenu({ id: tab.id, x: e.clientX, y: e.clientY });
+              }}
             >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={tab.id === activeId}
-                className="flex items-center gap-1"
-                onClick={() => select(tab.id)}
-                data-testid={`terminal-tab-${tab.id}`}
-              >
-                <span
-                  className={cn("h-1.5 w-1.5 shrink-0 rounded-full", DOT_CLASS[tab.status])}
-                  data-testid={`terminal-dot-${tab.id}`}
+              {editingId === tab.id ? (
+                <input
+                  className="h-5 w-32 rounded border border-input bg-background px-1 font-mono text-10px"
+                  defaultValue={tab.title}
+                  autoFocus
+                  aria-label={t("hook.terminal.rename")}
+                  data-testid="terminal-rename-input"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitRename(tab.id, (e.target as HTMLInputElement).value);
+                    if (e.key === "Escape") setEditingId(null);
+                  }}
+                  onBlur={(e) => commitRename(tab.id, e.target.value)}
                 />
-                <span className="max-w-[10rem] truncate">{tab.title}</span>
-              </button>
+              ) : (
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={tab.id === activeId}
+                  className="flex items-center gap-1"
+                  onClick={() => select(tab.id)}
+                  onDoubleClick={() => startRename(tab.id)}
+                  data-testid={`terminal-tab-${tab.id}`}
+                >
+                  <span
+                    className={cn("h-1.5 w-1.5 shrink-0 rounded-full", DOT_CLASS[tab.status])}
+                    data-testid={`terminal-dot-${tab.id}`}
+                  />
+                  <span className="max-w-[10rem] truncate">{tab.title}</span>
+                </button>
+              )}
               <button
                 type="button"
                 className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
@@ -604,6 +649,38 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
               </button>
             </div>
           ))}
+          <span
+            className="ml-1 shrink-0 text-10px text-muted-foreground"
+            data-testid="terminal-count"
+            title={t("hook.terminal.countTip", { max: MAX_TERMINAL_SESSIONS })}
+          >
+            {tabCount}/{MAX_TERMINAL_SESSIONS}
+          </span>
+        </div>
+      )}
+
+      {menu && (
+        <div
+          className="fixed z-50 min-w-32 rounded-md border border-border/70 bg-card p-1 text-10px shadow-lg"
+          style={{ left: menu.x, top: menu.y }}
+          data-testid="terminal-tab-menu"
+        >
+          <button
+            type="button"
+            className="block w-full rounded px-2 py-1 text-left hover:bg-muted"
+            onClick={() => startRename(menu.id)}
+            data-testid="terminal-menu-rename"
+          >
+            {t("hook.terminal.rename")}
+          </button>
+          <button
+            type="button"
+            className="block w-full rounded px-2 py-1 text-left text-destructive hover:bg-muted"
+            onClick={() => void closeTab(menu.id)}
+            data-testid="terminal-menu-close"
+          >
+            {t("hook.terminal.close")}
+          </button>
         </div>
       )}
 

@@ -183,6 +183,21 @@ export class TerminalSessionStore {
     entry.bundle.term.refresh(0, rows);
   }
 
+  /**
+   * 改 tab 标题（右键菜单里的"重命名"）。
+   * 空串与纯空白一律拒绝：标题清空会让用户认不出这块屏连的是什么，
+   * 那比留着默认名更糟。超长截断而不是拒绝——用户不会为 40 字以外的事负责。
+   */
+  rename(id: string, title: string): boolean {
+    const entry = this.entries.find((item) => item.tab.id === id);
+    if (!entry) return false;
+    const trimmed = title.trim();
+    if (!trimmed) return false;
+    entry.tab.title = trimmed.slice(0, 40);
+    this.deps.onChange();
+    return true;
+  }
+
   /** 关掉一个 tab。运行中且没确认 → `needsConfirm`，什么都不杀。 */
   async close(id: string, options: { force?: boolean } = {}): Promise<CloseResult> {
     const at = this.entries.findIndex((entry) => entry.tab.id === id);

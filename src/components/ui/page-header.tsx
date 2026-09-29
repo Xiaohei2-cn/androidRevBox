@@ -17,22 +17,16 @@ export function PageHeader({
   actions?: React.ReactNode;
   className?: string;
 }) {
+  /**
+   * 标题**不再渲染**：左侧主 tab 栏已经写着同一个名字（用户原话：
+   * "每个主tab页已经展示该页功能了，没必要在窗口左上角再展示一遍"）。
+   * 那一行只有说明或动作时才有意义，否则整行撤掉，把高度还给内容。
+   */
+  if (!description && !actions) return null;
   return (
-    <div
-      className={cn(
-        "flex shrink-0 items-center gap-3 pb-4 pt-1",
-        className,
-      )}
-    >
+    <div className={cn("flex shrink-0 items-center gap-3 pb-2 pt-1", className)} aria-label={title}>
       <div className="min-w-0 flex-1">
-        <h1 className="truncate text-lg font-semibold leading-tight tracking-tight">
-          {title}
-        </h1>
-        {description && (
-          <p className="mt-1 truncate text-xs text-muted-foreground">
-            {description}
-          </p>
-        )}
+        {description && <p className="truncate text-xs text-muted-foreground">{description}</p>}
       </div>
       {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
     </div>

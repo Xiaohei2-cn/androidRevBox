@@ -233,7 +233,8 @@ describe("真终端页（FT1 分页）", () => {
     await waitFor(() => expect(rowsOf(tab2)).toContain("LONG-1"));
     await waitFor(() => expect(rowsOf(tab2)).toContain("LONG-2"));
     expect(screen.getByTestId("terminal-dot-term-2").className).toContain("bg-emerald-500");
-    expect(screen.getByTestId("terminal-status").textContent).toContain("会话在跑");
+    // 状态不再常驻界面：断言改成"每个 tab 的悬停提示里能看到状态"
+    expect(screen.getByTestId("terminal-chip-term-2").getAttribute("title")).toContain("会话在跑");
 
     // 第 1 个还能打字：切过去之后焦点就落在那块屏的输入元素里（键盘事件才有地方进）。
     // 注意这里只断言到"焦点归谁"——**按键字节进哪条会话**由 terminalStore 用真 xterm 钉，
@@ -243,6 +244,46 @@ describe("真终端页（FT1 分页）", () => {
     await waitFor(() => expect(tab1.contains(document.activeElement)).toBe(true));
     expect(document.activeElement?.tagName).toBe("TEXTAREA");
     expect(fake.closes).toEqual([]);
+  });
+
+  /**
+   * tab 右键 → 重命名 → 回车：标题改掉，而且改的是会话表里的真值
+   * （不是只改输入框的显示）。空名字必须被拒——标题清空后没人认得出这块屏连的是什么。
+   */
+  it("右键 tab 可以重命名，空名字不会把标题清掉", async () => {
+    const { container } = await renderPage();
+    await newTab(container);
+    const chip = () => screen.getByTestId("terminal-chip-term-1");
+    expect(chip().textContent).toContain("zsh 1");
+
+    fireEvent.contextMenu(chip());
+    await waitFor(() => expect(screen.getByTestId("terminal-tab-menu")).toBeTruthy());
+    fireEvent.click(screen.getByTestId("terminal-menu-rename"));
+    const input = await screen.findByTestId("terminal-rename-input");
+
+    // 先试空串：会话表应当拒绝，标题保持原样
+    fireEvent.change(input, { target: { value: "   " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(screen.queryByTestId("terminal-rename-input")).toBeNull());
+    expect(chip().textContent).toContain("zsh 1");
+
+    fireEvent.contextMenu(chip());
+    fireEvent.click(screen.getByTestId("terminal-menu-rename"));
+    const input2 = await screen.findByTestId("terminal-rename-input");
+    fireEvent.change(input2, { target: { value: "签名抓取" } });
+    fireEvent.keyDown(input2, { key: "Enter" });
+    await waitFor(() => expect(chip().textContent).toContain("签名抓取"));
+    // 悬停提示还在说状态与尺寸：撤掉常驻文字不等于把信息弄丢
+    expect(chip().getAttribute("title")).toContain("会话在跑");
+  });
+
+  /** tab 条上的计数：开第二个会话要看到 2/8（她认可的唯一数字） */
+  it("tab 条上显示当前会话数与上限", async () => {
+    const { container } = await renderPage();
+    await newTab(container);
+    expect(screen.getByTestId("terminal-count").textContent).toBe("1/8");
+    await newTab(container);
+    expect(screen.getByTestId("terminal-count").textContent).toBe("2/8");
   });
 
   /** 关一个运行中的会话 = 杀进程：第一次点只登记"待确认"，什么都不许杀。 */
@@ -274,7 +315,9 @@ describe("真终端页（FT1 分页）", () => {
     const { container } = await renderPage();
     await newTab(container);
     fake.exits.forEach((handler) => handler({ id: "pty-1", exitCode: 1, signal: null } as PtyExit));
-    await waitFor(() => expect(screen.getByTestId("terminal-status").textContent).toContain("已退出（1）"));
+    await waitFor(() =>
+      expect(screen.getByTestId("terminal-chip-term-1").getAttribute("title")).toContain("已退出（1）"),
+    );
 
     fireEvent.click(screen.getByTestId("terminal-close-term-1"));
     await waitFor(() => expect(screen.queryByTestId("terminal-tabs")).toBeNull());
@@ -301,7 +344,9 @@ describe("真终端页（FT1 分页）", () => {
 
     fireEvent.click(screen.getByTestId("terminal-stop"));
     await waitFor(() => expect(fake.closes).toEqual(["pty-1"]));
-    expect(screen.getByTestId("terminal-status").textContent).toContain("会话已停止");
+    expect(screen.getByTestId("terminal-tabs").textContent).toContain("zsh 1");
+    // 停止之后状态仍要能查到（悬停），只是不再占界面
+    expect(document.querySelector('[data-testid^="terminal-chip-"]')?.getAttribute("title")).toContain("会话已停止");
     expect(tab.textContent).toContain("KEEP-ME");
     expect(hostsOf(container).length).toBe(1);
   });
