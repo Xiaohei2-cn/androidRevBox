@@ -146,7 +146,10 @@ export function FridaPage() {
               onClick={() => setView(key)}
               aria-pressed={view === key}
               className={`rounded px-2 py-0.5 ${
-                view === key ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted/50"
+                view === key
+                  ? // 与 A 区分段选择同一个选中态语言：选中 = 主色
+                    "bg-primary text-primary-foreground"
+                  : "text-muted-foreground hover:bg-muted/50"
               }`}
               data-testid={`frida-view-${key}`}
             >

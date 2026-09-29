@@ -215,7 +215,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-function Segmented<T extends string>({
+export function Segmented<T extends string>({
   value,
   options,
   onChange,
@@ -242,7 +242,8 @@ function Segmented<T extends string>({
           className={cn(
             "rounded px-2 py-0.5 text-11px transition-colors",
             value === o.v
-              ? "bg-background text-foreground shadow-sm"
+              ? // 选中态走主色（和设置页分段选择、左侧 tab 齿块、启动按钮同一个蓝）
+                "bg-primary text-primary-foreground"
               : "text-muted-foreground hover:text-foreground",
           )}
         >
