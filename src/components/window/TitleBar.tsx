@@ -19,9 +19,11 @@ export function TitleBar() {
   return (
     <header
       data-tauri-drag-region
-      // 穿透模式下标题栏永远算实体：不然窗口拖不动、也关不掉，等于把自己锁死
+      // 穿透模式下标题栏永远算实体：不然窗口拖不动、也关不掉，等于把自己锁死（实色见 .app-titlebar）
       data-click-through="solid"
-      className="flex h-10 shrink-0 items-center gap-3 border-b border-border/60"
+      // 控制栏不许透明化（用户要求）：底色走 .app-titlebar 的满 alpha，
+      // 和「背景不透明度」脱钩——那条只调主体与齿块。
+      className="app-titlebar flex h-10 shrink-0 items-center gap-3 border-b border-border/60"
     >
       {/* macOS：控制按钮在左（对齐系统习惯，红黄绿顺序）；拖拽区在其右 */}
       {isMacLike && <WindowControls />}

@@ -109,6 +109,14 @@
     background-color: rgb(var(--app-bg-rgb) / var(--app-bg-alpha));
   }
 
+  /* 控制栏（窗口最上方那条可拖动的）永远实色：不参与「背景不透明度」。
+     它是窗口的 chrome——拖窗、最小化、关闭都在这条上。让它半透明，那些按钮就变成
+     "隔着背后的桌面猜"；穿透模式也从不让这里让出去（TitleBar 标 data-click-through=solid）。
+     ⚠️ 同样不许加 backdrop-filter/transform：见上面 .app-surface 那条闪烁修复。 */
+  .app-titlebar {
+    background-color: rgb(var(--app-bg-rgb) / 1);
+  }
+
   /* 路径/信息文本：允许选择与双击全选（全局 user-select:none 的例外，P7） */
   .path-selectable {
     user-select: all;

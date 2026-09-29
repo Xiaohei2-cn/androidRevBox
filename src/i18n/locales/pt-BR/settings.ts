@@ -13,7 +13,7 @@ export default {
 
   "settings.opacity.label": "Opacidade do fundo",
   "settings.opacity.hint":
-    "Define a opacidade do fundo da janela. É apenas um preenchimento translúcido — nada atrás da janela fica desfocado (o WebKit não desboca fora de uma janela transparente e essa implementação foi removida). Mínimo 20% para manter o conteúdo legível.",
+    "Define a opacidade do fundo da janela. É apenas um preenchimento translúcido — nada atrás da janela fica desfocado (o WebKit não desboca fora de uma janela transparente e essa implementação foi removida). Mínimo 20% para manter o conteúdo legível. A barra de controle no topo (a arrastável, com os botões da janela) nunca fica translúcida.",
 
   "settings.agentAuto.label": "Conectar o Agent automaticamente quando um dispositivo aparece",
   "settings.agentAuto.hint":

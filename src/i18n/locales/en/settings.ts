@@ -13,7 +13,7 @@ export default {
 
   "settings.opacity.label": "Background opacity",
   "settings.opacity.hint":
-    "Sets how opaque the window background is. It is a translucent fill only — nothing behind the window gets blurred (WebKit cannot blur outside a transparent window, and that implementation was removed). Minimum 20% so content stays readable.",
+    "Sets how opaque the window background is. It is a translucent fill only — nothing behind the window gets blurred (WebKit cannot blur outside a transparent window, and that implementation was removed). Minimum 20% so content stays readable. The top control bar (the draggable one with the window buttons) never goes translucent.",
 
   "settings.agentAuto.label": "Connect the Agent automatically when a device appears",
   "settings.agentAuto.hint":

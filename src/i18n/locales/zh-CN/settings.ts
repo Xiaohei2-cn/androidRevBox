@@ -13,7 +13,7 @@ export default {
 
   "settings.opacity.label": "背景不透明度",
   "settings.opacity.hint":
-    "调节窗口背景的不透明度。只是半透明着色，不会模糊背后的内容（WebKit 在透明窗口里模糊不到窗口外的东西，那条实现已删）。最低 20%，保证内容可读。",
+    "调节窗口背景的不透明度。只是半透明着色，不会模糊背后的内容（WebKit 在透明窗口里模糊不到窗口外的东西，那条实现已删）。最低 20%，保证内容可读。最上方那条控制栏（能拖动、带关闭按钮）不参与，永远实色。",
 
   "settings.agentAuto.label": "设备上线后自动连接 Agent",
   "settings.agentAuto.hint":
