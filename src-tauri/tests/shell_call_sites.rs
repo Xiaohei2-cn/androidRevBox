@@ -184,6 +184,24 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
         Category::RootBranch,
         Some("候选③：模块 companion 提供特权启动"),
     ),
+    // 第八十五轮（root 支路的启动没包 su 的修复）：启动命令的形状从 `hosted_run_as_root`
+    // 抽成这个纯构造函数，好让"到底包没包 su"变成可单测的事实而不是读代码读出来的印象。
+    // 调用点没有增加，只是从上面那个函数搬了下来——登记必须跟着实现走，所以这里也搬。
+    (
+        "src/services/device_service.rs",
+        "hosted_run_adb_args",
+        Category::RootBranch,
+        Some("候选③：模块 companion 提供特权启动"),
+    ),
+    // 起进程前把上一次的运行日志归档走（root 跑过一次会让日志变成 root:root 0644，
+    // 下次以 shell 起就写不动，进程压根没 exec）。这一条 root 支路要跟着包 su，
+    // 所以是**新增的一个 shell 调用点**：按纪律在下面把期望数从 5 提到 6。
+    (
+        "src/services/device_service.rs",
+        "hosted_retire_log_adb_args",
+        Category::RootBranch,
+        Some("候选③：模块 companion 提供特权启动后，桌面不再自己收尾日志"),
+    ),
     (
         "src/services/device_service.rs",
         "read_hosted_log",
@@ -212,7 +230,10 @@ const EXPECTED_SITES_PER_CATEGORY: &[(Category, usize)] = &[
     // 固定提权脚本（先核身份再发信号），桌面侧那个 shell 调用点因此消失 —— AR12 少一项可删的
     // Legacy。这里跟着下调，是为了让"少一个回退点"也变成会被机器看见的事实，而不是悄悄发生。
     (Category::LegacyFallback, 7),
-    (Category::RootBranch, 5),
+    // 5 → 6（第八十五轮）：新增的是"起进程前归档旧日志"那一条（root 支路必须与启动同一身份）。
+    // 同一个批次里把启动命令从 `hosted_run_as_root` 抽到 `hosted_run_adb_args`，调用点没变多，
+    // 只是换了归属——数字要动就得在这里留一句话，跟当年 AR7.6 少一个点要改数是同一条纪律。
+    (Category::RootBranch, 6),
 ];
 
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {

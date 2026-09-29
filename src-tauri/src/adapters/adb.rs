@@ -478,6 +478,26 @@ pub fn hosted_run_cmd(name: &str, log: &str, carried: HostedCarried) -> String {
     )
 }
 
+/// 把上一次的运行日志**归档**，让本次启动写到自己的新文件里。
+///
+/// 为什么必须做（真机撞到的）：日志文件是**谁起就谁拥有**的。以前以 root 跑过一次，
+/// 文件就成了 `root:root 0644`；下一次以 shell 身份起（Agent 就是 shell）时
+/// `> 同一个文件` 直接被拒 —— `Permission denied`，进程根本没起来。
+/// 而旧代码接着去读那份日志找"死因"，读到的却是**上一次**的内容，
+/// 于是界面把"程序正在正常干活"的三行贴成"启动后立即退出"（用户原话：真终端里明明没问题）。
+///
+/// 三条形状要求：
+/// - 只留一份 `.prev`（先 `rm -f` 再 `mv`），不然点一次攒一个垃圾；
+/// - 用 `mv` 不用删：上一次到底输出了什么，排查时是有用的证据；
+/// - 结尾 `true`：没有旧文件（首次运行）或搬不动时**不该把整条命令的退出码带歪**——
+///   调用方靠退出码判断"命令有没有跑起来"，这里不能污染它。
+///
+/// 目录 `/data/local/tmp` 是 `drwxrwx--x shell`（无 sticky 位），实测 shell 可以
+/// rm/mv 掉 root 拥有的文件，所以两条支路都能用同一条命令。
+pub fn hosted_retire_log_cmd(log: &str) -> String {
+    format!("rm -f {log}.prev; mv -f {log} {log}.prev 2>/dev/null; true")
+}
+
 /// root 支路这次要不要带参数文件 / stdin 文件
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HostedCarried {
@@ -1218,6 +1238,25 @@ mod tests {
     /// 第一层的核心安全断言：**参数值与 stdin 内容永远不出现在命令行里**，
     /// 命令行只出现固定的文件路径。root 支路历史上就是栽在"把参数拼进 su -c 的引号里"
     /// （实测含分号的参数会把分号后面的命令以 root 执行）。
+    #[test]
+    fn hosted_retire_log_cmd_keeps_one_prev_and_never_fails_the_chain() {
+        let cmd = hosted_retire_log_cmd("/data/local/tmp/.auth-server.run.log");
+        // 只留一份 .prev：先删旧的再搬，避免点一次攒一个
+        assert_eq!(
+            cmd,
+            "rm -f /data/local/tmp/.auth-server.run.log.prev; \
+             mv -f /data/local/tmp/.auth-server.run.log /data/local/tmp/.auth-server.run.log.prev \
+             2>/dev/null; true"
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // 结尾必须是 true：首次运行没有旧文件，mv 失败不该把退出码带歪
+        assert!(cmd.ends_with("; true"), "{cmd}");
+        // su_wrap 的前提：整条命令不能含单引号，否则包裹会被自己截断
+        assert!(!cmd.contains('\''), "{cmd}");
+    }
+
     #[test]
     fn hosted_run_cmd_keeps_carried_values_out_of_the_command_line() {
         let log = "/data/local/tmp/.toybox.run.log";

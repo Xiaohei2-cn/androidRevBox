@@ -1205,7 +1205,7 @@ impl DeviceService {
         // 都不知道，勾了也不给——与其悄悄忽略，不如当场说清该换哪条路。
         if root && interactive {
             return Err(CoreError::InvalidInput(
-                "Root 支路没有输入通道（进程由 su 起，本工具不持有它的 stdin）。                 要运行中持续输入就取消 Root 走 Agent；一次性启动输入在 Root 支路照样可用"
+                "Root 支路没有输入通道（进程由 su 起，本工具不持有它的 stdin）。要运行中持续输入就取消 Root 走 Agent；一次性启动输入在 Root 支路照样可用"
                     .to_string(),
             ));
         }
@@ -1222,6 +1222,11 @@ impl DeviceService {
             );
             return Ok(view);
         }
+        // **先把上一次的日志归档走**（两条支路都要）：日志是谁起就谁拥有，
+        // root 跑过一次之后文件就是 root:root 0644，下一次以 shell 起时重定向会被拒——
+        // 进程压根没起来，而我们还去读那份旧日志当"本次死因"，界面上就成了"程序在正常干活却说它秒退"。
+        // 这一步放在"已经在跑"检查之后：那种情况下不该把别人正在写的日志搬走。
+        self.retire_hosted_log(serial, name, root).await;
         if root {
             return self.hosted_run_as_root(serial, name, args, stdin).await;
         }
@@ -1460,6 +1465,57 @@ impl DeviceService {
     /// nohup 一段进后台，nohup exec 后 pid 即二进制 pid。整段经 su -c 单引号包裹：
     /// 外层 shell 不动 `&`/`$!`/重定向，由 root 内层 shell 解释（否则 su 只收到 `cd`）。
     #[allow(clippy::too_many_arguments)]
+    /// 归档旧日志的 adb 参数（root 支路必须与启动同一身份，见 `hosted_run_adb_args` 的注释）。
+    fn hosted_retire_log_adb_args(serial: &str, log: &str, root: bool) -> Vec<String> {
+        let cmd = adb::hosted_retire_log_cmd(log);
+        let cmd = if root { adb::su_wrap(&cmd) } else { cmd };
+        adb::build_args(Some(serial), &adb::cmd_shell(&cmd))
+    }
+
+    /// 起托管进程前的收尾：把上一次的日志搬成 `.prev`。
+    ///
+    /// **搬不动也不算失败**（首次运行本来就没有、或者目录被别的 ROM 加了限制）：
+    /// 那不该阻止用户执行他的二进制。但要在报错里留一句——不然下一次"死因是旧日志"
+    /// 这种坑又回来了，而且没人知道。
+    async fn retire_hosted_log(&self, serial: &str, name: &str, root: bool) {
+        let log = adb::hosted_run_log(name);
+        let args = Self::hosted_retire_log_adb_args(serial, &log, root);
+        match self.run_adb(&args).await {
+            Ok(out) if out.exit_code == Some(0) => {}
+            Ok(out) => tracing::debug!(
+                serial,
+                name,
+                code = ?out.exit_code,
+                stderr = %out.stderr.trim(),
+                "归档托管日志没成功（不阻断启动，但下面的输出可能是上一次的）"
+            ),
+            Err(error) => tracing::debug!(
+                serial,
+                name,
+                error = %error,
+                "归档托管日志的命令没跑起来（不阻断启动）"
+            ),
+        }
+    }
+
+    /// 起进程与查活**必须同一身份**（root 支路）。
+    ///
+    /// 这条以前是坏的：启动那条命令没包 `su`（以 shell 身份跑），而 0.3 秒后的复查包了 `su`。
+    /// 后果不是"权限小了"这么简单——以 shell 身份写不动 root 拥有的日志时，
+    /// `> 日志` 直接被拒、进程压根没 exec，可 `echo $!` 照样吐一个 pid、外层退出码还是 0，
+    /// 于是界面收到的是"启动后立即退出 + 上一次日志的最后三行"。
+    fn hosted_run_adb_args(
+        serial: &str,
+        name: &str,
+        log: &str,
+        carried: adb::HostedCarried,
+        root: bool,
+    ) -> Vec<String> {
+        let cmd = adb::hosted_run_cmd(name, log, carried);
+        let cmd = if root { adb::su_wrap(&cmd) } else { cmd };
+        adb::build_args(Some(serial), &adb::cmd_shell(&cmd))
+    }
+
     async fn hosted_run_as_root(
         &self,
         serial: &str,
@@ -1496,8 +1552,7 @@ impl DeviceService {
             let _ = self.rm_carried_files(serial, name, carried).await;
             return Err(error);
         }
-        let run_cmd = adb::hosted_run_cmd(name, &log, carried);
-        let adb_args = adb::build_args(Some(serial), &adb::cmd_shell(&run_cmd));
+        let adb_args = Self::hosted_run_adb_args(serial, name, &log, carried, root);
         let out = match self.run_adb(&adb_args).await {
             Ok(out) => out,
             Err(error) => {
@@ -1505,11 +1560,11 @@ impl DeviceService {
                 return Err(error);
             }
         };
+        // 启动命令的 stderr：这次的真死因（`can't create ...: Permission denied`）就在这里，
+        // 以前因为外层退出码是 0 而被整段丢掉，界面上只剩一句误导人的"启动后立即退出"。
+        let start_stderr = out.stderr.trim().to_string();
         if out.exit_code != Some(0) {
-            return Err(CoreError::Internal(format!(
-                "启动失败: {}",
-                out.stderr.trim()
-            )));
+            return Err(CoreError::Internal(format!("启动失败: {start_stderr}")));
         }
         let pid = match adb::parse_run_pid(&out.stdout) {
             Some(pid) => pid,
@@ -1541,9 +1596,16 @@ impl DeviceService {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default();
             let detail = adb::run_log_diagnostics(&cause)
-                .unwrap_or_else(|| format!("（无输出可参考；完整日志见 {log}）"));
+                .unwrap_or_else(|| format!("（本次运行没有任何输出；完整日志见 {log}）"));
+            // 顺序刻意是"启动命令自己的 stderr 在前"：那条才是进程没 exec 时的第一手证据，
+            // 日志内容可能是"程序跑起来之后打的"，混在一句话里容易把人带偏。
+            let stderr_part = if start_stderr.is_empty() {
+                String::new()
+            } else {
+                format!("（启动命令的错误输出：{start_stderr}）")
+            };
             return Err(CoreError::Internal(format!(
-                "{name} 启动后立即退出：{detail}"
+                "{name} 启动后立即退出：{stderr_part}{detail}"
             )));
         }
         // AR7.7：root 支路的启动不经过 Agent，运行表里没有这条记录——不补登记的话，
@@ -3722,6 +3784,65 @@ mod tests {
     }
 
     /// AR7.2 等价性：Agent 的托管条目映射后必须与 Legacy `ls -l` + `file` 的组合结果同形。
+    /// 第八十五轮的真机教训钉成测试：**启动与查活必须同一身份**。
+    ///
+    /// 之前 root 支路的"查活"包了 `su` 而"启动"没包，于是以 shell 身份去写
+    /// 一份属于 root 的日志：重定向被拒、进程压根没 exec，可 `echo $!` 照样吐 pid、
+    /// 外层退出码还是 0 —— 用户收到的就是一句误导人的"启动后立即退出"。
+    /// 这条断言盯的不是"有没有 su 字样"这种表面，而是**两条命令的形状必须一致**。
+    #[test]
+    fn hosted_root_branch_launches_with_the_same_identity_it_checks_with() {
+        let log = adb::hosted_run_log("auth-server");
+        let carried = adb::HostedCarried::default();
+        let launch =
+            DeviceService::hosted_run_adb_args("SERIAL", "auth-server", &log, carried, true)
+                .join(" ");
+        let check = adb::build_args(
+            Some("SERIAL"),
+            &adb::cmd_shell(&adb::su_wrap(
+                "sleep 0.3; kill -0 12345 2>/dev/null && echo alive || echo dead",
+            )),
+        )
+        .join(" ");
+        assert!(
+            launch.contains("su -c 'cd /data/local/tmp; nohup ./auth-server"),
+            "root 支路的启动必须真的以 root 起: {launch}"
+        );
+        assert!(
+            check.contains("su -c '"),
+            "对照用：查活一直是包 su 的: {check}"
+        );
+        // 两条都提权，才不会出现"以 shell 起、以 root 查"的错位
+        assert_eq!(
+            launch.contains("su -c '"),
+            check.contains("su -c '"),
+            "启动与查活的身份不一致: {launch} / {check}"
+        );
+        // 非 root 支路绝不偷偷提权（那是 Agent 的地盘，且界面勾的是"不用 root"）
+        let plain =
+            DeviceService::hosted_run_adb_args("SERIAL", "auth-server", &log, carried, false)
+                .join(" ");
+        assert!(!plain.contains("su -c"), "非 root 支路不许包 su: {plain}");
+        assert!(plain.contains("nohup ./auth-server"), "{plain}");
+    }
+
+    /// 归档旧日志同样要跟着身份走：root 支路里那是个 root 拥有的文件，
+    /// shell 搬得动（目录不归 sticky），但复查/后续读日志都按 root 来，一致才不出现半提权状态。
+    #[test]
+    fn hosted_log_retire_follows_the_branch_identity() {
+        let log = adb::hosted_run_log("auth-server");
+        let root = DeviceService::hosted_retire_log_adb_args("SERIAL", &log, true).join(" ");
+        let plain = DeviceService::hosted_retire_log_adb_args("SERIAL", &log, false).join(" ");
+        assert!(root.contains("su -c 'rm -f "), "{root}");
+        assert!(root.contains(".run.log.prev"), "只留一份 .prev: {root}");
+        assert!(!plain.contains("su -c"), "{plain}");
+        // 归档失败（比如根本没有旧文件）不许把退出码带歪：调用方靠退出码判断命令跑没跑起来
+        assert!(
+            plain.ends_with("; true"),
+            "归档命令必须以 true 收尾: {plain}"
+        );
+    }
+
     #[test]
     fn agent_hosted_binaries_match_legacy_listing() {
         let info = |name: &str, mode: u32, size: u64| HostedBinaryInfo {
