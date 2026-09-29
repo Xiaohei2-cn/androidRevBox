@@ -30,7 +30,12 @@ import type { FridaSettings } from "@/features/hook/frida/types";
 import { deviceShellLaunch } from "@/lib/deviceShell";
 import { planFridaSession, type FridaSessionBlock } from "@/lib/fridaSession";
 import { collectTranscript, transcriptFileName, transcriptText } from "@/lib/terminalTranscript";
-import { MAX_TERMINAL_SESSIONS, TerminalSessionStore, type TerminalTab } from "@/lib/terminalStore";
+import {
+  MAX_TERMINAL_SESSIONS,
+  TerminalSessionStore,
+  type CreateTabResult,
+  type TerminalTab,
+} from "@/lib/terminalStore";
 import "@xterm/xterm/css/xterm.css";
 
 /**
@@ -56,6 +61,28 @@ function fridaBlockText(
       return t("hook.terminal.fridaNoScript");
     case "spawn-needs-package":
       return t("hook.terminal.fridaNoPackage");
+  }
+}
+
+/**
+ * 起会话被拒时的三种原因，各说各的。
+ * 特别地：`store-disposed`（这张表被收过）以前会一路混成"先说要跑什么程序"——
+ * 那是对着一个填得好好的命令框说谎。
+ */
+function createBlockText(
+  created: Exclude<CreateTabResult, { ok: true }>,
+  t: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  switch (created.reason) {
+    case "limit":
+      // 用表实际给出的上限，不写死：测试里会注入更小的值
+      return t("hook.terminal.limit", { max: created.max });
+    case "empty-program":
+      return t("hook.terminal.emptyProgram");
+    // 表被收过 / 起进程本身失败：都不是"你输入错了"，说成一次操作失败
+    case "store-disposed":
+    case "start-failed":
+      return t("hook.terminal.failedCreate");
   }
 }
 
@@ -105,7 +132,6 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
   const [program, setProgram] = useState("");
   const [argsText, setArgsText] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
-  const [hint, setHint] = useState<string | null>(null);
   const [presetBusy, setPresetBusy] = useState(false);
   const [saveOutcome, setSaveOutcome] = useState<{ ok: boolean; text: string } | null>(null);
   const [saving, setSaving] = useState(false);
@@ -133,7 +159,10 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
     storeRef.current = next;
     return next;
   };
-  const store = ensureStore();
+  // **这里不再抓一张表当变量**：动作全部在调用时 `ensureStore()` 现取。
+  // 渲染期抓的那一张会被 StrictMode 的假卸载 dispose 掉，之后的点击全打在废表上 ——
+  // 第八十九轮用户看到的"先说要跑什么程序"就是这么来的（那其实是"表被收了"，
+  // 一句与命令框无关的话被摆在了命令框旁边）。
 
   useEffect(() => {
     void ptyApi
@@ -182,11 +211,12 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
     // 切回来必须重新量一次：隐藏时量到 0，fit 什么都不改（R-03），
     // "刚变可见"这一刻是唯一能把它对齐的机会（ResizeObserver 也会在这里补一次）
     requestAnimationFrame(() => {
-      store.fit(id);
-      store.repaint(id);
-      store.focus(id);
+      const live = ensureStore();
+      live.fit(id);
+      live.repaint(id);
+      live.focus(id);
     });
-  }, [store]);
+  }, []);
 
   /**
    * 起会话卡在"starting"超过 2 秒就**主动说话**。
@@ -220,34 +250,30 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
         tab.id,
         setTimeout(() => {
           timers.delete(tab.id);
-          const now = storeRef.current?.tabs().find((item) => item.id === tab.id);
+          const now = ensureStore().tabs().find((item) => item.id === tab.id);
           if (now?.status === "starting") {
             setNotice(t("hook.terminal.stalled", { program: now.program }));
           }
         }, STALL_REPORT_MS),
       );
     }
-  }, [store, t, tabs]);
+  }, [t, tabs]);
 
   const createTab = useCallback(async () => {
     setNotice(null);
     const args = argsText.trim() ? argsText.trim().split(/\s+/) : [];
-    const created = await store.create({ program, args });
+    const created = await ensureStore().create({ program, args });
     if (!created) return;
     if (!created.ok) {
-      setNotice(
-        created.reason === "limit"
-          ? t("hook.terminal.limit", { max: created.max })
-          : t("hook.terminal.emptyProgram"),
-      );
+      setNotice(createBlockText(created, t));
       return;
     }
     setActiveId(created.id);
-  }, [argsText, program, store, t]);
+  }, [argsText, program, t]);
 
   const closeTab = useCallback(
     async (id: string) => {
-      const store2 = store;
+      const store2 = ensureStore();
       if (pendingClose !== id) {
         // 第一次点：只登记"待确认"。运行中的会话在这里就杀进程是不可接受的
         const tab = store2.tabs().find((item) => item.id === id);
@@ -260,7 +286,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
       }
       await finishClose(store2, id, setActiveId, setPendingClose, t);
     },
-    [pendingClose, store, t],
+    [pendingClose, t],
   );
 
   /**
@@ -272,8 +298,6 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
    */
   const createDeviceShell = useCallback(async () => {
     setNotice(null);
-    setHint(null);
-    setPresetBusy(true);
     try {
       const [env, devices] = await Promise.all([deviceApi.environment(), deviceApi.list(true)]);
       const online = devices.filter((d) => d.state === "device");
@@ -282,7 +306,8 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
         setNotice(built.block === "no-adb" ? t("hook.terminal.deviceNoAdb") : t("hook.terminal.deviceNoSerial"));
         return;
       }
-      const created = await store.create({
+      const live = ensureStore();
+      const created = await live.create({
         program: built.launch.program,
         args: built.launch.args,
         kind: "device",
@@ -293,17 +318,12 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
         return;
       }
       setActiveId(created.id);
-      setHint(
-        online.length > 1
-          ? t("hook.terminal.deviceMulti", { serial: online[0].serial, count: online.length })
-          : t("hook.terminal.devicePicked", { serial: online[0].serial }),
-      );
     } catch (reason) {
       setNotice(String((reason as Error)?.message ?? reason));
     } finally {
       setPresetBusy(false);
     }
-  }, [store, t]);
+  }, [t]);
 
   /**
    * 起一个**官方 frida REPL** 会话（FT3 路 B）。这里不自己拼参数：
@@ -315,7 +335,6 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
   const launchFrida = useCallback(
     async (request: FridaLaunchRequest) => {
       setNotice(null);
-      setHint(null);
       setPresetBusy(true);
       try {
         const python = await envApi.python();
@@ -326,7 +345,8 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
           setNotice(fridaBlockText(planned.block, t, python.path));
           return;
         }
-        const created = await store.create({
+        const live = ensureStore();
+        const created = await live.create({
           program: planned.plan.program,
           args: planned.plan.args,
           kind: "frida",
@@ -341,15 +361,14 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
           return;
         }
         setActiveId(created.id);
-        stampCommand(store, created.id, planned.plan.program, planned.plan.args);
-        setHint(t("hook.terminal.fridaStarted", { version: planned.plan.toolsVersion }));
+        stampCommand(live, created.id, planned.plan.program, planned.plan.args);
       } catch (reason) {
         setNotice(String((reason as Error)?.message ?? reason));
       } finally {
         setPresetBusy(false);
       }
     },
-    [store, t],
+    [t],
   );
 
   /**
@@ -374,7 +393,7 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
    */
   const saveActive = useCallback(async () => {
     if (!active || saving) return;
-    const bundle = store.bundle(active.id);
+    const bundle = ensureStore().bundle(active.id);
     if (!bundle) return;
     setSaveOutcome(null);
     const snapshot = collectTranscript(bundle.term, query);
@@ -404,25 +423,25 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
     } finally {
       setSaving(false);
     }
-  }, [active, query, saving, store, t]);
+  }, [active, query, saving, t]);
 
   const stopActive = useCallback(async () => {
     if (!active) return;
     setNotice(null);
-    await store.stop(active.id);
-  }, [active, store]);
+    await ensureStore().stop(active.id);
+  }, [active]);
 
   const search = useCallback(
     (next: boolean) => {
       if (!active || !query) return;
-      const bundle = store.bundle(active.id);
+      const bundle = ensureStore().bundle(active.id);
       if (!bundle) return;
       // **只下指令，不自己数命中**：命中数由 addon-search 的结果事件回来（下面的订阅），
       // 自己按 findNext 的布尔值猜一个数，就是把"没有命中"和"命中 1 处"混成一件事
       if (next) bundle.search.findNext(query);
       else bundle.search.findPrevious(query);
     },
-    [active, query, store],
+    [active, query],
   );
 
   const activeIdForSearch = active?.id ?? null;
@@ -431,11 +450,11 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
       setHits(null);
       return undefined;
     }
-    const bundle = store.bundle(activeIdForSearch);
+    const bundle = ensureStore().bundle(activeIdForSearch);
     if (!bundle) return undefined;
     const disposable = bundle.search.onDidChangeResults((event) => setHits(event.resultCount));
     return () => disposable.dispose();
-  }, [activeIdForSearch, store]);
+  }, [activeIdForSearch]);
 
   // 尺寸跟着容器走：每个 tab 各看自己的宿主（隐藏的那个量到 0，不会改动它的尺寸）
   useEffect(() => {
@@ -444,13 +463,14 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
       // 页面整体重新可见（Hook 子标签切走又切回）也走这里：尺寸一从 0 变成有值，
     // 除了量一次尺寸还要补一次重绘，否则隐藏期间到达的字节就一直不进屏
     hostsRef.current.forEach((el, id) => {
-      if (store.fit(id)) store.repaint(id);
-      else if (el.clientWidth > 0) store.repaint(id);
+      const live = ensureStore();
+      if (live.fit(id)) live.repaint(id);
+      else if (el.clientWidth > 0) live.repaint(id);
     });
     });
     hostsRef.current.forEach((el) => observer.observe(el));
     return () => observer.disconnect();
-  }, [store, tabs.length]);
+  }, [tabs.length]);
 
   const tabCount = tabs.length;
   useEffect(() => {
@@ -653,25 +673,13 @@ export function TerminalPanel({ fridaLaunch }: TerminalPanelProps) {
         )}
       </div>
 
-      {hint && (
-        <p className="shrink-0 text-10px text-emerald-500" data-testid="terminal-hint">
-          {hint}
-        </p>
-      )}
-      <p className="shrink-0 text-10px text-muted-foreground">{t("hook.terminal.hint")}</p>
+
       {notice && (
         <p className="shrink-0 break-all text-10px text-destructive" data-testid="terminal-error">
           {notice}
         </p>
       )}
 
-      {tabCount === 0 && (
-        // 空态要说清这块屏能起什么：这个位置现在是 frida 的控制台，
-        // 点左侧脚本起的是官方 frida；这两个按钮是另外两种会话
-        <div className="shrink-0 rounded border border-border/60 bg-muted/20 px-2 py-1.5 text-10px text-muted-foreground" data-testid="terminal-empty">
-          {t("hook.terminal.empty")}
-        </div>
-      )}
       {/* 每块屏都有自己的宿主：非活动 tab 只是 hidden，实例与缓冲区一直活着（分页那条验收的根） */}
       <div className="relative min-h-0 flex-1">
         {tabs.map((tab) => (

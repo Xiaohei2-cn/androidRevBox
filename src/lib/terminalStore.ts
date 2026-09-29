@@ -56,6 +56,9 @@ export type CreateTabResult =
   | { ok: true; id: string }
   | { ok: false; reason: "limit"; max: number }
   | { ok: false; reason: "empty-program" }
+  /** 这张表已经被收过（卸载/StrictMode 假卸载）：**必须与"程序为空"分开报**，
+   * 否则界面会对着一张填得好好的命令框说"先说要跑什么程序"。 */
+  | { ok: false; reason: "store-disposed" }
   | { ok: false; reason: "start-failed"; message: string };
 
 export type CloseResult =
@@ -200,7 +203,7 @@ export class TerminalSessionStore {
 
   /** 新开一个 tab：旧的**一个都不动**。 */
   async create(input: CreateTabInput): Promise<CreateTabResult> {
-    if (this.disposed) return { ok: false, reason: "empty-program" };
+    if (this.disposed) return { ok: false, reason: "store-disposed" };
     if (this.entries.length >= this.maxSessions) {
       return { ok: false, reason: "limit", max: this.maxSessions };
     }

@@ -509,9 +509,9 @@ describe("真终端页（FT1 分页）", () => {
       "shell",
       "-tt",
     ]);
-    // 标题带序列号：多设备时用户得看得见这块屏连的是哪台
+    // 序列号写进 tab 标题（那是终端自己的信息），界面 chrome 上不另说一句
     expect(screen.getByTestId("terminal-tabs").textContent).toContain("adb shell @ 600FL4");
-    expect(screen.getByTestId("terminal-hint").textContent).toContain("18271FDF600FL4");
+    expect(screen.queryByTestId("terminal-hint")).toBeNull();
   });
 
   /** 没设备就是开不了：不许起一条 `adb -s "" shell` 之类的空会话糊弄界面。 */
@@ -535,16 +535,45 @@ describe("真终端页（FT1 分页）", () => {
   });
 
   /** 多设备时必须说清用了哪一台——静默挑第一台是会让人误判"我在这台上操作"的那种错。 */
-  it("多台在线时说清用的是第一台、一共几台", async () => {
+  /**
+   * 多设备时**不许静默挑一台**：这里不用界面文案证明，而是钉"用的是哪台"必须能从
+   * 交给 PTY 的参数里读出来（tab 标题带着序列号，界面上不再另说一句说明文字）。
+   */
+  it("多台在线时用第一台，并把序列号写进 tab 标题而不是界面文案", async () => {
     adb.devices = [
       { serial: "AAA111", state: "device", transport: "usb", model: "" },
       { serial: "BBB222", state: "device", transport: "usb", model: "" },
     ];
     await renderPage();
     fireEvent.click(screen.getByTestId("terminal-device-shell"));
-    await waitFor(() => expect(screen.getByTestId("terminal-hint")).toBeTruthy());
-    expect(screen.getByTestId("terminal-hint").textContent).toContain("AAA111");
-    expect(screen.getByTestId("terminal-hint").textContent).toContain("2");
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
+    expect(vi.mocked(ptyApi.open).mock.calls[0][0].args).toEqual(["-s", "AAA111", "shell", "-tt"]);
+    expect(screen.getByTestId("terminal-tabs").textContent).toContain("AAA111");
+    expect(screen.queryByTestId("terminal-hint")).toBeNull();
+  });
+
+  /**
+   * 假卸载之后必须能用：StrictMode 会 mount→cleanup→mount，cleanup 里我们按 R-08 收了摊。
+   * 如果动作抓着"渲染时那张表"，之后的点击全打在废表上 ⇒ 用户看到的就是"点了没反应"。
+   */
+  it("面板被重新挂载之后，点新建仍然起得来一条会话", async () => {
+    const first = render(
+      <I18nProvider>
+        <TerminalPanel />
+      </I18nProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
+    first.unmount();
+
+    render(
+      <I18nProvider>
+        <TerminalPanel />
+      </I18nProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("terminal-new"));
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
+    expect(screen.queryByTestId("terminal-error")).toBeNull();
   });
 
   /** R-08：离开页面才是批量收摊的地方，三条活会话各关一次，一条不留。 */

@@ -330,6 +330,22 @@ describe("终端会话表（FT1）", () => {
     expect(api.transport.open).not.toHaveBeenCalled();
   });
 
+  /**
+   * 已收摊的表必须**如实说"表被收了"**。
+   * 它以前返回 `empty-program`，于是界面会在一个填得好好的命令框旁边说"先说要跑什么程序"
+   * ——那是把内部状态谎报成用户的输入错误（第八十九轮用户的截图就是这么来的）。
+   */
+  it("已 disposeAll 的表报 store-disposed，不谎称程序为空", async () => {
+    const api = fakeTransport();
+    const store = new TerminalSessionStore({
+      transport: api.transport,
+      onChange: () => undefined,
+      makeBundle: (options) => fakeBundle(options.cols, options.rows).bundle,
+    });
+    store.disposeAll();
+    expect(await store.create({ program: "/bin/zsh", args: [] })).toEqual({ ok: false, reason: "store-disposed" });
+  });
+
   /** 快照必须是"值"：调用方拿到内部对象的话，React 的比较与保活就都不算了。 */
   it("tabs() 给的是快照，改不动内部状态", async () => {
     const { store } = await opened();
