@@ -32,6 +32,8 @@ function fakeBundle(cols: number, rows: number): FakeBundle {
     open,
     focus,
     write,
+    getSelection: () => "",
+    paste: () => undefined,
     resize: vi.fn(),
     dispose: disposeTerm,
     onData: () => ({ dispose: () => undefined }),
@@ -147,6 +149,41 @@ describe("终端会话表（FT1）", () => {
     await Promise.resolve();
     expect(api.transport.open).toHaveBeenCalledTimes(1);
     expect(store.tabs()[0].status).toBe("running");
+  });
+
+  /**
+   * 右键菜单的两条底层能力：**选区取自终端自己**（我们不解析内容），
+   * **粘贴必须走 `term.paste()`**——只有它才会按 bracketed paste 模式包起来（C-07），
+   * 自己拼字节就等于把多行粘贴变成"连着敲回车执行"。
+   */
+  it("selection 取终端选区；paste 走 term.paste", async () => {
+    const api = fakeTransport();
+    const fakes: FakeBundle[] = [];
+    const store = new TerminalSessionStore({
+      transport: api.transport,
+      onChange: () => undefined,
+      makeBundle: (options) => {
+        const fake = fakeBundle(options.cols, options.rows);
+        fakes.push(fake);
+        return fake.bundle;
+      },
+    });
+    const created = await store.create({ program: "/bin/zsh", args: [] });
+    const id = created.ok ? created.id : "";
+    expect(store.selection(id), "还没挂载时不该有选区").toBe("");
+    expect(store.paste(id, "ls\n"), "还没挂载时不该假装粘贴成功").toBe(false);
+
+    store.mount(id, document.createElement("div"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    (fakes[0].bundle.term as unknown as { getSelection: () => string }).getSelection = () => "sign=abc";
+    expect(store.selection(id)).toBe("sign=abc");
+
+    const pasted: string[] = [];
+    (fakes[0].bundle.term as unknown as { paste: (t: string) => void }).paste = (text: string) => {
+      pasted.push(text);
+    };
+    expect(store.paste(id, "sign=abc")).toBe(true);
+    expect(pasted).toEqual(["sign=abc"]);
   });
 
   /**

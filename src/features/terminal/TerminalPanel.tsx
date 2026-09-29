@@ -89,15 +89,14 @@ function createBlockText(
 /** 卡住多久算"该说话了"：真机实测正常路径是 0.2 秒级（PTY 起来 + 首屏字节到屏），2 秒已经很宽 */
 const STALL_REPORT_MS = 2000;
 
-/** 右键菜单的项（顺序=使用频率）。文案全在词典里，这里只放键名 */
-const MENU_ITEMS = [
-  { key: "copy", danger: false },
-  { key: "paste", danger: false },
-  { key: "copyPath", danger: false },
-  { key: "rename", danger: false },
-  { key: "new", danger: false },
-  { key: "close", danger: true },
-] as const;
+/**
+ * 两份菜单（用户纠正过的分工）：
+ * - 标签上：只有 `rename`——标签只负责"这条会话叫什么"；
+ * - 屏里：`copy / paste / copyPath / new / close`——都是对这块终端本身做的事。
+ * 键名对应词典里的 `hook.terminal.menu.<键>`，文案不在代码里写。
+ */
+const TAB_MENU_ITEMS = ["rename"] as const;
+const PANE_MENU_ITEMS = ["copy", "paste", "copyPath", "new", "close"] as const;
 
 const DOT_CLASS: Record<TerminalTab["status"], string> = {
   running: "bg-emerald-500",
@@ -347,11 +346,11 @@ export function TerminalPanel({ fridaLaunch, host = "local" }: TerminalPanelProp
 
   /** 菜单动作：复制选区 / 粘贴 / 复制这块屏在跑什么的路径 */
   const menuAction = useCallback(
-    async (kind: "copy" | "paste" | "copyPath", id: string) => {
+    async (kind: "copy" | "paste" | "copyPath", id: string, preselected?: string) => {
       const live = ensureStore();
       setMenu(null);
       if (kind === "copy") {
-        const text = live.selection(id);
+        const text = preselected ?? live.selection(id);
         if (!text) {
           setNotice(t("hook.terminal.noSelection"));
           return;
@@ -533,13 +532,37 @@ export function TerminalPanel({ fridaLaunch, host = "local" }: TerminalPanelProp
     else if (!tabs.some((tab) => tab.id === activeId)) setActiveId(tabs[tabCount - 1].id);
   }, [tabCount, tabs, activeId]);
 
-  const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  /**
+   * 两个位置、两份菜单（用户纠正）：
+   * - **标签上**右键 = 只有「重命名」，那是标签自己的事；
+   * - **屏里**右键 = 复制 / 粘贴 / 复制当前路径 / 新建终端 / 关闭，那是终端的操作。
+   * 选区在按下右键时就抓下来：等到点"复制"时选区可能已经被清了，那时再取会拿到空串。
+   */
+  const [menu, setMenu] = useState<
+    | { kind: "tab"; id: string; x: number; y: number }
+    | { kind: "pane"; id: string; x: number; y: number; selected: string }
+    | null
+  >(null);
   const [editingId, setEditingId] = useState<string | null>(null);
 
   const menuRef = useRef<HTMLDivElement | null>(null);
 
+  const openTabMenu = useCallback((e: React.MouseEvent, id: string) => {
+    e.preventDefault();
+    setMenu({ kind: "tab", id, x: e.clientX, y: e.clientY });
+  }, []);
+
+  const openPaneMenu = useCallback(
+    (e: React.MouseEvent, id: string) => {
+      e.preventDefault();
+      const live = ensureStore();
+      setMenu({ kind: "pane", id, x: e.clientX, y: e.clientY, selected: live.selection(id) });
+    },
+    [ensureStore],
+  );
+
   const runMenuItem = useCallback(
-    async (key: (typeof MENU_ITEMS)[number]["key"], id: string) => {
+    async (key: (typeof PANE_MENU_ITEMS)[number] | "rename", id: string) => {
       if (key === "rename") {
         setMenu(null);
         setEditingId(id);
@@ -555,9 +578,11 @@ export function TerminalPanel({ fridaLaunch, host = "local" }: TerminalPanelProp
         await closeNow(id);
         return;
       }
-      await menuAction(key, id);
+      const selected = menu?.kind === "pane" ? menu.selected : undefined;
+      setMenu(null);
+      await menuAction(key, id, selected);
     },
-    [closeNow, createNew, menuAction],
+    [closeNow, createNew, menu, menuAction],
   );
 
   const startRename = useCallback((id: string) => {
@@ -633,10 +658,7 @@ export function TerminalPanel({ fridaLaunch, host = "local" }: TerminalPanelProp
             )}
             title={tabHint(tab)}
             data-testid={`terminal-chip-${tab.id}`}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              setMenu({ id: tab.id, x: e.clientX, y: e.clientY });
-            }}
+            onContextMenu={(e) => openTabMenu(e, tab.id)}
           >
             {editingId === tab.id ? (
               <input
@@ -702,18 +724,18 @@ export function TerminalPanel({ fridaLaunch, host = "local" }: TerminalPanelProp
           style={{ left: menu.x, top: menu.y }}
           data-testid="terminal-tab-menu"
         >
-          {MENU_ITEMS.map((item) => (
+          {(menu.kind === "tab" ? TAB_MENU_ITEMS : PANE_MENU_ITEMS).map((key) => (
             <button
-              key={item.key}
+              key={key}
               type="button"
               className={cn(
                 "block w-full rounded px-2 py-1 text-left hover:bg-muted",
-                item.danger && "text-destructive",
+                key === "close" && "text-destructive",
               )}
-              onClick={() => void runMenuItem(item.key, menu.id)}
-              data-testid={`terminal-menu-${item.key}`}
+              onClick={() => void runMenuItem(key, menu.id)}
+              data-testid={`terminal-menu-${key}`}
             >
-              {t(`hook.terminal.menu.${item.key}`)}
+              {t(`hook.terminal.menu.${key}`)}
             </button>
           ))}
         </div>
@@ -785,6 +807,7 @@ export function TerminalPanel({ fridaLaunch, host = "local" }: TerminalPanelProp
             ref={refFor(tab.id)}
             hidden={tab.id !== activeId}
             className="absolute inset-0 overflow-hidden rounded border border-border/60 bg-black/85 p-1"
+            onContextMenu={(e) => openPaneMenu(e, tab.id)}
             data-testid={tab.id === activeId ? "terminal-host" : `terminal-host-${tab.id}`}
           />
         ))}

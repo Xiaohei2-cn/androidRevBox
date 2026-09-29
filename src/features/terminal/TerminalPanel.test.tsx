@@ -553,6 +553,33 @@ describe("真终端页（FT1 分页）", () => {
     expect(screen.queryByTestId("terminal-hint")).toBeNull();
   });
 
+  /**
+   * 两份菜单的分工（用户纠正过）：标签上**只有「重命名」**，
+   * 复制/粘贴/复制当前路径/新建/关闭属于**屏里**的右键菜单。
+   */
+  it("标签右键只有重命名；屏里右键才是那五项", async () => {
+    const { container } = await renderPage();
+    const host = await newTab(container);
+
+    fireEvent.contextMenu(screen.getByTestId("terminal-chip-term-1"));
+    await waitFor(() => expect(screen.getByTestId("terminal-tab-menu")).toBeTruthy());
+    const tabItems = screen
+      .getAllByTestId(/^terminal-menu-/)
+      .map((b) => (b.getAttribute("data-testid") ?? "").replace("terminal-menu-", ""));
+    expect(tabItems).toEqual(["rename"]);
+
+    // 点一下菜单外就把上一份菜单收掉（这正是"点菜单自己不关"那条修复的另一半）
+    fireEvent.mouseDown(document.body);
+    fireEvent.contextMenu(host);
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByTestId(/^terminal-menu-/)
+          .map((b) => (b.getAttribute("data-testid") ?? "").replace("terminal-menu-", "")),
+      ).toEqual(["copy", "paste", "copyPath", "new", "close"]),
+    );
+  });
+
   /** 没设备就是开不了：不许起一条 `adb -s "" shell` 之类的空会话糊弄界面。 */
   it("没有在线设备时拒绝起会话，并且一次 PTY 都不开", async () => {
     adb.devices = [{ serial: "EMULATOR36X5X9X0", state: "offline", transport: "tcp", model: "" }];
