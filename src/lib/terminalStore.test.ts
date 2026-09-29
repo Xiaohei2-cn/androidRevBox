@@ -147,6 +147,41 @@ describe("终端会话表（FT1）", () => {
     expect(store.tabs()[0].status).toBe("running");
   });
 
+  /**
+   * **这条钉的就是"我这边测试全绿、用户界面上只有一颗灰点"那个 bug。**
+   *
+   * 真实浏览器里挂载时量尺寸一定成功（jsdom 永远量不到），量到的尺寸与初始 80×24 不同
+   * ⇒ 会话会发一次"还没在跑"的状态通知。旧代码把它当成"已结束"，状态翻成 exited，
+   * 于是"状态还是 starting 才去起进程"那句永远不成立 ⇒ 进程永不起、不报错、日志里也没有 pty_open。
+   * 换句话说：**量到了尺寸这件好事，反而让会话永远起不来。**
+   */
+  it("挂载时量到了不同尺寸，也照样得起进程（不许翻成已退出）", async () => {
+    const api = fakeTransport();
+    const store = new TerminalSessionStore({
+      transport: api.transport,
+      onChange: () => undefined,
+      makeBundle: (options) => {
+        const fake = fakeBundle(options.cols, options.rows);
+        (fake.bundle as unknown as { fit: { proposeDimensions: () => unknown } }).fit.proposeDimensions = () => ({
+          cols: 151,
+          rows: 43,
+        });
+        return fake.bundle;
+      },
+    });
+    const created = await store.create({ program: "/bin/zsh", args: [] });
+    store.mount(created.ok ? created.id : "", document.createElement("div"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(api.transport.open).toHaveBeenCalledTimes(1);
+    const tab = store.tabs()[0];
+    expect(tab.status).not.toBe("exited");
+    expect(tab.status).not.toBe("stopped");
+    // 量到的尺寸仍然要传下去（C-05 那两头对齐不能被这次修复弄丢）
+    expect(tab.cols).toBe(151);
+    expect(vi.mocked(api.transport.open).mock.calls[0][0].cols).toBe(151);
+  });
+
+
   /** StrictMode 会把 ref 回调 detach/attach 各来一遍：多起一条 PTY 就是多一个没人关的进程。 */
   it("同一个 tab 挂两次只开一条 PTY，也只 open 一次", async () => {
     const { store, api, id, fakes, host } = await opened();

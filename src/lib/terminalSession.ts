@@ -38,6 +38,17 @@ export class TerminalSession {
 
   private machineState: TerminalSessionState = { running: false, exitCode: null, cols: 0, rows: 0 };
 
+  /**
+   * 这一条会话**有没有真的起过进程**。
+   *
+   * 为什么需要它：`fit()` 量到尺寸也会调用状态通知，而通知里 `running` 自然是 false（还没起呢）。
+   * 会话表如果只看"running=false"就判成"已退出"，那么**挂载时量到了尺寸**这一件好事
+   * 反而会把状态翻成 exited，于是"状态还是 starting 才去起进程"的那道判断永远不成立
+   * ⇒ 进程永远不起、没有错误、日志里一次 pty_open 都没有。
+   * 真实浏览器里量尺寸一定成功，jsdom 里一定失败 ⇒ 这就是"我全绿、你灰点"的全部原因。
+   */
+  private everStarted = false;
+
   /** xterm 挂过的那个元素：没挂过就一个字也画不出来（见 mount()） */
   private hostElement: HTMLElement | null = null;
 
@@ -64,6 +75,11 @@ export class TerminalSession {
   /** 见 `signal` 字段：会话表要靠它区分"已停止"与"被信号杀掉"。 */
   get exitSignal(): string | null {
     return this.signal;
+  }
+
+  /** 见 `everStarted`：只有起过，"没在跑"才可能等于"已结束"。 */
+  get started(): boolean {
+    return this.everStarted;
   }
 
   /**
@@ -259,6 +275,7 @@ export class TerminalSession {
   }
 
   private update(patch: Partial<TerminalSessionState>): void {
+    if (patch.running === true) this.everStarted = true;
     this.machineState = { ...this.machineState, ...patch };
     this.events.onState?.({ ...this.machineState });
   }

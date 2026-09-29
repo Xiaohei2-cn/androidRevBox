@@ -291,6 +291,15 @@ export class TerminalSessionStore {
       entry.tab.exitCode = null;
       return;
     }
+    /**
+     * **还没起过进程**：这次通知只是尺寸/初始化，不是生命周期事件。
+     * 让它去翻状态就会出现"量到了尺寸 ⇒ 反而永远不起进程"（真浏览器必现、jsdom 必不现）。
+     */
+    if (!entry.session.started) {
+      if (state.cols) entry.tab.cols = state.cols;
+      if (state.rows) entry.tab.rows = state.rows;
+      return;
+    }
     if (entry.tab.status !== "running" && entry.tab.status !== "starting") return;
     entry.tab.exitCode = state.exitCode;
     entry.tab.exitSignal = entry.session.exitSignal;

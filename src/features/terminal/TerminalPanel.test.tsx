@@ -576,6 +576,28 @@ describe("真终端页（FT1 分页）", () => {
     expect(screen.queryByTestId("terminal-error")).toBeNull();
   });
 
+  /**
+   * StrictMode（开发模式会把组件挂载两次）下也必须真的起进程。
+   *
+   * 加这条的原因很实际：用户的界面**只在开发模式**里跑，而我此前的测试**没有开 StrictMode**——
+   * 环境和现场不一致时，"我这边全绿、你那边没反应"就没法解释。现在这一条替我把那个变量钉住了：
+   * 双挂载 + 表被回收再重建之后，点脚本仍然必须调用 `pty_open`。
+   */
+  it("StrictMode 双挂载之后，frida 请求仍然会真的起进程", async () => {
+    const { default: StrictModePkg } = await import("react");
+    const view = render(
+      <StrictModePkg.StrictMode>
+        <I18nProvider>
+          <TerminalPanel
+            fridaLaunch={{ scriptPath: "/hooks/hook.js", settings: fridaSettings(), nonce: 1 }}
+          />
+        </I18nProvider>
+      </StrictModePkg.StrictMode>,
+    );
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
+    expect(view.baseElement).toBeTruthy();
+  });
+
   /** R-08：离开页面才是批量收摊的地方，三条活会话各关一次，一条不留。 */
   it("离开页面把所有会话都关掉", async () => {
     const view = render(
