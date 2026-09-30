@@ -48,8 +48,6 @@ describe("环境这一半：只认 frida-tools，且必须用配置的那条解�
       plan: {
         program: "/pyenv/versions/3.13.5/bin/python3",
         args: [...FRIDA_REPL_ARGS, "-D", "18271FDF600FL4", "-F", "-l", SCRIPT],
-        title: "attach 自动前台 · hook.js",
-        toolsVersion: "13.7.0",
       },
     });
   });
@@ -80,11 +78,11 @@ describe("环境这一半：只认 frida-tools，且必须用配置的那条解�
 });
 
 describe("目标与连接形状", () => {
-  /** attach + 空目标是合法语义（附加当前前台），必须和界面那句"自动前台"一致。 */
+  /** attach + 空目标是合法语义：`-F` = 附加设备当前前台，和 A 区那句「自动前台」同一件事。
+   * （标题字段以前在这里断言，现在 tab 一律叫「会话 N」，跑的是什么只在悬停里。） */
   it("attach 空目标 → -F", () => {
     const r = planFridaSession(python(), frida(), settings(), SCRIPT);
     expect(r.ok && r.plan.args).toContain("-F");
-    expect(r.ok && r.plan.title).toBe("attach 自动前台 · hook.js");
   });
 
   it("attach 纯数字 → -p；attach 别的 → -n；spawn → -f", () => {
@@ -94,7 +92,6 @@ describe("目标与连接形状", () => {
     expect(name.ok && name.plan.args).toContain("-n");
     const spawn = planFridaSession(python(), frida(), settings({ runMode: "spawn", target: "com.x" }), SCRIPT);
     expect(spawn.ok && spawn.plan.args).toContain("-f");
-    expect(spawn.ok && spawn.plan.title).toBe("spawn com.x · hook.js");
   });
 
   /** 官方没有"spawn 前台"：缺包名就拒绝，别拼一个 `-f ""` 去撞运气。 */
@@ -143,6 +140,5 @@ describe("目标与连接形状", () => {
     const args = r.ok ? r.plan.args : [];
     expect(args[args.length - 2]).toBe("-l");
     expect(args[args.length - 1]).toBe("/tmp/my hooks/a b.js");
-    expect(r.ok && r.plan.title).toBe("attach 自动前台 · a b.js");
   });
 });

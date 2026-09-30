@@ -44,9 +44,6 @@ export type FridaSessionBlock =
 export interface FridaSessionPlan {
   program: string;
   args: string[];
-  /** tab 标题：一眼看得出连的是哪台、跑的是哪个脚本 */
-  title: string;
-  toolsVersion: string;
 }
 
 export type FridaSessionResult = { ok: true; plan: FridaSessionPlan } | { ok: false; block: FridaSessionBlock };
@@ -106,14 +103,11 @@ export function planFridaSession(
   const connection = connectionArgs(settings);
   if ("block" in connection) return { ok: false, block: connection.block };
 
-  const name = script.split("/").filter(Boolean).pop() ?? "script.js";
   return {
     ok: true,
     plan: {
       program: python.path,
       args: [...FRIDA_REPL_ARGS, ...connection, ...target, "-l", script],
-      title: `${settings.runMode} ${settings.target.trim() || "自动前台"} · ${name}`,
-      toolsVersion: tools,
     },
   };
 }

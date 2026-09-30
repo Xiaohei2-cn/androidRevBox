@@ -50,8 +50,6 @@ export interface CreateTabInput {
   cwd?: string | null;
   /** 缺省 `local`；设备/frida 会话必须显式写（状态灯旁那句"在跑 80×24"对不同宿主含义不同） */
   kind?: "local" | "device" | "frida";
-  /** 显式标题（设备会话用 `adb shell @ <serial>`）；不给就取程序名 + 序号 */
-  title?: string;
 }
 
 /**

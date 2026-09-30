@@ -9,13 +9,12 @@ import { describe, expect, it } from "vitest";
 import { deviceShellLaunch } from "./deviceShell";
 
 describe("设备 shell 启动参数（H-2）", () => {
-  it("拼出来的是 adb -s <serial> shell -tt，标题带上序列号", () => {
+  it("拼出来的是 adb -s <serial> shell -tt", () => {
     const built = deviceShellLaunch("/Users/me/Library/Android/sdk/platform-tools/adb", "18271FDF600FL4");
     expect(built.ok).toBe(true);
     if (!built.ok) return;
     expect(built.launch.program).toBe("/Users/me/Library/Android/sdk/platform-tools/adb");
     expect(built.launch.args).toEqual(["-s", "18271FDF600FL4", "shell", "-tt"]);
-    expect(built.launch.title).toBe("adb shell @ 600FL4");
   });
 
   /** 无线调试的序列号本身就是 `ip:port`，白名单不许把它当坏字符拒掉。 */

@@ -437,7 +437,6 @@ export function TerminalPanel({ fridaLaunch, host = "local", visible = true }: T
           program: planned.plan.program,
           args: planned.plan.args,
           kind: "frida",
-          title: planned.plan.title,
         });
         if (!created.ok) {
           setNotice(
