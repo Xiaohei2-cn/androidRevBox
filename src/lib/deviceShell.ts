@@ -24,8 +24,6 @@ export type DeviceShellBlock = "no-adb" | "no-serial" | "bad-serial";
 export interface DeviceShellLaunch {
   program: string;
   args: string[];
-  /** 界面用来当 tab 标题：`adb shell @ <serial 尾 6 位>` */
-  title: string;
 }
 
 /** serial 白名单：adb 的 `-s` 只接受这些字符，别把空格或 `;` 拼进参数数组。 */
@@ -47,7 +45,6 @@ export function deviceShellLaunch(
     launch: {
       program: path,
       args: ["-s", id, "shell", "-tt"],
-      title: `adb shell @ ${id.length > 8 ? id.slice(-6) : id}`,
     },
   };
 }
