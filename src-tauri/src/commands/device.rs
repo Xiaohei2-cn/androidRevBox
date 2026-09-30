@@ -552,26 +552,10 @@ pub async fn device_proc_by_port(
 
 // ===== 长操作：返回 task_id =====
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ShellArgs {
-    pub serial: String,
-    pub command: String,
-}
-
-#[tauri::command]
-pub async fn device_shell(
-    state: tauri::State<'_, AppState>,
-    args: ShellArgs,
-) -> CoreResult<String> {
-    if args.command.trim().is_empty() {
-        return Err(CoreError::Internal("命令不能为空".to_string()));
-    }
-    state
-        .device
-        .raw_shell_task(&args.serial, &args.command)
-        .await
-}
+// 设备页那条"原始 shell 命令 ⇒ 起一个任务"的入口（`device_shell` / `ShellArgs`）已经整体撤掉：
+// 交互式 shell 需要 PTY（Ctrl-C 中断、行编辑、top/vi 这类全屏程序、尺寸跟着窗口走），
+// 一条一条 `adb shell <cmd>` 拼不出那些能力。现在设备上敲东西只有一条路：
+// 设备页 → Shell 子标签那块真终端（`adb -s <选中的那台> shell -tt` 直接进 `pty_open`）。
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

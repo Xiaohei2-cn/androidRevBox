@@ -1,7 +1,6 @@
 /** Aba Hook (P10 console de sessões Frida + recursos futuros) — português (Brasil) */
 export default {
   "hook.terminal.loading": "Carregando o terminal…",  "hook.terminal.fridaPreset": "sessão frida",
-  "hook.terminal.deviceShell": "Shell do dispositivo",
   "hook.terminal.deviceNoAdb": "Nenhum adb utilizável: defina o caminho nas configurações",
   "hook.terminal.deviceNoSerial": "Nenhum dispositivo online",
   "hook.terminal.fridaNoPython": "Configure o Python nas configurações primeiro",

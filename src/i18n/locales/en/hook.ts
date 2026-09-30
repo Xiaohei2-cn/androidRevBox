@@ -1,7 +1,6 @@
 /** Hook tab (P10 Frida session console + future capabilities) — English */
 export default {
   "hook.terminal.loading": "Loading terminal…",  "hook.terminal.fridaPreset": "frida session",
-  "hook.terminal.deviceShell": "Device shell",
   "hook.terminal.deviceNoAdb": "No usable adb: set its path in Settings",
   "hook.terminal.deviceNoSerial": "No device online",
   "hook.terminal.fridaNoPython": "Configure Python in Settings first",

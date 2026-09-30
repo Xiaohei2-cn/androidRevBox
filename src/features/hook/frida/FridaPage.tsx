@@ -21,15 +21,16 @@ const TerminalPanel = lazy(() =>
 );
 
 /**
- * C 区是**三页**（她纠正过两次：设备 shell 既不是"往终端底下追加会话"，也不是一个开关）：
+ * C 区是**两页**：
  * - `terminal`：那块真终端屏——➕ 开本机会话，点左侧脚本 = 在这页开一个官方 frida REPL 会话
- * - `device`：设备 shell **自己的一整页**，自己一条 tab 条、自己一张会话表，进去就有会话 1
  * - `tracks`：我们自己的 NDJSON 结构化视图（原三轨 + JSON 树）
  *
- * 两页终端**同时挂着**，切页只改 `hidden`：卸载等于 disposeAll，会把她正在跑的会话连进程一起收掉。
- * 各自的会话表用不同 id 前缀（`term-*` / `dev-*`），所以两页可以同时有"会话 1"而不打架。
+ * 「设备 shell」**不在这一页**（第八十八轮定的位置）：它是**设备页的 Shell 子标签**，
+ * 那里连的是她在设备页选中的那台，也自有的一张会话表。这一页只管本机 shell 与官方 REPL。
+ *
+ * 切页只改 `hidden`，**绝不卸载**：卸载等于 disposeAll，会把她正在跑的会话连进程一起收掉。
  */
-type ConsoleView = "terminal" | "device" | "tracks";
+type ConsoleView = "terminal" | "tracks";
 
 const DEFAULT_SETTINGS: FridaSettings = {
   deviceSerial: null,
@@ -67,8 +68,6 @@ export function FridaPage() {
        * 会话起来之后她再改目标，不该把已经跑着的会话搅了。
        */
       if (view !== "tracks") {
-        // REPL 属于「终端」那一页：她在设备页点脚本，先看自己刚点起来的东西，别留一块没人看的屏
-        setView("terminal");
         nonceRef.current += 1;
         setLaunch({ scriptPath: script.path, settings: { ...settings }, nonce: nonceRef.current });
         return;
@@ -143,7 +142,7 @@ export function FridaPage() {
       {/* C 会话控制台：右侧 2/3，通高。两个视图都一直挂着，切换只改 hidden（卸载=杀会话） */}
       <div className="col-start-2 row-start-1 col-span-2 row-span-3 flex min-h-0 min-w-0 flex-col gap-2">
         <div className="flex shrink-0 items-center gap-1 text-10px" role="group" aria-label={t("hook.frida.consoleView")}>
-          {(["terminal", "device", "tracks"] as const).map((key) => (
+          {(["terminal", "tracks"] as const).map((key) => (
             <button
               key={key}
               type="button"
@@ -157,12 +156,7 @@ export function FridaPage() {
               }`}
               data-testid={`frida-view-${key}`}
             >
-              {key === "terminal"
-                ? t("hook.frida.viewTerminal")
-                : key === "device"
-                  ? // 设备 shell 是**一整页**，不是一个动作：点它=换页，页里自己有会话 1
-                    t("hook.terminal.deviceShell")
-                  : t("hook.frida.viewTracks")}
+              {key === "terminal" ? t("hook.frida.viewTerminal") : t("hook.frida.viewTracks")}
             </button>
           ))}
         </div>
@@ -175,19 +169,7 @@ export function FridaPage() {
               </div>
             }
           >
-            <TerminalPanel fridaLaunch={launch} host="local" visible={view === "terminal"} />
-          </Suspense>
-        </div>
-        {/* 「设备 shell」那页：自己的 tab 条、自己的会话表，不带 frida 预置（那一页不跑脚本） */}
-        <div className="min-h-0 flex-1" hidden={view !== "device"} data-testid="frida-device-view">
-          <Suspense
-            fallback={
-              <div className="p-3 text-10px text-muted-foreground" data-testid="device-loading">
-                {t("hook.terminal.loading")}
-              </div>
-            }
-          >
-            <TerminalPanel host="device" visible={view === "device"} />
+            <TerminalPanel fridaLaunch={launch} visible={view === "terminal"} />
           </Suspense>
         </div>
         <div className="min-h-0 flex-1" hidden={view !== "tracks"} data-testid="frida-tracks-view">

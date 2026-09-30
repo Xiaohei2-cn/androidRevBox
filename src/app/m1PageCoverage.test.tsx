@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { I18nProvider } from "@/i18n/I18nProvider";
@@ -46,11 +47,21 @@ const device = vi.hoisted(() => ({
   forwardList: vi.fn(),
   forwardSetup: vi.fn(),
   ip: vi.fn(),
-  shell: vi.fn(),
+  // 注意：这里**没有 `shell`** —— 设备页那块原始 shell 命令腿已整条删除（真终端走 pty）
   logcat: vi.fn(),
 }));
 
 const dialog = vi.hoisted(() => ({ pickFiles: vi.fn(), pickFile: vi.fn(), pickDirectory: vi.fn() }));
+/** 设备页 Shell 子标签那块真终端的传输层桩：只记参数，真 xterm 用生产那一份（jsdom 里跑得动） */
+const pty = vi.hoisted(() => ({
+  openCalls: [] as Array<{ program: string; args: string[] }>,
+  defaultProgram: vi.fn(),
+  open: vi.fn(),
+  write: vi.fn(),
+  resize: vi.fn(),
+  close: vi.fn(),
+  onExit: vi.fn(),
+}));
 const task = vi.hoisted(() => ({
   list: vi.fn(),
   run: vi.fn(),
@@ -63,6 +74,16 @@ vi.mock("@/api/device", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/api/device")>();
   return { ...actual, deviceApi: { ...actual.deviceApi, ...device } };
 });
+vi.mock("@/api/pty", () => ({
+  ptyApi: {
+    defaultProgram: pty.defaultProgram,
+    open: pty.open,
+    write: pty.write,
+    resize: pty.resize,
+    close: pty.close,
+    onExit: pty.onExit,
+  },
+}));
 vi.mock("@/api/task", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/api/task")>();
   return { ...actual, taskApi: { ...actual.taskApi, ...task } };
@@ -76,7 +97,9 @@ vi.mock("@/app/nav", () => ({
     pendingBinaryTab: null,
     gotoBinarySubTab: vi.fn(),
   }),
-  useActiveTab: () => true,
+  // 用 vi.fn 是为了能在单条用例里把"这一页在不在眼前"翻过去：七页常驻，
+  // 设备页的 Shell 那块屏必须同时看主 tab 与子标签才许自动开会话。
+  useActiveTab: vi.fn(() => true),
 }));
 vi.mock("@/hooks/useDragDropPath", () => ({ useDragDropPath: vi.fn() }));
 vi.mock("@/api/dialog", () => ({
@@ -96,6 +119,7 @@ vi.mock("@/api/agent", async (importOriginal) => {
   return { ...actual, agentApi: { ...actual.agentApi, ...agentMocks } };
 });
 
+import { useActiveTab } from "@/app/nav";
 import { AgentSessionSection, DevicesPage } from "@/features/devices/DevicesPage";
 import { BinaryHosting } from "@/features/binary/BinaryHosting";
 import { BinaryPage } from "@/features/binary/BinaryPage";
@@ -116,6 +140,26 @@ function renderPage(ui: React.ReactNode) {
 beforeEach(() => {
   Object.values(device).forEach((m) => m.mockReset());
   Object.values(task).forEach((m) => m.mockReset());
+  // "这一页在不在眼前"是全局 mock 的返回值，上一条用例翻过就必须翻回来，
+  // 否则后面的用例会以为自己渲染在后台页里（那种红完全指不到真问题）
+  vi.mocked(useActiveTab).mockReturnValue(true);
+  Object.values(pty).forEach((m) => typeof m === "function" && m.mockReset?.());
+  pty.openCalls.length = 0;
+  pty.defaultProgram.mockResolvedValue("/bin/zsh");
+  pty.open.mockImplementation(async (args: { program: string; args: string[] }) => {
+    pty.openCalls.push({ program: args.program, args: args.args });
+    return {
+      id: `pty-${pty.openCalls.length}`,
+      pid: 4242,
+      cols: (args as { cols?: number }).cols ?? 80,
+      rows: (args as { rows?: number }).rows ?? 24,
+      term: "xterm-256color",
+    };
+  });
+  pty.write.mockResolvedValue(undefined);
+  pty.resize.mockResolvedValue(undefined);
+  pty.close.mockResolvedValue(undefined);
+  pty.onExit.mockResolvedValue(() => {});
   // Agent 那组 mock 也要每条用例重来：结论条的用例要断言"点接管时不该调 install"，
   // 上一用例留下的调用记录会把它判成失败（第一版就是这么红的）。
   Object.values(agentMocks).forEach((m) => m.mockReset());
@@ -211,23 +255,86 @@ describe("设备页（列表 / 信息 / Shell / Logcat）", () => {
     expect(document.body.textContent).toContain("192.168.1.7");
   });
 
-  it("Shell 与 Logcat 明确标成 ADB 原始会话，且各自打到自己的 command", async () => {
-    device.shell.mockResolvedValue("task-1");
-    device.logcat.mockResolvedValue("task-2");
+  /**
+   * 设备页的 Shell 子标签**就是那块真终端**（第八十八轮：旧"命令框 + 回车执行一条 adb shell"
+   * 整体撤掉，点它只显示 shell 终端）。判据按交给 PTY 的参数数组原样钉：
+   * `adb -s <她选中的那台> shell -tt`——少那个 `-tt` 就没有远端 PTY，
+   * Ctrl-C 中断、行编辑、top/vi 这类全屏程序全都不成立（五条实测见 `lib/deviceShell`）。
+   *
+   * 同时钉住三件相邻的事：
+   * - 停在别的子标签时**一块屏都不开**（隐藏的页偷偷起进程 = 她看不见也关不掉）；
+   * - 旧的命令框与那句"ADB 原始会话（不经 Agent）"的说明**不许留着**（撤功能不许留半个）；
+   * - Logcat 那条**没被顺手搬走**，仍是原始任务链路。
+   */
+  it("设备页 Shell 子标签只有一块真终端，开的是 adb -s <选中的那台> shell -tt", async () => {
     renderPage(<DevicesPage />);
-    fireEvent.click(await screen.findByRole("tab", { name: "Shell" }));
-    // 边界文案必须出现在界面上（AR9.3 的分类不能只写在文档里）
-    expect(document.body.textContent).toContain("不经 Agent");
-    const box = await screen.findByPlaceholderText(/input text hello/);
-    fireEvent.change(box, { target: { value: "getprop ro.product.model" } });
-    fireEvent.keyDown(box, { key: "Enter" });
-    await waitFor(() => expect(device.shell).toHaveBeenCalledWith("PIXEL-1", "getprop ro.product.model"));
+    await screen.findByText("Pixel 6");
+    // 子标签内容是一直挂着的（切走不该杀会话），所以"面板活着"不能当证据：
+    // 要等到懒加载那块面板**已经能自动开屏**之后再等一会儿，才说明"没在看它"真的没起进程。
+    // （上一版这里只等了 20 ms、面板还在解析 chunk，撤掉 `visible` 那道闸都测不出来——撤闸验证当场把它抓了。）
+    await waitFor(() => expect(screen.getByTestId("terminal-tabs")).toBeTruthy());
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    // 默认在「设备列表」：这块屏还没被看到，一条进程都不该起
+    expect(pty.openCalls).toEqual([]);
 
-    fireEvent.click(screen.getByRole("tab", { name: "Logcat" }));
+    // ⚠️ 这里必须用 `userEvent`：Radix 的子标签**靠聚焦切换**，`fireEvent.click` 不带焦点，
+    // 于是"点了 Shell"其实一页都没换——测试会以为自己点了个不存在的入口（第一版就是这么红的）。
+    await userEvent.click(await screen.findByRole("tab", { name: "Shell" }));
+    await waitFor(() => expect(screen.getByTestId("terminal-chip-dev-1")).toBeTruthy());
+    await waitFor(() => expect(pty.openCalls.length).toBe(1));
+    expect(pty.openCalls[0]).toEqual({
+      program: "/sdk/adb",
+      args: ["-s", "PIXEL-1", "shell", "-tt"],
+    });
+    // 会话开在设备页自己那张表里（dev-1），名字仍是「会话 N」
+    const shellPane = within(screen.getByTestId("terminal-tabs"));
+    expect(shellPane.getByTestId("terminal-chip-dev-1").textContent).toContain("会话 1");
+
+    // 旧形状不许留下痕迹：命令框、占位提示、那句边界说明，一个都不在
+    expect(screen.queryByPlaceholderText(/input text hello/)).toBeNull();
+    expect(document.body.textContent).not.toContain("不经 Agent");
+
+    // Logcat 还在原地，走的仍是它自己那条 command（这次搬走的不该顺手带走它）
+    device.logcat.mockResolvedValue("task-2");
+    await userEvent.click(screen.getByRole("tab", { name: "Logcat" }));
     const filter = await screen.findByPlaceholderText(/如 crash/);
     fireEvent.change(filter, { target: { value: "ActivityManager" } });
     fireEvent.keyDown(filter, { key: "Enter" });
     await waitFor(() => expect(device.logcat).toHaveBeenCalledWith("PIXEL-1", "ActivityManager"));
+    // 起了一条设备会话之后，Logcat 不该再多起屏
+    expect(pty.openCalls.length).toBe(1);
+  });
+
+  /**
+   * 同一件事的另一半：**主 tab 不在设备页时**，哪怕子标签停在 Shell 上也不许起进程。
+   * 七页是常驻的（切主 tab 只改 visibility），只看子标签就会出现"她在别的页上，
+   * 这里偷偷开了一条设备 shell"——看不见，也就关不掉。
+   */
+  it("设备页不在眼前时，Shell 子标签一块屏都不开；切回来才开", async () => {
+    // 这一条要**重渲染同一个树**（切主 tab 在真窗口里就是一次重渲染），所以不用 renderPage：
+    // 它会把 provider 一起换掉，rerender 只喂 `<DevicesPage />` 就把 QueryClient/I18n 都丢了。
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => (
+      <QueryClientProvider client={qc}>
+        <I18nProvider>
+          <DevicesPage />
+        </I18nProvider>
+      </QueryClientProvider>
+    );
+    vi.mocked(useActiveTab).mockReturnValue(false);
+    const view = render(tree());
+    await waitFor(() => expect(screen.getByTestId("terminal-tabs")).toBeTruthy());
+    await userEvent.click(await screen.findByRole("tab", { name: "Shell" }));
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(pty.openCalls).toEqual([]);
+
+    // 她把主 tab 切回设备页（子标签还停在 Shell）：这一下才该有会话 1。
+    // 改完 mock 必须**真的重渲染一次**——返回值变了不会自己触发渲染，
+    // 少了这一行就会得到"切回来还是不开"的假红（第一版就是这么红的）。
+    vi.mocked(useActiveTab).mockReturnValue(true);
+    view.rerender(tree());
+    await waitFor(() => expect(pty.openCalls.length).toBe(1));
+    expect(pty.openCalls[0].args).toEqual(["-s", "PIXEL-1", "shell", "-tt"]);
   });
 });
 

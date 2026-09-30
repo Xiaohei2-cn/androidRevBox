@@ -1,7 +1,6 @@
 /** Hook タブ（P10 Frida セッションコンソール＋将来機能）— 日本語 */
 export default {
   "hook.terminal.loading": "ターミナルを読み込み中…",  "hook.terminal.fridaPreset": "frida セッション",
-  "hook.terminal.deviceShell": "デバイス shell",
   "hook.terminal.deviceNoAdb": "使える adb がありません：設定でパスを指定",
   "hook.terminal.deviceNoSerial": "オンラインのデバイスがありません",
   "hook.terminal.fridaNoPython": "まず設定で Python を指定してください",

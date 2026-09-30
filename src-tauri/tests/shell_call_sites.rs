@@ -120,13 +120,10 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
         Category::Transport,
         None,
     ),
-    // Raw Tool：AR9.3 已限定只能由命令层为「用户主动发起的会话」调用
-    (
-        "src/services/device_service.rs",
-        "raw_shell_task",
-        Category::RawTool,
-        None,
-    ),
+    // Raw Tool：AR9.3 已限定只能由命令层为「用户主动发起的会话」调用。
+    // （原来这里的 `raw_shell_task` 已随设备页 Shell 子标签换成真终端而整条删除：
+    //   交互式 shell 需要 PTY，一条一条 `adb shell <cmd>` 拼不出来 —— 少一个调用点
+    //   在这里留下事实，与当年 AR7.6 少一个点要改数是同一条纪律。）
     (
         "src/services/device_service.rs",
         "raw_logcat_task",
@@ -225,7 +222,9 @@ const EXPECTED_SITES_PER_CATEGORY: &[(Category, usize)] = &[
     // 留一句话——和当年 AR7.6 少一个点要改数字是同一条纪律。
     (Category::Bootstrap, 12),
     (Category::Transport, 5),
-    (Category::RawTool, 2),
+    // 2 → 1（提交本次）：`raw_shell_task` 整条删掉了，剩下 `raw_logcat_task` 一条。
+    // 数字往下走也要在这里说一句，别让"少了一个回退点"悄悄发生。
+    (Category::RawTool, 1),
     // 8（原 9）：AR7.6 把 root 终止从 `adb shell su -c "kill -9 <pid>"` 改成走 Agent 的
     // 固定提权脚本（先核身份再发信号），桌面侧那个 shell 调用点因此消失 —— AR12 少一项可删的
     // Legacy。这里跟着下调，是为了让"少一个回退点"也变成会被机器看见的事实，而不是悄悄发生。

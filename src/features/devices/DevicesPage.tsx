@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck, Cpu, Save, FolderPlus, Pencil, KeyRound, Trash2, Eye, EyeOff, Search, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -22,7 +22,7 @@ import {
 import { zygiskApi, type ZygiskAppItem, type ZygiskScope } from "@/api/zygisk";
 import { agentApi, type AgentProbe, type AgentSessionState } from "@/api/agent";
 import { envApi } from "@/api/env";
-import { useAppNav } from "@/app/nav";
+import { useActiveTab, useAppNav } from "@/app/nav";
 import { useI18n } from "@/i18n";
 import { PathText } from "@/components/ui/PathText";
 import { ProcPaths } from "@/features/devices/ProcPaths";
@@ -31,9 +31,25 @@ import { cn } from "@/lib/utils";
 import { pickDirectory, pickFile } from "@/api/dialog";
 
 /**
+ * Shell 子标签用的那块**真终端**（xterm + 本机 PTY 里跑 `adb -s <选中的那台> shell -tt`）。
+ *
+ * 懒加载是有意的：xterm 家族 min 后约 823 kB，不该在软件一打开就进主块
+ * （第八十三轮实测：主 JS 1,275.87 → 751.94 kB）。同一个 `TerminalPanel` 组件也在 frida 页用一次
+ * （那边是 `host="local"`），**两页各一张会话表**，互不追加会话。
+ */
+const TerminalPanel = lazy(() =>
+  import("@/features/terminal/TerminalPanel").then((m) => ({ default: m.TerminalPanel })),
+);
+
+/**
  * 设备页（P3）：设备列表/信息/Shell/文件/应用/Logcat 六个分 tab。
- * 长操作（shell/logcat/install/uninstall/push/pull）一律走 TaskService 任务，
+ * 长操作（logcat/install/uninstall/push/pull）一律走 TaskService 任务，
  * 内联展示实时输出；设备热插拔由后端 watch 线程事件驱动刷新。
+ *
+ * **Shell 这个子标签现在就是那块真终端**（第八十八轮口径：点它=只显示 shell 终端）：
+ * 原来那个"命令框 + 回车执行一条 `adb shell <cmd>`"的原始会话已经整体撤掉——
+ * 交互式 shell（Ctrl-C 中断、top/vi 这类全屏程序、改尺寸跟着走）需要 PTY，
+ * 一条一条 `adb shell` 拼不出来，那些能力是实测过的（FT2 五条，见 `lib/deviceShell`）。
  */
 /** 包写操作的展示模型：三态（executed / replayed / noOp）与复核结论必须分开显示。 */
 interface PackageWriteView {
@@ -47,11 +63,18 @@ interface PackageWriteView {
 }
 
 export function DevicesPage() {
+  const { t } = useI18n();
   const [selected, setSelected] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
   const { pendingDevicesTab } = useAppNav();
   // 子 tab 受控：导航信号到达时切到对应 tab（list/info）
   const [subTab, setSubTab] = useState("list");
+  /**
+   * 这一页现在在她眼前吗。七页是**常驻**的（切主 tab 只改 visibility），
+   * 所以"Shell 子标签可见"必须同时看主 tab 与子标签：只看子标签的话，
+   * 她在别的页上时这块屏会自己起一条设备 shell —— 看不见，也就关不掉。
+   */
+  const devicesActive = useActiveTab("devices");
   useEffect(() => {
     if (pendingDevicesTab) setSubTab(pendingDevicesTab);
   }, [pendingDevicesTab]);
@@ -160,17 +183,21 @@ export function DevicesPage() {
         {
           id: "shell",
           label: "Shell",
+          // 只有这一块屏：没有命令框、没有说明文字。要跑什么直接在上面敲。
           content: (
-            <TaskLaunchPanel
-              label="命令"
-              placeholder="如：input text hello（回车执行；要 Ctrl+C 就去终端）"
-              note="ADB 原始会话（没有 PTY）：命令原样交给 adb shell，不经 Agent，也没有 typed 错误码。要交互式 shell（Ctrl-C 中断、top/vi 这类全屏程序）去 Hook → 终端 → 设备 shell；设备侧结构化能力请改用各功能页。"
-              disabled={!activeSerial}
-              onRun={async (input) => {
-                if (!activeSerial || !input.trim()) return null;
-                return deviceApi.shell(activeSerial, input);
-              }}
-            />
+            <Suspense
+              fallback={
+                <div className="p-3 text-10px text-muted-foreground" data-testid="device-shell-loading">
+                  {t("hook.terminal.loading")}
+                </div>
+              }
+            >
+              <TerminalPanel
+                host="device"
+                deviceSerial={activeSerial}
+                visible={devicesActive && subTab === "shell"}
+              />
+            </Suspense>
           ),
         },
         {

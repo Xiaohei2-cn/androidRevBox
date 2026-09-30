@@ -5,9 +5,10 @@
  * 不是另开的一个子标签——左边 A 区设置、B 区脚本，点脚本 = 在这里起一个官方 frida REPL。
  * 面板自己只管"几块屏、谁在跑、什么时候才许杀进程"，会话状态在 `lib/terminalStore`。
  *
- * 这一份组件被 frida 页用**两次**（`host="local"` = 「终端」那页，`host="device"` = 「设备 shell」那页）：
- * 两页各有各的会话表，谁也不给谁追加会话（她纠正过：设备 shell 是一整页，不是在终端底下多一块屏）。
- * 两页**一直挂着**，切换只改 `hidden`——卸载等于 disposeAll，会把人家正在跑的会话连进程一起收掉。
+  * 同一份组件在两个地方各挂一次：frida 页右侧那块屏用 `host="local"`（本机 shell + 官方 frida REPL），
+ * 设备页的 Shell 子标签用 `host="device"`（每条屏都是 `adb -s <选中的那台> shell -tt`）。
+ * **两处各拿一张会话表**，谁也不给谁追加会话；页内切换只改 `hidden` 不卸载——
+ * 卸载等于 disposeAll，会把人家正在跑的会话连进程一起收掉。
  *
  * 组件只做四件事：把 tab 画出来、把每块屏挂到它自己的宿主 div 上、
  * 把"量得到的尺寸"转成 fit、把用户意图转成会话表的调用。
@@ -148,9 +149,21 @@ interface TerminalPanelProps {
    * 隐藏的那页偷偷起进程，她既看不见也关不掉（上一版"进页面凭空开会话"就是这个形状）。
    */
   visible?: boolean;
+  /**
+   * 设备那页**要看哪台**：由页面把"她现在选中的那台序列号"交进来。
+   * 面板不许自己去设备列表里挑一台——多设备时那会把会话开到她没选的那台上，
+   * 而她后面敲的每条命令都打进那台里（`lib/fridaSession` 对 `-U` 是同一个口径）。
+   * 没有序列号就直说"没有在线设备"，一块屏都不开。
+   */
+  deviceSerial?: string | null;
 }
 
-export function TerminalPanel({ fridaLaunch, host = "local", visible = true }: TerminalPanelProps) {
+export function TerminalPanel({
+  fridaLaunch,
+  host = "local",
+  visible = true,
+  deviceSerial = null,
+}: TerminalPanelProps) {
   const { t } = useI18n();
   const storeRef = useRef<TerminalSessionStore | null>(null);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
@@ -180,8 +193,8 @@ export function TerminalPanel({ fridaLaunch, host = "local", visible = true }: T
     // onChange 闭包里引用 next 本身是安全的：它只在表发生变动后才被调用
     const next = new TerminalSessionStore({
       transport: ptyApi,
-      // 「终端」与「设备 shell」两张表都在同一屏的 DOM 里，序号又都从 1 起：
-      // 前缀不分开，`term-1` 会同时属于两块屏，测试与排查都指不到是谁
+      // 整个窗口是"七页常驻"的 ⇒ frida 页那块屏与设备页那块屏**同时在 DOM 里**，
+      // 两张表的序号又都从 1 起：前缀不分开，`term-1` 就同时属于两块屏，指不到是谁
       idPrefix: host === "device" ? "dev" : "term",
       onChange: () => setTabs(next.tabs()),
     });
@@ -292,6 +305,9 @@ export function TerminalPanel({ fridaLaunch, host = "local", visible = true }: T
   /**
    * 设备 shell 会话（H-2，FT2）：**直接起一块屏**，不像 frida 预置那样只填命令。
    *
+   * 设备来自 `deviceSerial`（设备页选中的那台），这里**不查设备列表**：
+   * 列表是页面级的真相，面板只负责把"这一页选中的那台"拼成一条 `adb -s … shell -tt`。
+   *
    * 差别的原因是"还缺不缺参数"：`adb -s <serial> shell -tt` 已经是一个完整可用的交互 shell，
    * 而官方 REPL 必须有目标。实测过 `-tt` 下 Ctrl-C 能中断、改尺寸能传到远端
    * （`stty size` 跟着变），所以这块屏不需要任何新的桌面通道——PTY 不关心跑的是谁。
@@ -304,11 +320,12 @@ export function TerminalPanel({ fridaLaunch, host = "local", visible = true }: T
     setNotice(null);
     try {
       const store = target ?? ensureStore();
-      const [env, devices] = await Promise.all([deviceApi.environment(), deviceApi.list(true)]);
-      const online = devices.filter((d) => d.state === "device");
-      const built = deviceShellLaunch(env.path, online[0]?.serial);
+      const env = await deviceApi.environment();
+      const built = deviceShellLaunch(env.path, deviceSerial);
       if (!built.ok) {
-        setNotice(built.block === "no-adb" ? t("hook.terminal.deviceNoAdb") : t("hook.terminal.deviceNoSerial"));
+        setNotice(
+          built.block === "no-adb" ? t("hook.terminal.deviceNoAdb") : t("hook.terminal.deviceNoSerial"),
+        );
         return false;
       }
       if (store.isDisposed) return false;
@@ -329,7 +346,7 @@ export function TerminalPanel({ fridaLaunch, host = "local", visible = true }: T
       setNotice(String((reason as Error)?.message ?? reason));
       return false;
     }
-  }, [ensureStore, t]);
+  }, [deviceSerial, ensureStore, t]);
 
   /**
    * ➕ / 菜单里的"新建终端"。**没有命令输入框了**：「终端」那页起系统告诉我们的默认程序
@@ -473,8 +490,9 @@ export function TerminalPanel({ fridaLaunch, host = "local", visible = true }: T
    * 「设备 shell」那一页**进去就有一块能敲的屏**（她的用法：点它是开一整页，不是往终端那页追加会话）。
    *
    * 三条闸，每条都是一次真 bug 换来的：
-   * - `visible`：隐藏的那页不许自动开。之前它挂在"外部点了没点"上，结果 `useState(0)` 的初值
-   *   被当成"点了一次"，一进 frida 页就凭空多出一条她没打算要的设备会话。
+   * - `visible`：**这一页真的在她眼前**才自动开（调用方要把"主 tab + 子标签"两件事一起算好交进来，
+   *   因为七页是常驻的）。它的上一版挂在"外部点了没点"上，`useState(0)` 的初值被当成"点了一次"，
+   *   于是她一进 frida 页就凭空多出一条没打算要的设备会话。
    * - **按会话表记**，不按布尔量记：开发模式(StrictMode)会把面板挂两次，第一次收尾时那张表
    *   已经被 `disposeAll` 收了；拿布尔量记"开过了"，第二次就不开 → 设备页永远空着。
    *   记"我为哪张表开过"，表被收之后 `ensureStore()` 给的是新表，于是仍然只开一块屏。

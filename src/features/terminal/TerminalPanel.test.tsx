@@ -8,6 +8,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { deviceApi } from "@/api/device";
 import { I18nProvider } from "@/i18n/I18nProvider";
 import { TerminalPanel } from "./TerminalPanel";
 
@@ -50,7 +51,11 @@ const dialog = {
   saved: [] as Array<{ path: string; content: string }>,
 };
 
-/** 设备与 adb 环境的可控桩（H-2 设备 shell 宿主要用它拿 adb 路径与在线设备列表） */
+/**
+ * 设备与 adb 环境的可控桩（H-2 设备 shell 那宿只用它拿 **adb 路径**）。
+ * ⚠️ `devices` 这份列表是**页面**的事：面板不再去查它（要哪台由调用方给序列号），
+ * 留着它只为演"列表里有几台都不算数"那两条。
+ */
 const adb = {
   env: { installed: true, path: "/sdk/platform-tools/adb" } as Record<string, unknown>,
   devices: [{ serial: "18271FDF600FL4", state: "device", transport: "usb", model: "Pixel 6" }],
@@ -143,6 +148,8 @@ async function newTab(container: HTMLElement, _program?: string): Promise<HTMLEl
   return hostsOf(container)[before];
 }
 
+const SERIAL = "18271FDF600FL4";
+
 const fridaSettings = () => ({
   deviceSerial: "18271FDF600FL4",
   connMode: "usb" as const,
@@ -161,13 +168,17 @@ function renderPanel(request: { scriptPath: string; settings: ReturnType<typeof 
 }
 
 /**
- * 「设备 shell」是**一整页**（不是往终端那页追加会话）：自己的会话表、自己的 tab 条，
- * 进去可见就自己开第一块屏。`visible: false` 演"这页现在没在看"。
+ * 「设备 shell」是**一整页**（现在是设备页的 Shell 子标签）：自己的会话表、自己的 tab 条，
+ * 进去可见就自己开第一块屏。`visible: false` 演"这个子标签现在没在看"，`serial: null` 演"一台都没选中"。
+ *
+ * ⚠️ 设备**由调用方给**：面板不许自己去设备列表里挑一台（下面有专门一条钉着），
+ * 所以每个设备页测试都必须显式说要哪台。
  */
-function renderDevicePanel(visible = true) {
+function renderDevicePanel(opts: { visible?: boolean; serial?: string | null } = {}) {
+  const { visible = true, serial = SERIAL } = opts;
   return render(
     <I18nProvider>
-      <TerminalPanel host="device" visible={visible} />
+      <TerminalPanel host="device" visible={visible} deviceSerial={serial} />
     </I18nProvider>,
   );
 }
@@ -593,29 +604,29 @@ describe("真终端页（FT1 分页）", () => {
   it("设备页：隐藏时一块都不开，可见时只开一块，➕ 才开第二块", async () => {
     const view = render(
       <I18nProvider>
-        <TerminalPanel host="device" visible={false} />
+        <TerminalPanel host="device" visible={false} deviceSerial={SERIAL} />
       </I18nProvider>,
     );
     await waitFor(() => expect(screen.getByTestId("terminal-tabs")).toBeTruthy());
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(fake.openArgs).toEqual([]);
 
-    // 她把 frida 页切到「设备 shell」：这一下才该有第一块屏
+    // 她点开设备页的 Shell 子标签：这一下才该有第一块屏
     view.rerender(
       <I18nProvider>
-        <TerminalPanel host="device" visible />
+        <TerminalPanel host="device" visible deviceSerial={SERIAL} />
       </I18nProvider>,
     );
     await waitFor(() => expect(fake.openArgs.length).toBe(1));
     // 切走再切回来 = 同一张会话表，绝不再自动开第二块（她没点 ➕）
     view.rerender(
       <I18nProvider>
-        <TerminalPanel host="device" visible={false} />
+        <TerminalPanel host="device" visible={false} deviceSerial={SERIAL} />
       </I18nProvider>,
     );
     view.rerender(
       <I18nProvider>
-        <TerminalPanel host="device" visible />
+        <TerminalPanel host="device" visible deviceSerial={SERIAL} />
       </I18nProvider>,
     );
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -641,13 +652,19 @@ describe("真终端页（FT1 分页）", () => {
     expect(vi.mocked(ptyApi.open).mock.calls[1][0].args).toEqual(["-s", "18271FDF600FL4", "shell", "-tt"]);
   });
 
-  /** 没设备就是开不了：不许起一条 `adb -s "" shell` 之类的空会话糊弄界面。 */
-  it("没有在线设备时拒绝起会话，并且一次 PTY 都不开", async () => {
+  /**
+   * 没选中设备就是开不了：不许起一条 `adb -s "" shell` 之类的空会话糊弄界面，
+   * 更**不许面板自己去设备列表里挑一台**——多设备时那会把会话开到她没选的那台上，
+   * 后面她敲的每条命令都打进那台里（`lib/fridaSession` 对 `-U` 是同一个口径）。
+   */
+  it("没选中设备时拒绝起会话：不开 PTY，也不去设备列表里挑一台", async () => {
     adb.devices = [{ serial: "EMULATOR36X5X9X0", state: "offline", transport: "tcp", model: "" }];
-    renderDevicePanel();
+    renderDevicePanel({ serial: null });
     await waitFor(() => expect(screen.getByTestId("terminal-error")).toBeTruthy());
     expect(screen.getByTestId("terminal-error").textContent).toContain("没有在线设备");
     expect(fake.openArgs).toEqual([]);
+    // 关键：面板根本没去问设备列表——"要哪台"是页面的事
+    expect(vi.mocked(deviceApi.list)).not.toHaveBeenCalled();
   });
 
   /** adb 没配好就直说去设置里配，不去 PATH 里猜一个 adb（猜出来的和检测到的可能不是一条）。 */
@@ -659,21 +676,19 @@ describe("真终端页（FT1 分页）", () => {
     expect(fake.openArgs).toEqual([]);
   });
 
-  /** 多设备时必须说清用了哪一台——静默挑第一台是会让人误判"我在这台上操作"的那种错。 */
   /**
-   * 多设备时**不许静默挑一台**：这里不用界面文案证明，而是钉"用的是哪台"必须能从
-   * 交给 PTY 的参数里读出来（tab 标题带着序列号，界面上不再另说一句说明文字）。
+   * 多设备时**用的是哪台由页面说**：这里故意给"列表里的第二台"，PTY 就必须拿到第二台。
+   * 判据钉在交给 PTY 的参数数组上（序列号在 tab 悬停里看得到，界面上不再另说一句说明文字）。
    */
-  it("多台在线时用第一台，并把序列号写进 tab 标题而不是界面文案", async () => {
+  it("多台在线时开的是传进来的那台，不是列表里的第一台", async () => {
     adb.devices = [
       { serial: "AAA111", state: "device", transport: "usb", model: "" },
       { serial: "BBB222", state: "device", transport: "usb", model: "" },
     ];
-    renderDevicePanel();
+    renderDevicePanel({ serial: "BBB222" });
     await waitFor(() => expect(fake.openArgs.length).toBe(1));
-    await waitFor(() => expect(fake.openArgs.length).toBe(1));
-    expect(vi.mocked(ptyApi.open).mock.calls[0][0].args).toEqual(["-s", "AAA111", "shell", "-tt"]);
-    expect(screen.getByTestId("terminal-chip-dev-1").getAttribute("title")).toContain("-s AAA111");
+    expect(vi.mocked(ptyApi.open).mock.calls[0][0].args).toEqual(["-s", "BBB222", "shell", "-tt"]);
+    expect(screen.getByTestId("terminal-chip-dev-1").getAttribute("title")).toContain("-s BBB222");
     expect(screen.queryByTestId("terminal-hint")).toBeNull();
   });
 

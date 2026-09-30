@@ -627,9 +627,8 @@ export const deviceApi = {
     return invokeCommand<PortHolder[]>("device_proc_by_port", { serial, port, root });
   },
   /** 以下长操作返回 task_id，输出走 task:// 事件流 */
-  shell(serial: string, command: string): Promise<string> {
-    return invokeCommand<string>("device_shell", { args: { serial, command } });
-  },
+  /** 设备页的交互式 shell **不在这里**：那块屏走 PTY（`lib/deviceShell` + `pty_open`），
+   * 旧的"一条 `adb shell <cmd>` 起一个任务"已经整体撤掉，别再拿它当出口。 */
   /**
    * 安装：多件即 split 套件，设备侧会自动改用 `adb install-multiple -r`（AR8.2 方案 A）。
    * 仍是长操作 → 返回 task_id，输出走 task:// 事件流。

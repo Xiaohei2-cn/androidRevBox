@@ -119,16 +119,11 @@ vi.mock("@/api/task", () => ({
 }));
 
 /**
- * 「终端」那页的作用域。frida 页现在**同时挂着两块面板**（终端 / 设备 shell），
- * 两边的控件同名，所以测试必须写明"我点的是哪页的那个"——顶层 getByTestId 会一次撞两个。
+ * 「终端」那页的作用域。同名控件在**设备页的 Shell 子标签**也有一份（整个窗口七页常驻），
+ * 所以这里按页限定查询：写明"我点的是 frida 这一页的那个"，别让它指到别人身上。
  */
 function terminalPane() {
   return within(screen.getByTestId("frida-terminal-view"));
-}
-
-/** 「设备 shell」那页的作用域 */
-function devicePane() {
-  return within(screen.getByTestId("frida-device-view"));
 }
 
 function renderHook() {
@@ -183,10 +178,11 @@ describe("Hook 页：frida 右侧那块就是真终端", () => {
     fireEvent.click(terminalPane().getByTestId("terminal-new"));
     await waitFor(() => expect(terminalPane().getByTestId("terminal-tabs")).toBeTruthy());
 
-    // 设备 shell 与终端/结构化同级：**三页各自的面板一直挂着**，切页只改 hidden
-    fireEvent.click(screen.getByTestId("frida-view-device"));
-    expect(screen.getByTestId("frida-terminal-view").hasAttribute("hidden")).toBe(true);
-    expect(screen.getByTestId("frida-device-view").hasAttribute("hidden")).toBe(false);
+    // C 区只有两页：终端 / 结构化终端（设备 shell 已经搬去设备页的 Shell 子标签）
+    expect(screen.getAllByTestId(/^frida-view-/).map((b) => b.getAttribute("data-testid"))).toEqual([
+      "frida-view-terminal",
+      "frida-view-tracks",
+    ]);
 
     fireEvent.click(screen.getByTestId("frida-view-tracks"));
     await waitFor(() => expect(screen.getByTestId("frida-tracks-view").hasAttribute("hidden")).toBe(false));
@@ -196,48 +192,22 @@ describe("Hook 页：frida 右侧那块就是真终端", () => {
   });
 
   /**
-   * 「设备 shell」是**一整页**，不是往终端那页底下追加一块屏（第八十七轮她纠正的地方）。
-   *
-   * 判据按"两页各有各的会话表"来钉，而不是按文案：
-   * - 在终端那页开的本机会话（`term-*`）与设备页自动开的会话（`dev-*`）**互不吞并**；
-   * - 切到设备页**不许把终端的会话杀掉**（关次数为 0、终端 tab 还在）；
-   * - 设备页那一条 PTY 是 `adb … shell`，本机会话那一条是 $SHELL——
-   *   混在一张表里就回答不了"我现在敲的这行到底去哪儿"。
+   * 「设备 shell」**不在这一页**（第八十八轮定的位置：它是设备页的 Shell 子标签，
+   * 连的是她在设备页选中的那台）。这条钉"不许换个形式回来"：
+   * C 区没有设备入口，在这页怎么点都**不会**交给 PTY 一条 `adb … shell`。
+   * 两页两张会话表这件事一旦破，她的设备会话就又会长回终端那页底下——那正是被推翻过的形状。
    */
-  it("设备 shell 自己是一页：本机会话不被吞、不被杀，设备会话开在自己的表里", async () => {
+  it("frida 页没有设备 shell 入口，也永远不会起设备会话", async () => {
     renderHook();
     await waitFor(() => expect(terminalPane().getByTestId("terminal-new")).toBeEnabled());
+    expect(screen.queryByTestId("frida-view-device")).toBeNull();
+    expect(screen.queryByTestId("frida-device-view")).toBeNull();
+
     fireEvent.click(terminalPane().getByTestId("terminal-new"));
-    await waitFor(() => expect(terminalPane().getByTestId("terminal-chip-term-1")).toBeTruthy());
-    expect(pty.openArgs[0].program).toBe("/bin/zsh");
-
-    fireEvent.click(screen.getByTestId("frida-view-device"));
-    await waitFor(() => expect(pty.openArgs.length).toBe(2));
-    expect(pty.openArgs[1].program).toBe("/sdk/adb");
-    expect(pty.openArgs[1].args).toEqual(["-s", "18271FDF600FL4", "shell", "-tt"]);
-
-    // 设备页是它自己的一页：自己的 tab 条、自己的「会话 1」，终端页那条没被并进来也没被关
-    expect(devicePane().getByTestId("terminal-chip-dev-1").textContent).toContain("会话 1");
-    expect(devicePane().queryByTestId("terminal-chip-term-1")).toBeNull();
-    expect(terminalPane().getByTestId("terminal-chip-term-1")).toBeTruthy();
-    expect(vi.mocked(ptyApi.close)).not.toHaveBeenCalled();
-
-    // 切回终端：两块屏都还在，谁也没被卸载
-    fireEvent.click(screen.getByTestId("frida-view-terminal"));
-    expect(terminalPane().getByTestId("terminal-chip-term-1")).toBeTruthy();
-    expect(devicePane().getByTestId("terminal-chip-dev-1")).toBeTruthy();
-    expect(vi.mocked(ptyApi.close)).not.toHaveBeenCalled();
-  });
-
-  /**
-   * 隐藏的那页**不许偷偷起进程**：她一进 frida 页就该是本机那块屏，
-   * 设备会话只有她把那页翻出来才开（上一版"进页面凭空多一个设备会话"就是这么来的）。
-   */
-  it("只停在终端页时一个设备会话都不开", async () => {
-    renderHook();
-    await waitFor(() => expect(terminalPane().getByTestId("terminal-new")).toBeEnabled());
+    await waitFor(() => expect(pty.openArgs.length).toBe(1));
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(pty.openArgs).toEqual([]);
+    // 只有那条本机 shell；设备会话的 adb 一次都没出现
+    expect(pty.openArgs.map((a) => a.program)).toEqual(["/bin/zsh"]);
   });
 
   /**
