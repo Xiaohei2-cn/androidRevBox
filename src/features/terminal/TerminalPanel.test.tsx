@@ -160,11 +160,14 @@ function renderPanel(request: { scriptPath: string; settings: ReturnType<typeof 
   );
 }
 
-/** 「设备 shell」是一个动作：nonce 每变一次，面板就该**独立多开一个设备会话** */
-function renderDevicePanel(nonce = 1) {
+/**
+ * 「设备 shell」是**一整页**（不是往终端那页追加会话）：自己的会话表、自己的 tab 条，
+ * 进去可见就自己开第一块屏。`visible: false` 演"这页现在没在看"。
+ */
+function renderDevicePanel(visible = true) {
   return render(
     <I18nProvider>
-      <TerminalPanel deviceLaunch={{ nonce }} />
+      <TerminalPanel host="device" visible={visible} />
     </I18nProvider>,
   );
 }
@@ -547,8 +550,9 @@ describe("真终端页（FT1 分页）", () => {
       "-tt",
     ]);
     // 默认名仍是「会话 N」；跑的是什么放在悬停提示里（要查的时候拿得到，不占界面）
-    expect(screen.getByTestId("terminal-chip-term-1").textContent).toContain("会话 1");
-    expect(screen.getByTestId("terminal-chip-term-1").getAttribute("title")).toContain("/sdk/platform-tools/adb");
+    // id 带 `dev-` 前缀：设备那页与终端那页的序号各自从 1 起，前缀不分开就指不出是谁
+    expect(screen.getByTestId("terminal-chip-dev-1").textContent).toContain("会话 1");
+    expect(screen.getByTestId("terminal-chip-dev-1").getAttribute("title")).toContain("/sdk/platform-tools/adb");
     expect(screen.queryByTestId("terminal-hint")).toBeNull();
   });
 
@@ -580,38 +584,61 @@ describe("真终端页（FT1 分页）", () => {
   });
 
   /**
-   * 「设备 shell」是动作，不是模式：
-   * ① 面板刚挂上时**不能凭空开一个会话**（nonce=0 被当成"点过一次"就是上一版的真 bug）；
-   * ② 每点一次独立多一块屏，第二块不会去动第一块。
+   * 「设备 shell」是一页，不是一个动作。三条都是真 bug 换来的：
+   * ① **不可见就不许开**：上一版这页挂在"外部点了几次"上，`useState(0)` 的初值被当成点过一次，
+   *    于是她一进 frida 页，没在看的那页就凭空起了一条 adb shell。
+   * ② 变可见只开**一块**屏（重渲染、来回切页都不许多开）。
+   * ③ 要第二块得她自己在设备页点 ➕，而且那是一块**独立的**新屏，不动第一块。
    */
-  it("点两次设备 shell 得到两个独立会话，挂载时一个都不开", async () => {
-    // 故意用 {nonce: 0}——上一版 frida 页就是这么传的（useState(0) 初值），
-    // 面板把它当成"点了一次"，一进页面就凭空开一个设备会话。这条断言必须抓住那个形状。
+  it("设备页：隐藏时一块都不开，可见时只开一块，➕ 才开第二块", async () => {
     const view = render(
       <I18nProvider>
-        <TerminalPanel deviceLaunch={{ nonce: 0 }} />
+        <TerminalPanel host="device" visible={false} />
       </I18nProvider>,
     );
-    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
+    await waitFor(() => expect(screen.getByTestId("terminal-tabs")).toBeTruthy());
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(fake.openArgs).toEqual([]);
 
+    // 她把 frida 页切到「设备 shell」：这一下才该有第一块屏
     view.rerender(
       <I18nProvider>
-        <TerminalPanel deviceLaunch={{ nonce: 1 }} />
+        <TerminalPanel host="device" visible />
       </I18nProvider>,
     );
     await waitFor(() => expect(fake.openArgs.length).toBe(1));
+    // 切走再切回来 = 同一张会话表，绝不再自动开第二块（她没点 ➕）
     view.rerender(
       <I18nProvider>
-        <TerminalPanel deviceLaunch={{ nonce: 2 }} />
+        <TerminalPanel host="device" visible={false} />
       </I18nProvider>,
     );
+    view.rerender(
+      <I18nProvider>
+        <TerminalPanel host="device" visible />
+      </I18nProvider>,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(fake.openArgs.length).toBe(1);
+
+    fireEvent.click(screen.getByTestId("terminal-new"));
     await waitFor(() => expect(fake.openArgs.length).toBe(2));
     expect(screen.getAllByTestId(/^terminal-chip-/)).toHaveLength(2);
     // 两块屏各自一条 pty：id 必须不同（同一块屏不可能共享一条会话）
     expect(vi.mocked(ptyApi.open).mock.calls.length).toBe(2);
-    void view;
+  });
+
+  /**
+   * 设备页的 ➕ 起的是 **adb shell**，不是本机那条 $SHELL。
+   * 判据是交给 PTY 的参数数组：混用宿主时"我在这块屏上敲的东西到底去了哪儿"就没法回答。
+   */
+  it("设备页的新建起的是设备会话，不是本机 shell", async () => {
+    renderDevicePanel();
+    await waitFor(() => expect(fake.openArgs.length).toBe(1));
+    fireEvent.click(screen.getByTestId("terminal-new"));
+    await waitFor(() => expect(fake.openArgs.length).toBe(2));
+    expect(fake.openArgs[1].program).toBe("/sdk/platform-tools/adb");
+    expect(vi.mocked(ptyApi.open).mock.calls[1][0].args).toEqual(["-s", "18271FDF600FL4", "shell", "-tt"]);
   });
 
   /** 没设备就是开不了：不许起一条 `adb -s "" shell` 之类的空会话糊弄界面。 */
@@ -646,7 +673,7 @@ describe("真终端页（FT1 分页）", () => {
     await waitFor(() => expect(fake.openArgs.length).toBe(1));
     await waitFor(() => expect(fake.openArgs.length).toBe(1));
     expect(vi.mocked(ptyApi.open).mock.calls[0][0].args).toEqual(["-s", "AAA111", "shell", "-tt"]);
-    expect(screen.getByTestId("terminal-chip-term-1").getAttribute("title")).toContain("-s AAA111");
+    expect(screen.getByTestId("terminal-chip-dev-1").getAttribute("title")).toContain("-s AAA111");
     expect(screen.queryByTestId("terminal-hint")).toBeNull();
   });
 

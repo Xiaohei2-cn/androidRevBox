@@ -9,7 +9,7 @@
  * 3. 切到"轨道"视图时终端容器**仍在 DOM 里**——卸载等于 disposeAll，会杀掉她的会话；
  * 4. B 区点脚本 = 在这块屏上起**官方 frida REPL**，参数原样交给 PTY。
  */
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -17,6 +17,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { HookPage } from "./HookPage";
 import { I18nProvider } from "@/i18n/I18nProvider";
 import { hookApi } from "@/api/hook";
+import { ptyApi } from "@/api/pty";
 
 /** 设备上 frida-server 的探活结果（起 REPL 前的前置检查读它） */
 const device = { serverRunning: true };
@@ -117,6 +118,19 @@ vi.mock("@/api/task", () => ({
   },
 }));
 
+/**
+ * 「终端」那页的作用域。frida 页现在**同时挂着两块面板**（终端 / 设备 shell），
+ * 两边的控件同名，所以测试必须写明"我点的是哪页的那个"——顶层 getByTestId 会一次撞两个。
+ */
+function terminalPane() {
+  return within(screen.getByTestId("frida-terminal-view"));
+}
+
+/** 「设备 shell」那页的作用域 */
+function devicePane() {
+  return within(screen.getByTestId("frida-device-view"));
+}
+
 function renderHook() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   // TooltipProvider 是 AppProviders 给全局的（B 区脚本条的气泡要用），测试自己补上
@@ -134,6 +148,7 @@ function renderHook() {
 beforeEach(() => {
   device.serverRunning = true;
   pty.openArgs.length = 0;
+  vi.mocked(ptyApi.close).mockClear();
   pty.feeders.clear();
   vi.mocked(hookApi.sessionStart).mockClear();
 });
@@ -153,31 +168,76 @@ describe("Hook 页：frida 右侧那块就是真终端", () => {
     expect(screen.getByTestId("frida-terminal-view").hasAttribute("hidden")).toBe(false);
     // 一块屏要真正"挂上"才有 xterm 自己的节点（起会话前这里连元素都没有，那是正常的空面板）
     // 等的是**懒加载的那块面板本身**：不等到它就点，测的是"点了个不存在的按钮"
-    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
-    fireEvent.click(screen.getByTestId("terminal-new"));
-    await waitFor(() => expect(screen.getByTestId("terminal-host")).toBeTruthy());
+    await waitFor(() => expect(terminalPane().getByTestId("terminal-new")).toBeEnabled());
+    fireEvent.click(terminalPane().getByTestId("terminal-new"));
+    await waitFor(() => expect(terminalPane().getByTestId("terminal-host")).toBeTruthy());
     await waitFor(() =>
-      expect(screen.getByTestId("terminal-host").querySelector(".xterm-screen")).toBeTruthy(),
+      expect(terminalPane().getByTestId("terminal-host").querySelector(".xterm-screen")).toBeTruthy(),
     );
   });
 
   /** 切视图只改 hidden：**卸载 = disposeAll = 杀掉她正在跑的会话**，那是不可接受的。 */
   it("切到轨道视图时终端容器还在 DOM 里（不卸载、不杀会话）", async () => {
     renderHook();
-    await waitFor(() => expect(screen.getByTestId("terminal-new")).toBeEnabled());
-    fireEvent.click(screen.getByTestId("terminal-new"));
-    await waitFor(() => expect(screen.getByTestId("terminal-tabs")).toBeTruthy());
+    await waitFor(() => expect(terminalPane().getByTestId("terminal-new")).toBeEnabled());
+    fireEvent.click(terminalPane().getByTestId("terminal-new"));
+    await waitFor(() => expect(terminalPane().getByTestId("terminal-tabs")).toBeTruthy());
 
-    // 设备 shell 与终端/结构化同级：切到它**不换面板**（换面板等于把会话杀掉）
+    // 设备 shell 与终端/结构化同级：**三页各自的面板一直挂着**，切页只改 hidden
     fireEvent.click(screen.getByTestId("frida-view-device"));
-    expect(screen.getByTestId("frida-terminal-view").hasAttribute("hidden")).toBe(false);
-    expect(screen.getByTestId("terminal-new")).toBeTruthy();
+    expect(screen.getByTestId("frida-terminal-view").hasAttribute("hidden")).toBe(true);
+    expect(screen.getByTestId("frida-device-view").hasAttribute("hidden")).toBe(false);
 
     fireEvent.click(screen.getByTestId("frida-view-tracks"));
     await waitFor(() => expect(screen.getByTestId("frida-tracks-view").hasAttribute("hidden")).toBe(false));
     expect(screen.getByTestId("frida-terminal-view").hasAttribute("hidden")).toBe(true);
-    // 那一块屏没有被从 DOM 里拿掉：会话表与 xterm 实例都还活着
-    expect(screen.getByTestId("terminal-tabs")).toBeTruthy();
+    // 终端那页没有被从 DOM 里拿掉：会话表与 xterm 实例都还活着（切回来还是原来那块屏）
+    expect(terminalPane().getByTestId("terminal-tabs")).toBeTruthy();
+  });
+
+  /**
+   * 「设备 shell」是**一整页**，不是往终端那页底下追加一块屏（第八十七轮她纠正的地方）。
+   *
+   * 判据按"两页各有各的会话表"来钉，而不是按文案：
+   * - 在终端那页开的本机会话（`term-*`）与设备页自动开的会话（`dev-*`）**互不吞并**；
+   * - 切到设备页**不许把终端的会话杀掉**（关次数为 0、终端 tab 还在）；
+   * - 设备页那一条 PTY 是 `adb … shell`，本机会话那一条是 $SHELL——
+   *   混在一张表里就回答不了"我现在敲的这行到底去哪儿"。
+   */
+  it("设备 shell 自己是一页：本机会话不被吞、不被杀，设备会话开在自己的表里", async () => {
+    renderHook();
+    await waitFor(() => expect(terminalPane().getByTestId("terminal-new")).toBeEnabled());
+    fireEvent.click(terminalPane().getByTestId("terminal-new"));
+    await waitFor(() => expect(terminalPane().getByTestId("terminal-chip-term-1")).toBeTruthy());
+    expect(pty.openArgs[0].program).toBe("/bin/zsh");
+
+    fireEvent.click(screen.getByTestId("frida-view-device"));
+    await waitFor(() => expect(pty.openArgs.length).toBe(2));
+    expect(pty.openArgs[1].program).toBe("/sdk/adb");
+    expect(pty.openArgs[1].args).toEqual(["-s", "18271FDF600FL4", "shell", "-tt"]);
+
+    // 设备页是它自己的一页：自己的 tab 条、自己的「会话 1」，终端页那条没被并进来也没被关
+    expect(devicePane().getByTestId("terminal-chip-dev-1").textContent).toContain("会话 1");
+    expect(devicePane().queryByTestId("terminal-chip-term-1")).toBeNull();
+    expect(terminalPane().getByTestId("terminal-chip-term-1")).toBeTruthy();
+    expect(vi.mocked(ptyApi.close)).not.toHaveBeenCalled();
+
+    // 切回终端：两块屏都还在，谁也没被卸载
+    fireEvent.click(screen.getByTestId("frida-view-terminal"));
+    expect(terminalPane().getByTestId("terminal-chip-term-1")).toBeTruthy();
+    expect(devicePane().getByTestId("terminal-chip-dev-1")).toBeTruthy();
+    expect(vi.mocked(ptyApi.close)).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 隐藏的那页**不许偷偷起进程**：她一进 frida 页就该是本机那块屏，
+   * 设备会话只有她把那页翻出来才开（上一版"进页面凭空多一个设备会话"就是这么来的）。
+   */
+  it("只停在终端页时一个设备会话都不开", async () => {
+    renderHook();
+    await waitFor(() => expect(terminalPane().getByTestId("terminal-new")).toBeEnabled());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(pty.openArgs).toEqual([]);
   });
 
   /**

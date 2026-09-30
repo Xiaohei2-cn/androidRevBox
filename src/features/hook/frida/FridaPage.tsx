@@ -21,17 +21,15 @@ const TerminalPanel = lazy(() =>
 );
 
 /**
- * C 区：**两个视图 + 一个动作**（用户纠正后的形状）
- * - `terminal`：那块真终端屏（➕ 开本机会话；点左侧脚本 = 开一个官方 frida REPL 会话）
+ * C 区是**三页**（她纠正过两次：设备 shell 既不是"往终端底下追加会话"，也不是一个开关）：
+ * - `terminal`：那块真终端屏——➕ 开本机会话，点左侧脚本 = 在这页开一个官方 frida REPL 会话
+ * - `device`：设备 shell **自己的一整页**，自己一条 tab 条、自己一张会话表，进去就有会话 1
  * - `tracks`：我们自己的 NDJSON 结构化视图（原三轨 + JSON 树）
  *
- * 「设备 shell」**不是视图也不是模式**：它是个动作——点一次就**独立开一个新的设备会话**，
- * 与屏上已有会话互不发生关系，可以连着点出好几个。之前我把它做成"切宿主"，
- * 点完还得再点 ➕ 才出现会话——那不是入口，那是开关。
- *
- * 切视图只改 `hidden`，**绝不卸载**：卸载等于 disposeAll，会把会话连同进程一起杀掉。
+ * 两页终端**同时挂着**，切页只改 `hidden`：卸载等于 disposeAll，会把她正在跑的会话连进程一起收掉。
+ * 各自的会话表用不同 id 前缀（`term-*` / `dev-*`），所以两页可以同时有"会话 1"而不打架。
  */
-type ConsoleView = "terminal" | "tracks";
+type ConsoleView = "terminal" | "device" | "tracks";
 
 const DEFAULT_SETTINGS: FridaSettings = {
   deviceSerial: null,
@@ -52,8 +50,6 @@ export function FridaPage() {
   const [error, setError] = useState<string | null>(null);
   const [focusScriptsTick, setFocusScriptsTick] = useState(0);
   const [view, setView] = useState<ConsoleView>("terminal");
-  /** 「设备 shell」被点了几次：每变一次就开一个**独立**的设备会话 */
-  const [deviceNonce, setDeviceNonce] = useState(0);
   const [launch, setLaunch] = useState<FridaLaunchRequest | null>(null);
   const nonceRef = useRef(0);
 
@@ -70,7 +66,9 @@ export function FridaPage() {
        * 脚本绝对路径（B 区给的 `path`）和 A 区当时的设置快照交出去——设置快照这点很重要：
        * 会话起来之后她再改目标，不该把已经跑着的会话搅了。
        */
-      if (view === "terminal") {
+      if (view !== "tracks") {
+        // REPL 属于「终端」那一页：她在设备页点脚本，先看自己刚点起来的东西，别留一块没人看的屏
+        setView("terminal");
         nonceRef.current += 1;
         setLaunch({ scriptPath: script.path, settings: { ...settings }, nonce: nonceRef.current });
         return;
@@ -145,7 +143,7 @@ export function FridaPage() {
       {/* C 会话控制台：右侧 2/3，通高。两个视图都一直挂着，切换只改 hidden（卸载=杀会话） */}
       <div className="col-start-2 row-start-1 col-span-2 row-span-3 flex min-h-0 min-w-0 flex-col gap-2">
         <div className="flex shrink-0 items-center gap-1 text-10px" role="group" aria-label={t("hook.frida.consoleView")}>
-          {(["terminal", "tracks"] as const).map((key) => (
+          {(["terminal", "device", "tracks"] as const).map((key) => (
             <button
               key={key}
               type="button"
@@ -159,21 +157,17 @@ export function FridaPage() {
               }`}
               data-testid={`frida-view-${key}`}
             >
-              {t(key === "terminal" ? "hook.frida.viewTerminal" : "hook.frida.viewTracks")}
+              {key === "terminal"
+                ? t("hook.frida.viewTerminal")
+                : key === "device"
+                  ? // 设备 shell 是**一整页**，不是一个动作：点它=换页，页里自己有会话 1
+                    t("hook.terminal.deviceShell")
+                  : t("hook.frida.viewTracks")}
             </button>
           ))}
-          {/* 设备 shell：一个**动作**。点一次 = 独立开一个新设备会话 */}
-          <button
-            type="button"
-            className="rounded px-2 py-0.5 text-muted-foreground hover:bg-muted/50"
-            onClick={() => setDeviceNonce((n) => n + 1)}
-            data-testid="frida-view-device"
-          >
-            {t("hook.terminal.deviceShell")}
-          </button>
         </div>
-        {/* 所有会话（本机 / 设备 / frida）都在这块屏上；切视图绝不重载面板（重载 = 杀会话） */}
-        <div className="min-h-0 flex-1" hidden={view === "tracks"} data-testid="frida-terminal-view">
+        {/* 「终端」那页：本机 shell + 点脚本起的官方 REPL。切页绝不重载面板（重载 = 杀会话） */}
+        <div className="min-h-0 flex-1" hidden={view !== "terminal"} data-testid="frida-terminal-view">
           <Suspense
             fallback={
               <div className="p-3 text-10px text-muted-foreground" data-testid="terminal-loading">
@@ -181,8 +175,19 @@ export function FridaPage() {
               </div>
             }
           >
-            {/* 没点过就是不请求：传 {nonce:0} 会被当成"点了一次"，一进页面就凭空多开一个设备会话 */}
-            <TerminalPanel fridaLaunch={launch} deviceLaunch={deviceNonce ? { nonce: deviceNonce } : null} />
+            <TerminalPanel fridaLaunch={launch} host="local" visible={view === "terminal"} />
+          </Suspense>
+        </div>
+        {/* 「设备 shell」那页：自己的 tab 条、自己的会话表，不带 frida 预置（那一页不跑脚本） */}
+        <div className="min-h-0 flex-1" hidden={view !== "device"} data-testid="frida-device-view">
+          <Suspense
+            fallback={
+              <div className="p-3 text-10px text-muted-foreground" data-testid="device-loading">
+                {t("hook.terminal.loading")}
+              </div>
+            }
+          >
+            <TerminalPanel host="device" visible={view === "device"} />
           </Suspense>
         </div>
         <div className="min-h-0 flex-1" hidden={view !== "tracks"} data-testid="frida-tracks-view">

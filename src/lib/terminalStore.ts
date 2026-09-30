@@ -91,6 +91,13 @@ export interface StoreDeps {
   /** 造终端实例——测试注入，生产用 `createTerminal`。 */
   makeBundle?: (options: { cols: number; rows: number }) => TerminalBundle;
   maxSessions?: number;
+  /**
+   * tab id 的前缀，缺省 `term`。
+   * frida 页现在**同时挂着两张表**（「终端」和「设备 shell」各一张），两边序号都从 1 起：
+   * 都叫 `term-1` 的话，同一屏里两块面板的元素标识撞在一起，"刚才那条输出是哪块屏打的"
+   * 就没法追了。前缀由面板按自己那页给（`term` / `dev`）。
+   */
+  idPrefix?: string;
 }
 
 /** 起不到会话时给界面的兜底尺寸（jsdom 量不到、隐藏容器也量不到，绝不能传 0）。 */
@@ -104,15 +111,18 @@ export class TerminalSessionStore {
 
   private readonly maxSessions: number;
 
+  private readonly idPrefix: string;
+
   /**
    * 序号**跟着表走**，不用模块级全局：全局计数器让 id 跨页面/跨测试一直往后涨
    * （`term-7`、`term-8`……），于是"关掉第一个 tab"这种断言写成 `term-1` 就会红，
-   * 而红的原因和代码对不对毫无关系。id 只要在一张表里唯一就够用。
+   * 而红的原因和代码对不对毫无关系。id 只要在**自己那张表**里唯一就够用（跨表再靠前缀分开）。
    */
   private seq = 0;
 
   constructor(private readonly deps: StoreDeps) {
     this.maxSessions = deps.maxSessions ?? MAX_TERMINAL_SESSIONS;
+    this.idPrefix = deps.idPrefix ?? "term";
   }
 
   /** 快照只给"值"，不给内部对象：调用方拿到的是可以直接渲染的普通数据。 */
@@ -267,7 +277,7 @@ export class TerminalSessionStore {
     });
     const entry: Entry = {
       tab: {
-        id: `term-${this.seq}`,
+        id: `${this.idPrefix}-${this.seq}`,
         kind: input.kind ?? "local",
         // 默认**不给句子**：只给序号，名字由界面按语言渲染（"会话 1"）。
         title: null,
