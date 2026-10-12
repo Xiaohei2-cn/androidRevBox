@@ -12,7 +12,7 @@ export default {
   "nav.binary": "バイナリ",
   "nav.unpack": "脱殻",
   "nav.kernel": "カーネル",
-  "nav.crypto": "アルゴリズム",
+  "nav.crypto": "アルゴリズムセンター",
   "nav.plugins": "プラグイン",
   "nav.tasks": "タスク",
   "nav.market": "ツールマーケット",

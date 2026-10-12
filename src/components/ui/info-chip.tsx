@@ -15,9 +15,9 @@ export function InfoChip({
   return (
     <span
       data-testid={testid}
-      title={title}
+      title={title ?? label}
       className={cn(
-        "path-selectable max-w-full break-all rounded bg-emerald-500/10 px-1.5 py-0.5 font-mono text-emerald-500",
+        "path-selectable max-w-full min-w-0 truncate rounded bg-emerald-500/10 px-1.5 py-0.5 font-mono text-emerald-500",
         className,
       )}
     >

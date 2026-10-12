@@ -16,33 +16,23 @@ export interface PreflightDto {
   pythonOk: boolean;
   pythonHint?: string | null;
   pythonPath?: string | null;
+  /**
+   * 官方 REPL（`python -m frida_tools.repl`）对这条 Python 的要求：**frida-tools 在不在**。
+   * 与 `lib/fridaSession` 的 `no-frida-tools` 判据同源——前置亮绿与实际点下去报不报
+   * `No module named frida_tools` 必须是同一件事。
+   */
   fridaOk: boolean;
+  /** Python 绑定包（`import frida`）版本；只有 frida-tools 的机器上为 null */
   fridaVersion?: string | null;
+  /** frida-tools 版本（REPL 本体）；两版都给出来后置药丸显示得更准确 */
+  fridaToolsVersion?: string | null;
   fridaHint?: string | null;
   /** 远程模式探活结果；非远程模式 null（不探） */
   remoteOk: boolean | null;
   remoteHint?: string | null;
-  runnerOk: boolean;
-  runnerHint?: string | null;
   /** 与设备 frida-server 的真实握手；null/undefined = 没探（Python 未就绪），界面上不出现这一项 */
   channelOk?: boolean | null;
   channelHint?: string | null;
-}
-
-export interface HookSessionStartArgs {
-  /** USB 模式：adb serial；远程模式 null */
-  serial: string | null;
-  /** 远程模式：host:port；USB null */
-  remote: string | null;
-  spawn: boolean;
-  /**
-   * Spawn：包名（必填）。
-   * Attach：包名或 pid；**空串是合法值，含义是"附加当前前台应用"**（frida -F）。
-   * 这个翻译只在宿主 `frida::resolve_target` 一处做。
-   */
-  target: string;
-  /** 工作目录下的 .js 文件名 */
-  script: string;
 }
 
 export const hookApi = {
@@ -51,7 +41,7 @@ export const hookApi = {
     return invokeCommand<JsFileDto[]>("hook_js_list", { dir: dir ?? null });
   },
   /**
-   * 前置检查链聚合（adb/python/frida/runner/远程 TCP/frida 通道握手）。
+   * 前置检查链聚合（adb/python/frida-tools/远程 TCP/frida 通道握手）。
    * serial 只在 USB 模式下给：握手必须连**要用的那台设备**，不然探的是别机的 server。
    */
   preflight(remote?: string, serial?: string): Promise<PreflightDto> {
@@ -60,86 +50,28 @@ export const hookApi = {
       serial: serial ?? null,
     });
   },
-  /** 起 frida runner 会话任务，返回 taskId；停止=task_cancel，输出=task://output */
-  sessionStart(args: HookSessionStartArgs): Promise<string> {
-    return invokeCommand<string>("hook_session_start", { args });
+  /**
+   * 读工作目录里的一个脚本正文（IDE 打开脚本时用）。
+   * 边界（名字白名单、一层目录内、拒绝符号链接）全在宿主侧，前端只传名字。
+   */
+  scriptRead(name: string): Promise<string> {
+    return invokeCommand<string>("hook_script_read", { name });
+  },
+  /** 写一个脚本（IDE 保存；返回落盘字节数，宿主写完回读自证）。
+   * createOnly=true 是「新建」语义：撞名拒绝，不静默覆盖已有脚本 */
+  scriptWrite(name: string, content: string, createOnly = false): Promise<number> {
+    return invokeCommand<number>("hook_script_write", { name, content, createOnly });
+  },
+  /** 删一个脚本（IDE 的「删除」；只删工作目录里的普通 .js） */
+  scriptDelete(name: string): Promise<void> {
+    return invokeCommand<void>("hook_script_delete", { name });
   },
   /**
-   * 「保存日志」：把**用户在对话框里亲自选中的本机路径**交给桌面端写盘，返回落盘的字节数。
-   * 返回字节数而不是布尔：界面要说"存了 1.2 MB"，而不是让用户以为"成功=有内容"。
+   * 「保存日志」：把**用户在对话框里亲自选中的本机路径**交给桌面端写盘（真终端页在用），
+   * 返回落盘的字节数。返回字节数而不是布尔：界面要说"存了 1.2 MB"，
+   * 而不是让用户以为"成功=有内容"。
    */
   exportSave(path: string, content: string): Promise<number> {
     return invokeCommand<number>("hook_export_save", { path, content });
   },
 };
-
-// ===== runner NDJSON 行协议（§5.2）：纯解析，vitest 覆盖 =====
-
-export type FridaEvent =
-  | { kind: "ready"; pid: number | null; mode: string; pkg: string; frida?: string }
-  | { kind: "log"; lvl: string; msg: string }
-  | { kind: "send"; tag?: string; seq?: number; data: unknown; dataBin?: string }
-  | { kind: "error"; why: string; stack?: string | null }
-  | { kind: "exit"; code: number | null; why?: string }
-  /** 解析失败的行降级为原文（向前兼容 + 脚本手写非协议输出） */
-  | { kind: "raw"; text: string };
-
-/**
- * 解析一行 runner 输出 → 事件对象。
- * 非 JSON / 缺 t 字段 / 未知 t → raw 降级；system 流（pid= 等）由调用方标注。
- */
-export function parseFridaLine(line: string): FridaEvent {
-  const trimmed = line.trim();
-  if (!trimmed.startsWith("{")) return { kind: "raw", text: line };
-  let obj: unknown;
-  try {
-    obj = JSON.parse(trimmed);
-  } catch {
-    return { kind: "raw", text: line };
-  }
-  if (typeof obj !== "object" || obj === null) return { kind: "raw", text: line };
-  const o = obj as Record<string, unknown>;
-  switch (o.t) {
-    case "ready":
-      return {
-        kind: "ready",
-        pid: typeof o.pid === "number" ? o.pid : null,
-        mode: String(o.mode ?? ""),
-        pkg: String(o.pkg ?? ""),
-        frida: typeof o.frida === "string" ? o.frida : undefined,
-      };
-    case "log":
-      return { kind: "log", lvl: String(o.lvl ?? "log"), msg: String(o.msg ?? "") };
-    case "send": {
-      const bin = o.data_bin as { _hex?: unknown } | undefined;
-      return {
-        kind: "send",
-        tag: o.tag != null ? String(o.tag) : undefined,
-        seq: typeof o.seq === "number" ? o.seq : undefined,
-        data: o.data,
-        dataBin: typeof bin?._hex === "string" ? bin._hex : undefined,
-      };
-    }
-    case "error":
-      return { kind: "error", why: String(o.why ?? "unknown"), stack: o.stack == null ? null : String(o.stack) };
-    case "exit":
-      return {
-        kind: "exit",
-        code: typeof o.code === "number" ? o.code : null,
-        why: typeof o.why === "string" ? o.why : undefined,
-      };
-    default:
-      return { kind: "raw", text: line };
-  }
-}
-
-/** send 行摘要（M1 卡片标题用）：`sign("abc…") → "e10a…"` 式的单行压缩 */
-export function summarizeEventData(data: unknown): string {
-  if (data == null) return "null";
-  if (typeof data !== "object") return String(data);
-  try {
-    return JSON.stringify(data);
-  } catch {
-    return "[unserializable]";
-  }
-}

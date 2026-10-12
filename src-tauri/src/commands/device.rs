@@ -11,12 +11,11 @@ use agent_protocol::{
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::adapters::adb::{
-    DeviceEntry, DeviceInfo, FileEntry, HostedBinary, ListenPort, PortHolder,
-};
+use crate::adapters::adb::{DeviceEntry, DeviceInfo, ListenPort, PortHolder};
 use crate::core::error::{CoreError, CoreResult};
 use crate::services::device_service::{
-    AdbEnvironment, DeviceChangedPayload, ForwardRule, HostedRunView,
+    AdbEnvironment, DeviceChangedPayload, FileListing, ForwardRule, HostedClaimView,
+    HostedListView, HostedRunView,
 };
 
 // ===== 环境 / 列表 =====
@@ -88,8 +87,12 @@ pub async fn device_ls(
     state: tauri::State<'_, AppState>,
     serial: String,
     path: String,
-) -> CoreResult<Vec<FileEntry>> {
-    state.device.list_files(&serial, &path).await
+    root: Option<bool>,
+) -> CoreResult<FileListing> {
+    state
+        .device
+        .list_files(&serial, &path, root.unwrap_or(false))
+        .await
 }
 
 #[tauri::command]
@@ -153,7 +156,7 @@ pub async fn adb_forward_remove(
 pub async fn device_binaries(
     state: tauri::State<'_, AppState>,
     serial: String,
-) -> CoreResult<Vec<HostedBinary>> {
+) -> CoreResult<HostedListView> {
     state.device.hosted_binaries(&serial).await
 }
 
@@ -212,6 +215,33 @@ pub async fn device_binary_run(
             &args.unwrap_or_default(),
             stdin_data.as_deref(),
             interactive.unwrap_or(false),
+        )
+        .await
+}
+
+/// 把「交互终端刚起的那个进程」认领进设备侧托管运行表。
+///
+/// 终端那次 exec 走 `adb shell -tt`，不经过 Agent，运行表里没有记录 —— 不补这一条，
+/// 界面只能说"它在跑，可它不在托管表里"，而它明明是用户在本工具里点起来的。
+/// `knownPids` 是启动前同名进程的 pid（那些不是这次起的，不能认领）；
+/// 认领成不成立由设备侧按 /proc 实证判，失败只写进 detail，不当成启动失败。
+#[tauri::command]
+pub async fn device_binary_claim(
+    state: tauri::State<'_, AppState>,
+    serial: String,
+    name: String,
+    args: Option<Vec<String>>,
+    root: Option<bool>,
+    known_pids: Option<Vec<u32>>,
+) -> CoreResult<HostedClaimView> {
+    state
+        .device
+        .hosted_claim_terminal(
+            &serial,
+            &name,
+            &args.unwrap_or_default(),
+            root.unwrap_or(false),
+            &known_pids.unwrap_or_default(),
         )
         .await
 }
@@ -303,10 +333,16 @@ pub async fn device_file_stat(
     serial: String,
     path: String,
     follow_symlink: Option<bool>,
+    root: Option<bool>,
 ) -> CoreResult<FilesystemStatResult> {
     state
         .device
-        .file_stat(&serial, &path, follow_symlink.unwrap_or(false))
+        .file_stat(
+            &serial,
+            &path,
+            follow_symlink.unwrap_or(false),
+            root.unwrap_or(false),
+        )
         .await
 }
 
@@ -317,8 +353,12 @@ pub async fn device_fs_mkdir(
     state: tauri::State<'_, AppState>,
     serial: String,
     path: String,
+    root: Option<bool>,
 ) -> CoreResult<agent_protocol::FilesystemMkdirResult> {
-    state.device.fs_mkdir(&serial, &path).await
+    state
+        .device
+        .fs_mkdir(&serial, &path, root.unwrap_or(false))
+        .await
 }
 
 /// 重命名 / 移动（文件页的"改"）。目标已存在时设备侧会拒绝，不静默覆盖。
@@ -328,8 +368,13 @@ pub async fn device_fs_rename(
     serial: String,
     from: String,
     to: String,
+
+    root: Option<bool>,
 ) -> CoreResult<agent_protocol::FilesystemRenameResult> {
-    state.device.fs_rename(&serial, &from, &to).await
+    state
+        .device
+        .fs_rename(&serial, &from, &to, root.unwrap_or(false))
+        .await
 }
 
 /// 删除（文件页的"删"）。`recursive` 默认 false：非空目录会被拒并告知条目数。
@@ -339,10 +384,17 @@ pub async fn device_fs_remove(
     serial: String,
     path: String,
     recursive: Option<bool>,
+
+    root: Option<bool>,
 ) -> CoreResult<agent_protocol::FilesystemRemoveResult> {
     state
         .device
-        .fs_remove(&serial, &path, recursive.unwrap_or(false))
+        .fs_remove(
+            &serial,
+            &path,
+            recursive.unwrap_or(false),
+            root.unwrap_or(false),
+        )
         .await
 }
 
@@ -354,8 +406,13 @@ pub async fn device_fs_chmod(
     serial: String,
     path: String,
     mode: u32,
+
+    root: Option<bool>,
 ) -> CoreResult<agent_protocol::FilesystemChmodResult> {
-    state.device.fs_chmod(&serial, &path, mode).await
+    state
+        .device
+        .fs_chmod(&serial, &path, mode, root.unwrap_or(false))
+        .await
 }
 
 /// 受限预览（AR7.1，Agent only）：文本按 utf8 返回，二进制按小写 hex；
@@ -367,10 +424,17 @@ pub async fn device_file_preview(
     path: String,
     max_bytes: Option<u32>,
     from_end: Option<bool>,
+    root: Option<bool>,
 ) -> CoreResult<FilesystemPreviewResult> {
     state
         .device
-        .file_preview(&serial, &path, max_bytes, from_end.unwrap_or(false))
+        .file_preview(
+            &serial,
+            &path,
+            max_bytes,
+            from_end.unwrap_or(false),
+            root.unwrap_or(false),
+        )
         .await
 }
 

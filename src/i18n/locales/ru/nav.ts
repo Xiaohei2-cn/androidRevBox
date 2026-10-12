@@ -12,7 +12,7 @@ export default {
   "nav.binary": "Бинарник",
   "nav.unpack": "Распаковка",
   "nav.kernel": "Ядро",
-  "nav.crypto": "Алгоритмы",
+  "nav.crypto": "Центр алгоритмов",
   "nav.plugins": "Плагины",
   "nav.tasks": "Задачи",
   "nav.market": "Маркет инструментов",

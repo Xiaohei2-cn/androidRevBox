@@ -49,6 +49,16 @@ pub enum CoreError {
     /// 坏了，而真正该做的只是把那个空着的框填上。**故障和"你还没填"必须分得开。**
     #[error("还差一步：{0}")]
     InvalidInput(String),
+
+    /// 选中的那台设备此刻**不在这台 adb 的列表里**：拔线、换手机、adb server 重启、
+    /// 无线调试地址过期，都会落到这里。
+    ///
+    /// 立这个变体的理由和 `NotFound`/`Conflict` 一样：这句原本从
+    /// `内部错误: 读取 /data/local/tmp 失败: adb: device '18271FDF600FL4' not found`
+    /// 里冒出来，用户只能以为工具坏了；真相是"这台设备已经不在眼前"，
+    /// 该做的是把界面切回当前在线的那台（前端按 DEVICE_OFFLINE 这个码分支）。
+    #[error("设备当前不在这台 adb 的列表里：{0}")]
+    DeviceOffline(String),
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;
@@ -67,6 +77,7 @@ impl CoreError {
             CoreError::AgentIncompatible(_) => "AGENT_INCOMPATIBLE",
             CoreError::AgentTransportLost(_) => "AGENT_TRANSPORT_LOST",
             CoreError::InvalidInput(_) => "INVALID_INPUT",
+            CoreError::DeviceOffline(_) => "DEVICE_OFFLINE",
         }
     }
 }

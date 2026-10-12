@@ -52,3 +52,30 @@ export const CardContent = forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLD
   ),
 );
 CardContent.displayName = "CardContent";
+/** 卡片副标题：一句话说明这块面板是干什么的（标题只放名词） */
+export const CardSubtitle = forwardRef<
+  HTMLParagraphElement,
+  React.HTMLAttributes<HTMLParagraphElement>
+>(({ className, ...props }, ref) => (
+  <p
+    ref={ref}
+    className={cn("min-w-0 truncate text-[11px] leading-none text-muted-foreground", className)}
+    {...props}
+  />
+));
+CardSubtitle.displayName = "CardSubtitle";
+
+/** 卡片底栏：放"存取/清除"这类次要动作，与顶部的主动作分层 */
+export const CardFooter = forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
+  ({ className, ...props }, ref) => (
+    <div
+      ref={ref}
+      className={cn(
+        "flex shrink-0 flex-wrap items-center gap-1 border-t border-border/60 px-2 py-1.5",
+        className,
+      )}
+      {...props}
+    />
+  ),
+);
+CardFooter.displayName = "CardFooter";

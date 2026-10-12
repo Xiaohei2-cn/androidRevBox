@@ -12,7 +12,7 @@ export default {
   "nav.binary": "Binary",
   "nav.unpack": "Unpack",
   "nav.kernel": "Kernel",
-  "nav.crypto": "Algorithms",
+  "nav.crypto": "Algorithm Hub",
   "nav.plugins": "Plugins",
   "nav.tasks": "Tasks",
   "nav.market": "Tool market",

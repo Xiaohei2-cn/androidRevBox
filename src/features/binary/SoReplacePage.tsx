@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Select } from "@/components/ui/select";
 import { useQuery } from "@tanstack/react-query";
 import { FolderInput, Play, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -122,7 +123,7 @@ export function SoReplacePage({ active = true }: { active?: boolean }) {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-3 overflow-y-auto overflow-x-hidden">
+    <div className="pane-scroll flex h-full min-h-0 flex-col gap-3 overflow-y-auto overflow-x-hidden">
       <p className="shrink-0 text-xs leading-relaxed text-muted-foreground">{t("binary.so.description")}</p>
 
       {online.length === 0 ? (
@@ -130,8 +131,8 @@ export function SoReplacePage({ active = true }: { active?: boolean }) {
       ) : (
         <label className="flex shrink-0 items-center gap-2 text-xs">
           <span className="font-mono text-muted-foreground">-s</span>
-          <select
-            className="h-7 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
+          <Select
+            className="h-7 font-mono"
             value={deviceSerial ?? ""}
             onChange={(e) => {
               setDeviceSerial(e.target.value);
@@ -143,7 +144,7 @@ export function SoReplacePage({ active = true }: { active?: boolean }) {
                 {d.model || d.serial}（{d.serial}）
               </option>
             ))}
-          </select>
+          </Select>
         </label>
       )}
 

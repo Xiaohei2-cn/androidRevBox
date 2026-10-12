@@ -20,9 +20,10 @@ use agent_protocol::method::{
     FILESYSTEM_RENAME, FILESYSTEM_STAT,
 };
 use agent_protocol::{
-    AgentError, ErrorCode, FileKind, FileStat, FilesystemListParams, FilesystemListResult,
-    FilesystemPreviewParams, FilesystemPreviewResult, FilesystemStatParams, FilesystemStatResult,
-    PERMISSION_BITS, PreviewEncoding, ProviderHealth, ProviderInfo, render_mode_text,
+    AgentError, DEFAULT_PREVIEW_BYTES, ErrorCode, FileKind, FileStat, FilesystemListParams,
+    FilesystemListResult, FilesystemPreviewParams, FilesystemPreviewResult, FilesystemStatParams,
+    FilesystemStatResult, MAX_PREVIEW_BYTES, PERMISSION_BITS, PreviewEncoding, ProviderHealth,
+    ProviderInfo, render_mode_text,
 };
 use serde_json::Value;
 
@@ -42,8 +43,7 @@ const FILESYSTEM_METHODS: &[&str] = &[
 /// 单次 `filesystem.list` 的条目上限。一帧上限 8 MiB（`MAX_FRAME_SIZE`），
 /// 2 万条按每条约 200 字节算约 4 MiB：宁可标 `truncated`，也不撑爆帧、不无界扫描。
 const MAX_LIST_ENTRIES: usize = 20_000;
-const DEFAULT_PREVIEW_BYTES: u32 = 64 * 1024;
-const MAX_PREVIEW_BYTES: u32 = 256 * 1024;
+// 默认与硬上限来自协议（桌面 root 腿用的是同一对数）：这里不再各自定义
 
 pub struct FilesystemProvider;
 

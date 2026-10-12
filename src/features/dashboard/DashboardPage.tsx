@@ -22,7 +22,7 @@ export function DashboardPage() {
       />
       <div
         data-testid="dashboard-grid"
-        className="grid min-h-0 flex-1 grid-cols-2 content-start gap-4 overflow-auto pb-1"
+        className="pane-scroll grid min-h-0 flex-1 grid-cols-2 content-start gap-4 overflow-auto pb-1"
       >
         <AdbCard />
         <PythonCard />

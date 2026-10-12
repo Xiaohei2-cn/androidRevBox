@@ -178,47 +178,114 @@ pub struct FileEntry {
     pub perms: String,
 }
 
+/// `stat -c '%a|%s|%u|%g|%Y|%F'` 的一行输出 → 结构化字段。
+///
+/// 字段顺序刻意把**可能含分隔符的文本放最后**（`%F` 是类型名，不会含 `|`），
+/// 于是 `splitn` 一次就够，不用猜哪个字段里冒出了分隔符。
+/// 数值字段一律按无符号解；解不出来就是这条设备上的 stat 不认这个格式，返回 None（调用方直说读不到，
+/// 绝不拿 0 凑一个"看起来正常"的元数据）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatFields {
+    pub mode: u32,
+    pub size: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime_unix: u64,
+    /// `%F` 的原文（"directory" / "regular file" / "symbolic link" / "character special file"…）
+    pub kind_text: String,
+}
+
+impl StatFields {
+    /// 类型名 → 本项目的 FileKind 语义（与 Agent 的 `lstat` 判定同口径）
+    pub fn kind(&self) -> agent_protocol::FileKind {
+        let text = self.kind_text.to_ascii_lowercase();
+        if text.contains("directory") {
+            return agent_protocol::FileKind::Dir;
+        }
+        if text.contains("symbolic link") {
+            return agent_protocol::FileKind::Symlink;
+        }
+        if text.contains("socket") {
+            return agent_protocol::FileKind::Socket;
+        }
+        if text.contains("fifo") {
+            return agent_protocol::FileKind::Fifo;
+        }
+        if text.starts_with("block") {
+            return agent_protocol::FileKind::Block;
+        }
+        if text.starts_with("character") {
+            return agent_protocol::FileKind::Char;
+        }
+        if text.contains("file") {
+            return agent_protocol::FileKind::File;
+        }
+        agent_protocol::FileKind::Other
+    }
+}
+
+pub fn parse_stat_fields(line: &str) -> Option<StatFields> {
+    let mut it = line.trim_end_matches('\r').trim().splitn(6, '|');
+    let mode = u32::from_str_radix(it.next()?, 8).ok()?;
+    let size = it.next()?.parse().ok()?;
+    let uid = it.next()?.parse().ok()?;
+    let gid = it.next()?.parse().ok()?;
+    let mtime_unix = it.next()?.parse().ok()?;
+    Some(StatFields {
+        mode,
+        size,
+        uid,
+        gid,
+        mtime_unix,
+        kind_text: it.next()?.to_string(),
+    })
+}
+
+/// `od -An -tx1 -v` 的输出 → 字节。stdout 走的是文本通道（`AdbRunOutput::stdout: String`），
+/// 所以 root 腿读二进制必须在设备上先转十六进制——不能指望字符串扛住任意字节。
+pub fn parse_hex_dump(text: &str) -> Vec<u8> {
+    text.split_whitespace()
+        .filter_map(|token| {
+            if token.len() != 2 {
+                return None;
+            }
+            u8::from_str_radix(token, 16).ok()
+        })
+        .collect()
+}
+
 /// 解析 `ls -l` 行。示例：
 /// `drwxrwx--x 2 root root 3452 2024-01-01 08:00 storage`
 /// `-rw-rw---- 1 u0_a1 u0_a1 1024 2024-01-01 08:00 a.txt`
 /// `lrwxrwxrwx 1 root root 11 ... init -> /init`
 pub fn parse_ls_long(line: &str) -> Option<FileEntry> {
     let line = line.trim_end_matches('\r').trim();
-    if line.is_empty() {
+    if line.is_empty() || line.starts_with("total ") {
         return None;
     }
-    // 目录汇总行 "total 12" 跳过
-    if line.starts_with("total ") {
+    // 列布局（toybox `ls -l`）：perms links user group size date time name...
+    // 字符/块设备那一列是 "major, minor" 两个 token（`crw-rw-rw- 1 root root 1, 3 ...`），
+    // 不处理就会把时间当成名字的一部分（/dev 那一类目录一定撞得上）
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    if cols.len() < 8 {
         return None;
     }
-    let mut it = line.split_whitespace();
-    let perms = it.next()?;
-    // 权限字段首字符表示类型：d 目录、l 链接、- 常规、其余按非目录
+    let perms = cols[0];
     let is_dir = perms.starts_with('d');
     let is_link = perms.starts_with('l');
-    // 跳过 links/owner/group/size 中的前三个，size 是数值列
-    let mut size = 0i64;
-    let mut seen_size = false;
-    let mut rest_cols: Vec<&str> = Vec::new();
-    // 结构：links owner group size date time name...
-    for (i, col) in it.enumerate() {
-        match i {
-            0..=2 => {} // links, owner, group
-            3 => {
-                size = col.parse().unwrap_or(0);
-                seen_size = true;
-            }
-            _ => rest_cols.push(col), // date, time, name...
+    let mut name_from = 7usize;
+    let size = match cols[4].trim_end_matches(',').parse::<i64>() {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    if cols[4].ends_with(',') {
+        // "1," + "3"：多占一列，名字从第 8 列之后开始
+        name_from = 8;
+        if cols.len() < 9 {
+            return None;
         }
     }
-    if !seen_size {
-        return None;
-    }
-    // rest_cols = [date, time, name...]（date/time 共 2 列）
-    if rest_cols.len() < 3 {
-        return None;
-    }
-    let name_and_target = rest_cols[2..].join(" ");
+    let name_and_target = cols[name_from..].join(" ");
     let (name, symlink) = if is_link {
         match name_and_target.split_once(" -> ") {
             Some((n, t)) => (n.to_string(), Some(t.to_string())),
@@ -251,6 +318,32 @@ pub fn join_remote_path(dir: &str, name: &str) -> String {
     let mut segs = clean_path_segments(dir);
     segs.extend(clean_path_segments(name));
     format!("/{}", segs.join("/"))
+}
+
+/// 认 adb 那句"这台设备不在它眼前"的 stderr（纯函数，各种措辞都要能覆盖）。
+///
+/// 为什么要专门认：`adb -s <已经不在了的 serial> shell ls` 退出码非零、stderr 是
+/// `adb: device '18271FDF600FL4' not found`，一路塞进「内部错误」之后，用户看到的就是
+/// `内部错误: 读取 /data/local/tmp 失败: adb: device ... not found` —— 那既不是故障，
+/// 也不是"目录里没有文件"，而是**这台设备已经不在 adb 的列表里**（拔线/换机/adb 重启）。
+///
+/// 只认设备侧那几条，**绝不**顺手把别的失败也归成它：
+/// 比如 `/system/bin/sh: xxx: inaccessible or not found` 也含 "not found"，
+/// 但那是"这个命令/文件不存在"，跟设备在不在线没关系，误判会把界面引去改选设备。
+pub fn device_missing_hint(stderr: &str) -> Option<String> {
+    let text = stderr.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let lower = text.to_lowercase();
+    // adb 的措辞有两种前缀（`adb:` 与 `error:`），设备号可能根本没有（没插任何设备）
+    let hits_device_gone = lower.contains("device") && lower.contains("not found");
+    let hits_no_devices = lower.contains("no devices/emulators found");
+    let hits_offline = lower.contains("device offline");
+    if hits_device_gone || hits_no_devices || hits_offline {
+        return Some(text.to_string());
+    }
+    None
 }
 
 // ===== 二进制托管（/data/local/tmp）=====
@@ -424,6 +517,22 @@ pub fn hosted_run_log(name: &str) -> String {
 pub fn su_wrap(cmd: &str) -> String {
     debug_assert!(!cmd.contains('\''), "su_wrap 命令含单引号会破坏包裹");
     format!("su -c '{cmd}'")
+}
+
+/// POSIX 单引号引用：除单引号外，一切字符都按字面量处理。
+///
+/// 设备侧命令永远由 `/system/bin/sh` 解释，路径里的空格/`&`/`;`/引号/中文必须先过这一层，
+/// 否则"文件名带空格"就会变成"顺手多执行一条命令"。
+pub fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// 把**一整条**内层命令交给 root：内层自己先把各参数引用好，这里再把整条引用一层。
+///
+/// 两遍引用是故意的：`adb shell` 会把这条交给一个 shell，`su -c` 的参数又被 root 侧
+/// shell 解析一次。少一层就是注入面，多一层就是显示错——所以只准走这个函数。
+pub fn su_c(inner: &str) -> String {
+    format!("su -c {}", sh_quote(inner))
 }
 
 /// 判定 `su -c id` 探测输出是否代表拿到了 root。
@@ -1330,6 +1439,67 @@ mod tests {
     }
 
     #[test]
+    fn parse_ls_long_handles_names_with_spaces_and_special_devices() {
+        let file = parse_ls_long("-rwxr-xr-x 1 shell shell 10240 2026-01-01 08:00 my tool run")
+            .expect("带空格的名字要整体保住");
+        assert_eq!(file.name, "my tool run");
+        assert_eq!(file.size, 10240);
+        assert!(!file.is_dir);
+        let dir = parse_ls_long("drwxrwx--x 2 root root 3452 2024-01-01 08:00 storage").unwrap();
+        assert!(dir.is_dir);
+        // 字符设备：major,minor 占两列，旧实现会把 "08:00" 当成名字的一部分
+        let ch = parse_ls_long("crw-rw-rw- 1 root root 1, 3 2024-01-01 08:00 null").unwrap();
+        assert_eq!(ch.name, "null");
+        assert_eq!(ch.perms, "crw-rw-rw-");
+        let link =
+            parse_ls_long("lrwxrwxrwx 1 root root 11 2024-01-01 08:00 init -> /init").unwrap();
+        assert_eq!(link.symlink.as_deref(), Some("/init"));
+        assert_eq!(link.name, "init");
+        assert!(parse_ls_long("total 12").is_none());
+        assert!(parse_ls_long("-rw 1 a b").is_none(), "列数不够就是不该猜");
+    }
+
+    #[test]
+    fn parse_stat_fields_and_hex_dump_are_the_root_read_leg_carriers() {
+        let fields = parse_stat_fields("700|3452|0|0|1700000000|directory").expect("能解");
+        assert_eq!(fields.mode, 0o700);
+        assert_eq!(fields.size, 3452);
+        assert_eq!(fields.uid, 0);
+        assert_eq!(fields.kind_text, "directory");
+        assert_eq!(fields.kind(), agent_protocol::FileKind::Dir);
+        assert_eq!(
+            parse_stat_fields("644|10|0|0|1|regular file")
+                .unwrap()
+                .kind(),
+            agent_protocol::FileKind::File
+        );
+        assert_eq!(
+            parse_stat_fields("777|11|0|0|1|symbolic link 'init'")
+                .unwrap()
+                .kind(),
+            agent_protocol::FileKind::Symlink
+        );
+        // 名字里带 '|' 不影响：唯一可能含分隔符的字段放在最后
+        assert_eq!(
+            parse_stat_fields("600|1|0|0|1|regular file").unwrap().size,
+            1
+        );
+        assert!(
+            parse_stat_fields("nope|1|2|3|4|file").is_none(),
+            "八进制解不出就直说解不了"
+        );
+        assert_eq!(
+            parse_hex_dump(" 48 65 6c 6c 6f\n0a  "),
+            vec![b'H', b'e', b'l', b'l', b'o', b'\n']
+        );
+        assert_eq!(
+            parse_hex_dump("zz 41"),
+            vec![b'A'],
+            "非十六进制的词（表格线）跳过"
+        );
+    }
+
+    #[test]
     fn build_args_with_and_without_serial() {
         assert_eq!(
             build_args(Some("emulator-5554"), &["shell", "getprop"]),
@@ -1588,6 +1758,28 @@ mod tests {
     }
 
     #[test]
+    fn device_missing_hint_only_matches_the_device_gone_class() {
+        for gone in [
+            "adb: device '18271FDF600FL4' not found",
+            "error: device offline",
+            "error: no devices/emulators found",
+        ] {
+            assert!(device_missing_hint(gone).is_some(), "{gone} 是设备不在眼前");
+        }
+        for other in [
+            "",
+            "/system/bin/sh: id_android_svr64: inaccessible or not found",
+            "ls: /data/local/tmp: No such file or directory",
+            "adb: more than one device/emulator",
+        ] {
+            assert!(
+                device_missing_hint(other).is_none(),
+                "{other} 不是设备不在眼前，不许误判成它"
+            );
+        }
+    }
+
+    #[test]
     fn hosted_binaries_filters_elf_only() {
         let ls = "-rwxr-xr-x 1 shell shell 10240 2026-01-01 08:00 test\r\n\
                   -rw-r--r-- 1 shell shell 2048 2026-01-01 08:00 noexec\r\n\
@@ -1637,6 +1829,20 @@ mod tests {
     #[test]
     fn hosted_run_log_hidden_in_dir() {
         assert_eq!(hosted_run_log("test"), "/data/local/tmp/.test.run.log");
+    }
+
+    #[test]
+    fn nested_quoting_survives_spaces_and_quotes_in_paths() {
+        // 真机上完全合法的文件名：空格 + 单引号 + 中文 + shell 元字符
+        let inner = format!("mkdir -- {}", sh_quote("/sdcard/我的 目录/a'b;id.txt"));
+        let whole = su_c(&inner);
+        assert!(whole.starts_with("su -c '"), "{whole}");
+        // 内层那对单引号必须被拆成 '\''，不然 root 侧 shell 会在这里断开并执行 `id`
+        assert!(whole.contains(r#"'''"#), "{whole}");
+        assert!(
+            !whole.contains(";id' "),
+            "{whole}：分号后面不能出现裸的命令尾巴"
+        );
     }
 
     #[test]

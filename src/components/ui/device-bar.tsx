@@ -1,5 +1,6 @@
 /** 设备选择条 + Root 开关：托管页与进程端口页共用（原来寄存在 BinaryHosting 里，那一页搬到「二进制」主 tab 后两个使用者都不该去 import 它） */
 import { RefreshCw } from "lucide-react";
+import { Select } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { type DeviceEntry } from "@/api/device";
 import { useI18n } from "@/i18n";
@@ -34,8 +35,8 @@ export function DeviceBar({
       {online.length > 1 && (
         <label className="flex items-center gap-2">
           <span className="font-mono text-muted-foreground">-s</span>
-          <select
-            className="h-7 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
+          <Select
+            className="h-7 font-mono"
             value={selected ?? ""}
             onChange={(e) => onSelect(e.target.value)}
           >
@@ -44,7 +45,7 @@ export function DeviceBar({
                 {d.model || d.serial}（{d.serial}）
               </option>
             ))}
-          </select>
+          </Select>
         </label>
       )}
       <label

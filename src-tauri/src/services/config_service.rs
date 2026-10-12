@@ -7,10 +7,7 @@ use crate::core::error::{CoreError, CoreResult};
 use crate::db::{Db, config_repo};
 
 pub const KEY_THEME: &str = "app.settings.theme";
-pub const KEY_OPACITY: &str = "app.settings.opacity";
 pub const KEY_LOG_LEVEL: &str = "app.settings.log_level";
-/// 透明区点击穿透开关（第五十四轮）：开着它，界面上纯透明的留白处点击会落到后面的 App
-pub const KEY_CLICK_THROUGH: &str = "app.settings.click_through";
 /// 手动指定的 adb 路径（P3）；空 = 走环境变量自动探测
 pub const KEY_ADB_PATH: &str = "app.adb.path";
 /// Android Agent binary 显式路径；空 = 环境变量/resource/workspace 自动发现
@@ -61,13 +58,6 @@ fn is_valid_locale(v: &str) -> bool {
 
 fn is_valid_theme(v: &str) -> bool {
     matches!(v, "light" | "dark" | "system")
-}
-
-/// 不透明度：整数字符串，20–100（与前端钳制一致）
-fn is_valid_opacity(v: &str) -> bool {
-    v.parse::<f64>()
-        .map(|n| (20.0..=100.0).contains(&n))
-        .unwrap_or(false)
 }
 
 /// 布尔型设置：只认 "true"/"false" 两个字面量（跟前端 JSON 序列化口径一致）。
@@ -150,14 +140,23 @@ fn is_valid_port(v: &str) -> bool {
     v.parse::<u16>().is_ok()
 }
 
+/// 已经**整体撤掉**的功能留下的键：不再进白名单（读不到也写不进），启动时顺手清掉。
+///
+/// - `app.settings.opacity`：背景不透明度。滑杆、设置键、React 写出口全删了，
+///   CSS 里 `--app-bg-alpha` 恒为 1（底色不透视）。
+/// - `app.settings.click_through`：透明区点击穿透不再是开关——它是窗口形状自带的
+///   默认能力（`useClickThrough`），设置页里那一行连同实时读数一起撤了。
+///
+/// 为什么要真删库里的行而不是"没人读就行"：留着的就是一个没人认领的旋钮，
+/// 下一个看到它的人有充分理由以为"接上它就能改"，那才是这类功能复活的方式。
+const RETIRED_KEYS: &[&str] = &["app.settings.opacity", "app.settings.click_through"];
+
 type ValueValidator = fn(&str) -> bool;
 
 /// 允许前端读写的键白名单（防止任意键写入）
 const ALLOWED_KEYS: &[(&str, ValueValidator)] = &[
     (KEY_THEME, is_valid_theme),
-    (KEY_OPACITY, is_valid_opacity),
     (KEY_LOG_LEVEL, is_valid_log_level),
-    (KEY_CLICK_THROUGH, is_valid_bool),
     (KEY_ADB_PATH, is_valid_path),
     (KEY_AGENT_PATH, is_valid_path),
     (KEY_AGENT_AUTO_CONNECT, is_valid_bool),
@@ -186,6 +185,12 @@ pub struct ConfigService {
 
 impl ConfigService {
     pub fn new(db: Arc<Db>) -> Self {
+        // 退休键的一次性清理：删失败不影响启动（本来就是尽力而为，读也不会再读到）
+        for key in RETIRED_KEYS {
+            if let Err(error) = config_repo::remove(&db, key) {
+                tracing::warn!(key, error = %error, "清理退休配置键失败（不影响启动）");
+            }
+        }
         Self { db }
     }
 
@@ -320,8 +325,39 @@ mod tests {
     fn rejects_invalid_value() {
         let s = svc();
         assert!(s.set(KEY_THEME, "neon").is_err());
-        assert!(s.set(KEY_OPACITY, "5").is_err());
-        assert!(s.set(KEY_OPACITY, "80").is_ok());
+        // 数值范围类的键：超范围必须拒（这条测的是"校验器真的在挡"，不是只挡未知键）
+        assert!(s.set(KEY_PLUGIN_CALL_TIMEOUT_MS, "10").is_err());
+        assert!(s.set(KEY_PLUGIN_CALL_TIMEOUT_MS, "5000").is_ok());
+    }
+
+    #[test]
+    fn retired_keys_are_unwritable_and_old_rows_get_pruned() {
+        // 装机库里的退休键是常态（旧版本写过的），启动清理必须把它抹掉：
+        // 留着不会出错，但那是个没人认领的旋钮，早晚有人照着它接线。
+        let db = Arc::new(Db::in_memory().unwrap());
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO app_settings(key, value) VALUES('app.settings.opacity','45')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let s = ConfigService::new(db.clone());
+        assert!(
+            s.set("app.settings.opacity", "50").is_err(),
+            "背景透明度已整体撤掉，键不该还能被写"
+        );
+        assert!(
+            s.set("app.settings.click_through", "true").is_err(),
+            "穿透是默认能力，不该再是设置项"
+        );
+        assert!(
+            config_repo::get(&db, "app.settings.opacity")
+                .unwrap()
+                .is_none(),
+            "启动清理要把旧值删掉"
+        );
     }
 
     #[test]
@@ -334,7 +370,7 @@ mod tests {
     fn snapshot_only_contains_whitelisted_keys() {
         let s = svc();
         s.set(KEY_THEME, "light").unwrap();
-        s.set(KEY_OPACITY, "90").unwrap();
+        s.set(KEY_LOG_LEVEL, "debug").unwrap();
         // 手工写入一个非白名单键，snapshot 应过滤掉
         s.db.with(|c| {
             c.execute(

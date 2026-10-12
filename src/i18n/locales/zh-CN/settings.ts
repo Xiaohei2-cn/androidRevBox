@@ -11,21 +11,11 @@ export default {
   "settings.theme.system": "跟随系统",
   "settings.theme.hint": "「跟随系统」会实时响应系统深浅色切换",
 
-  "settings.opacity.label": "背景不透明度",
-  "settings.opacity.hint":
-    "调节窗口背景的不透明度。只是半透明着色，不会模糊背后的内容（WebKit 在透明窗口里模糊不到窗口外的东西，那条实现已删）。最低 20%，保证内容可读。最上方那条控制栏（能拖动、带关闭按钮）不参与，永远实色。",
-
   "settings.agentAuto.label": "设备上线后自动连接 Agent",
   "settings.agentAuto.hint":
     "只读探测每次插线都会做；往设备写产物、起常驻进程这件事，第一次会在设备页请你点一次确认，之后同一台设备全自动。关掉它就只能手动连。",
-  "settings.clickThrough.label": "透明区点击穿透",
-  "settings.clickThrough.hint":
-    "打开后只有一处把点击让给后面的 App：齿块**左边**那条透明留白（逐行）。tab 齿块整体、图标、tab 之间的缝隙、当前 tab、所有内容区一律接住 —— 点 tab 是基本操作，绝不能穿到后面去；窗口四边各 12px 永远保留拉伸抓住区。当前状态见下方实时读数。",
 
-  "settings.clickThrough.status.solid": "当前：光标在实体上，本工具接点击",
-  "settings.clickThrough.status.passing": "当前：光标在透明处，点击交给后面的 App",
-  "settings.clickThrough.status.outside": "当前：光标不在本窗口内",
-  "settings.clickThrough.status.error": "当前：取不到指针位置，已按可点击处理",  "settings.language.label": "界面语言",
+  "settings.language.label": "界面语言",
   "settings.language.hint": "切换后立即生效并持久化，重启自动恢复。",
   "settings.language.restartHint": "部分系统提示语（如 adb/进程错误）重启后完全生效。",
 

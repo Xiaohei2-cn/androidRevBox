@@ -9,6 +9,7 @@ import type { HostedBinary, HostedProbeResult } from "@/api/device";
 // 分词器放在纯 lib 里：从 @/api/task 引它会连带把 @tauri-apps/api/core 拖进
 // 这个模块的单测（jsdom 下解析不了），而它本身一行 Tauri 都不需要
 import { tokenizeCommand } from "@/lib/commandTokens";
+import { launchKeyOf } from "./hostedRecords";
 
 /**
  * 「探测帮助」的候选，按在本机这类 Android/Linux ELF 上**从最常见到最少见**排。
@@ -126,10 +127,9 @@ export function judgeProbe(
   return { kind: "none" };
 }
 
-/** 参数与 stdin 的本地预检上限：与协议里那两个数同值（后端与设备还会各拦一道） */
+/** 参数的本地预检上限：与协议里那两个数同值（后端与设备还会各拦一道） */
 export const MAX_ARGS = 64;
 export const MAX_ARG_LEN = 512;
-export const MAX_STDIN_BYTES = 64 * 1024;
 
 /** 按 UTF-8 字节数算上限：中文一个字就占 3 字节，按字符数算会双双低估 */
 export function utf8Bytes(text: string): number {
@@ -166,19 +166,15 @@ export function argsProblem(args: string[], root: boolean): string | null {
   return null;
 }
 
-/** 启动偏好的存储形状：参数、一次性输入、是否保持输入通道、以及当时的版本指纹 */
+/** 启动偏好的存储形状：参数 + 保存那一刻的版本指纹（输入走交互终端，不在这里） */
 export interface LaunchPrefs {
   argsText: string;
-  stdinText: string;
-  interactive: boolean;
   /** 保存那一刻的指纹（见 encodeStamp）；空串 = 没记过 */
   stamp: string;
 }
 
 export const emptyLaunchPrefs = (): LaunchPrefs => ({
   argsText: "",
-  stdinText: "",
-  interactive: false,
   stamp: "",
 });
 
@@ -222,9 +218,8 @@ export function compareStamp(saved: Stamp | null, current: Stamp): StampCompare 
   return saved.mtime === current.mtime ? "same" : "changed";
 }
 
-/** 存储键：设备 + 文件两个维度（与备注同一个口径） */
-export const launchKey = (serial: string, name: string) =>
-  `adb.binary.launch.${serial}.${name}`;
+/** 存储键：设备 + 文件两个维度。格式的唯一出口在 `hostedRecords.ts`（那边还要按前缀清理） */
+export const launchKey = launchKeyOf;
 
 const clip = (value: string | null, max: number) =>
   value && utf8Bytes(value) > max ? value.slice(0, max) : value ?? "";
@@ -237,16 +232,12 @@ export function loadLaunchPrefs(
   let raw: LaunchPrefs | null = null;
   try {
     const argsText = localStorage.getItem(`${launchKey(serial, name)}.args`);
-    const stdinText = localStorage.getItem(`${launchKey(serial, name)}.stdin`);
-    const interactive = localStorage.getItem(`${launchKey(serial, name)}.interactive`);
     const stamp = localStorage.getItem(`${launchKey(serial, name)}.stamp`);
-    if (argsText === null && stdinText === null && interactive === null && stamp === null) {
+    if (argsText === null && stamp === null) {
       return emptyLaunchPrefs();
     }
     raw = {
       argsText: clip(argsText, MAX_ARG_LEN * MAX_ARGS),
-      stdinText: clip(stdinText, MAX_STDIN_BYTES),
-      interactive: interactive === "1",
       stamp: stamp ?? "",
     };
   } catch {
@@ -265,8 +256,6 @@ export function saveLaunchPrefs(serial: string, name: string, prefs: LaunchPrefs
     else localStorage.setItem(`${launchKey(serial, name)}${suffix}`, value);
   };
   set(".args", prefs.argsText);
-  set(".stdin", prefs.stdinText);
-  set(".interactive", prefs.interactive ? "1" : null);
   set(".stamp", prefs.stamp);
 }
 

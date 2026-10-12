@@ -34,7 +34,6 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "../scripts/frida_runner.py": "scripts/frida_runner.py",
       "resources/android-agent/": ""
     },
     "icon": [

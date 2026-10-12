@@ -89,6 +89,16 @@ if (typeof window !== "undefined" && typeof window.HTMLCanvasElement !== "undefi
   });
 }
 
+/*
+ * jsdom 没有 PointerEvent 构造器。fireEvent.pointerDown/Move/Up 于是退化成**不带坐标**的
+ * Event，任何依赖 clientX/clientY 的交互（算法清单的指针拖拽）在测试里读到的永远是
+ * undefined —— 表现是"测试全绿但拖不动"或反过来。用 MouseEvent 顶上：坐标、button、
+ * bubbles 都对齐真实行为。
+ */
+if (typeof window !== "undefined" && typeof window.PointerEvent === "undefined") {
+  window.PointerEvent = window.MouseEvent as unknown as typeof window.PointerEvent;
+}
+
 // radix 组件在 jsdom 中依赖 ResizeObserver
 if (typeof globalThis.ResizeObserver !== "function") {
   globalThis.ResizeObserver = class ResizeObserver {

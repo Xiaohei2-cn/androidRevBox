@@ -20,32 +20,24 @@ export type LogLevel = "trace" | "debug" | "info" | "warn" | "error";
 
 /** 与 Rust ConfigService 白名单键一致 */
 export const KEY_THEME = "app.settings.theme";
-export const KEY_OPACITY = "app.settings.opacity";
 export const KEY_LOG_LEVEL = "app.settings.log_level";
-/** 透明区点击穿透（第五十四轮）：开则界面上纯透明的留白处点击落到后面的 App */
-export const KEY_CLICK_THROUGH = "app.settings.click_through";
 
 const THEME_VALUES: readonly string[] = ["light", "dark", "system"];
 const LOG_LEVELS: readonly LogLevel[] = ["trace", "debug", "info", "warn", "error"];
-export const MIN_OPACITY = 20;
-const DEFAULT_OPACITY = 100;
 const DEFAULT_LOG_LEVEL: LogLevel = "info";
 
 interface SettingsContextValue {
   theme: ThemePref;
   setTheme: (theme: ThemePref) => void;
   effectiveTheme: EffectiveTheme;
-  /** 窗口主体背景不透明度，20–100（%），UI 层钳制最小值防止全透 */
-  opacity: number;
-  setOpacity: (value: number) => void;
   logLevel: LogLevel;
   setLogLevel: (level: LogLevel) => void;
   /**
-   * 透明区点击穿透。默认关：它会改变"点下去归谁"这件事，属于要用户主动要的行为。
-   * 关掉之后 Rust 侧立刻恢复可点击，不留中间态。
+   * 背景**不透视**、也不可选：底色是实色渐变（见 globals.css 的 --app-bg-*），
+   * "背景透明度"这个设置项整体撤掉过（用户口径：不要能调，去掉）。
+   * 透明区点击穿透同样不再是个开关——它是窗口形状自带的默认能力（见 useClickThrough），
+   * 界面上不该出现"要不要让点击漏下去"这种用户答得了但答不对的问题。
    */
-  clickThrough: boolean;
-  setClickThrough: (value: boolean) => void;
   /** 后端配置是否已从 SQLite 完成水合（P0 localStorage 用户在迁移完成前看到缓存值） */
   hydrated: boolean;
 }
@@ -65,30 +57,6 @@ function readStoredTheme(): ThemePref {
     // localStorage 不可用时静默回退
   }
   return "system";
-}
-
-function readStoredOpacity(): number {
-  try {
-    const raw = localStorage.getItem(KEY_OPACITY);
-    if (raw !== null) {
-      const parsed = Number(raw);
-      if (Number.isFinite(parsed)) {
-        return Math.min(100, Math.max(MIN_OPACITY, parsed));
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return DEFAULT_OPACITY;
-}
-
-function readStoredClickThrough(): boolean {
-  try {
-    return localStorage.getItem(KEY_CLICK_THROUGH) === "true";
-  } catch {
-    // localStorage 不可用时按"关"处理：默认值不该依赖存储
-  }
-  return false;
 }
 
 function readStoredLogLevel(): LogLevel {
@@ -116,9 +84,7 @@ function isValidLogLevel(v: string): v is LogLevel {
 function SettingsProvider({ children }: { children: ReactNode }) {
   // 初值取 localStorage 缓存：P1 前装机的用户立即可见自己的旧设置，之后异步被 SQLite 覆盖
   const [theme, setThemeState] = useState<ThemePref>(readStoredTheme);
-  const [opacity, setOpacityState] = useState<number>(readStoredOpacity);
   const [logLevel, setLogLevelState] = useState<LogLevel>(readStoredLogLevel);
-  const [clickThrough, setClickThroughState] = useState<boolean>(readStoredClickThrough);
   const [hydrated, setHydrated] = useState(false);
   const [systemDark, setSystemDark] = useState<boolean>(
     () => window.matchMedia("(prefers-color-scheme: dark)").matches,
@@ -162,26 +128,13 @@ function SettingsProvider({ children }: { children: ReactNode }) {
           }
         };
         await migrateUp(KEY_THEME, theme);
-        await migrateUp(KEY_OPACITY, String(opacity));
         await migrateUp(KEY_LOG_LEVEL, logLevel);
-        await migrateUp(KEY_CLICK_THROUGH, String(clickThrough));
         if (cancelled) return;
 
         const dbTheme = db.get(KEY_THEME);
         if (dbTheme && THEME_VALUES.includes(dbTheme)) {
           setThemeState(dbTheme as ThemePref);
           persistCache(KEY_THEME, dbTheme);
-        }
-        const dbOpacity = Number(db.get(KEY_OPACITY));
-        if (Number.isFinite(dbOpacity)) {
-          const clamped = Math.min(100, Math.max(MIN_OPACITY, dbOpacity));
-          setOpacityState(clamped);
-          persistCache(KEY_OPACITY, String(clamped));
-        }
-        // 只认 "true"：脏值/缺键一律落回"关"，不拿猜出来的值去改点击归属
-        if (db.get(KEY_CLICK_THROUGH) === "true") {
-          setClickThroughState(true);
-          persistCache(KEY_CLICK_THROUGH, "true");
         }
         const dbLevel = db.get(KEY_LOG_LEVEL);
         if (dbLevel && isValidLogLevel(dbLevel)) {
@@ -233,23 +186,6 @@ function SettingsProvider({ children }: { children: ReactNode }) {
     [writeThrough],
   );
 
-  const setOpacity = useCallback(
-    (value: number) => {
-      const clamped = Math.round(Math.min(100, Math.max(MIN_OPACITY, value)));
-      setOpacityState(clamped);
-      writeThrough(KEY_OPACITY, String(clamped));
-    },
-    [writeThrough],
-  );
-
-  const setClickThrough = useCallback(
-    (next: boolean) => {
-      setClickThroughState(next);
-      writeThrough(KEY_CLICK_THROUGH, String(next));
-    },
-    [writeThrough],
-  );
-
   const setLogLevel = useCallback(
     (next: LogLevel) => {
       setLogLevelState(next);
@@ -263,24 +199,16 @@ function SettingsProvider({ children }: { children: ReactNode }) {
       theme,
       setTheme,
       effectiveTheme,
-      opacity,
-      setOpacity,
       logLevel,
       setLogLevel,
-      clickThrough,
-      setClickThrough,
       hydrated,
     }),
     [
       theme,
       setTheme,
       effectiveTheme,
-      opacity,
-      setOpacity,
       logLevel,
       setLogLevel,
-      clickThrough,
-      setClickThrough,
       hydrated,
     ],
   );

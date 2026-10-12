@@ -169,6 +169,22 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
         Some("AR12.1 after AR6.1"),
     ),
     // root=true 支路：做不到 typed 化，等候选③（模块 root companion）
+    // 设备页文件写/读侧的 root 腿：Agent 以 shell 身份运行，root 属主的东西它改不动也读不到
+    (
+        // 设备页文件**读**侧的 root 腿（su -c）：`/data` 这类目录 shell 连 opendir 都进不去，
+        // Agent 只能如实回"读不到"，界面上就成了"这个目录是空的"。读不受写侧两棵树的限制
+        // （要看得到东西才谈得上逆向），但同样不许拿"读不到"冒充"空"。
+        "src/services/device_service.rs",
+        "fs_read_rooted",
+        Category::RootBranch,
+        Some("候选③：模块 root companion 提供特权读"),
+    ),
+    (
+        "src/services/device_service.rs",
+        "fs_run_rooted",
+        Category::RootBranch,
+        Some("候选③：模块 root companion 提供特权写"),
+    ),
     (
         "src/services/device_service.rs",
         "hosted_chmod",
@@ -232,7 +248,15 @@ const EXPECTED_SITES_PER_CATEGORY: &[(Category, usize)] = &[
     // 5 → 6（第八十五轮）：新增的是"起进程前归档旧日志"那一条（root 支路必须与启动同一身份）。
     // 同一个批次里把启动命令从 `hosted_run_as_root` 抽到 `hosted_run_adb_args`，调用点没变多，
     // 只是换了归属——数字要动就得在这里留一句话，跟当年 AR7.6 少一个点要改数是同一条纪律。
-    (Category::RootBranch, 6),
+    // 6 → 7（本轮）：设备页文件写侧的 root 腿 `fs_run_rooted`。它不是漂移出来的裸 adb shell——
+    // 路径先过 `fs_policy` 白名单（增删改只允许 /data/local/tmp 与 /sdcard 两棵树，root 也不放宽范围），
+    // 干完回设备复核（复核读不到 = 不算成功），所以按 RootBranch 归类，删除阶段照旧挂候选③。
+    // 7 → 8（本轮）：再加一条**读**侧 root 腿 `fs_read_rooted`。用户要的是"给了 root 就能看 /data"——
+    // Agent 以 shell 身份跑，`/data` 连 opendir 都进不去，它只能如实报"读不到"，而旧接口把结果压成
+    // 一个数组，界面于是把"读不到"画成了"这个目录是空的"。这条腿同样不是裸 adb shell：
+    // 只读、不做任何写；列目录用 `cd 目录 && ls -lA -- .`（第七十一轮删掉的旧 Legacy 腿正是
+    // 因为直接 `ls -lA <符号链接目录>` 会列出链接自身、造出 /sdcard/sdcard 假条目）。
+    (Category::RootBranch, 8),
 ];
 
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {

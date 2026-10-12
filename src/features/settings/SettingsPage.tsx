@@ -1,21 +1,26 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { FolderOpen } from "lucide-react";
-import { Label } from "@/components/ui/label";
 import {
-  getClickThroughStatus,
-  subscribeClickThroughStatus,
-} from "@/lib/clickThroughStatus";
-import { Slider } from "@/components/ui/slider";
+  Bot,
+  FolderOpen,
+  Info,
+  Languages,
+  Monitor,
+  ScrollText,
+  Smartphone,
+  Sparkles,
+  Wrench,
+} from "lucide-react";
+import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { aiApi } from "@/api/ai";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { IconTile } from "@/components/ui/icon-tile";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
 import { SubTabs } from "@/components/nav/SubTabs";
 import { Placeholder } from "@/components/nav/Placeholder";
 import {
-  MIN_OPACITY,
   useSettings,
   type LogLevel,
   type ThemePref,
@@ -118,21 +123,16 @@ export function SettingsPage() {
   );
 }
 
-/** 显示：主题 + 背景不透明度 */
+/** 显示：主题（背景不透视、也不可选，见 AppShell 那段注释） */
 function DisplayTab() {
-  const { theme, setTheme, opacity, setOpacity, clickThrough, setClickThrough } = useSettings();
-  // 穿透状态的实时读数（开关在 AppShell 里驱动轮询，这里只订阅显示）
-  const status = useSyncExternalStore(
-    subscribeClickThroughStatus,
-    getClickThroughStatus,
-    getClickThroughStatus,
-  );
+  const { theme, setTheme } = useSettings();
   const { t } = useI18n();
 
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 pt-2">
       <Card>
         <CardHeader>
+          <IconTile icon={Monitor} toneClass="bg-sky-500/15 text-sky-600 dark:text-sky-400" size="sm" />
           <CardTitle>{t("settings.theme.label")}</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
@@ -162,72 +162,6 @@ function DisplayTab() {
           <p className="text-xs text-muted-foreground">{t("settings.theme.hint")}</p>
         </CardContent>
       </Card>
-
-      <Card>
-        <CardHeader>
-          <div className="flex w-full items-center justify-between">
-            <CardTitle>
-              <Label htmlFor="opacity-slider" className="text-sm font-semibold leading-none">
-                {t("settings.opacity.label")}
-              </Label>
-            </CardTitle>
-            <span className="text-sm tabular-nums text-muted-foreground">
-              {opacity}%
-            </span>
-          </div>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3">
-          <Slider
-            id="opacity-slider"
-            min={MIN_OPACITY}
-            max={100}
-            step={5}
-            value={[opacity]}
-            onValueChange={(values) => setOpacity(values[0])}
-          />
-          <p className="text-xs text-muted-foreground">{t("settings.opacity.hint")}</p>
-          {/*
-            透明区点击穿透（第五十四轮）：透明度调低之后，那些"看得透"的留白仍然会把点击
-            吃掉——macOS 不看像素 alpha，DOM 也不看 opacity。这个开关让判定跟着鼠标走：
-            底下是实体就接，底下只有半透明底色就把点击交给后面的 App。
-          */}
-          <label className="flex items-start gap-2 pt-1 text-sm">
-            <input
-              type="checkbox"
-              data-testid="click-through-toggle"
-              className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary"
-              checked={clickThrough}
-              onChange={(e) => setClickThrough(e.target.checked)}
-            />
-            <span className="min-w-0">
-              <span className="font-medium">{t("settings.clickThrough.label")}</span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">
-                {t("settings.clickThrough.hint")}
-              </span>
-              {/*
-                实时读数：开关打开后，"没生效"、"循环没跑"、"判定认为那儿是实体"
-                这三种故障在界面上原本长得一模一样，有这条才分得开。
-              */}
-              {clickThrough && status !== "off" && (
-                <span
-                  data-testid="click-through-status"
-                  className={cn(
-                    "mt-1 block text-xs",
-                    status === "passing" ? "text-emerald-500" : "text-muted-foreground",
-                  )}
-                >
-                  {{
-                    solid: t("settings.clickThrough.status.solid"),
-                    passing: t("settings.clickThrough.status.passing"),
-                    outside: t("settings.clickThrough.status.outside"),
-                    error: t("settings.clickThrough.status.error"),
-                  }[status]}
-                </span>
-              )}
-            </span>
-          </label>
-        </CardContent>
-      </Card>
     </div>
   );
 }
@@ -240,6 +174,7 @@ function LanguageTab() {
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 pt-2">
       <Card>
         <CardHeader>
+          <IconTile icon={Languages} toneClass="bg-violet-500/15 text-violet-600 dark:text-violet-400" size="sm" />
           <CardTitle>{t("settings.language.label")}</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
@@ -342,6 +277,7 @@ function EnvironmentTab() {
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 pt-2">
       <Card>
         <CardHeader>
+          <IconTile icon={Smartphone} toneClass="bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" size="sm" />
           <CardTitle>{t("settings.adb.label")}</CardTitle>
         </CardHeader>
         <CardContent>
@@ -360,6 +296,7 @@ function EnvironmentTab() {
       */}
       <Card>
         <CardHeader>
+          <IconTile icon={Bot} toneClass="bg-amber-500/15 text-amber-600 dark:text-amber-400" size="sm" />
           <CardTitle>{t("settings.agentAuto.label")}</CardTitle>
         </CardHeader>
         <CardContent>
@@ -369,6 +306,7 @@ function EnvironmentTab() {
 
       <Card>
         <CardHeader>
+          <IconTile icon={Sparkles} toneClass="bg-fuchsia-500/15 text-fuchsia-600 dark:text-fuchsia-400" size="sm" />
           <CardTitle>{t("settings.ai.title")}</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
@@ -393,6 +331,7 @@ function EnvironmentTab() {
 
       <Card>
         <CardHeader>
+          <IconTile icon={Wrench} toneClass="bg-cyan-500/15 text-cyan-600 dark:text-cyan-400" size="sm" />
           <CardTitle>{t("settings.tools.label")}</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
@@ -440,6 +379,7 @@ function SystemTab() {
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 pt-2">
       <Card>
         <CardHeader>
+          <IconTile icon={ScrollText} toneClass="bg-rose-500/15 text-rose-600 dark:text-rose-400" size="sm" />
           <CardTitle>{t("settings.log.label")}</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
@@ -735,7 +675,8 @@ function AboutSection() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>{t("settings.about.label")}</CardTitle>
+        <IconTile icon={Info} toneClass="bg-indigo-500/15 text-indigo-600 dark:text-indigo-400" size="sm" />
+          <CardTitle>{t("settings.about.label")}</CardTitle>
       </CardHeader>
       <CardContent>
         <dl data-testid="about-section" className="space-y-1.5 text-xs">

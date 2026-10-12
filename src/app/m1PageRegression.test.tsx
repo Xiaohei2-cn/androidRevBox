@@ -98,15 +98,22 @@ beforeEach(() => {
 describe("文件页（AR7.1 typed DTO 的渲染证据）", () => {
   it("把 wire 的 mode_text / mtime_unix 真的画出来，而不是空白", async () => {
     // device_file_list 走的是本地 FileEntry（camelCase），别和协议 DTO 混了
-    api.ls.mockResolvedValue([
-      {
-        name: "frida-server",
-        isDir: false,
-        size: 53539200,
-        symlink: null,
-        perms: "-rwxr-xr-x",
-      },
-    ]);
+    // 目录列举回的是 FileListing：条目 + 「这份是不是这个目录的全部」+「以谁的身份读的」
+    api.ls.mockResolvedValue({
+      path: "/sdcard",
+      entries: [
+        {
+          name: "frida-server",
+          isDir: false,
+          size: 53539200,
+          symlink: null,
+          perms: "-rwxr-xr-x",
+        },
+      ],
+      unreadable: [],
+      truncated: false,
+      source: "agent",
+    });
     api.fileStat.mockResolvedValue({
       requested_path: "/data/local/tmp/frida-server",
       path: "/data/local/tmp/frida-server",

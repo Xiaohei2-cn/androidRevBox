@@ -51,7 +51,7 @@ export function SubTabs({ tabs, value, onValueChange, activateSignal }: SubTabsP
           key={tab.id}
           value={tab.id}
           forceMount
-          className="min-h-0 flex-1 overflow-auto data-[state=inactive]:hidden"
+          className="pane-scroll min-h-0 flex-1 overflow-auto data-[state=inactive]:hidden"
         >
           {tab.content}
         </TabsContent>

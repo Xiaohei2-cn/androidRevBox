@@ -51,17 +51,21 @@ export type FridaSessionResult = { ok: true; plan: FridaSessionPlan } | { ok: fa
 /**
  * 目标形状 → 官方参数。
  * attach + 空目标是**合法输入**（= 附加设备当前前台，等价 `frida -UF` 的 `-F`），
- * 这条语义必须和 `types.fridaSessionLabel` 一致，否则界面显示"自动前台"而命令是另一回事。
+ * 这条语义在 `types.ts` 的 FridaSettings 注释里也写着：界面显示"自动前台"而命令是另一回事，
+ * 那种错不许再犯。
  */
 function targetArgs(settings: FridaSettings): string[] | { block: FridaSessionBlock } {
-  const target = settings.target.trim();
   if (settings.runMode === "spawn") {
-    if (!target) return { block: "spawn-needs-package" };
-    return ["-f", target];
+    const pkg = settings.target.trim();
+    if (!pkg) return { block: "spawn-needs-package" };
+    return ["-f", pkg];
   }
-  if (!target) return ["-F"];
-  if (/^\d+$/.test(target)) return ["-p", target];
-  return ["-n", target];
+  // attach 只有一种语义：**附加设备当前前台**（-F）。
+  // 以前填了包名走 `-n <包名>`、填了数字走 `-p <pid>`，结果 `-n` 在真机上是个坑：
+  // frida 的 `-n` 匹配的是**进程名**，而很多 ROM（尤其 MIUI 多进程应用）进程名不等于包名，
+  // 于是"留空能起、点了取前台填上包名反而起不来"。一个看名字的行不通的选项不值得留在界面上，
+  // 所以 attach 模式忽略目标串：界面上那个输入框也一并禁用，不留"看着能填"的错觉。
+  return ["-F"];
 }
 
 /**

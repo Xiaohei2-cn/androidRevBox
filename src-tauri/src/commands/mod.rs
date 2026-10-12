@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod ai;
+pub mod chef;
 pub mod config;
 pub mod device;
 pub mod env;

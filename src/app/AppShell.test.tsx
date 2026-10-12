@@ -106,10 +106,11 @@ describe("AppShell（P7 交互）", () => {
 
   it("keep-mounted：非激活页面在 DOM 中但不可见（visibility:hidden + aria-hidden）", () => {
     renderShell();
-    // 设置页的滑杆仍在 DOM（visibility:hidden 不触发合成层失效，故用 invisible 类）
-    const slider = screen.getByRole("slider", { hidden: true });
-    expect(slider).toBeInTheDocument();
-    expect(slider.closest(".invisible")).not.toBeNull();
+    // 拿设置页的主题选项当"这一页在不在 DOM"的标记（背景透明度那件设置已整体撤掉，滑杆没了）：
+    // visibility:hidden 不触发合成层失效，故用 invisible 类
+    const themeOption = screen.getByRole("radio", { name: "跟随系统", hidden: true });
+    expect(themeOption).toBeInTheDocument();
+    expect(themeOption.closest(".invisible")).not.toBeNull();
     // 仪表盘内容可见（无 .invisible 祖先）
     const grid = screen.getByTestId("dashboard-grid");
     expect(grid.closest(".invisible")).toBeNull();
@@ -126,8 +127,8 @@ describe("AppShell（P7 交互）", () => {
       return el;
     });
     expect(input.className).toContain("config-flash");
-    // 设置页已激活：滑杆祖先不再是 invisible
-    expect(screen.getByRole("slider").closest(".invisible")).toBeNull();
+    // 设置页已激活：主题选项的祖先不再是 invisible
+    expect(screen.getByRole("radio", { name: "跟随系统" }).closest(".invisible")).toBeNull();
   });
 });
 

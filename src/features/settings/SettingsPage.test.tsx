@@ -3,7 +3,6 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { AppProviders } from "@/app/providers";
 import { SettingsPage } from "./SettingsPage";
-import { setClickThroughStatus } from "@/lib/clickThroughStatus";
 
 const systemMocks = vi.hoisted(() => ({ ping: vi.fn() }));
 const configMocks = vi.hoisted(() => ({ snapshot: vi.fn(), set: vi.fn() }));
@@ -65,57 +64,18 @@ describe("SettingsPage", () => {
     ).toHaveAttribute("aria-checked", "false");
   });
 
-  it("透明度滑杆存在且初始值为 100", () => {
+  it("显示这一页只剩主题：透明度与点击穿透都不再是设置项", async () => {
+    // 两句用户口径都在这里钉住：背景透明度"整体去掉、默认不可设置"；
+    // 透明区点击穿透"是默认能力，不需要展示"。谁把它们再做回设置页，这条就红。
     render(
       <AppProviders>
         <SettingsPage />
       </AppProviders>,
     );
-    expect(screen.getByRole("slider")).toBeInTheDocument();
-    expect(screen.getByText("100%")).toBeInTheDocument();
-  });
-
-  it("「透明区点击穿透」勾选后写回配置键，且界面立刻是选中态", async () => {
-    // 写回 SQLite 只在 Tauri 环境发生（浏览器里退回 localStorage），这里得把环境装上；
-    // 另外必须等水合完成——水合期间故意不写回，免得把缓存值当成用户的新设置覆盖上去
-    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
-    render(
-      <AppProviders>
-        <SettingsPage />
-      </AppProviders>,
-    );
-    const box = (await screen.findByTestId("click-through-toggle")) as HTMLInputElement;
-    await waitFor(() => expect(configMocks.snapshot).toHaveBeenCalled());
-    expect(box.checked).toBe(false); // 默认必须关：它会改变"点下去归谁"
-    await userEvent.click(box);
-    expect(box.checked).toBe(true);
-    await waitFor(() =>
-      expect(configMocks.set).toHaveBeenCalledWith("app.settings.click_through", "true"),
-    );
-    await userEvent.click(box);
-    await waitFor(() =>
-      expect(configMocks.set).toHaveBeenLastCalledWith("app.settings.click_through", "false"),
-    );
-    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
-  });
-
-  it("开关打开后给出实时读数：能分清「没生效」与「那儿本来就是实体」", async () => {
-    // 用户报"透传没生效"时，开关没跑、循环卡住、判定认为那儿是实体这三种情况在界面上
-    // 长得一模一样。这条读数就是用来把它们分开的，所以必须钉住它真的会跟着状态变。
-    render(
-      <AppProviders>
-        <SettingsPage />
-      </AppProviders>,
-    );
-    const box = await screen.findByTestId("click-through-toggle");
-    expect(screen.queryByTestId("click-through-status")).toBeNull(); // 关着不显示
-    await userEvent.click(box);
-    setClickThroughStatus("solid");
-    const reading = await screen.findByTestId("click-through-status");
-    expect(reading.textContent ?? "").toContain("实体");
-    setClickThroughStatus("passing");
-    const passing2 = await screen.findByTestId("click-through-status");
-    expect(passing2.textContent ?? "").toContain("后面的 App");
+    expect(await screen.findByRole("radio", { name: "跟随系统" })).toBeInTheDocument();
+    expect(screen.queryByRole("slider")).toBeNull();
+    expect(screen.queryByTestId("click-through-toggle")).toBeNull();
+    expect(screen.queryByTestId("click-through-status")).toBeNull();
   });
 
   it("关于小节显示应用版本/Tauri 版本/运行平台（自仪表盘迁入，P7）", async () => {

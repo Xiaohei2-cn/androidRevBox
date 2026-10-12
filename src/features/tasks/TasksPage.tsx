@@ -180,7 +180,7 @@ export function TasksPage() {
               {tasks.length}
             </span>
           </CardHeader>
-          <div className="mx-4 mb-4 min-h-0 flex-1 overflow-auto rounded-lg border border-border/70 bg-background">
+          <div className="pane-scroll mx-4 mb-4 min-h-0 flex-1 overflow-auto rounded-lg border border-border/70 bg-background">
             {tasks.length === 0 && (
               <p className="p-4 text-center text-xs text-muted-foreground">
                 暂无任务，输入命令开始第一个
@@ -250,7 +250,7 @@ export function TasksPage() {
                   }
                 />
               </TabsContent>
-              <TabsContent value="info" className="min-h-0 flex-1 overflow-auto">
+              <TabsContent value="info" className="pane-scroll min-h-0 flex-1 overflow-auto">
                 <InfoView task={selected} />
               </TabsContent>
             </Tabs>
@@ -391,7 +391,7 @@ function OutputView({
     <div
       ref={boxRef}
       data-testid="task-output"
-      className="h-full overflow-auto rounded-xl border bg-black/80 p-3 font-mono text-sm leading-relaxed dark:bg-black/40"
+      className="pane-scroll h-full overflow-auto rounded-xl border bg-black/80 p-3 font-mono text-sm leading-relaxed dark:bg-black/40"
     >
       {lines.length === 0 && (
         <span className="text-muted-foreground">{running ? "等待输出…" : "（无输出）"}</span>

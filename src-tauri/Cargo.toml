@@ -33,6 +33,41 @@ getrandom = "0.3"
 tauri-plugin-dialog = "2.7.3"
 portable-pty = "0.9.0"
 
+# ===== 算法中心（CyberChef 移植：内置算法注册表 + 配方执行）=====
+# 版本一律锁在 digest 0.10 / cipher 0.4 这一代：混用 0.11/0.5 会让
+# hmac / block-modes 的 trait bound 直接不成立。
+base64 = "0.22"
+hex = "0.4"
+regex = "1"
+rand = "0.8"
+encoding_rs = "0.8"
+md-5 = "0.10"
+digest = "0.10"
+sha1 = "0.10"
+sha3 = "0.10"
+blake2 = "0.10"
+blake3 = "1"
+md4 = "0.10"
+ripemd = "0.1"
+hmac = "0.12"
+hkdf = "0.12"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+cipher = "0.4"
+aes = "0.8"
+des = "0.8"
+sm4 = "0.5"
+sm3 = "0.4"
+data-encoding = "2"
+typenum = "1"
+aes-gcm = "0.10"
+chacha20 = "0.9"
+chacha20poly1305 = "0.10"
+rsa = { version = "0.9", features = ["std", "pem", "sha1", "sha2"] }
+bcrypt = "0.15"
+flate2 = "1"
+bzip2-rs = "0.1"
+brotli = "8"
+
 [dev-dependencies]
 tempfile = "3"
 # 集成测试需要真实 cdylib 产物：依赖保证 cargo 先构建插件（同时产出 cdylib 与 rlib）

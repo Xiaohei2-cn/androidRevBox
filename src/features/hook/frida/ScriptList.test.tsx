@@ -1,15 +1,13 @@
 /**
- * B 区脚本条的显示口径（用户反馈：名字才是主角）。
+ * B 区脚本条的显示口径（第九十六轮：编辑器落地之后的交互更新）。
  *
- * 上一版把 名字 / 大小 / 修改时间 挤在同一行：右边那两列吃掉 130+ px，
- * 名字被 truncate 成「hook_wechat_dexdu…」、只有 hover 才看得到全名——
- * 而她选脚本靠的就是名字，认不出名字等于这一条失败。
+ * 显示口径（第九十二轮用户反馈，不变）：**名字才是主角**——行内只有名字；
+ * 大小 / 修改时间 / 完整路径收进 hover 气泡（ScriptMeta 直接渲染来验）。
  *
- * 现在钉四件事：
- * 1. 行内只有名字，大小与时间不出现在行里；
- * 2. 名字不再靠原生 title 藏起来（那是"要 hover 才看得见"的老毛病）；
- * 3. 大小 / 修改时间 / 完整路径的唯一去处是气泡内容（ScriptMeta 直接渲染来验）；
- * 4. 那条仍然是可双击启动的 tooltip 触发器。
+ * 交互口径（第九十六轮新增，钉住这次改版）：
+ * - **单击一行 = 在编辑器里打开**（onOpen）——编辑是这一层的主线；
+ * - **▶ = 起会话**（onStart）——双击不再启动（与"单击打开"打架，二选一取单击）；
+ * - **脏标**：dirtyNames 里有这个名字时，行上出现 ●（未保存的改动要看得见）。
  *
  * ⚠️ "鼠标移上去气泡真的弹出来"这条不在这里测：jsdom 没有排版，Radix 浮层
  * 一挂载就要 ~14 s（@floating-ui 在 jsdom 里把 getComputedStyle 当循环用）。
@@ -17,7 +15,7 @@
  * 气泡的弹出归真机手工矩阵（docs/frida_terminal_phases.md §5）。
  */
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -32,13 +30,6 @@ const { SCRIPT } = vi.hoisted(() => ({
     size: 2048,
     mtime: 1_700_000_000,
   } as JsFileDto,
-}));
-
-vi.mock("@/api/config", () => ({
-  configApi: {
-    get: vi.fn(async () => "/Users/me/hooks"),
-    set: vi.fn(async () => undefined),
-  },
 }));
 
 vi.mock("@/api/hook", () => ({
@@ -61,9 +52,23 @@ function withinProviders(ui: React.ReactElement) {
   );
 }
 
+/** 这版 ScriptList 的工作目录由外部持有（编辑器要同一份真相） */
+function list(props: Partial<Parameters<typeof ScriptList>[0]> = {}) {
+  return withinProviders(
+    <ScriptList
+      workdir="/Users/me/hooks"
+      onWorkdirChange={vi.fn()}
+      onStart={vi.fn()}
+      onOpen={vi.fn()}
+      refreshSignal={0}
+      {...props}
+    />,
+  );
+}
+
 describe("ScriptList：名字在行里，大小与时间在气泡里", () => {
   it("行内只写名字：长名字整行归名字，不再挤大小与时间", async () => {
-    withinProviders(<ScriptList running={false} onStart={vi.fn()} />);
+    list();
     const name = await screen.findByText(SCRIPT.name);
     const row = screen.getByTestId(`script-row-${SCRIPT.name}`);
 
@@ -78,28 +83,57 @@ describe("ScriptList：名字在行里，大小与时间在气泡里", () => {
   });
 
   it("那条就是气泡的触发器（Radix 在 trigger 上打 data-state）", async () => {
-    withinProviders(<ScriptList running={false} onStart={vi.fn()} />);
+    list();
     await screen.findByText(SCRIPT.name);
     const row = screen.getByTestId(`script-row-${SCRIPT.name}`);
     expect(row).toHaveAttribute("data-state", "closed");
     // 弹出本身（closed → delayed-open）见文件头：jsdom 下测它等于测浮层库
   });
 
-  it("气泡内容收着完整名字、路径、大小、修改时间与双击语义", () => {
+  it("气泡内容收着完整名字、路径、大小、修改时间与点击语义", () => {
     withinProviders(<ScriptMeta file={SCRIPT} />);
     const bubble = screen.getByText(SCRIPT.name).closest("div");
     expect(bubble).toHaveTextContent(SCRIPT.path);
     expect(bubble).toHaveTextContent(formatSize(SCRIPT.size)); // 2.0 KB
     expect(bubble).toHaveTextContent(formatMtime(SCRIPT.mtime)); // 2023-11-15 06:13（随本机时区）
-    expect(bubble).toHaveTextContent("双击以当前设置启动会话");
+    expect(bubble).toHaveTextContent("点一行在编辑器里打开");
+  });
+});
+
+describe("交互：单击打开、▶ 启动、脏标可见", () => {
+  it("单击一行 = 打开（onOpen），不起会话", async () => {
+    const onOpen = vi.fn();
+    const onStart = vi.fn();
+    list({ onOpen, onStart });
+    await screen.findByText(SCRIPT.name);
+    fireEvent.click(screen.getByTestId(`script-row-${SCRIPT.name}`));
+    expect(onOpen).toHaveBeenCalledWith(SCRIPT);
+    expect(onStart).not.toHaveBeenCalled();
   });
 
-  it("气泡不吃交互：双击那条仍然启动会话", async () => {
+  it("▶ = 起会话，且不触发「打开」（事件停在了按钮上）", async () => {
+    const onOpen = vi.fn();
     const onStart = vi.fn();
-    withinProviders(<ScriptList running={false} onStart={onStart} />);
+    list({ onOpen, onStart });
+    await screen.findByText(SCRIPT.name);
+    const row = screen.getByTestId(`script-row-${SCRIPT.name}`);
+    fireEvent.click(within(row).getByText("启动"));
+    await waitFor(() => expect(onStart).toHaveBeenCalledWith(SCRIPT));
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it("双击不再启动会话（单击已经占住「打开」；两个手势各表一义）", async () => {
+    const onStart = vi.fn();
+    list({ onStart });
     await screen.findByText(SCRIPT.name);
     fireEvent.doubleClick(screen.getByTestId(`script-row-${SCRIPT.name}`));
-    await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
-    expect(onStart).toHaveBeenCalledWith(SCRIPT);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(onStart).not.toHaveBeenCalled();
+  });
+
+  it("脏文件行上有 ●（未保存的改动不许看不见）", async () => {
+    list({ dirtyNames: new Set([SCRIPT.name]) });
+    await screen.findByText(SCRIPT.name);
+    expect(screen.getByTestId(`script-dirty-${SCRIPT.name}`)).toBeTruthy();
   });
 });

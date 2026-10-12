@@ -48,3 +48,69 @@ export function deviceShellLaunch(
     },
   };
 }
+
+/**
+ * 交互式托管会话：在**同一块设备 PTY 屏**里跑某个托管二进制（IDA 的 `id_android_svr64`、
+ * `gdbserver`、`lldb-server`、任何"要边输出边等输入"的控制台程序）。
+ *
+ * 为什么这类程序不能走「托管执行」那条路（结构性不匹配，不是参数没调好）：
+ *
+ * | 托管执行（Agent nohup + 日志 + 可选 stdin 管道） | 这类程序要的是 |
+ * |---|---|
+ * | 没有 PTY：程序 `isatty()` 走非交互分支，不做行编辑、不回提示符 | 有 tty，提示符/回显/全屏都在 |
+ * | 输出靠**轮询日志文件**，调试会话里等于"看录像" | 输出即时到屏上 |
+ * | stdin 是"喂一行"，没有 Ctrl-C / Ctrl-D / 窗口尺寸 | 键盘与信号直达对端 |
+ *
+ * 所以这里只做一件事：把命令行拼成 `adb -s <serial> shell -tt "<远端命令>"`，
+ * 交给设备那块屏（见本文件顶部的实测表 —— `-tt` 有 winsize 通道、Ctrl-C 走行规程）。
+ * 不新增 Rust 通道，也不需要重装 Agent。
+ *
+ * 引用规则：**每个 token 单独 `shQuote`**，远端只看到一个字符串参数，不经过我们的 shell 分词。
+ * `su -c` 那层是**再套一次引用**（内层字符串本身就是设备侧 shell 的一条命令），
+ * 所以出现 `'\''` 这种嵌套转义是正常的，不是漏网。
+ */
+export type HostedBinaryBlock = DeviceShellBlock | "bad-name";
+
+export interface HostedBinaryLaunchRequest {
+  /** 托管目录（设备侧），如 `/data/local/tmp` */
+  dir: string;
+  /** 二进制文件名（不含目录） */
+  name: string;
+  /** 启动参数，逐个引用 */
+  args?: string[];
+  /** 以 root 起（`su -c`）：注入类 server 常态需要 */
+  root?: boolean;
+}
+
+/** POSIX 单引号引用：内部出现的 `'` 收拢成 `'\''`，其余一律字面量。 */
+export function shQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** 文件名不许带路径分隔与控制字符：目录由 `dir` 固定，这里只该是个名字。 */
+const NAME_PATTERN = /^[^\s/\\]{1,120}$/;
+
+export function hostedBinaryLaunch(
+  adbPath: string | null | undefined,
+  serial: string | null | undefined,
+  request: HostedBinaryLaunchRequest,
+): { ok: true; launch: DeviceShellLaunch; remote: string } | { ok: false; block: HostedBinaryBlock } {
+  const base = deviceShellLaunch(adbPath, serial);
+  if (!base.ok) return { ok: false, block: base.block };
+  const name = request.name.trim();
+  if (!NAME_PATTERN.test(name)) return { ok: false, block: "bad-name" };
+  const dir = (request.dir || "/data/local/tmp").trim() || "/data/local/tmp";
+  // 必须带 `./`：Android 的 shell 找可执行文件走 PATH，裸文件名会直接
+  // `inaccessible or not found`（真机上报的就是这条）。名字里已含目录时尊重原样。
+  const executable = name.includes("/") ? name : `./${name}`;
+  const inner = [executable, ...(request.args ?? [])].map(shQuote).join(" ");
+  // 远端由 `/system/bin/sh -c` 解析：先 cd 进托管目录，再（可选）换 root 执行
+  const remote = request.root
+    ? `cd ${shQuote(dir)} && su -c ${shQuote(inner)}`
+    : `cd ${shQuote(dir)} && ${inner}`;
+  return {
+    ok: true,
+    launch: { program: base.launch.program, args: [...base.launch.args, remote] },
+    remote,
+  };
+}

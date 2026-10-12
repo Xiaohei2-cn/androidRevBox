@@ -210,23 +210,12 @@ describe("版本指纹（mtime + size）", () => {
   });
 
   it("参数按设备+文件存，且空值不占键", () => {
-    saveLaunchPrefs("SERIAL1", "toybox", {
-      argsText: "-l 27042",
-      stdinText: "",
-      interactive: true,
-      stamp: "100:5",
-    });
+    saveLaunchPrefs("SERIAL1", "toybox", { argsText: "-l 27042", stamp: "100:5" });
     expect(localStorage.getItem("adb.binary.launch.SERIAL1.toybox.args")).toBe("-l 27042");
-    expect(localStorage.getItem("adb.binary.launch.SERIAL1.toybox.stdin")).toBeNull();
-    expect(loadLaunchPrefs("SERIAL1", "toybox")).toEqual({
-      argsText: "-l 27042",
-      stdinText: "",
-      interactive: true,
-      stamp: "100:5",
-    });
+    expect(loadLaunchPrefs("SERIAL1", "toybox")).toEqual({ argsText: "-l 27042", stamp: "100:5" });
     // 换一台设备不该串味
     expect(loadLaunchPrefs("OTHER", "toybox")).toEqual(emptyLaunchPrefs());
-    // 用户清空后读回来仍是空，且不留三个空键
+    // 用户清空后读回来仍是空，且不留下空键
     saveLaunchPrefs("SERIAL1", "toybox", emptyLaunchPrefs());
     expect(localStorage.getItem("adb.binary.launch.SERIAL1.toybox.args")).toBeNull();
     expect(loadLaunchPrefs("SERIAL1", "toybox")).toEqual(emptyLaunchPrefs());

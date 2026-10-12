@@ -3,64 +3,14 @@ import { describe, expect, it, vi } from "vitest";
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
-import { hookApi, parseFridaLine, summarizeEventData } from "@/api/hook";
+import { hookApi } from "@/api/hook";
 
-describe("parseFridaLine（runner NDJSON 协议，§5.2）", () => {
-  it("ready 控制行", () => {
-    expect(
-      parseFridaLine('{"t":"ready","pid":1234,"mode":"spawn","pkg":"com.x","frida":"16.5.9"}'),
-    ).toEqual({ kind: "ready", pid: 1234, mode: "spawn", pkg: "com.x", frida: "16.5.9" });
-  });
-
-  it("log 三级", () => {
-    expect(parseFridaLine('{"t":"log","lvl":"warn","msg":"slow"}')).toEqual({
-      kind: "log",
-      lvl: "warn",
-      msg: "slow",
-    });
-  });
-
-  it("send 带 tag/seq 与二进制旁路", () => {
-    const e = parseFridaLine('{"t":"send","tag":"sign","seq":7,"data":{"a":1},"data_bin":{"_hex":"1a2b"}}');
-    expect(e).toEqual({ kind: "send", tag: "sign", seq: 7, data: { a: 1 }, dataBin: "1a2b" });
-  });
-
-  it("error 行带堆栈", () => {
-    expect(parseFridaLine('{"t":"error","why":"boom","stack":"at x"}')).toEqual({
-      kind: "error",
-      why: "boom",
-      stack: "at x",
-    });
-  });
-
-  it("exit 行", () => {
-    expect(parseFridaLine('{"t":"exit","code":0,"why":"process-terminated"}')).toEqual({
-      kind: "exit",
-      code: 0,
-      why: "process-terminated",
-    });
-  });
-
-  it("非协议行降级原文不崩", () => {
-    for (const line of ["plain text", "pid=42", "{not json", "[1,2]", '{"t":"future","x":1}', ""]) {
-      expect(parseFridaLine(line)).toEqual({ kind: "raw", text: line });
-    }
-  });
-
-  it("pid 非数字（attach 无 pid）容忍", () => {
-    const e = parseFridaLine('{"t":"ready","mode":"attach","pkg":"com.x"}');
-    expect(e.kind === "ready" && e.pid).toBe(null);
-  });
-});
-
-describe("summarizeEventData", () => {
-  it("标量与对象", () => {
-    expect(summarizeEventData("abc")).toBe("abc");
-    expect(summarizeEventData(42)).toBe("42");
-    expect(summarizeEventData(null)).toBe("null");
-    expect(summarizeEventData({ a: 1 })).toBe('{"a":1}');
-  });
-});
+/**
+ * Hook API 的入参形状护栏。
+ *
+ * parseFridaLine / summarizeEventData 的测试随结构化终端一起退役（第九十六轮）：
+ * NDJSON 行协议、三轨过滤、导出拼装都不再存在，本文件只管**还在的命令**怎么发。
+ */
 
 describe("hook_preflight 的入参", () => {
   it("USB 模式必须把 serial 一起送出去（否则探的是上一台机的 frida-server）", async () => {
@@ -79,5 +29,35 @@ describe("hook_preflight 的入参", () => {
       remote: "127.0.0.1:27042",
       serial: null,
     });
+  });
+});
+
+describe("脚本读写接口（IDE 用的三条）", () => {
+  it("读：只传名字，边界在宿主侧", async () => {
+    invokeMock.mockReset().mockResolvedValue("// x");
+    await hookApi.scriptRead("hook.js");
+    expect(invokeMock).toHaveBeenCalledWith("hook_script_read", { name: "hook.js" });
+  });
+
+  it("写：默认不是 createOnly；新建时显式为 true（宿主据此拒绝撞名）", async () => {
+    invokeMock.mockReset().mockResolvedValue(3);
+    await hookApi.scriptWrite("a.js", "abc");
+    expect(invokeMock).toHaveBeenLastCalledWith("hook_script_write", {
+      name: "a.js",
+      content: "abc",
+      createOnly: false,
+    });
+    await hookApi.scriptWrite("b.js", "x", true);
+    expect(invokeMock).toHaveBeenLastCalledWith("hook_script_write", {
+      name: "b.js",
+      content: "x",
+      createOnly: true,
+    });
+  });
+
+  it("删：只传名字", async () => {
+    invokeMock.mockReset().mockResolvedValue(undefined);
+    await hookApi.scriptDelete("gone.js");
+    expect(invokeMock).toHaveBeenCalledWith("hook_script_delete", { name: "gone.js" });
   });
 });

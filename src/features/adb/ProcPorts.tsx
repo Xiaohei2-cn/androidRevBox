@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowRightLeft, OctagonX, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { PaneHeader } from "@/components/ui/pane-header";
 import { AdbNotReadyState } from "@/components/ui/adb-gate";
 import { deviceApi, type PortHolder } from "@/api/device";
 import { DeviceBar } from "@/components/ui/device-bar";
@@ -176,7 +177,7 @@ export function ProcPorts() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-3 overflow-auto">
+    <div className="pane-scroll flex h-full min-h-0 flex-col gap-3 overflow-auto">
       <p className="shrink-0 text-xs leading-relaxed text-muted-foreground">
         {t("adb.proc.description")}
       </p>
@@ -204,10 +205,7 @@ export function ProcPorts() {
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-2">
         {/* 端口 → 进程 */}
         <section className="flex min-h-0 flex-col gap-2 rounded-xl border border-border/70 bg-card shadow-card p-3" aria-label={t("adb.proc.byPort")}>
-          <h3 className="flex items-center gap-1.5 text-xs font-semibold">
-            <ArrowRightLeft className="h-3.5 w-3.5 text-muted-foreground" />
-            {t("adb.proc.byPort")}
-          </h3>
+          <PaneHeader compact icon={ArrowRightLeft} title={t("adb.proc.byPort")} className="min-w-0" />
           <div className="flex shrink-0 items-center gap-2">
             <input
               aria-label={t("adb.proc.portLabel")}
@@ -227,7 +225,7 @@ export function ProcPorts() {
               {t("adb.proc.query")}
             </Button>
           </div>
-          <div className="min-h-0 flex-1 overflow-auto text-xs">
+          <div className="pane-scroll min-h-0 flex-1 overflow-auto text-xs">
             {portHit === null ? (
               <p className="text-muted-foreground">{t("adb.proc.idle")}</p>
             ) : portHit.holders.length === 0 ? (
@@ -265,10 +263,7 @@ export function ProcPorts() {
 
         {/* 进程 → 端口 */}
         <section className="flex min-h-0 flex-col gap-2 rounded-xl border border-border/70 bg-card shadow-card p-3" aria-label={t("adb.proc.byPid")}>
-          <h3 className="flex items-center gap-1.5 text-xs font-semibold">
-            <ArrowRightLeft className="h-3.5 w-3.5 text-muted-foreground" />
-            {t("adb.proc.byPid")}
-          </h3>
+          <PaneHeader compact icon={ArrowRightLeft} title={t("adb.proc.byPid")} className="min-w-0" />
           <div className="flex shrink-0 items-center gap-2">
             <input
               aria-label={t("adb.proc.pidLabel")}
@@ -288,7 +283,7 @@ export function ProcPorts() {
               {t("adb.proc.query")}
             </Button>
           </div>
-          <div className="min-h-0 flex-1 overflow-auto text-xs">
+          <div className="pane-scroll min-h-0 flex-1 overflow-auto text-xs">
             {pidHit === null ? (
               <p className="text-muted-foreground">{t("adb.proc.idle")}</p>
             ) : pidHit.ports.length === 0 ? (

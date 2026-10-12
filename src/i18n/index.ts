@@ -9,6 +9,7 @@
 export { I18nProvider, useI18n } from "./I18nProvider";
 export { makeTranslate, I18nContext, useI18nContext, type TranslateFn } from "./context";
 export {
+  DICTIONARIES,
   LOCALES,
   DEFAULT_LOCALE,
   LOCALE_LABELS,

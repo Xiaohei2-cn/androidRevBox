@@ -18,6 +18,18 @@ import { FilesView } from "@/features/devices/DevicesPage";
  * 这个区别本身就是 D043 修掉的东西，所以要在测试里保持可见。
  */
 
+/** 清单 DTO 现在带着「这份是不是设备上的全貌」：测试默认给一份完整的 Agent 清单 */
+const listing = (
+  binaries: unknown[],
+  over: Partial<{ truncated: boolean; unreadable: string[]; source: string }> = {},
+) => ({ binaries, truncated: false, unreadable: [], source: "agent", ...over });
+
+/** 目录列举的返回值现在带着「这份是不是全貌」「以谁的身份读的」（FileListing） */
+const lsOf = (
+  entries: unknown[],
+  over: Partial<{ path: string; unreadable: string[]; truncated: boolean; source: string }> = {},
+) => ({ path: "/sdcard", entries, unreadable: [], truncated: false, source: "agent", ...over });
+
 const device = vi.hoisted(() => ({
   environment: vi.fn(),
   list: vi.fn(),
@@ -28,6 +40,7 @@ const device = vi.hoisted(() => ({
   binaries: vi.fn(),
   hostedRuns: vi.fn(),
   binaryRun: vi.fn(),
+  binaryClaim: vi.fn(),
   binaryChmod: vi.fn(),
   binaryKill: vi.fn(),
   binaryPorts: vi.fn(),
@@ -171,6 +184,9 @@ beforeEach(() => {
   device.onChanged.mockResolvedValue(() => {});
   device.rootCheck.mockResolvedValue(true);
   device.binarySuCheck.mockResolvedValue(true);
+  // 终端启动之后那次「补登记」默认没登记上：各行仍按表外进程说实话，
+  // 只有专门的用例才把它翻成 claimed:true（见下面那两条）
+  device.binaryClaim.mockResolvedValue({ claimed: false, pid: null, detail: null });
   device.ip.mockResolvedValue("192.168.1.7");
   device.hostedRuns.mockResolvedValue([
     {
@@ -187,7 +203,7 @@ beforeEach(() => {
       detail: null,
     },
   ]);
-  device.binaries.mockResolvedValue([
+  device.binaries.mockResolvedValue(listing([
     {
       name: "frida-server",
       path: "/data/local/tmp/frida-server",
@@ -205,7 +221,7 @@ beforeEach(() => {
       hasExec: false,
       externalProcs: [],
     },
-  ]);
+  ]));
   device.procPorts.mockResolvedValue([
     { address: "0100007F:6978", port: 27000, listen: true, family: "tcp" },
   ]);
@@ -386,8 +402,51 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     // 关键：设备说"在跑"时「终止」必须是**可点**的。曾经 running 一个字段兼作两用
     // （设备在跑 / 我的指令在途），于是按钮 disabled={row.running} 把在跑的行的终止
     // 自己禁成灰色 —— 用户报的"发现托管进程在跑但停不掉"就是它。
+    // 可执行状态就着名字上色（绿=可执行、红=不可执行）；「外部在跑」另给一枚黄色徽章
+    expect(
+      within(screen.getByTestId("bin-frida-server")).getByText("frida-server").className,
+    ).toContain("text-emerald-600");
+    expect(within(screen.getByTestId("bin-helper.dex")).getByText("helper.dex").className).toContain(
+      "text-red-500",
+    );
+    // 入口归属：清单行只管"加入托管"(+)，启动入口在托管执行那一行——
+    // 原来那枚「执行」被终端按钮替掉了，两件事不再混在一个列表行里。
+    const add = screen.getByTestId("add-frida-server");
+    expect(add.closest("li")).toBe(screen.getByTestId("bin-frida-server"));
+    expect(add).toBeEnabled();
+    expect(screen.getByTestId("add-helper.dex")).toBeDisabled(); // 没执行位的文件不给启动
+    expect(screen.queryByTestId("interactive-frida-server")).toBeNull();
+    // 设备说这一行"在跑"，就不该再给启动入口（终端启动也一样：不给同一个文件起第二个实例）
+    expect(screen.queryByTestId("hosted-terminal-frida-server")).toBeNull();
     expect(screen.getByTestId("kill-frida-server")).toBeEnabled();
-    expect(screen.queryByTestId("run-frida-server")).toBeNull(); // 在跑不该再给「执行」
+    const external = screen.getByTestId("external-frida-server");
+    expect(external.className).toContain("bg-amber-500/10");
+    expect(external.className).toContain("text-amber-500");
+
+    // 备注归文件列表那一行，而且**平时只是文字**：点"加备注"才出现输入框（不是每行挂着表单）
+    for (const el of screen.getAllByTestId(/^note-/)) {
+      expect(el.closest("li")).toHaveAttribute("data-testid", expect.stringMatching(/^bin-/));
+    }
+    expect(screen.queryByTestId("note-frida-server")).toBeNull();
+    fireEvent.click(screen.getByTestId("note-add-frida-server"));
+    const noteInput = await screen.findByTestId("note-frida-server");
+    // 快捷备注曾经点了没反应：输入框的无条件 onBlur 会在鼠标落到下拉前就把编辑行卸载掉。
+    // 判据就是这条 —— 焦点移到下拉时不许收起，移到别处才收起。
+    const quick = screen.getByTestId("note-quick-frida-server");
+    fireEvent.blur(noteInput, { relatedTarget: quick });
+    expect(screen.getByTestId("note-frida-server")).toBeInTheDocument();
+    // 预设真的写进去了，并且写完就收起（此时那一行显示备注文字 + 铅笔）
+    fireEvent.change(quick, { target: { value: "frida server" } });
+    expect(await screen.findByText("frida server")).toBeInTheDocument();
+    expect(screen.queryByTestId("note-frida-server")).toBeNull();
+    const again = screen.getByTestId("note-edit-frida-server");
+    fireEvent.click(again);
+    const second = await screen.findByTestId("note-frida-server");
+    // 焦点移到别处才收起
+    fireEvent.blur(second, { relatedTarget: document.body });
+    expect(screen.queryByTestId("note-frida-server")).toBeNull();
+    expect(screen.getByTestId("kill-frida-server")).toBeEnabled();
+    expect(screen.queryByTestId("hosted-terminal-frida-server")).toBeNull(); // 设备说在跑，就不给启动入口
     // 真点一下：按钮必须是活的，按 handle 停止要真的被调用
     device.hostedStop.mockResolvedValue({
       record: {
@@ -427,16 +486,15 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     device.binaryKill.mockResolvedValue(undefined);
     renderPage(<BinaryHosting />);
     expect(await screen.findByTestId("external-frida-server")).toBeTruthy();
-    fireEvent.doubleClick((screen.getByTestId("bin-frida-server").querySelector("button") ??
-      screen.getByTestId("bin-frida-server")) as Element);
+    fireEvent.doubleClick((await screen.findByTestId("bin-row-frida-server")) as Element);
     const hosted = await screen.findByTestId("hosted-frida-server");
     expect(hosted.textContent ?? "").toContain("已在运行 pid 31337");
     // 关键反向断言：这一行**没有**「执行」按钮 —— 点了也只会起一个秒退的进程
-    expect(screen.queryByTestId("run-frida-server")).toBeNull();
+    expect(screen.queryByTestId("hosted-terminal-frida-server")).toBeNull();
     device.binaryRun.mockClear();
     device.binaryKill.mockClear();
     // 停止后清单会重新拉一次：这次报告"没有外部实例了"，模拟进程真被停掉
-    device.binaries.mockResolvedValue([
+    device.binaries.mockResolvedValue(listing([
       {
         name: "frida-server",
         path: "/data/local/tmp/frida-server",
@@ -445,7 +503,7 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
         hasExec: true,
         externalProcs: [],
       },
-    ]);
+    ]));
     fireEvent.click(screen.getByTestId("stop-external-frida-server"));
     // 不可逆操作先确认一次，不直接杀
     expect(device.binaryKill).not.toHaveBeenCalled();
@@ -459,15 +517,14 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
       expect(device.binaryKill).toHaveBeenCalledWith("PIXEL-1", 31337, true, "frida-server"),
     );
     expect(device.binaryRun).not.toHaveBeenCalled();
-    // 停下来之后，同一行才变回「执行」
-    await waitFor(() => expect(screen.getByTestId("run-frida-server")).toBeTruthy());
+    // 停下来之后，同一行才重新给出启动入口
+    await waitFor(() => expect(screen.getByTestId("hosted-terminal-frida-server")).toBeTruthy());
   });
 
-  it("就算界面状态是旧的，桌面侧拦下了第二次启动也只说「已经在跑」，不报成失败", async () => {
-    // binaryRun 返回 started=false：这是"没起新的"，不是"起失败了"——
-    // 报红色失败会让人以为自己的二进制坏了。
-    device.hostedRuns.mockResolvedValue([]);
-    device.binaries.mockResolvedValue([
+  it("点「终端启动」走的是终端：开一块 PTY 屏，不再打 device_binary_run", async () => {
+    // 启动方式换了：不再由 Agent 后台起 + 日志文件轮询，而是在本页右侧那块真终端里跑。
+    // 判据两头都要钉：新链路确实起了 PTY（参数里带 ./文件名），老链路一次都没被碰。
+    device.binaries.mockResolvedValue(listing([
       {
         name: "frida-server",
         path: "/data/local/tmp/frida-server",
@@ -476,30 +533,174 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
         hasExec: true,
         externalProcs: [],
       },
-    ]);
-    device.binaryRun.mockResolvedValue({
-      pid: 4242,
-      started: false,
-      detail: "frida-server 已经在跑（pid 4242 · 父进程 3900 · uid 2000），不在本工具的托管表里",
-    });
+    ]));
+    device.hostedRuns.mockResolvedValue([]);
     renderPage(<BinaryHosting />);
-    // 清单是异步来的，先等它出现（上一条测试是"先等到有外部实例"才动的，这里同理）
-    const row = await screen.findByTestId("bin-frida-server");
-    fireEvent.doubleClick((row.querySelector("button") ?? row) as Element);
-    await screen.findByTestId("hosted-frida-server");
-    fireEvent.click(screen.getByTestId("run-frida-server"));
-    await waitFor(() =>
-      expect(screen.getAllByText(/已经在跑|已有一个实例在跑/).length).toBeGreaterThan(0),
+    fireEvent.doubleClick((await screen.findByTestId("bin-row-frida-server")) as Element);
+    const row = await screen.findByTestId("hosted-frida-server");
+    fireEvent.click(row.querySelector("[data-testid='hosted-terminal-frida-server']") as Element);
+    await waitFor(() => expect(pty.open).toHaveBeenCalled());
+    const openedArgs = vi.mocked(pty.open).mock.calls.at(-1)?.[0].args ?? [];
+    expect(openedArgs).toContain("-tt");
+    // 名字必须带 ./（裸文件名会被设备 shell 按 PATH 找）；引用写法随 Root 开关变，所以只认文件名
+    expect(openedArgs.at(-1)).toContain("./frida-server");
+    expect(device.binaryRun).not.toHaveBeenCalled();
+    expect(screen.queryByTestId(/^err-/)).toBeNull(); // 换启动方式不是失败，别报红
+  });
+
+  it("终端起的那次执行会补登记：设备运行表收下之后，行按表显示 pid 与「终止」", async () => {
+    // 用户报的现场：明明是在这一页点起来的，行上却说"它不在本工具的托管表里"。
+    // 根因是终端那次 exec 走 adb shell、不经过 Agent，表里自然没有记录。
+    // 现在开屏之后补一次认领：桌面只交候选 pid，认不认由设备侧实证判。
+    device.binaries.mockResolvedValue(listing([
+      {
+        name: "frida-server",
+        path: "/data/local/tmp/frida-server",
+        size: 53_539_200,
+        perms: "-rwxr-xr-x",
+        hasExec: true,
+        externalProcs: [],
+      },
+    ]));
+    let runs: unknown[] = [];
+    device.hostedRuns.mockImplementation(async () => runs);
+    let resolveClaim: (value: unknown) => void = () => {};
+    device.binaryClaim.mockReturnValue(
+      new Promise((resolve) => {
+        resolveClaim = resolve;
+      }),
     );
-    expect(document.body.textContent ?? "").not.toContain("启动失败");
+    renderPage(<BinaryHosting />);
+    fireEvent.doubleClick((await screen.findByTestId("bin-row-frida-server")) as Element);
+    const row = await screen.findByTestId("hosted-frida-server");
+    fireEvent.click(row.querySelector("[data-testid='hosted-terminal-frida-server']") as Element);
+    await waitFor(() => expect(device.binaryClaim).toHaveBeenCalled());
+    // 参数：本设备的序列号、这个文件、启动用的参数、以及开屏前就在跑的同名 pid（这里没有）
+    expect(device.binaryClaim.mock.calls.at(-1)?.slice(0, 4)).toEqual([
+      "PIXEL-1",
+      "frida-server",
+      [],
+      [],
+    ]);
+    // 认领在途时不许出现"可能不是你起的"那种猜测文案，也不该已经有 pid
+    expect(row.textContent ?? "").not.toContain("不在本工具的托管表里");
+    expect(screen.queryByTestId("pid-frida-server")).toBeNull();
+    // 设备把这条收进表了：行的 pid/终止全部来自运行表，不是桌面自己记的
+    runs = [
+      {
+        handle: "aa55bb66cc77dd88",
+        name: "frida-server",
+        pid: 24208,
+        start_time_ticks: 22_981_210,
+        started_at_unix: 1_755_000_000,
+        log_path: "/data/local/tmp/.frida-server.run.log",
+        root: false,
+        state: "running",
+        exit_code: null,
+        detail: "adopted",
+      },
+    ];
+    resolveClaim({ claimed: true, pid: 24208, detail: null });
+    await waitFor(() =>
+      expect(screen.getByTestId("pid-frida-server").textContent ?? "").toContain("24208"),
+    );
+    expect(await screen.findByTestId("kill-frida-server")).toBeEnabled();
+    expect(screen.queryByTestId("external-note-frida-server")).toBeNull();
+    // 「终止」把设备上的进程停掉之后，为它开的那块屏也得收掉：
+    // 进程早没了、屏还亮着一段跑完的输出，看上去就是"没停干净"。
+    device.hostedStop.mockResolvedValue({
+      record: {
+        handle: "aa55bb66cc77dd88",
+        name: "frida-server",
+        pid: 24208,
+        start_time_ticks: 22_981_210,
+        started_at_unix: 1_755_000_000,
+        log_path: "/data/local/tmp/.frida-server.run.log",
+        root: false,
+        state: "exited",
+        exit_code: null,
+        detail: null,
+      },
+      outcome: "signaled",
+      identity_verified: true,
+      record_dropped: true,
+    });
+    fireEvent.click(screen.getByTestId("kill-frida-server"));
+    await waitFor(() =>
+      expect(device.hostedStop).toHaveBeenCalledWith("PIXEL-1", "aa55bb66cc77dd88", 24208),
+    );
+    await waitFor(() => expect(pty.close).toHaveBeenCalledWith("pty-1"));
+    // 结果播报走**中性那一格**（红色那格只留给真错误：旧版"停止成功"也标红，看着像失败）
+    await waitFor(() =>
+      expect(screen.getByTestId("action-note-frida-server").textContent ?? "").toContain(
+        "终端屏也一起关掉了",
+      ),
+    );
+    expect(screen.queryByTestId("err-frida-server")).toBeNull();
+    // 设备表里这条已经没了 ⇒ 行回到"未运行"，启动入口重新出现
+    runs = [];
+    fireEvent.click(screen.getByTestId("hosted-terminal-frida-server"));
+    await waitFor(() => expect(screen.queryByTestId("pid-frida-server")).toBeNull());
+    // 用户报的错显就在这一步：停完再启动，行上既不该还挂着上一次"已终止 pid …"那格播报，
+    // 也不该在根本没查过端口之前印一句"无 LISTEN 端口"（那是把没发生的查询当证据）
+    await waitFor(() => expect(screen.queryByTestId("action-note-frida-server")).toBeNull());
+    expect(screen.queryByTestId("err-frida-server")).toBeNull();
+    expect(screen.queryByTestId("ports-frida-server")).toBeNull();
+    expect(row.textContent ?? "").not.toContain("无 LISTEN 端口");
+    // 也没有第二套输入通道：stdin 就在那块屏里，行上不许再冒"输入通道"这种话
+    expect(row.textContent ?? "").not.toContain("输入通道");
   });
 
-  it("登记进托管表的 root 进程：pid 由设备侧凭据支撑，按钮走「终止」", async () => {
-    // AR7.7：勾 Root 的启动以前只在桌面本地记一个 pid；现在 Agent 认领后会写进运行表。
-    // tracked:true 的这条，界面显示的就是设备认得的进程，终止也按句柄/身份来。
-    device.hostedRuns.mockResolvedValue([]);
+  it("托管行布局：文件名独立一行，pid 到探测帮助在下一行", async () => {
+    renderPage(<BinaryHosting />);
+    fireEvent.doubleClick((await screen.findByTestId("bin-row-frida-server")) as Element);
+    const row = await screen.findByTestId("hosted-frida-server");
+    const chip = row.querySelector("[data-testid='cmd-frida-server']") as Element;
+    const actions = row.querySelector(
+      "[data-testid='hosted-actions-frida-server']",
+    ) as HTMLElement;
+    expect(chip).toBeTruthy();
+    expect(actions).toBeTruthy();
+    // 名字不许挤进动作那一行：一行里塞四五个按钮，长文件名就会被截断（用户要的就是分开）
+    expect(chip.closest("[data-testid='hosted-actions-frida-server']")).toBeNull();
+    // pid / 终止 / 探测帮助都归第二行
+    for (const id of ["pid-frida-server", "kill-frida-server", "probe-frida-server"]) {
+      expect(actions.querySelector(`[data-testid='${id}']`), `${id} 该在动作那一行`).toBeTruthy();
+    }
+  });
+
+  it("端口那块只说查过的事：查失败就说查失败，不许默认「无 LISTEN 端口」", async () => {
+    // 用户报的第三条错显就是这句：进程重新起来后，谁都没查过端口，行上先印了"无 LISTEN 端口"。
+    device.binaryPorts.mockRejectedValue(new Error("设备端读不到 /proc/net/tcp"));
+    renderPage(<BinaryHosting />);
+    fireEvent.doubleClick((await screen.findByTestId("bin-row-frida-server")) as Element);
+    // 设备运行表说 pid 25265 在跑 ⇒ 这一行自己去查一次（老「执行」那条路本来会自动查）
+    await waitFor(() =>
+      expect(device.binaryPorts).toHaveBeenCalledWith("PIXEL-1", 25265, false),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("ports-error-frida-server").textContent ?? "").toContain(
+        "端口没查到",
+      ),
+    );
+    expect(screen.getByTestId("ports-frida-server").textContent ?? "").not.toContain("无 LISTEN");
+  });
+
+  it("确实查过、真的没有监听端口，才说「无 LISTEN 端口」", async () => {
     device.binaryPorts.mockResolvedValue([]);
-    device.binaries.mockResolvedValue([
+    renderPage(<BinaryHosting />);
+    fireEvent.doubleClick((await screen.findByTestId("bin-row-frida-server")) as Element);
+    await waitFor(() =>
+      expect(screen.getByTestId("ports-frida-server").textContent ?? "").toContain(
+        "无 LISTEN 端口",
+      ),
+    );
+  });
+
+  it("Root 开关开着时，终端启动按 root 起，登记也按 root 报", async () => {
+    // 页顶那句"以 root 执行 chmod/启动/终止"以前对启动是空话：终端那条路一直按普通执行起。
+    // 现在开关说了算：远端命令套 su -c，认领时也把 root 一并交给设备侧核对属主。
+    device.binaries.mockResolvedValue(listing([
       {
         name: "frida-server",
         path: "/data/local/tmp/frida-server",
@@ -508,37 +709,32 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
         hasExec: true,
         externalProcs: [],
       },
-    ]);
-    device.binaryRun.mockResolvedValue({ pid: 4321, started: true, tracked: true, detail: null });
+    ]));
+    device.hostedRuns.mockResolvedValue([]);
+    device.binaryClaim.mockResolvedValue({ claimed: false, pid: null, detail: null });
     renderPage(<BinaryHosting />);
-    const entry = await screen.findByTestId("bin-frida-server");
-    fireEvent.doubleClick((entry.querySelector("button") ?? entry) as Element);
+    const box = (await screen.findByRole("checkbox", { name: "Root 执行" })) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(true)); // su 探得过 → 默认开
+    fireEvent.doubleClick((await screen.findByTestId("bin-row-frida-server")) as Element);
+    const row = await screen.findByTestId("hosted-frida-server");
+    fireEvent.click(row.querySelector("[data-testid='hosted-terminal-frida-server']") as Element);
+    await waitFor(() => expect(pty.open).toHaveBeenCalled());
+    const remote = vi.mocked(pty.open).mock.calls.at(-1)?.[0].args.at(-1) ?? "";
+    expect(remote).toContain("su -c");
+    expect(remote).toContain("./frida-server");
+    await waitFor(() => expect(device.binaryClaim).toHaveBeenCalled());
+    expect(device.binaryClaim.mock.calls.at(-1)?.[4]).toBe(true);
+  });
+
+  it("pid 只由设备运行表支撑：在册的那行显示 pid 并给「终止」", async () => {
+    // AR7.7 的要点没变，来源变了：pid 不再是"桌面点过一次执行"的记忆，
+    // 而是设备侧 hosted.runs 回读的记录 —— 所以界面也不再有"未登记"那种半截状态。
+    renderPage(<BinaryHosting />);
+    fireEvent.doubleClick((await screen.findByTestId("bin-row-frida-server")) as Element);
     await screen.findByTestId("hosted-frida-server");
-    fireEvent.click(screen.getByTestId("run-frida-server"));
-    expect((await screen.findByTestId("pid-frida-server")).textContent ?? "").toContain("4321");
-    // 登记上了就不该出现「未登记」标记，也不该出现「停止进程」（那是给表外进程用的）
-    expect(screen.queryByTestId("running-untracked-frida-server")).toBeNull();
-    expect(screen.queryByTestId("stop-external-frida-server")).toBeNull();
-  });
-
-  it("Root 默认开：进页面探一次 su，探得过就以 root 身份待命", async () => {
-    localStorage.clear();
-    device.binarySuCheck.mockResolvedValue(true);
-    renderPage(<BinaryHosting />);
-    const box = (await screen.findByRole("checkbox", { name: "Root 执行" })) as HTMLInputElement;
-    await waitFor(() => expect(box.checked).toBe(true));
-    // 是探出来的，不是写死的：没探过就不该假装 root 生效
-    expect(device.binarySuCheck).toHaveBeenCalledWith("PIXEL-1");
-  });
-
-  it("su 不可用时保持普通执行，并且必须说明原因（安静降级比不开更糟）", async () => {
-    localStorage.clear();
-    device.binarySuCheck.mockResolvedValue(false);
-    renderPage(<BinaryHosting />);
-    const box = (await screen.findByRole("checkbox", { name: "Root 执行" })) as HTMLInputElement;
-    await waitFor(() => expect(box.checked).toBe(false));
-    const notice = await screen.findByTestId("binary-notice");
-    expect(notice.textContent ?? "").toContain("保持普通执行");
+    expect((await screen.findByTestId("pid-frida-server")).textContent ?? "").toContain("25265");
+    expect(await screen.findByTestId("kill-frida-server")).toBeEnabled();
+    expect(screen.queryByTestId("hosted-terminal-frida-server")).toBeNull(); // 在跑就不给再启动
   });
 
   it("这台机手动关过就不再自动开、也不再探测（非 root 手机不该每次被试）", async () => {
@@ -564,7 +760,7 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
         externalProcs: [],
       },
     ];
-    device.binaries.mockResolvedValue(hosted);
+    device.binaries.mockResolvedValue(listing(hosted));
     dialog.pickFiles.mockResolvedValue([
       "/Users/x/Downloads/frida-server",
       "/Users/x/Downloads/中文",
@@ -611,6 +807,8 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
         "PIXEL-1",
         "/data/local/tmp/frida-server",
         0o755,
+        // 第四位是这台设备的 root 意图（与文件页共用同一份偏好）
+        expect.any(Boolean),
       ),
     );
     expect(device.binaryChmod).not.toHaveBeenCalled();
@@ -623,8 +821,88 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     expect(notice.textContent ?? "").toContain("白名单");
   });
 
+  it("这台手机上已经没有这个文件了 → 它的本机记录随之删掉（每台手机各管各的）", async () => {
+    // 用户口径：清单必须是从这台手机读来的，本机只留备注/参数，且按设备号对应；
+    // 手机自己把文件删了，记录就不该继续躺着。判据见 listingIsTrustworthy。
+    localStorage.clear();
+    localStorage.setItem("adb.binary.note.PIXEL-1.gone.bin", "旧备注");
+    localStorage.setItem("adb.binary.launch.PIXEL-1.gone.bin.args", "-h");
+    localStorage.setItem("adb.binary.note.OTHER-9.gone.bin", "另一台手机的同名记录");
+    // 删之前必须逐个回问设备：只有它明确回答"没有这个文件"才算被删
+    device.fileStat.mockRejectedValue({
+      code: "NOT_FOUND",
+      message: "设备上没有这个文件或目录：/data/local/tmp/gone.bin",
+    });
+    renderPage(<BinaryHosting />);
+    await waitFor(() =>
+      expect(localStorage.getItem("adb.binary.note.PIXEL-1.gone.bin")).toBeNull(),
+    );
+    expect(localStorage.getItem("adb.binary.launch.PIXEL-1.gone.bin.args")).toBeNull();
+    // 别的设备一条不碰：序列号就是这些记录的户口
+    expect(localStorage.getItem("adb.binary.note.OTHER-9.gone.bin")).toBe("另一台手机的同名记录");
+    const notice = await screen.findByTestId("binary-notice");
+    // 删了用户的数据就必须交代：几条、为什么
+    expect(notice.textContent ?? "").toContain("清掉本机记录 2 条");
+    expect(device.fileStat).toHaveBeenCalledWith("PIXEL-1", "/data/local/tmp/gone.bin");
+    localStorage.clear();
+  });
+
+  it("文件其实还在（清单与推送撞了几秒钟）：一条记录都不许删", async () => {
+    localStorage.clear();
+    localStorage.setItem("adb.binary.note.PIXEL-1.gone.bin", "旧备注");
+    device.fileStat.mockResolvedValue({
+      requested_path: "/data/local/tmp/gone.bin",
+      path: "/data/local/tmp/gone.bin",
+      stat: {
+        name: "gone.bin",
+        kind: "file",
+        mode: 0o755,
+        mode_text: "-rwxr-xr-x",
+        uid: 2000,
+        gid: 2000,
+        size: 10,
+        mtime_unix: 1,
+        readable: true,
+      },
+    });
+    renderPage(<BinaryHosting />);
+    await waitFor(() => expect(device.fileStat).toHaveBeenCalled());
+    // 设备说"在这儿呢"：本机记录留着，也不许冒出"清掉了几条"这种话
+    expect(localStorage.getItem("adb.binary.note.PIXEL-1.gone.bin")).toBe("旧备注");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(screen.queryByTestId("binary-notice")?.textContent ?? "").not.toContain("清掉本机记录");
+    localStorage.clear();
+  });
+
+  it("清单被设备端截断：说破「不是目录全貌」，本机记录一条都不删", async () => {
+    localStorage.clear();
+    localStorage.setItem("adb.binary.note.PIXEL-1.gone.bin", "旧备注");
+    device.fileStat.mockRejectedValue({ code: "NOT_FOUND", message: "没有" });
+    device.binaries.mockResolvedValue(
+      listing([{ name: "frida-server", path: "/data/local/tmp/frida-server", size: 1, perms: "-rwxr-xr-x", hasExec: true, externalProcs: [] }], { truncated: true }),
+    );
+    renderPage(<BinaryHosting />);
+    await waitFor(() => expect(screen.getByTestId("binaries-truncated")).toBeTruthy());
+    // 清单不完整时连"回问设备"都不该发起：它没有资格怀疑任何文件被删了
+    expect(device.fileStat).not.toHaveBeenCalled();
+    expect(localStorage.getItem("adb.binary.note.PIXEL-1.gone.bin")).toBe("旧备注");
+    localStorage.clear();
+  });
+
+  it("设备不在 adb 列表里：不是故障，给的是下一步", async () => {
+    device.binaries.mockRejectedValue({
+      code: "DEVICE_OFFLINE",
+      message: "设备当前不在这台 adb 的列表里：adb: device 'PIXEL-1' not found",
+    });
+    renderPage(<BinaryHosting />);
+    const err = await screen.findByTestId("binaries-error");
+    expect(err.textContent ?? "").toContain("不在这台 adb 的列表里");
+    expect(err.textContent ?? "").not.toContain("内部错误");
+    expect(err.textContent ?? "").toContain("允许调试");
+  });
+
   it("收不成 0755 时退回只补执行位，并且明说「组/其他仍可写」的风险", async () => {
-    device.binaries.mockResolvedValue([
+    device.binaries.mockResolvedValue(listing([
       {
         name: "newbin",
         path: "/data/local/tmp/newbin",
@@ -633,7 +911,7 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
         hasExec: false,
         externalProcs: [],
       },
-    ]);
+    ]));
     dialog.pickFiles.mockResolvedValue(["/Users/x/Downloads/newbin"]);
     device.push.mockResolvedValue("task-loose-1");
     task.list.mockResolvedValue([
@@ -659,7 +937,7 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
   });
 
   it("上传任务没跑完就照实说，不报成功、也不去补权限", async () => {
-    device.binaries.mockResolvedValue([]);
+    device.binaries.mockResolvedValue(listing([]));
     dialog.pickFiles.mockResolvedValue(["/Users/x/Downloads/newbin"]);
     device.push.mockResolvedValue("task-push-2");
     task.list.mockResolvedValue([
@@ -695,13 +973,11 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     ]);
   });
 
-  it("没登记进托管表：标成「已在运行（未登记）」，不拿桌面记忆冒充设备状态", async () => {
-    // Agent 未在线 / 进程名对不上时 adopt 会失败。进程确实起来了，所以不能写「未运行」；
-    // 但我们手里只剩一个数字，所以也不能按"本工具在管着它"来显示。
-    // Agent 拿不到 = "不知道"，不是"没在跑"：这条只能显示成未登记，不能显示成未运行
+  it("拿不到设备运行表时不拿桌面记忆冒充：没有 pid chip，也不说未登记", async () => {
+    // 这条是 AR7.7 原则在新链路下的版本：pid 的唯一来源是设备回读的运行表。
+    // 启动方式换成终端以后，界面更没有"我记得我起过"这种状态了 —— 读不到就是不说它在跑。
     device.hostedRuns.mockRejectedValue(new Error("Agent 未在线"));
-    device.binaryPorts.mockResolvedValue([]);
-    device.binaries.mockResolvedValue([
+    device.binaries.mockResolvedValue(listing([
       {
         name: "frida-server",
         path: "/data/local/tmp/frida-server",
@@ -710,25 +986,18 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
         hasExec: true,
         externalProcs: [],
       },
-    ]);
-    device.binaryRun.mockResolvedValue({
-      pid: 4321,
-      started: true,
-      tracked: false,
-      detail: "已启动 pid 4321，但没能登记进托管表：Agent 未在线",
-    });
+    ]));
     renderPage(<BinaryHosting />);
-    const entry = await screen.findByTestId("bin-frida-server");
-    fireEvent.doubleClick((entry.querySelector("button") ?? entry) as Element);
+    fireEvent.doubleClick((await screen.findByTestId("bin-row-frida-server")) as Element);
     await screen.findByTestId("hosted-frida-server");
-    fireEvent.click(screen.getByTestId("run-frida-server"));
-    expect(await screen.findByText(/没能登记进托管表/)).toBeTruthy();
-    const chip = await screen.findByTestId("running-untracked-frida-server");
-    expect(chip.textContent ?? "").toContain("未登记");
-    // 反向断言：这条没有设备侧凭据，不能显示成普通的运行中 pid chip
     expect(screen.queryByTestId("pid-frida-server")).toBeNull();
-    // 也不能被写成"未运行"——它真的起来了
-    expect(screen.queryByText("未运行")).toBeNull();
+    expect(screen.queryByTestId("running-untracked-frida-server")).toBeNull();
+    // 读不到运行表就照实说"未运行"：这一行没有设备侧凭据可显示。
+    // 用终端起的那个进程不在设备运行表里，它的状态由右边那块屏自己说。
+    expect(screen.getByTestId("hosted-frida-server").textContent ?? "").toContain("未运行");
+    // 没凭据就不给「终止」，给的是启动入口
+    expect(screen.queryByTestId("kill-frida-server")).toBeNull();
+    expect(screen.getByTestId("hosted-terminal-frida-server")).toBeEnabled();
   });
 
   it("进程端口两个方向都能渲染（PID→端口、端口→PID）", async () => {
@@ -948,7 +1217,7 @@ describe("设备页 Agent · 结论条在前，开发者诊断在后（第七十
    * 看起来像设备坏了的错（/sdcard/sdcard 那次就是这样）。
    */
   it("文件页：新建目录把拼好的完整路径交给 filesystem.mkdir", async () => {
-    device.ls.mockResolvedValue([{ name: "Download", isDir: true, size: 0, symlink: null, perms: "drwxrwx--x" }]);
+    device.ls.mockResolvedValue(lsOf([{ name: "Download", isDir: true, size: 0, symlink: null, perms: "drwxrwx--x" }]));
     device.fsMkdir.mockResolvedValue({
       path: "/sdcard/新目录",
       created: true,
@@ -961,16 +1230,150 @@ describe("设备页 Agent · 结论条在前，开发者诊断在后（第七十
     fireEvent.change(box, { target: { value: "新目录" } });
     fireEvent.click(screen.getByRole("button", { name: "执行" }));
     await waitFor(() => expect(device.fsMkdir).toHaveBeenCalled());
-    expect(device.fsMkdir).toHaveBeenCalledWith("PIXEL-1", "/sdcard/新目录");
+    // 第三位是这台设备的 root 意图（探得过 su 就默认 true），路径拼法仍是主角
+    expect(device.fsMkdir).toHaveBeenCalledWith("PIXEL-1", "/sdcard/新目录", expect.any(Boolean));
     // 结论要说"建了还是本来就在"，不能只说成功
     await waitFor(() => expect(document.body.textContent).toContain("目录已就绪"));
   });
 
+  it("文件页：Root (su) 默认开着，增删改按 root 身份发给设备", async () => {
+    device.ls.mockResolvedValue(lsOf([]))
+    device.binarySuCheck.mockResolvedValue(true);
+    device.fsMkdir.mockResolvedValue({
+      path: "/sdcard/x",
+      created: true,
+      mode: 0o777,
+      mode_text: "drwxrwxrwx",
+    });
+    renderPage(<FilesView serial="PIXEL-1" />);
+    const box = (await screen.findByRole("checkbox", { name: "Root (su)" })) as HTMLInputElement;
+    // 用户要的"默认给 su 权限"：探得过就开，不用他每件事手动勾一次
+    await waitFor(() => expect(box.checked).toBe(true));
+    // 范围也摆在台面上：给的是权限，不是放开整个文件系统
+    expect((await screen.findByTestId("fs-write-scope")).textContent ?? "").toContain(
+      "/data/local/tmp",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "新建目录" }));
+    fireEvent.change(await screen.findByRole("textbox", { name: "新建目录" }), {
+      target: { value: "x" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "执行" }));
+    await waitFor(() => expect(device.fsMkdir).toHaveBeenCalledWith("PIXEL-1", "/sdcard/x", true));
+  });
+
+  it("文件页：探不到 su 就按 shell 执行并说破，不假装 root 已生效", async () => {
+    device.ls.mockResolvedValue(lsOf([]))
+    device.binarySuCheck.mockResolvedValue(false);
+    device.fsMkdir.mockResolvedValue({
+      path: "/sdcard/x",
+      created: true,
+      mode: 0o777,
+      mode_text: "drwxrwxrwx",
+    });
+    renderPage(<FilesView serial="PIXEL-1" />);
+    const box = (await screen.findByRole("checkbox", { name: "Root (su)" })) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(false));
+    await screen.findByTestId("fs-root-notice");
+    fireEvent.click(screen.getByRole("button", { name: "新建目录" }));
+    fireEvent.change(await screen.findByRole("textbox", { name: "新建目录" }), {
+      target: { value: "x" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "执行" }));
+    await waitFor(() => expect(device.fsMkdir).toHaveBeenCalledWith("PIXEL-1", "/sdcard/x", false));
+  });
+
+  it("文件页：`sdcard` 这种链接点名字就能进去，也不再冒「目录没有预览」", async () => {
+    // 用户就是在这儿撞见的：根目录下点 sdcard ⇒ 一栏 symlink 元数据 + 一句"预览失败：目录没有预览"。
+    // 根因两处：元数据按 lstat 读（链接自己），预览又无条件对每一行发起。
+    device.binarySuCheck.mockResolvedValue(false);
+    device.ls.mockResolvedValue(
+      lsOf(
+        [{ name: "sdcard", isDir: false, size: 21, symlink: "/storage/emulated/0", perms: "lrwxrwxrwx" }],
+        { path: "/" },
+      ),
+    );
+    device.fileStat.mockResolvedValue({
+      requested_path: "/sdcard",
+      path: "/storage/emulated/0",
+      stat: {
+        name: "sdcard",
+        kind: "dir",
+        mode: 0o2777,
+        mode_text: "drwxrwsrwx",
+        uid: 1023,
+        gid: 1023,
+        size: 3452,
+        mtime_unix: 1_230_768_000,
+        symlink_target: null,
+        readable: true,
+      },
+    });
+    device.filePreview.mockRejectedValue(new Error("不该被调用"));
+    renderPage(<FilesView serial="PIXEL-1" />);
+    // 这一条测的就是"在根目录点 sdcard"：不先退到 /，行路径会拼成 /sdcard/sdcard（那是另一件事）
+    fireEvent.click(await screen.findByRole("button", { name: "上一级" }));
+    const row = (await screen.findByTestId("fs-info-sdcard")).closest("li")!;
+    // 先看它本身（行内 ⓘ）：元数据跟链读 ⇒ kind=dir ⇒ 这一行根本不该发预览请求
+    fireEvent.click(within(row).getByTestId("fs-info-sdcard"));
+    await waitFor(() =>
+      expect(device.fileStat).toHaveBeenCalledWith("PIXEL-1", "/sdcard", true, false),
+    );
+    // 也就没有那句红字
+    expect(device.filePreview).not.toHaveBeenCalled();
+    expect(screen.queryByText(/预览失败/)).toBeNull();
+    // 名字与真实路径之间要有分隔：没有它就成了 "sdcard" + "/storage/emulated/0" 糊成一条路径
+    const head = (await screen.findByTestId("files-stat-path")).parentElement?.textContent ?? "";
+    expect(head).toContain("·");
+    // 点链接的名字就是**跟进去**：旧规则按列表那一行的 lstat 类型决定能不能点，
+    // symlink 没有尾斜杠 ⇒ 永远只能被选中，正是用户报的"末尾没有 / 就点不进去"
+    fireEvent.click(within(row).getByText("sdcard"));
+    await waitFor(() => expect(device.ls).toHaveBeenLastCalledWith("PIXEL-1", "/sdcard", false));
+  });
+
+  it("文件页：读不到就说读不到，绝不画成「这个目录是空的」", async () => {
+    // 用户报的"/data 下面是空的"就是这么来的：Agent 以 shell 身份 opendir 失败，
+    // 设备回的是「条目为空 + 一条读不到的原因」，旧接口把原因丢了 ⇒ 界面只能说"空目录"。
+    device.binarySuCheck.mockResolvedValue(false);
+    device.ls.mockResolvedValue(
+      lsOf([], { path: "/data", unreadable: ["/data: Permission denied (13)"] }),
+    );
+    renderPage(<FilesView serial="PIXEL-1" />);
+    const why = await screen.findByText(/读不到/);
+    expect(why.textContent ?? "").toContain("Permission denied");
+    // 还要给一句能照着做的下一步
+    expect(why.textContent ?? "").toContain("Root (su)");
+    expect(why.textContent ?? "").not.toContain("这个目录是空的");
+  });
+
+  it("文件页：开着 Root 时列目录也按 root 身份问设备，并写明本屏读自谁", async () => {
+    device.binarySuCheck.mockResolvedValue(true);
+    device.ls.mockResolvedValue(lsOf([], { path: "/sdcard", source: "root" }));
+    renderPage(<FilesView serial="PIXEL-1" />);
+    await waitFor(() => expect(device.ls).toHaveBeenCalledWith("PIXEL-1", "/sdcard", true));
+    await waitFor(() =>
+      expect(screen.getByTestId("fs-read-source").textContent ?? "").toContain("root"),
+    );
+  });
+
+  it("文件页：出了那两棵树就不给改，按钮禁着并说清只能在哪儿", async () => {
+    device.ls.mockResolvedValue(lsOf([]))
+    renderPage(<FilesView serial="PIXEL-1" />);
+    fireEvent.click(await screen.findByRole("button", { name: "上一级" }));
+    const mkdir = (await screen.findByRole("button", {
+      name: "新建目录",
+    })) as HTMLButtonElement;
+    await waitFor(() => expect(mkdir.disabled).toBe(true));
+    // 被禁必须给理由，而且理由里要有"那我能在哪儿改"
+    expect(mkdir.title).toContain("只能在这两处之内");
+    expect(mkdir.title).toContain("/sdcard");
+    expect(screen.getByRole("button", { name: /上传/ }).hasAttribute("disabled")).toBe(true);
+  });
+
   it("文件页：删除必须先确认，且目录的递归要显式勾选", async () => {
-    device.ls.mockResolvedValue([
+    device.ls.mockResolvedValue(lsOf([
       { name: "old.log", isDir: false, size: 12, symlink: null, perms: "-rw-r--r--" },
       { name: "stuff", isDir: true, size: 0, symlink: null, perms: "drwxr-xr-x" },
-    ]);
+    ]));
     device.fsRemove.mockResolvedValue({
       path: "/sdcard/old.log",
       removed: true,
@@ -985,7 +1388,9 @@ describe("设备页 Agent · 结论条在前，开发者诊断在后（第七十
     expect(device.fsRemove).not.toHaveBeenCalled();
     await screen.findByText(/确认删除/);
     fireEvent.click(screen.getByTestId("fs-remove-confirm"));
-    await waitFor(() => expect(device.fsRemove).toHaveBeenCalledWith("PIXEL-1", "/sdcard/old.log", false));
+    await waitFor(() =>
+      expect(device.fsRemove).toHaveBeenCalledWith("PIXEL-1", "/sdcard/old.log", false, expect.any(Boolean)),
+    );
     await waitFor(() => expect(document.body.textContent).toContain("已删除 /sdcard/old.log"));
 
     // 目录：确认条上必须出现"连内容一起删"这条显式选择
@@ -1003,10 +1408,10 @@ describe("设备页 Agent · 结论条在前，开发者诊断在后（第七十
    * ——测试通过不等于功能存在。类名检查能挡住"再用 opacity-0 藏起来"这种回退。
    */
   it("文件页：删除与取回入口默认可见，不靠悬停才出现", async () => {
-    device.ls.mockResolvedValue([
+    device.ls.mockResolvedValue(lsOf([
       { name: "tool", isDir: false, size: 5, symlink: null, perms: "-rw-r--r--" },
       { name: "stuff", isDir: true, size: 0, symlink: null, perms: "drwxr-xr-x" },
-    ]);
+    ]));
     renderPage(<FilesView serial="PIXEL-1" />);
     const fileRow = (await screen.findByText("tool")).closest("li")!;
     const actions = within(fileRow).getByTestId("fs-row-actions");
@@ -1019,16 +1424,17 @@ describe("设备页 Agent · 结论条在前，开发者诊断在后（第七十
         .filter(Boolean),
     ).toEqual(["取回本地…", "重命名", "改权限", "删除"]);
     const dirRow = screen.getByText(/^stuff\/$/).closest("li")!;
+    // 能点进去的行（目录、链接）多一个"只看它本身"的入口：跟错链接时不用退回上级去查它
     expect(
       within(dirRow)
         .getAllByRole("button")
         .map((b) => b.getAttribute("aria-label"))
         .filter(Boolean),
-    ).toEqual(["取回本地…", "重命名", "改权限", "删除"]);
+    ).toEqual(["只看它本身的元数据", "取回本地…", "重命名", "改权限", "删除"]);
   });
 
   it("文件页：改权限把八进制按数值送出去，并把设备回读的实际值显示出来", async () => {
-    device.ls.mockResolvedValue([{ name: "tool", isDir: false, size: 5, symlink: null, perms: "-rw-r--r--" }]);
+    device.ls.mockResolvedValue(lsOf([{ name: "tool", isDir: false, size: 5, symlink: null, perms: "-rw-r--r--" }]));
     device.fsChmod.mockResolvedValue({
       path: "/sdcard/tool",
       mode: 0o700,
@@ -1043,7 +1449,7 @@ describe("设备页 Agent · 结论条在前，开发者诊断在后（第七十
     const box = await screen.findByPlaceholderText(/八进制|Octal/);
     fireEvent.change(box, { target: { value: "700" } });
     fireEvent.click(screen.getByRole("button", { name: "执行" }));
-    await waitFor(() => expect(device.fsChmod).toHaveBeenCalledWith("PIXEL-1", "/sdcard/tool", 0o700));
+    await waitFor(() => expect(device.fsChmod).toHaveBeenCalledWith("PIXEL-1", "/sdcard/tool", 0o700, expect.any(Boolean)));
     // verified=false 要说"实际生效"，不能照抄请求值假装成功
     await waitFor(() => expect(document.body.textContent).toContain("设备实际生效 -rwx------"));
   });

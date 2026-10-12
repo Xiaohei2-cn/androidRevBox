@@ -35,23 +35,23 @@ export function AppShell() {
 
 function ShellBody() {
   const { tab } = useAppNav();
-  const { effectiveTheme, opacity, clickThrough } = useSettings();
-  // 透明区点击穿透（第五十四轮）：只有鼠标底下没有实体时让点击出去
-  useClickThrough(clickThrough);
+  const { effectiveTheme } = useSettings();
+  // 透明区点击穿透不再是设置项：它是窗口形状自带的默认能力（底下没有实体就把点击交出去）。
+  // 那个开关删掉了；安全靠 useClickThrough 里"卸载、页面隐藏、问不到指针都必须收回穿透"那几条兜底。
+  useClickThrough();
 
-  // CSS 变量供 .app-surface（主体 + 锯齿齿块）共用：同色、同透明度。
+  // 这个变量供 .app-surface（主体 + 锯齿齿块）与控制栏共用：--app-bg-rgb 是底色基准。
+  // 底色是一层斜向渐变（globals.css 的 --app-bg-hi/mid/lo + 两枚光斑），而且**不透视**：
+  // 「背景不透明度」这个功能整体撤了，`--app-bg-alpha` 固定在 CSS 里恒为 1，界面上没有这个旋钮。
   // ⚠️ 不要给 .app-surface 加回 backdrop-filter/transform：WKWebView 合成层
   // 在重绘/悬停/前后台切换时销毁重建，透明窗口上表现为满 alpha 实色闪一帧
-  // （P7 三轮闪烁反馈的根因，详见 PHASES §10.5.1）。
-
-  // CSS 变量供 .app-surface（主体 + 锯齿齿块）共用：同色、同透明度、同毛玻璃
+  // （P7 三轮闪烁反馈的根因；渐变跨度由 surfaceGradient.test.ts 守着，毛玻璃那条实现早已删除）。
   const shellStyle = useMemo(
     () =>
       ({
         "--app-bg-rgb": BODY_BG_RGB[effectiveTheme],
-        "--app-bg-alpha": String(opacity / 100),
       }) as CSSProperties,
-    [effectiveTheme, opacity],
+    [effectiveTheme],
   );
 
   return (

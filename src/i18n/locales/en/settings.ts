@@ -11,21 +11,11 @@ export default {
   "settings.theme.system": "System",
   "settings.theme.hint": "“System” follows the OS theme in real time",
 
-  "settings.opacity.label": "Background opacity",
-  "settings.opacity.hint":
-    "Sets how opaque the window background is. It is a translucent fill only — nothing behind the window gets blurred (WebKit cannot blur outside a transparent window, and that implementation was removed). Minimum 20% so content stays readable. The top control bar (the draggable one with the window buttons) never goes translucent.",
-
   "settings.agentAuto.label": "Connect the Agent automatically when a device appears",
   "settings.agentAuto.hint":
     "The read-only probe runs on every plug-in. Writing the binary and keeping a process running is confirmed once on the devices page; after that the same device is fully automatic. Turn this off and you are back to connecting by hand.",
-  "settings.clickThrough.label": "Click through transparent areas",
-  "settings.clickThrough.hint":
-    "When on, exactly one area hands clicks to the app behind: the transparent gutter to the LEFT of each tab. The whole tab body, its icon, the gaps between tabs, the active tab and every content area keep the clicks — clicking a tab is a basic operation and must never fall through. The outer 12px on each window edge stays a resize grip. The live readout below shows the current state.",
 
-  "settings.clickThrough.status.solid": "Now: pointer is over real content, this tool keeps the clicks",
-  "settings.clickThrough.status.passing": "Now: pointer is over a transparent spot, clicks go to the app behind",
-  "settings.clickThrough.status.outside": "Now: the pointer is outside this window",
-  "settings.clickThrough.status.error": "Now: pointer position unavailable, kept the window clickable",  "settings.language.label": "Language",
+  "settings.language.label": "Language",
   "settings.language.hint": "Applies immediately and persists across restarts.",
   "settings.language.restartHint":
     "Some system messages (e.g. adb/process errors) fully apply after a restart.",

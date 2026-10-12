@@ -31,6 +31,7 @@ use crate::services::agent_auto::AgentAutoService;
 use crate::services::agent_manager::AgentManager;
 use crate::services::ai_service;
 use crate::services::android_backend::{CapabilityRouter, default_legacy_capabilities};
+use crate::services::chef::ChefService;
 use crate::services::config_service::ConfigService;
 use crate::services::device_service::{AdbRunner, DeviceService, RealAdbRunner};
 use crate::services::env_service::EnvService;
@@ -59,6 +60,8 @@ pub struct AppState {
     pub zygisk_applist: Arc<ZygiskApplistService>,
     /// 翻译接口（只在本机发起，key 不出桌面）
     pub ai: Arc<ai_service::AiService>,
+    /// 算法中心（CyberChef 移植）：内置算法注册表 + 配方执行，无状态
+    pub chef: Arc<ChefService>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -122,13 +125,9 @@ pub fn run() {
                 android.clone(),
             ));
 
-            // 4.6) HookService：Frida 会话工作台（P10）——js 扫描/runner 组装/前置检查
-            let hook = Arc::new(HookService::new(
-                config.clone(),
-                env.clone(),
-                task_service.clone(),
-                app.handle().clone(),
-            ));
+            // 4.6) HookService：Frida 工作台（P10）——js 扫描/脚本读写/前置检查。
+            // 起会话不经过这里：官方 REPL 走真终端（PTY），结构化 runner 已退役。
+            let hook = Arc::new(HookService::new(config.clone(), env.clone()));
 
             // 5) PluginService：受控目录 app_data/plugins，启动即扫描加载（P4/P6）
             let plugin_root = data_dir.join("plugins");
@@ -183,6 +182,7 @@ pub fn run() {
                 agent_auto,
                 zygisk_applist,
                 ai,
+                chef: Arc::new(ChefService),
             });
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -201,6 +201,8 @@ pub fn run() {
             commands::agent::agent_restart,
             commands::agent::agent_diagnostics,
             commands::agent::agent_probe,
+            commands::chef::chef_operations,
+            commands::chef::chef_bake,
             commands::config::config_snapshot,
             commands::config::config_get,
             commands::config::config_set,
@@ -230,6 +232,7 @@ pub fn run() {
             commands::ai::ai_translate,
             commands::device::device_binary_probe,
             commands::device::device_binary_run,
+            commands::device::device_binary_claim,
             commands::device::device_hosted_write,
             commands::device::device_binary_kill,
             commands::device::device_binary_ports,
@@ -276,7 +279,9 @@ pub fn run() {
             commands::plugins::plugins_set_enabled,
             commands::hook::hook_js_list,
             commands::hook::hook_preflight,
-            commands::hook::hook_session_start,
+            commands::hook::hook_script_read,
+            commands::hook::hook_script_write,
+            commands::hook::hook_script_delete,
             commands::hook::hook_export_save,
             commands::pty::pty_open,
             commands::pty::pty_write,

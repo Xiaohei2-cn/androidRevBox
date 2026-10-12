@@ -702,6 +702,19 @@ pub struct FilesystemStatResult {
     pub stat: FileStat,
 }
 
+/// `filesystem.preview` 的默认与硬上限：**Agent 腿与桌面 root 腿共用同一对数**。
+///
+/// 放在协议层而不是各自文件里，是为了不让"同一次点击、两条腿读回来的量不一样"发生
+/// （root 腿是 `su -c` + 十六进制回传，走的是另一套代码）。
+pub const DEFAULT_PREVIEW_BYTES: u32 = 64 * 1024;
+pub const MAX_PREVIEW_BYTES: u32 = 256 * 1024;
+
+/// root 只读腿一条命令要拿回的 `stat` 字段：`%F`（类型名，可能含空格）放最后，
+/// 前面全是数值字段，于是 `splitn` 一次就够，不怕路径或类型名里冒出分隔符。
+pub const STAT_ROOT_FORMAT: &str = "%a|%s|%u|%g|%Y|%F";
+
+/// 预览内容的呈现方式：桌面按这个字段决定用文本框还是 hex 视图。
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreviewEncoding {

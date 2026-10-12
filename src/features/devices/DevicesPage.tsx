@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Copy, RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck, Cpu, Save, FolderPlus, Pencil, KeyRound, Trash2, Eye, EyeOff, Search, X } from "lucide-react";
+import { Copy, Info, RefreshCw, Smartphone, PackageOpen, Rocket, CircleStop, Download, Upload, ShieldCheck, Cpu, Save, FolderPlus, Pencil, KeyRound, Trash2, Eye, EyeOff, Search, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -28,6 +28,8 @@ import { PathText } from "@/components/ui/PathText";
 import { ProcPaths } from "@/features/devices/ProcPaths";
 import { BrandIcon } from "@/components/ui/BrandIcon";
 import { cn } from "@/lib/utils";
+import { canWritePath, writableRootsLabel } from "@/lib/deviceFsPolicy";
+import { loadRootPref, saveRootPref, shouldTryRoot } from "@/lib/hostedRoot";
 import { pickDirectory, pickFile } from "@/api/dialog";
 
 /**
@@ -356,7 +358,7 @@ function DeviceCardsView({
     return <Empty text="无在线设备：连接设备后此页显示设备卡片。" />;
   }
   return (
-    <div ref={containerRef} className="flex h-full flex-col gap-4 overflow-auto pb-2">
+    <div ref={containerRef} className="pane-scroll flex h-full flex-col gap-4 overflow-auto pb-2">
       {online.map((d) => (
         <DeviceFullCard key={d.serial} serial={d.serial} transport={d.transport} />
       ))}
@@ -902,21 +904,93 @@ export function FilesView({ serial }: { serial: string | null }) {
   const [writeBusy, setWriteBusy] = useState(false);
   const [writeNotice, setWriteNotice] = useState<string | null>(null);
   const [writeError, setWriteError] = useState<string | null>(null);
-  const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ["device", "ls", serial, path],
-    queryFn: () => deviceApi.ls(serial!, path),
+  /**
+   * Root (su)：这台设备的文件**增删改**默认以 root 执行（用户要求），
+   * 但"默认"是**默认想开、要现场证明**：进这一页探一次 su，探不过就按 shell 身份改并说明。
+   * 偏好与二进制托管共用一份（`adb.binary.root.<serial>`）：一台手机一个 root 意图，
+   * 两处各摆一个开关迟早互相打架。手动关过就不再自动探（非 root 的机器不该每次被试）。
+   */
+  const [root, setRoot] = useState(false);
+  const [rootProbing, setRootProbing] = useState(false);
+  const [rootNotice, setRootNotice] = useState<string | null>(null);
+  /**
+   * 目录列表**每次现读**，且查询键带着 `root`：换了身份就必须重读一遍，
+   * 不能拿上一种身份的结果继续画（那正是"/data 看着是空的"的来源）。
+   */
+  const {
+    data: listing,
+    isLoading,
+    error,
+    refetch,
+  } = useQuery({
+    queryKey: ["device", "ls", serial, path, root],
+    queryFn: () => deviceApi.ls(serial!, path, root),
     enabled: !!serial,
   });
+  const data = listing?.entries;
+  useEffect(() => {
+    setRootNotice(null);
+    if (!serial) {
+      setRoot(false);
+      return;
+    }
+    if (!shouldTryRoot(loadRootPref(serial))) {
+      setRoot(false);
+      return;
+    }
+    let cancelled = false;
+    setRootProbing(true);
+    void (async () => {
+      let ok = false;
+      try {
+        ok = await deviceApi.binarySuCheck(serial);
+      } catch {
+        ok = false;
+      }
+      if (cancelled) return;
+      setRoot(ok);
+      // 安静地把 root 当成已生效比不开更糟：这一页接下来的每一次写都要按这个身份解释
+      if (!ok) setRootNotice(t("devices.files.rootUnavailable"));
+      setRootProbing(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [serial, t]);
+
+  const toggleRoot = (checked: boolean) => {
+    setRoot(checked);
+    setRootNotice(null);
+    saveRootPref(serial, checked);
+  };
+
+  /**
+   * 能读不代表能写：这一页可以浏览整棵文件系统（逆向要看得到东西），
+   * 但增删改只允许 `/data/local/tmp` 与 `/sdcard` 两棵树——**开了 root 也只是把权限给足，
+   * 不是把范围放开**（判据在 Rust `services/fs_policy.rs`，这里只是把按钮提前禁掉并说清原因）。
+   */
+  const writableHere = canWritePath(path);
+  const outsideReason = writableHere ? undefined : t("devices.files.writeOutside", {
+    roots: writableRootsLabel(),
+  });
+  const writeGuard = (label: string) => (writableHere ? label : outsideReason ?? label);
+
   const selectedPath = selected ? joinRemote(path, selected) : null;
   const stat = useQuery({
-    queryKey: ["device", "file-stat", serial, selectedPath],
-    queryFn: () => deviceApi.fileStat(serial!, selectedPath!),
+    // follow=true：这一栏要回答的是"我点的东西是什么"。`/sdcard` 这类**指向目录的符号链接**，
+    // 按链接自己(lstat)读会拿到 kind=symlink，预览随即冒一句"目录没有预览"——
+    // 用户看到的是"点一下就报错"。跟着链接走，目录就是目录、文件就是文件，两种都不该报错。
+    queryKey: ["device", "file-stat", serial, selectedPath, root],
+    queryFn: () => deviceApi.fileStat(serial!, selectedPath!, true, root),
     enabled: !!serial && !!selectedPath,
   });
   const preview = useQuery({
-    queryKey: ["device", "file-preview", serial, selectedPath],
-    queryFn: () => deviceApi.filePreview(serial!, selectedPath!, { maxBytes: 64 * 1024 }),
-    enabled: !!serial && !!selectedPath,
+    queryKey: ["device", "file-preview", serial, selectedPath, root],
+    queryFn: () =>
+      deviceApi.filePreview(serial!, selectedPath!, { maxBytes: 64 * 1024, root }),
+    // 只有元数据说"这是个普通文件"才去读内容：对目录发预览必然换一条错误回来，
+    // 那条红字对用户不是信息，是噪音（他就是在这儿撞见"还差一步：目录没有预览"的）
+    enabled: !!serial && !!selectedPath && stat.data?.stat.kind === "file",
   });
 
   /**
@@ -946,7 +1020,7 @@ export function FilesView({ serial }: { serial: string | null }) {
     const target = joinRemote(path, name);
     setEditor(null);
     void runWrite(t("devices.files.mkdir"), async () => {
-      const result = await deviceApi.fsMkdir(serial!, target);
+      const result = await deviceApi.fsMkdir(serial!, target, root);
       return result.created
         ? t("devices.files.mkdirDone", { path: result.path })
         : t("devices.files.mkdirExists");
@@ -982,7 +1056,7 @@ export function FilesView({ serial }: { serial: string | null }) {
     const from = editor.path;
     setEditor(null);
     void runWrite(t("devices.files.rename"), async () => {
-      const result = await deviceApi.fsRename(serial!, from, to);
+      const result = await deviceApi.fsRename(serial!, from, to, root);
       return t("devices.files.renameDone", { to: result.to });
     });
   };
@@ -997,7 +1071,7 @@ export function FilesView({ serial }: { serial: string | null }) {
     const target = editor.path;
     setEditor(null);
     void runWrite(t("devices.files.chmod"), async () => {
-      const result = await deviceApi.fsChmod(serial!, target, mode);
+      const result = await deviceApi.fsChmod(serial!, target, mode, root);
       return result.verified
         ? t("devices.files.chmodDone", { mode: result.mode_text })
         : t("devices.files.chmodNotVerified", { mode: result.mode_text });
@@ -1009,8 +1083,12 @@ export function FilesView({ serial }: { serial: string | null }) {
     const { path: target, recursive } = pendingDelete;
     setPendingDelete(null);
     void runWrite(t("devices.files.remove"), async () => {
-      const result = await deviceApi.fsRemove(serial!, target, recursive);
-      return t("devices.files.removeDone", { path: result.path, size: formatSize(result.freed_bytes) });
+      const result = await deviceApi.fsRemove(serial!, target, recursive, root);
+      // "释放了多少"只在真有数字时说出来：root 腿删目录不累计递归总量，
+      // 拿 0 去说"释放 0 B"就是一句假话
+      return result.freed_bytes > 0
+        ? t("devices.files.removeDone", { path: result.path, size: formatSize(result.freed_bytes) })
+        : t("devices.files.removeDoneNoSize", { path: result.path });
     });
   };
   if (!serial) return <Empty text="未选择设备" />;
@@ -1022,18 +1100,60 @@ export function FilesView({ serial }: { serial: string | null }) {
         <Button
           {...actionButton}
           className="h-7"
-          disabled={writeBusy}
+          disabled={writeBusy || !writableHere}
+          title={writeGuard(t("devices.files.mkdir"))}
           onClick={() => setEditor({ kind: "mkdir", path, value: "" })}
         >
           <FolderPlus className="h-3.5 w-3.5" />
           {t("devices.files.mkdir")}
         </Button>
-        <Button {...actionButton} className="h-7" disabled={writeBusy} onClick={uploadHere}>
+        <Button
+          {...actionButton}
+          className="h-7"
+          disabled={writeBusy || !writableHere}
+          title={writeGuard(t("devices.files.upload"))}
+          onClick={uploadHere}
+        >
           <Upload className="h-3.5 w-3.5" />
           {t("devices.files.upload")}
         </Button>
         {writeBusy && <span className="text-xs text-muted-foreground">{t("devices.files.busy")}</span>}
+        {/* 边界与身份都摆在台面上：这一页能浏览整棵文件系统，但只有两棵树能改。
+            Root (su) 是"给足权限"，不是"放开范围"。 */}
+        <span className="ml-auto flex shrink-0 items-center gap-2">
+          {/* 这一屏的内容是谁读出来的，必须看得见：同一个 /data，shell 与 root 看到的是两回事 */}
+          <span className="text-10px text-muted-foreground" data-testid="fs-read-source">
+            {t("devices.files.readAs", {
+              who: listing?.source === "root" ? "root" : "shell",
+            })}
+          </span>
+          <span className="text-10px text-muted-foreground" data-testid="fs-write-scope">
+            {t("devices.files.writeScope", { roots: writableRootsLabel() })}
+          </span>
+          <label
+            className={cn(
+              "flex items-center gap-1.5 text-xs text-muted-foreground",
+              rootProbing && "opacity-50",
+            )}
+            title={t("devices.files.rootHint")}
+          >
+            <input
+              type="checkbox"
+              className="h-3.5 w-3.5 shrink-0 accent-primary"
+              aria-label={t("devices.files.rootLabel")}
+              checked={root}
+              disabled={rootProbing}
+              onChange={(e) => toggleRoot(e.target.checked)}
+            />
+            {t("devices.files.rootLabel")}
+          </label>
+        </span>
       </div>
+      {rootNotice && (
+        <p className="shrink-0 text-xs text-muted-foreground" data-testid="fs-root-notice">
+          {rootNotice}
+        </p>
+      )}
       {editor?.kind === "mkdir" && (
         <div className="flex shrink-0 items-center gap-2 rounded-lg border bg-muted/30 p-2 text-xs">
           <span className="shrink-0">{t("devices.files.mkdirInto", { path })}</span>
@@ -1055,28 +1175,68 @@ export function FilesView({ serial }: { serial: string | null }) {
       )}
       {writeNotice && <p className="shrink-0 text-xs text-muted-foreground">{writeNotice}</p>}
       {writeError && <p className="shrink-0 text-xs text-destructive">{t("devices.files.failed", { error: writeError })}</p>}
-      <div className="min-h-0 flex-1 overflow-auto rounded-xl border border-border/70 bg-card shadow-card">
-        {isLoading && <Empty text="加载中…" />}
+      <div className="pane-scroll min-h-0 flex-1 overflow-auto rounded-xl border border-border/70 bg-card shadow-card">
+        {isLoading && <Empty text={t("devices.files.reading")} />}
         {error && (
-          <Empty text={`读取失败：${String((error as Error)?.message ?? error)}`} />
+          <Empty
+            text={t("devices.files.loadFailed", {
+              error: String((error as Error)?.message ?? error),
+            })}
+          />
         )}
-        {data && data.length === 0 && <Empty text="（空目录）" />}
+        {/* 「没有条目」与「读不到」是两件事：只回一个数组时，界面必然把后者画成"空目录"。
+            这里把设备给的原因原样贴出来，并给一句能照着做的下一步（开 Root 或换路径）。 */}
+        {data && data.length === 0 && (listing?.unreadable.length ?? 0) > 0 && (
+          <Empty
+            text={t("devices.files.unreadableDir", {
+              path: listing?.path ?? path,
+              detail: (listing?.unreadable ?? []).join("；"),
+            })}
+          />
+        )}
+        {data && data.length === 0 && (listing?.unreadable.length ?? 0) === 0 && !error && (
+          <Empty text={t("devices.files.emptyDir")} />
+        )}
+        {data && data.length > 0 && (listing?.unreadable.length ?? 0) > 0 && (
+          <p className="px-3 py-1 text-10px text-amber-500" data-testid="fs-unreadable">
+            {t("devices.files.unreadableSome", {
+              count: String(listing?.unreadable.length ?? 0),
+            })}
+          </p>
+        )}
+        {listing?.truncated && (
+          <p className="px-3 py-1 text-10px text-amber-500" data-testid="fs-truncated">
+            {t("devices.files.listTruncated")}
+          </p>
+        )}
         {data && (
           <ul className="divide-y text-xs">
             {data.map((f) => {
               const entryPath = joinRemote(path, f.name);
+              /*
+               * 能不能"点进去"不能只看列表那一行的类型：`/sdcard` 这种**指向目录的符号链接**，
+               * 按链接自己读是 symlink（名字后面没有 `/`），旧规则下它永远只能被选中、进不去
+               *（用户原话："只要文件夹末尾没有 / 这个斜杠都点不进去"）。
+               * 链接一律按"跟进去"处理；真跟进了文件，设备回一句"这不是一个目录"，
+               * 而同一行的 ⓘ 入口就在旁边，立刻能看它到底是什么。
+               */
+              const openable = f.isDir || !!f.symlink;
+              const openTitle = f.isDir
+                ? t("devices.files.enterDir", { name: f.name })
+                : t("devices.files.enterLink", { target: f.symlink ?? "" });
               return (
                 <li key={f.name} className="group flex items-center gap-2 px-3 py-1.5">
-                  {f.isDir ? (
+                  {openable ? (
                     <button
                       type="button"
                       className="flex min-w-0 flex-1 items-center gap-2 text-left hover:underline"
+                      title={openTitle}
                       onClick={() => {
                         setSelected(null);
                         nav.go(entryPath);
                       }}
                     >
-                      <span className="break-all font-medium">{f.name}/</span>
+                      <span className="break-all font-medium">{f.isDir ? `${f.name}/` : f.name}</span>
                     </button>
                   ) : (
                     <button
@@ -1085,7 +1245,7 @@ export function FilesView({ serial }: { serial: string | null }) {
                         "min-w-0 flex-1 break-all text-left hover:underline",
                         selected === f.name && "font-medium text-foreground underline",
                       )}
-                      title="查看元数据与受限预览"
+                      title={t("devices.files.selectHint")}
                       onClick={() => setSelected(selected === f.name ? null : f.name)}
                     >
                       {f.name}
@@ -1109,6 +1269,18 @@ export function FilesView({ serial }: { serial: string | null }) {
                     data-testid="fs-row-actions"
                     className="flex shrink-0 items-center gap-0.5 opacity-70 transition-opacity group-hover:opacity-100 focus-within:opacity-100"
                   >
+                    {openable && (
+                      <Button
+                        {...actionButton}
+                        className="h-6 w-6 px-0"
+                        title={t("devices.files.metadataOnly")}
+                        aria-label={t("devices.files.metadataOnly")}
+                        data-testid={`fs-info-${f.name}`}
+                        onClick={() => setSelected(selected === f.name ? null : f.name)}
+                      >
+                        <Info className="h-3 w-3" />
+                      </Button>
+                    )}
                     {/* 目录也给"取回本地"：adb pull 对目录是递归拷贝，没理由只让文件能取 */}
                     <Button
                       {...actionButton}
@@ -1123,9 +1295,9 @@ export function FilesView({ serial }: { serial: string | null }) {
                     <Button
                       {...actionButton}
                       className="h-6 w-6 px-0"
-                      title={t("devices.files.rename")}
+                      title={writeGuard(t("devices.files.rename"))}
                       aria-label={t("devices.files.rename")}
-                      disabled={writeBusy}
+                      disabled={writeBusy || !writableHere}
                       onClick={() => setEditor({ kind: "rename", path: entryPath, value: f.name })}
                     >
                       <Pencil className="h-3 w-3" />
@@ -1133,9 +1305,9 @@ export function FilesView({ serial }: { serial: string | null }) {
                     <Button
                       {...actionButton}
                       className="h-6 w-6 px-0"
-                      title={t("devices.files.chmod")}
+                      title={writeGuard(t("devices.files.chmod"))}
                       aria-label={t("devices.files.chmod")}
-                      disabled={writeBusy}
+                      disabled={writeBusy || !writableHere}
                       onClick={() =>
                         setEditor({
                           kind: "chmod",
@@ -1149,9 +1321,9 @@ export function FilesView({ serial }: { serial: string | null }) {
                     <Button
                       {...actionButton}
                       className="h-6 w-6 px-0 text-destructive hover:text-destructive"
-                      title={t("devices.files.remove")}
+                      title={writeGuard(t("devices.files.remove"))}
                       aria-label={t("devices.files.remove")}
-                      disabled={writeBusy}
+                      disabled={writeBusy || !writableHere}
                       onClick={() =>
                         setPendingDelete({ path: entryPath, name: f.name, isDir: f.isDir, recursive: false })
                       }
@@ -1169,6 +1341,10 @@ export function FilesView({ serial }: { serial: string | null }) {
         <div className="shrink-0 rounded-xl border bg-card p-3 text-xs shadow-card">
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
             <span className="font-medium">{selected}</span>
+            {/* 没有这个点，`sdcard` 与 `/sdcard` 会连成 "sdcard/sdcard"，看着像一条拼错的路径 */}
+            <span aria-hidden className="text-muted-foreground">
+              ·
+            </span>
             <PathText value={stat.data?.path ?? selectedPath} testid="files-stat-path" className="font-mono text-muted-foreground" />
           </div>
           {stat.isLoading && <p className="mt-1 text-muted-foreground">读取元数据…</p>}
@@ -1203,7 +1379,7 @@ export function FilesView({ serial }: { serial: string | null }) {
                 {preview.data.encoding === "hex" && "，二进制按 hex 显示"}
                 {preview.data.detail && `（${preview.data.detail}）`}
               </p>
-              <pre className="mt-1 max-h-48 overflow-auto rounded-md bg-muted/40 p-2 font-mono whitespace-pre-wrap break-all">
+              <pre className="pane-scroll mt-1 max-h-48 overflow-auto rounded-md bg-muted/40 p-2 font-mono whitespace-pre-wrap break-all">
                 {preview.data.encoding === "hex"
                   ? preview.data.hex
                   : preview.data.text}
@@ -1557,7 +1733,7 @@ export function AppsView({ serial }: { serial: string | null }) {
             {warnings[0].message}
           </p>
         )}
-        <div className="min-h-0 flex-1 overflow-auto rounded-xl border border-border/70 bg-card shadow-card">
+        <div className="pane-scroll min-h-0 flex-1 overflow-auto rounded-xl border border-border/70 bg-card shadow-card">
           {visibleApps.length === 0 &&
             (needle ? (
               <div className="px-3 py-4 text-center text-xs">

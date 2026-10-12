@@ -4,6 +4,7 @@ import dashboard from "./dashboard";
 import devices from "./devices";
 import hook from "./hook";
 import nav from "./nav";
+import chef from "./chef";
 import settings from "./settings";
 
 /** English (fallback target after zh-CN) */
@@ -11,6 +12,7 @@ export default {
   ...common,
   ...apps,
   ...nav,
+  ...chef,
   ...dashboard,
   ...devices,
   ...settings,

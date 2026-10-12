@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { PreflightDto } from "@/api/hook";
 import { PreflightList } from "./SettingsPanel";
 
-const T = (k: string) => (k === "hook.frida.channel" ? "frida 通道（握手）" : k);
+const T = (k: string) => k === "hook.frida.channel" ? "frida 通道（握手）" : k === "hook.frida.gotoForward" ? "去转发" : k === "hook.frida.fix" ? "去修" : k;
 
 function base(over: Partial<PreflightDto>): PreflightDto {
   return {
@@ -16,8 +16,6 @@ function base(over: Partial<PreflightDto>): PreflightDto {
     fridaOk: true,
     fridaVersion: "16.5.7",
     fridaHint: null,
-    runnerOk: true,
-    runnerHint: null,
     ...over,
   } as PreflightDto;
 }
@@ -37,16 +35,21 @@ describe("preflight 的「frida 通道」项（三态）", () => {
     const hint =
       "连不上设备上的 frida-server：ProtocolError unable to communicate…（工具用的 frida 是 16.5.7，两端主版本必须一致）";
     const { container } = list(base({ channelOk: false, channelHint: hint }));
-    const row = screen.getByText("frida 通道（握手）");
-    expect(row).toBeInTheDocument();
-    expect(row.getAttribute("title")).toBe(hint);
-    // 这一项自己必须是红的（别的项照样可以绿：整体图标不是这里要钉的东西）
-    expect(row.className).toContain("text-destructive");
-    const item = row.closest("div") as HTMLElement;
-    expect(item.querySelector("svg.text-destructive")).toBeTruthy();
-    // 顶部汇总图标不再涂绿（单项可以是绿的，所以按位置取头部那一行）
-    const head = container.firstElementChild?.firstElementChild as HTMLElement;
-    expect(head.querySelector("svg.text-emerald-500")).toBeNull();
+    const label = screen.getByText("frida 通道（握手）");
+    const pill = label.closest("button") as HTMLElement;
+    expect(pill).toBeTruthy();
+    // 原因挂在药丸的 title 上：版本不匹配那句话很长，截断后也要能查到
+    expect(pill.getAttribute("title")).toBe(hint);
+    // 这一项自己必须是红的
+    expect(pill.className).toContain("text-destructive");
+    expect(pill.querySelector("svg.text-destructive")).toBeTruthy();
+    // 而且必须有"去哪修"的动作：remote 类跳端口转发页
+    // 失败且知道去哪修的，药丸上直接带动作（这一项的去处是托管二进制页）
+    expect(pill.textContent).toContain("去修");
+    expect(pill).toBeEnabled();
+    // 汇总图标压根不该存在：单项有绿有红时，一个总体绿勾就是撒谎
+    expect(container.querySelector('[data-testid="preflight-summary"]')).toBeNull();
+    expect((container.firstElementChild as HTMLElement).tagName).toBe("DIV");
   });
 
   it("探过且通了才画绿勾", () => {

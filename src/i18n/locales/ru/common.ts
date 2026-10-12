@@ -26,4 +26,5 @@ export default {
   "common.device": "Устройство",
   "common.updatedAt": "Обновлено",
   "common.phasePlaceholder": "Заглушка · в планах",
+  "common.cancel": "Отмена",
 } as const;

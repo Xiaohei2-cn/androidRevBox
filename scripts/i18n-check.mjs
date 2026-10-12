@@ -4,7 +4,7 @@
  * 规则：zh-CN 为源语言必须最全；其余语言键集必须与 zh-CN 完全一致
  * （多、少都算失败）——保证「新增功能必须同步补多语词典」落到 CI。
  */
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -97,6 +97,75 @@ function collectUsedKeys() {
   };
   walk(srcDir);
   return used;
+}
+
+
+// ---------------------------------------------------------------------------
+// 第三道闸：写死在组件里的中文（这些不会被上面两道闸看见）。
+//
+// 为什么要管：本仓库支持 5 种语言，但历史上有些页面（任务中心整页、设备页若干空态、
+// 控制栏的 aria 名）把文案直接写成了中文字面量——切到英文/俄语时这些地方仍是中文，
+// 用户看到的就是"翻译做了一半"。
+//
+// 现状还很多，所以这里做**棘轮**而不是立刻清零：
+// 基线 scripts/i18n-hardcoded-baseline.json 记每个文件当前的行数，
+// **只许减不许增**；某个文件降了，就把基线改小（脚本会提示你）。
+// ---------------------------------------------------------------------------
+const CJK_RE = /[\u4e00-\u9fff]/;
+const BASELINE_FILE = join(repoRoot, "scripts/i18n-hardcoded-baseline.json");
+const baseline = existsSync(BASELINE_FILE)
+  ? JSON.parse(readFileSync(BASELINE_FILE, "utf8"))
+  : {};
+
+function countHardcodedCjk() {
+  const found = {};
+  const walk = (dir) => {
+    for (const name of readdirSync(dir)) {
+      const full = join(dir, name);
+      if (statSync(full).isDirectory()) {
+        if (name === "i18n") continue; // 词典本身当然全是目标语言
+        walk(full);
+        continue;
+      }
+      if (!name.endsWith(".tsx") || name.includes(".test.")) continue;
+      const text = readFileSync(full, "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+      let n = 0;
+      for (const line of text.split("\n")) {
+        const t = line.trim();
+        if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) continue;
+        // 开发者日志不算界面文案（console.* 里带中文不该挡 CI）
+        if (line.includes("console.")) continue;
+        if (CJK_RE.test(line)) n += 1;
+      }
+      const rel = full.replace(repoRoot + "/", "");
+      if (n > 0) found[rel] = n;
+    }
+  };
+  walk(join(repoRoot, "src"));
+  return found;
+}
+
+const hardcoded = countHardcodedCjk();
+const over = [];
+const improved = [];
+for (const [file, n] of Object.entries(hardcoded)) {
+  const allowed = baseline[file] ?? 0;
+  if (n > allowed) over.push([file, n, allowed]);
+  else if (n < allowed) improved.push([file, n, allowed]);
+}
+if (over.length) {
+  failed = true;
+  console.error(`\u2717 有 ${over.length} 个文件新增了写死的中文界面文案（棘轮只许减不许增）`);
+  for (const [file, n, allowed] of over) {
+    console.error(`   ${file}: 现在 ${n} 行，基线 ${allowed} 行 -> 请改用 t("域.键") 并补 5 份词典`);
+  }
+} else if (improved.length) {
+  const totalNow = Object.values(hardcoded).reduce((a, b) => a + b, 0);
+  console.log(`\u26a0 写死中文比基线少了 ${improved.length} 个文件（现在共 ${totalNow} 行）：记得把 scripts/i18n-hardcoded-baseline.json 改小，别让它反弹`);
+  for (const [file, n, allowed] of improved) console.log(`   ${file}: ${allowed} -> ${n}`);
+} else {
+  const totalNow = Object.values(hardcoded).reduce((a, b) => a + b, 0);
+  console.log(`\u2713 写死中文未新增（棘轮基线内，当前合计 ${totalNow} 行待收进词典）`);
 }
 
 const used = collectUsedKeys();

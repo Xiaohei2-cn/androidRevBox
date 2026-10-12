@@ -85,13 +85,30 @@ describe("目标与连接形状", () => {
     expect(r.ok && r.plan.args).toContain("-F");
   });
 
-  it("attach 纯数字 → -p；attach 别的 → -n；spawn → -f", () => {
-    const pid = planFridaSession(python(), frida(), settings({ target: " 12345 " }), SCRIPT);
-    expect(pid.ok && pid.plan.args).toEqual([...FRIDA_REPL_ARGS, "-D", "18271FDF600FL4", "-p", "12345", "-l", SCRIPT]);
-    const name = planFridaSession(python(), frida(), settings({ target: "com.example.app" }), SCRIPT);
-    expect(name.ok && name.plan.args).toContain("-n");
+  it("attach 填了什么都算前台（-F），只有 spawn 才带包名（-f）", () => {
+    // 目标串残留时也不能改形状：界面在 attach 下已经禁用输入框，
+    // 万一 settings 里还留着切模式前的包名，会话必须仍然附加前台，而不是去匹配一个进程名。
+    for (const target of ["com.example.app", " 12345 "]) {
+      const r = planFridaSession(python(), frida(), settings({ target }), SCRIPT);
+      expect(r.ok && r.plan.args).toEqual([
+        ...FRIDA_REPL_ARGS,
+        "-D",
+        "18271FDF600FL4",
+        "-F",
+        "-l",
+        SCRIPT,
+      ]);
+    }
     const spawn = planFridaSession(python(), frida(), settings({ runMode: "spawn", target: "com.x" }), SCRIPT);
-    expect(spawn.ok && spawn.plan.args).toContain("-f");
+    expect(spawn.ok && spawn.plan.args).toEqual([
+      ...FRIDA_REPL_ARGS,
+      "-D",
+      "18271FDF600FL4",
+      "-f",
+      "com.x",
+      "-l",
+      SCRIPT,
+    ]);
   });
 
   /** 官方没有"spawn 前台"：缺包名就拒绝，别拼一个 `-f ""` 去撞运气。 */

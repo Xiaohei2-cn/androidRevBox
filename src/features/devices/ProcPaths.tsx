@@ -123,7 +123,7 @@ function ProcFileDetail({
 
   return (
     <div
-      className="rounded-lg border bg-card p-2"
+      className="rounded-xl border border-border/70 bg-card shadow-card p-2"
       data-testid={`fg-proc-detail-${target.serial}-${target.file}`}
     >
       <div className="flex items-center gap-2">
@@ -181,7 +181,7 @@ function ProcFileDetail({
       </p>
       {query.data ? (
         <pre
-          className="mt-1 max-h-64 overflow-auto rounded bg-muted/40 p-1.5 font-mono text-[10.5px] leading-snug"
+          className="pane-scroll mt-1 max-h-64 overflow-auto rounded bg-muted/40 p-1.5 font-mono text-[10.5px] leading-snug"
           data-testid="fg-proc-detail-body"
         >
           {query.data.text || t("common.emptyValue")}

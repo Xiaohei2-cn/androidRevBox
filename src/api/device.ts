@@ -39,6 +39,22 @@ export interface FileEntry {
   perms?: string;
 }
 
+/**
+ * 一次目录列举：条目 + 「这份是不是这个目录的全部」。
+ *
+ * `unreadable`/`truncated` 必须一路带到界面：Agent 以 shell 身份跑，`/data` 这类目录它连
+ * `opendir` 都进不去 —— **条目是空的、原因不是空的**。只回一个数组，界面就必然把"读不到"
+ * 画成"这个目录是空的"（用户报的"/data 下面是空的"就是这么来的）。
+ * `source`：`agent` = 设备端 typed 通道（shell 身份）；`root` = 桌面代发 `su -c`。
+ */
+export interface FileListing {
+  path: string;
+  entries: FileEntry[];
+  unreadable: string[];
+  truncated: boolean;
+  source: "agent" | "root";
+}
+
 /** 设备端文件类型（AR7.1 `filesystem.*`，由 lstat 判定，不靠猜） */
 export type FileKind =
   | "dir"
@@ -251,6 +267,19 @@ export interface HostedRunView {
   detail?: string | null;
 }
 
+/**
+ * 交互终端那次启动的**认领结果**（进程早就起来了，这里只补登记，不报成败）。
+ *
+ * `claimed:true` = 设备侧托管运行表已收下它，之后刷新/重启都认得，行上给「终止」；
+ * `claimed:false` = 没登记上（Agent 不在线、设备侧证据不足、或压根没出现新进程），
+ * 界面继续按「表外同名进程」说实话，不装作在管。
+ */
+export interface HostedClaimView {
+  claimed: boolean;
+  pid: number | null;
+  detail?: string | null;
+}
+
 /** /data/local/tmp 下被托管的 ELF 二进制 */
 export interface HostedBinary {
   name: string;
@@ -271,6 +300,22 @@ export interface HostedBinary {
    * Legacy 的 `ls -l` 给不出可信时间时为 null：这时界面只说"没做版本核对"。
    */
   mtimeUnix?: number | null;
+}
+
+/**
+ * 托管目录清单 + 「这份清单是不是这台设备的全部」。
+ *
+ * 界面必须带着这两个信号做事，不能把清单当成绝对事实：
+ * 设备端扫描有条数上限（Agent 侧 2000），也可能有个别文件读不出来；
+ * 那种情况下"清单里没有这个文件"根本推不出"手机上没有这个文件"，
+ * 于是**绝不允许**据此删除用户按设备号存的备注/启动参数（见 features/binary/hostedRecords.ts）。
+ * `source` 说明这份出自哪条腿：`agent` = 设备端逐文件读头；`adb` = 回退腿（看不见完整性）。
+ */
+export interface HostedListing {
+  binaries: HostedBinary[];
+  truncated: boolean;
+  unreadable: string[];
+  source: "agent" | "adb";
 }
 
 /**
@@ -426,8 +471,8 @@ export const deviceApi = {
   info(serial: string): Promise<DeviceInfo> {
     return invokeCommand<DeviceInfo>("device_info", { serial });
   },
-  ls(serial: string, path: string): Promise<FileEntry[]> {
-    return invokeCommand<FileEntry[]>("device_ls", { serial, path });
+  ls(serial: string, path: string, root = false): Promise<FileListing> {
+    return invokeCommand<FileListing>("device_ls", { serial, path, root });
   },
   /**
    * 单路径元数据（AR7.1，Agent only）。`followSymlink=false` 是 lstat 语义（链接本身），
@@ -455,11 +500,13 @@ export const deviceApi = {
     serial: string,
     path: string,
     followSymlink = false,
+    root = false,
   ): Promise<FileStatResult> {
     return invokeCommand<FileStatResult>("device_file_stat", {
       serial,
       path,
       followSymlink,
+      root,
     });
   },
   /**
@@ -469,13 +516,14 @@ export const deviceApi = {
   filePreview(
     serial: string,
     path: string,
-    options?: { maxBytes?: number; fromEnd?: boolean },
+    options?: { maxBytes?: number; fromEnd?: boolean; root?: boolean },
   ): Promise<FilePreviewResult> {
     return invokeCommand<FilePreviewResult>("device_file_preview", {
       serial,
       path,
       maxBytes: options?.maxBytes ?? null,
       fromEnd: options?.fromEnd ?? false,
+      root: options?.root ?? false,
     });
   },
   packages(serial: string): Promise<string[]> {
@@ -502,8 +550,8 @@ export const deviceApi = {
     return invokeCommand<void>("adb_forward_remove", { serial, local: local ?? null });
   },
   /** 列出 /data/local/tmp 下的 ELF 二进制（含执行权限） */
-  binaries(serial: string): Promise<HostedBinary[]> {
-    return invokeCommand<HostedBinary[]>("device_binaries", { serial });
+  binaries(serial: string): Promise<HostedListing> {
+    return invokeCommand<HostedListing>("device_binaries", { serial });
   },
   /** 探测 su 可用性（Root 开关前置检查） */
   binarySuCheck(serial: string): Promise<boolean> {
@@ -514,35 +562,52 @@ export const deviceApi = {
     return invokeCommand<void>("device_binary_chmod", { serial, name, root });
   },
   /**
-   * 后台启动二进制。**桌面侧启动前会先查"是不是已经有实例在跑"**：
-   * 在跑就不起新进程，而是把在跑的 pid 交回来（`started: false`），
-   * 由界面给「停止进程」按钮 —— 不是丢一句"启动失败"。
-   */
-  /**
-   * 后台启动二进制（UI-6 第一/四层）。
+   * 起一个托管进程（后台常驻那条路，UI-6 第一/四层）。
    *
-   * `args` 是参数数组：Agent 支路直交 exec（不进 shell，所以含空格/分号都不用转义）；
+   * `args` 是参数数组：Agent 支路直交 exec（不进 shell，含空格/分号都不用转义）；
    * Root 支路由桌面把参数落成设备上的文件、命令模板按行还原，值不进命令行。
-   * `stdinData` 是一次性启动输入（写完给 EOF）；`interactive` 才是要**保持**输入通道，
-   * 只有 Agent 支路支持（Root 支路会被后端明确拒绝，不是默默忽略）。
+   *
+   * ⚠️ 界面已经不调这条了：托管执行的启动入口换成了「终端启动」（见 `HostedTerminal`）。
+   * 方法与契约测试先留着 —— 它和 `hostedRuns` / `hostedStop` / 日志读的是同一套身份口径
+   * （handle + start time），设备侧运行表里历史的、或在别处起的进程仍然要靠那一族来停。
+   * 要连这条 IPC 一起清掉，说一声：那要顺带收命令表与 surface 测试，不该顺手做。
+   *
+   * 这里**不再带** `stdinData` / `interactive`（启动就喂一段内容、或保持输入通道）：
+   * 那是"没有终端可用"时补的洞 —— 一次性喂进去写完就 EOF，程序要边跑边问就卡死。
+   * 现在要输入走本页右侧的交互终端（真 PTY、真 tty）。桌面命令与 Agent 的能力保留
+   * （老运行记录可能还报 stdin_mode=open），只是这条路不填那两个参数。
    */
-  binaryRun(
+  binaryRun(serial: string, name: string, root = false, args: string[] = []): Promise<HostedRunView> {
+    return invokeCommand<HostedRunView>("device_binary_run", { serial, name, root, args });
+  },
+
+  /**
+   * 把「刚在交互终端里跑起来的那个进程」认领进设备侧托管运行表。
+   *
+   * 为什么要有这一步：终端启动走的是 `adb shell -tt`，那次 exec 不经过 Agent，
+   * 运行表里没有记录 ⇒ 界面只能说"它在跑，可它不在托管表里"，而它明明是用户
+   * 在这个页面点起来的。桌面在这里只交候选 pid（`knownPids` 之外的同名新进程），
+   * 认不认由设备侧按 /proc 实证判（进程名/命令行/属主/启动时刻）。
+   *
+   * 这条**不报失败**：没认领上也要正常返回，让界面改口说"没登记上"，
+   * 而不是把一次成功启动说成启动失败。
+   */
+  binaryClaim(
     serial: string,
     name: string,
-    root = false,
     args: string[] = [],
-    stdinData?: string,
-    interactive = false,
-  ): Promise<HostedRunView> {
-    return invokeCommand<HostedRunView>("device_binary_run", {
+    knownPids: number[] = [],
+    root = false,
+  ): Promise<HostedClaimView> {
+    return invokeCommand<HostedClaimView>("device_binary_claim", {
       serial,
       name,
-      root,
       args,
-      stdinData: stdinData && stdinData.length > 0 ? stdinData : null,
-      interactive,
+      knownPids,
+      root,
     });
   },
+
   /**
    * 用一组参数探测一次会怎样（UI-6 第二层）。
    *
@@ -633,21 +698,38 @@ export const deviceApi = {
    * 安装：多件即 split 套件，设备侧会自动改用 `adb install-multiple -r`（AR8.2 方案 A）。
    * 仍是长操作 → 返回 task_id，输出走 task:// 事件流。
    */
-  /** 新建目录（增）。父目录必须已存在，不做 mkdir -p */
-  fsMkdir(serial: string, path: string): Promise<FsMkdirResult> {
-    return invokeCommand<FsMkdirResult>("device_fs_mkdir", { serial, path });
+  /**
+   * 新建目录（增）。父目录必须已存在，不做 mkdir -p。
+   *
+   * `root=true` 走设备侧 `su -c` 那条腿（用户给这台设备的授权）：能改 root 属主的东西。
+   * 两条腿都只允许在 `/data/local/tmp` 与 `/sdcard` 两棵树里写（判据在 Rust
+   * `services/fs_policy.rs`，界面镜像在 `lib/deviceFsPolicy.ts`），越界一律 INVALID_INPUT。
+   * root 腿干完会回设备复核，复核读不到就不说"建好了"。
+   */
+  fsMkdir(serial: string, path: string, root = false): Promise<FsMkdirResult> {
+    return invokeCommand<FsMkdirResult>("device_fs_mkdir", { serial, path, root });
   },
   /** 重命名 / 移动（改）。目标已存在会被设备侧拒绝，不覆盖 */
-  fsRename(serial: string, from: string, to: string): Promise<FsRenameResult> {
-    return invokeCommand<FsRenameResult>("device_fs_rename", { serial, from, to });
+  fsRename(serial: string, from: string, to: string, root = false): Promise<FsRenameResult> {
+    return invokeCommand<FsRenameResult>("device_fs_rename", { serial, from, to, root });
   },
   /** 删除（删）。非空目录必须显式 recursive，否则设备侧直接拒 */
-  fsRemove(serial: string, path: string, recursive = false): Promise<FsRemoveResult> {
-    return invokeCommand<FsRemoveResult>("device_fs_remove", { serial, path, recursive });
+  fsRemove(
+    serial: string,
+    path: string,
+    recursive = false,
+    root = false,
+  ): Promise<FsRemoveResult> {
+    return invokeCommand<FsRemoveResult>("device_fs_remove", { serial, path, recursive, root });
   },
   /** 改权限（改）。mode 只接受 0o000-0o777 */
-  fsChmod(serial: string, path: string, mode: number): Promise<FsChmodResult> {
-    return invokeCommand<FsChmodResult>("device_fs_chmod", { serial, path, mode });
+  fsChmod(
+    serial: string,
+    path: string,
+    mode: number,
+    root = false,
+  ): Promise<FsChmodResult> {
+    return invokeCommand<FsChmodResult>("device_fs_chmod", { serial, path, mode, root });
   },
   install(serial: string, apkPaths: string[]): Promise<string> {
     return invokeCommand<string>("device_install", { args: { serial, apkPaths } });

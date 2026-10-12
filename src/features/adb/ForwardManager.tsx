@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Select } from "@/components/ui/select";
 import { useQuery } from "@tanstack/react-query";
 import { CheckCircle2, CircleSlash, Plus, RefreshCw, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -97,7 +98,7 @@ export function ForwardManager() {
 
       <DevicePicker online={online} selected={deviceSerial} onSelect={setDeviceSerial} />
 
-      <div className="min-h-0 flex-1 space-y-2 overflow-auto pr-1">
+      <div className="pane-scroll min-h-0 flex-1 space-y-2 overflow-auto pr-1">
         {rows.map((row, idx) => (
           <ForwardRow
             key={row.id}
@@ -179,8 +180,8 @@ function DevicePicker({
   return (
     <label className="flex items-center gap-2 text-xs">
       <span className="text-muted-foreground">-s</span>
-      <select
-        className="h-7 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
+      <Select
+        className="h-7 font-mono"
         value={selected ?? ""}
         onChange={(e) => onSelect(e.target.value)}
       >
@@ -189,7 +190,7 @@ function DevicePicker({
             {d.model || d.serial}（{d.serial}）
           </option>
         ))}
-      </select>
+      </Select>
     </label>
   );
 }

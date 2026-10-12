@@ -34,28 +34,54 @@
     /* 窗口表面色板默认（浅色）：CSS 先行定义，React 水合前首帧即正确，
        消除「启动时像加载配置」的二次重绘（P7 闪烁修复） */
     --app-bg-rgb: 255 255 255;
+    /* 「背景不透明度」这个功能整体撤了：不再有滑杆、不再进设置、React 也不再写它。
+       这个变量恒为 1（窗口底色完全不透视），留着只是让下面每一档 stop 的写法统一，
+       别再把它当设置出口。 */
     --app-bg-alpha: 1;
+    /* 窗口底色不再是纯色：三档同色相递进 + 左上角一枚极淡的主色光斑。
+       每一档都乘同一个 --app-bg-alpha，alpha 恒 1 ⇒ 看到的就是那三层实色渐变。 */
+    --app-bg-hi: 255 255 255;
+    --app-bg-mid: 231 229 250;
+    --app-bg-lo: 203 203 240;
+    --app-bg-tint-rgb: 99 102 241;
+    --app-bg-tint-alpha: 0.30;
+    /* 右下角第二枚冷色光斑：只有一枚的话，渐变读起来像"一边脏了"，
+       两枚对角相夹才像一片有光源的斜面。 */
+    --app-bg-tint2-rgb: 56 189 248;
+    --app-bg-tint2-alpha: 0.22;
   }
 
   .dark {
-    --background: 240 6% 10%;
+    /* 深色层级（这轮重排）：窗口渐变最亮处 rgb(40,40,66)（L 2.4），
+       卡片抬到 20%（L 2.9）才浮得起来；旧值 12%（L 1.2）只比渐变中段亮 0.4 个亮度点，
+       看着就是几块黑洞。层级：canvas 14% < card 20% < muted/accent/描边 25-29%，
+       输入字段再沉回 background（比卡片暗一档，读作"凹槽"）。 */
+    --app-bg-hi: 40 40 66;
+    --app-bg-mid: 21 21 33;
+    --app-bg-lo: 8 8 16;
+    --app-bg-tint-rgb: 129 140 248;
+    --app-bg-tint-alpha: 0.34;
+    --app-bg-tint2-rgb: 34 211 238;
+    --app-bg-tint2-alpha: 0.16;
+
+    --background: 235 10% 14%;
     --foreground: 0 0% 100%;
-    --card: 240 6% 12%;
+    --card: 235 10% 20%;
     --card-foreground: 0 0% 100%;
-    --popover: 240 6% 12%;
+    --popover: 235 10% 20%;
     --popover-foreground: 0 0% 100%;
     --primary: 243 75% 59%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 240 4% 16%;
+    --secondary: 235 9% 25%;
     --secondary-foreground: 0 0% 100%;
-    --muted: 240 4% 16%;
+    --muted: 235 9% 25%;
     --muted-foreground: 240 6% 84%;
-    --accent: 240 4% 16%;
+    --accent: 235 9% 25%;
     --accent-foreground: 0 0% 100%;
     --destructive: 0 62.8% 58%;
     --destructive-foreground: 0 0% 98%;
-    --border: 240 4% 22%;
-    --input: 240 4% 22%;
+    --border: 235 8% 29%;
+    --input: 235 8% 29%;
     --ring: 243 75% 59%;
   }
 
@@ -97,24 +123,76 @@
     user-select: text;
   }
 
+  /* 指针拖拽进行中（类名由 usePickDrag.ts 挂/摘）：整棵树禁选 + 统一 grabbing 光标。
+     只在起点条目上写 select-none 不够——WebKit 起选区时会把锚点落到最近的可选文本上，
+     指针一伸进"算法组合"就把那边涂蓝。拖完必须恢复，所以用类名而不是常驻规则。 */
+  .chef-dragging,
+  .chef-dragging * {
+    -webkit-user-select: none;
+    user-select: none;
+    cursor: grabbing;
+  }
+
   /* 窗口表面：主体与锯齿齿块共用，保证颜色一致。
      第三轮闪烁修复——彻底移除 backdrop-filter：
      WKWebView 的 backdrop-filter 无法模糊透明窗口「背后」的桌面（它只看得到
      同一 webview 内的 DOM，这里元素背后是透明的 → 模糊 = 空操作），
      却会强制一个独立合成层；任何子树重绘/悬停/前后台切换都会让 WebKit 销毁重建
      该层，重建的当帧以满 alpha 实色打底 → 用户看到的「先不透明再变透明」闪烁。
-     透明效果由下面的半透明背景色（--app-bg-alpha）承担，视觉上与原「毛玻璃」一致
-     （本就只是半透明着色），且不再有重合成空帧。 */
+     当初的"半透明着色"由下面的 --app-bg-alpha 承担，且不再有重合成空帧；
+     现在这个功能整体撤了：alpha 恒 1，窗口底色不透视，但背景形状与齿块几何一点没变。 */
   .app-surface {
-    background-color: rgb(var(--app-bg-rgb) / var(--app-bg-alpha));
+    /* 不再是纯色：三档同色相递进 + 左上角一枚极淡主色光斑。
+       每个 stop 都乘同一个 --app-bg-alpha；它已固定为 1（透明度不再是设置项）。 */
+    background-image:
+      radial-gradient(
+        64% 40% at 6% 0%,
+        rgb(var(--app-bg-tint-rgb) / calc(var(--app-bg-tint-alpha) * var(--app-bg-alpha))) 0%,
+        rgb(var(--app-bg-tint-rgb) / 0) 66%
+      ),
+      radial-gradient(
+        58% 42% at 96% 100%,
+        rgb(var(--app-bg-tint2-rgb) / calc(var(--app-bg-tint2-alpha) * var(--app-bg-alpha))) 0%,
+        rgb(var(--app-bg-tint2-rgb) / 0) 62%
+      ),
+      linear-gradient(
+        150deg,
+        rgb(var(--app-bg-hi) / var(--app-bg-alpha)) 0%,
+        rgb(var(--app-bg-mid) / var(--app-bg-alpha)) 48%,
+        rgb(var(--app-bg-lo) / var(--app-bg-alpha)) 100%
+      );
+    /* 齿块 / 窗口主体 / 控制栏是三个独立元素。attachment: fixed 让渐变按整个窗口坐标铺开，
+       三块拼出来是同一篇连续的色阶，而不是每个元素各自从最亮重跑到最暗。 */
+    background-attachment: fixed;
   }
 
   /* 控制栏（窗口最上方那条可拖动的）永远实色：不参与「背景不透明度」。
      它是窗口的 chrome——拖窗、最小化、关闭都在这条上。让它半透明，那些按钮就变成
      "隔着背后的桌面猜"；穿透模式也从不让这里让出去（TitleBar 标 data-click-through=solid）。
      ⚠️ 同样不许加 backdrop-filter/transform：见上面 .app-surface 那条闪烁修复。 */
+  /* 控制栏走同一条色阶，但每一档 alpha 恒为 1：这里永远实色。
+     TitleBar.test.tsx 会逐条断言这条规则：不许出现透明度变量，也不许出现那两个
+     会立合成层的属性名（所以说明写在这里，不写在规则体内部）。 */
   .app-titlebar {
     background-color: rgb(var(--app-bg-rgb) / 1);
+    background-image:
+      radial-gradient(
+        40% 200% at 6% 0%,
+        rgb(var(--app-bg-tint-rgb) / var(--app-bg-tint-alpha)) 0%,
+        rgb(var(--app-bg-tint-rgb) / 0) 70%
+      ),
+      radial-gradient(
+        36% 200% at 96% 100%,
+        rgb(var(--app-bg-tint2-rgb) / var(--app-bg-tint2-alpha)) 0%,
+        rgb(var(--app-bg-tint2-rgb) / 0) 66%
+      ),
+      linear-gradient(
+        150deg,
+        rgb(var(--app-bg-hi) / 1) 0%,
+        rgb(var(--app-bg-mid) / 1) 48%,
+        rgb(var(--app-bg-lo) / 1) 100%
+      );
+    background-attachment: fixed;
   }
 
   /* 路径/信息文本：允许选择与双击全选（全局 user-select:none 的例外，P7） */
@@ -127,10 +205,21 @@
   /* 内容区底层：比窗口表面略深一档，让 bg-card 卡片浮起来
      （透明窗口下 .app-surface 是半透明着色，这里再叠一层极浅的着色拉开层级）。 */
   .page-canvas {
-    background-color: rgb(17 24 39 / 0.03);
+    /* 内容区也是一层方向性压暗（顶部略重），卡片浮起的层次靠它托 */
+    background-image: linear-gradient(
+      180deg,
+      rgb(17 24 39 / 0.022) 0%,
+      rgb(17 24 39 / 0.007) 55%,
+      rgb(17 24 39 / 0) 100%
+    );
   }
   .dark .page-canvas {
-    background-color: rgb(255 255 255 / 0.03);
+    background-image: linear-gradient(
+      180deg,
+      rgb(255 255 255 / 0.024) 0%,
+      rgb(255 255 255 / 0.007) 55%,
+      rgb(255 255 255 / 0) 100%
+    );
   }
 
   /* 骨架屏微光（加载态统一语言，替代孤零零的一行小字） */
@@ -166,3 +255,31 @@
     animation: config-flash 0.6s ease-in-out 2;
   }
 }
+
+  /* 面板内滚动条：原生悬浮滚动条在半透明面板上很跳眼（算法中心四块面板都滚动）。
+     统一 8px 细条、轨道透明、拇指走 --border 色，hover 时加深一档。 */
+  .pane-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+  .pane-scroll::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .pane-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .pane-scroll::-webkit-scrollbar-thumb {
+    border-radius: 9999px;
+    background-color: hsl(var(--border));
+  }
+  .pane-scroll:hover::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--muted-foreground) / 0.35);
+  }
+
+  /* 面板里的"凹槽"：建立第三层深度（页面 page-canvas -> 卡片 bg-card -> 凹槽 bg-muted）。
+     输入框、输出正文、展开的参数区都用它，代替各处手写的 bg-muted/30，
+     免得同一个界面里出现四五种深浅。 */
+  .pane-inset {
+    @apply rounded-xl border border-border/60 bg-muted/40;
+  }

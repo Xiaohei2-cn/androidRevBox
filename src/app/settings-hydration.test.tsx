@@ -10,14 +10,12 @@ vi.mock("@tauri-apps/api/core", () => ({
 import { AppProviders, useSettings } from "@/app/providers";
 
 function Probe() {
-  const { theme, opacity, logLevel, clickThrough, hydrated } = useSettings();
+  const { theme, logLevel, hydrated } = useSettings();
   return (
     <div
       data-testid="probe"
       data-theme={theme}
-      data-opacity={opacity}
       data-log-level={logLevel}
-      data-click-through={String(clickThrough)}
       data-hydrated={String(hydrated)}
     />
   );
@@ -33,38 +31,6 @@ describe("SettingsProvider（Tauri 环境：SQLite 持久化 + P0 迁移）", ()
   afterEach(() => {
     localStorage.clear();
     delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
-  });
-
-  it("透明区点击穿透：DB 明确写 true 才开，脏值与缺键都算关", async () => {
-    // 这个设置会改变"点下去归谁"，默认必须是关：拿猜出来的值去开穿透是危险的
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "config_snapshot") {
-        return [{ key: "app.settings.click_through", value: "maybe" }];
-      }
-      return null;
-    });
-    const dirty = render(
-      <AppProviders>
-        <Probe />
-      </AppProviders>,
-    );
-    await waitFor(() => expect(dirty.getByTestId("probe").dataset.hydrated).toBe("true"));
-    expect(dirty.getByTestId("probe").dataset.clickThrough).toBe("false");
-    dirty.unmount();
-
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "config_snapshot") {
-        return [{ key: "app.settings.click_through", value: "true" }];
-      }
-      return null;
-    });
-    const ok = render(
-      <AppProviders>
-        <Probe />
-      </AppProviders>,
-    );
-    await waitFor(() => expect(ok.getByTestId("probe").dataset.clickThrough).toBe("true"));
-    ok.unmount();
   });
 
   it("DB 值覆盖 localStorage 缓存（SQLite 为事实源）", async () => {
@@ -92,7 +58,6 @@ describe("SettingsProvider（Tauri 环境：SQLite 持久化 + P0 迁移）", ()
 
   it("P0 旧值一次性迁移：DB 缺失的键会被回写", async () => {
     localStorage.setItem("app.settings.theme", "dark");
-    localStorage.setItem("app.settings.opacity", "60");
     localStorage.setItem("app.settings.log_level", "warn");
     invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "config_snapshot") return [];
@@ -110,9 +75,11 @@ describe("SettingsProvider（Tauri 环境：SQLite 持久化 + P0 迁移）", ()
     );
     const setCalls = invokeMock.mock.calls.filter((c) => c[0] === "config_set");
     const keys = setCalls.map((c) => (c[1] as { args: { key: string } }).args.key);
-    expect(keys).toEqual(
-      expect.arrayContaining(["app.settings.theme", "app.settings.opacity"]),
-    );
+    // 迁移名单只剩主题与界面语言（日志级别走 log_set_level，不是 config_set）
+    expect(keys).toContain("app.settings.theme");
+    // 背景透明度与点击穿透已经不是设置项：谁把它们塞回迁移名单，这里就红
+    expect(keys).not.toContain("app.settings.opacity");
+    expect(keys).not.toContain("app.settings.click_through");
     expect(invokeMock).toHaveBeenCalledWith("log_set_level", { level: "warn" });
   });
 

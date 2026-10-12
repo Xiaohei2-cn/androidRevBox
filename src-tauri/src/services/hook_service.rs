@@ -1,23 +1,19 @@
-//! HookService（P10 Frida 会话工作台）：js 工作目录扫描、runner CommandSpec 组装、
-//! 前置检查聚合、远程端点探活。设计 docs/frida-console-design.md §3/§4/§6。
+//! HookService（P10 Frida 会话工作台）：js 工作目录扫描与读写、前置检查聚合、远程端点探活。
 //!
-//! 纪律：Command 薄层只做转发；纯逻辑（目录扫描规则、runner 参数、端点解析）
+//! 纪律：Command 薄层只做转发；纯逻辑（目录扫描规则、脚本读写边界、端点解析）
 //! 分别进本文件（IO 侧）与 adapters::frida（纯参数侧）单测；
-//! 脚本内容零进宿主命令行——只传绝对路径，由 runner 从磁盘读。
+//! **起会话不再经过本服务**：结构化终端与它的 Python runner 已整体退役，
+//! 起会话统一走真终端页里的官方 `frida_tools.repl`（前端 `lib/fridaSession`）。
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::Manager;
 
 use crate::adapters::frida;
 use crate::core::error::{CoreError, CoreResult};
-use crate::services::config_service::{ConfigService, KEY_HOOK_WORKDIR, KEY_PYTHON_PATH};
+use crate::services::config_service::{ConfigService, KEY_HOOK_WORKDIR};
 use crate::services::env_service::{EnvService, FridaEnv};
-use crate::services::process_service::CommandSpec;
-use crate::services::task_service::TaskService;
 
 /// 单次会话最多输出的事件类型对齐：hook_js_list 目录项上限（§4 防爆目录）
 const JS_LIST_CAP: usize = 500;
@@ -25,8 +21,9 @@ const JS_LIST_CAP: usize = 500;
 const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_millis(1_500);
 /// frida 握手要 spawn python 并在设备上找 server，比 TCP 探活慢一个量级
 const CHANNEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// runner 随包资源名（tauri.conf bundle.resources 落点）
-const RUNNER_RESOURCE: &str = "scripts/frida_runner.py";
+/// 脚本读写单次上限。hook 脚本是文本工程件（几 KB 到几百 KB），
+/// 4 MiB 足够宽松；超出说明这被当成了数据文件，读/写都拒掉并说清。
+const MAX_SCRIPT_BYTES: usize = 4 * 1024 * 1024;
 
 // ===== DTO =====
 
@@ -43,6 +40,9 @@ pub struct JsFileDto {
 
 /// 前置检查链聚合（§3）：adb → python → frida →（远程模式）TCP 可达。
 /// 前端按 ok 标红 + 按 hint 给修复跳转。
+///
+/// 这一版去掉了「Runner 脚本」那一项：结构化终端整体退役后，起会话走官方 REPL，
+/// 不再有随包 runner 要查。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreflightDto {
@@ -50,22 +50,19 @@ pub struct PreflightDto {
     pub adb_hint: Option<String>,
     pub python_ok: bool,
     pub python_hint: Option<String>,
-    /// 生效的 python 解释器（runner 用它；None = 未配置/不可用）
+    /// 生效的 python 解释器（None = 未配置/不可用）
     pub python_path: Option<String>,
-    /// 结构化（轨道）会话的要求：**这个 Python 里必须有 frida 绑定包**（我们的 runner 走
-    /// `import frida`）。以前这里挂的是 `FridaEnv::installed`——那句是"frida 或 frida-tools
-    /// 任一即通过"，于是只装了 frida-tools 的机器前置显示绿灯、一点起会话就收到
-    /// `ModuleNotFoundError: frida`。终端里那条路（官方 REPL）要的是 frida-tools，
-    /// 它自己在真终端页判（`src/lib/fridaTerminal.ts`）：**两边分开判，谁缺谁说**（D091）。
+    /// 官方 REPL（`python -m frida_tools.repl`）对 Python 环境的要求：**这个 Python 里
+    /// 必须有 frida-tools**（REPL 本体就在它里面）。判据与 `lib/fridaSession` 完全同源，
+    /// 界面上的绿/红与"点下去会不会报 No module named frida_tools"是同一件事。
     pub frida_ok: bool,
     pub frida_version: Option<String>,
+    /// frida-tools 版本（官方 REPL 本体）——判据与显示都靠它
+    pub frida_tools_version: Option<String>,
     pub frida_hint: Option<String>,
     /// 远程模式探活结果；非远程模式为 None（不探）
     pub remote_ok: Option<bool>,
     pub remote_hint: Option<String>,
-    /// runner 脚本是否随包可达
-    pub runner_ok: bool,
-    pub runner_hint: Option<String>,
     /// 与设备 frida-server 的真实握手结果。`None` = 这一项没探（Python 未就绪），
     /// 三态是必需的：把"没探"画成绿色对勾就是骗人，画成红色又是噪音。
     #[serde(default)]
@@ -124,45 +121,34 @@ pub fn parse_channel_probe(stdout: &str, host_frida: Option<&str>) -> (bool, Opt
     }
 }
 
-/// hook_session_start 入参（命令层薄校验后传入）
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HookSessionStartArgs {
-    /// USB 模式：adb serial（远程模式为 None）
-    pub serial: Option<String>,
-    /// 远程模式：host:port（USB 模式为 None）
-    pub remote: Option<String>,
-    pub spawn: bool,
-    /// 包名（spawn）/ 包名或 pid（attach）
-    pub target: String,
-    /// 工作目录下的 .js 文件名
-    pub script: String,
-}
-
+/// HookService：工作目录扫描与受限读写（IDE 编辑的是用户自己磁盘上的 .js）。
+/// 起会话不在这里——官方 REPL 走 PTY，见命令层注释。
 pub struct HookService {
     config: std::sync::Arc<ConfigService>,
     env: std::sync::Arc<EnvService>,
-    tasks: std::sync::Arc<TaskService>,
-    app: tauri::AppHandle,
 }
 
-/// 结构化会话对 frida 环境的要求（纯函数，便于把四种组合都测到）：
+/// 官方 REPL 对 frida 环境的要求（纯函数，便于把四种组合都测到）：
 /// 返回 `(能不能用, 该显示的原因)`。
 ///
-/// 四种组合里只有一种放行：**绑定包在**。另外三种各有自己的话：
-/// - 只有 frida-tools ⇒ 明说"只有 tools"，并点出**终端 REPL 不受这条影响**
-///   （不然她会把整个 frida 能力当成坏了，而那条路是真能跑的）；
-/// - 两个都没有 ⇒ 沿用 EnvService 那句原文（它已经在说 pip install frida-tools），不在这里改写；
+/// 判据是 **frida-tools 在不在**（`frida_tools.repl` 就在它里面），
+/// 与前端 `lib/fridaSession` 的 `no-frida-tools` 判据逐字同源：
+/// 界面上亮绿的前置与实际点下去报不报 `No module named frida_tools` 必须是同一件事。
+///
+/// 四种组合：
+/// - tools 在 ⇒ 放行（绑定包在不在无所谓——REPL 才不 import frida 绑定包）；
+/// - tools 不在、绑定包在 ⇒ 拒，并说清缺的是 tools、给 pip 命令；
+/// - 两个都没有 ⇒ 沿用 EnvService 那句原文（它已经在说 pip install frida-tools）；
 /// - Python 压根没就绪 ⇒ 也沿用原文那句（此时去谈装哪个包是误导）。
-fn frida_binding_requirement(env: &FridaEnv) -> (bool, Option<String>) {
-    if env.frida_version.is_some() {
+fn frida_repl_requirement(env: &FridaEnv) -> (bool, Option<String>) {
+    if env.frida_tools_version.is_some() {
         return (true, None);
     }
-    if env.python_ready && env.frida_tools_version.is_some() {
+    if env.python_ready && env.frida_version.is_some() {
         return (
             false,
             Some(
-                "这个 Python 里只有 frida-tools，没有 Python 绑定包：我们的 runner 走 `import frida`，装一下 frida（pip install frida）。真终端里的官方 REPL 不受这条影响。"
+                "这个 Python 里只有 frida 绑定包，没有 frida-tools：官方 REPL（python -m frida_tools.repl）装一下 frida-tools（pip install frida-tools）。"
                     .to_string(),
             ),
         );
@@ -171,23 +157,13 @@ fn frida_binding_requirement(env: &FridaEnv) -> (bool, Option<String>) {
         false,
         env.hint
             .clone()
-            .or_else(|| Some("这个 Python 里没有 frida：pip install frida".to_string())),
+            .or_else(|| Some("这个 Python 里没有 frida 工具：pip install frida-tools".to_string())),
     )
 }
 
 impl HookService {
-    pub fn new(
-        config: std::sync::Arc<ConfigService>,
-        env: std::sync::Arc<EnvService>,
-        tasks: std::sync::Arc<TaskService>,
-        app: tauri::AppHandle,
-    ) -> Self {
-        Self {
-            config,
-            env,
-            tasks,
-            app,
-        }
+    pub fn new(config: std::sync::Arc<ConfigService>, env: std::sync::Arc<EnvService>) -> Self {
+        Self { config, env }
     }
 
     /// 已配置的工作目录（空 = 未选择）。
@@ -199,7 +175,7 @@ impl HookService {
             .to_string()
     }
 
-    // ===== 脚本区（§4） =====
+    // ===== 脚本区（§4）：列表 + 受限读写（IDE 编辑工作目录里的 .js） =====
 
     /// 扫描工作目录一层 *.js（非递归、忽略符号链接、上限 500、名字过白名单）。
     /// 目录非法（不存在/非目录）返回 Err，前端提示重新选择。
@@ -207,13 +183,37 @@ impl HookService {
         scan_js_dir(Path::new(dir.trim()))
     }
 
-    /// 选择/更新工作目录前回探：必须是存在的目录。
-    pub fn validate_workdir(&self, dir: &str) -> CoreResult<()> {
-        let dir = dir.trim();
-        if dir.is_empty() || !Path::new(dir).is_dir() {
-            return Err(CoreError::Internal(format!("工作目录不存在: {dir}")));
+    /// 读一个脚本正文（IDE 打开时用）。
+    pub fn read_script(&self, name: &str) -> CoreResult<String> {
+        read_script_in(&self.workdir_abs()?, name)
+    }
+
+    /// 写一个脚本正文（IDE 保存；覆盖与新建两种形状，新建同样过白名单）。
+    /// 判据是磁盘上真有这份文件：写完**回读比对字节数**，对不上就报错——
+    /// "我调用过 write"不是完成（与用户主动导出那条落盘纪律同源）。
+    ///
+    /// `create_only` = true 时要求目标**不存在**（IDE「新建」按钮）：名字撞上一个已有脚本时
+    /// 必须拒，否则一次点击就把人家手写的脚本静默盖了。
+    pub fn write_script(&self, name: &str, content: &str, create_only: bool) -> CoreResult<u64> {
+        write_script_in(&self.workdir_abs()?, name, content, create_only)
+    }
+
+    /// 删除一个脚本（IDE 的「删除」）。
+    pub fn delete_script(&self, name: &str) -> CoreResult<()> {
+        delete_script_in(&self.workdir_abs()?, name)
+    }
+
+    /// 已配置工作目录的 canonicalize 形态（读写文件的公共前置）。
+    fn workdir_abs(&self) -> CoreResult<PathBuf> {
+        let workdir = self.workdir();
+        if workdir.is_empty() {
+            return Err(CoreError::InvalidInput(
+                "还没选择脚本工作目录（设置 → Hook → 工作目录）".into(),
+            ));
         }
-        Ok(())
+        Path::new(&workdir)
+            .canonicalize()
+            .map_err(|_| CoreError::InvalidInput(format!("工作目录不可访问: {workdir}")))
     }
 
     // ===== 前置检查链（§3） =====
@@ -234,8 +234,7 @@ impl HookService {
             }
             None => (None, None),
         };
-        let runner = self.runner_path();
-        let binding = frida_binding_requirement(&frida_env);
+        let binding = frida_repl_requirement(&frida_env);
         PreflightDto {
             adb_ok: adb.installed,
             adb_hint: if adb.installed {
@@ -248,19 +247,12 @@ impl HookService {
             python_path: python.path.clone(),
             frida_ok: binding.0,
             frida_version: frida_env.frida_version.clone(),
+            frida_tools_version: frida_env.frida_tools_version.clone(),
             frida_hint: binding.1,
             remote_ok,
             remote_hint,
             channel_ok: channel.checked.then_some(channel.ok),
             channel_hint: channel.hint,
-            runner_ok: runner.is_some(),
-            runner_hint: if runner.is_some() {
-                None
-            } else {
-                Some(format!(
-                    "未找到随包 runner（{RUNNER_RESOURCE}）：开发环境请确认 workspace scripts/ 目录"
-                ))
-            },
         }
     }
 
@@ -340,128 +332,12 @@ impl HookService {
         }
     }
 
-    // ===== 会话启动（§6.1/§6.2） =====
-
-    /// 组 CommandSpec 起 runner 任务，返回 taskId（kind="frida"，输出/回放/取消
-    /// 全部复用 TaskService 链路）。停止 = task_cancel，杀 runner 即 detach。
-    pub async fn start_session(&self, args: HookSessionStartArgs) -> CoreResult<String> {
-        let runner = self
-            .runner_path()
-            .ok_or_else(|| CoreError::Internal("未找到 frida runner 脚本".into()))?;
-        let python = self
-            .config
-            .get(KEY_PYTHON_PATH, "")
-            .map(|v| v.trim().to_string())
-            .ok()
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| CoreError::Internal("未配置 Python 解释器（设置 → 工具环境）".into()))?;
-        if !Path::new(&python).is_file() {
-            return Err(CoreError::Internal(format!(
-                "Python 解释器不可用: {python}"
-            )));
-        }
-
-        let script_name = args.script.trim();
-        if !frida::is_safe_js_script_name(script_name) {
-            return Err(CoreError::Internal(format!(
-                "脚本文件名非法（仅字母数字与 _.-、不以 . 或 - 开头、.js 结尾）: {script_name}"
-            )));
-        }
-        let workdir = self.workdir();
-        if workdir.is_empty() {
-            return Err(CoreError::InvalidInput(
-                "还没选择脚本工作目录（设置 → Hook → 工作目录）".into(),
-            ));
-        }
-        let workdir_abs = Path::new(&workdir)
-            .canonicalize()
-            .map_err(|_| CoreError::InvalidInput(format!("工作目录不可访问: {workdir}")))?;
-        let script_abs = workdir_abs.join(script_name);
-        let script_abs = script_abs.canonicalize().map_err(|_| {
-            CoreError::InvalidInput(format!("脚本不存在: {}", script_abs.display()))
-        })?;
-        // canonicalize 解析符号链接后必须仍落在工作目录一层内（符号链接逃逸防线）
-        if script_abs.parent() != Some(workdir_abs.as_path()) || !script_abs.is_file() {
-            return Err(CoreError::InvalidInput(
-                "脚本必须是所选工作目录下的普通 .js 文件（符号链接已拒绝）".into(),
-            ));
-        }
-
-        let usb = args
-            .serial
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let remote = args
-            .remote
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        if usb.is_none() && remote.is_none() {
-            return Err(CoreError::InvalidInput(
-                "还没选择设备或远程端点：USB 模式需要先在列表里选一台设备".into(),
-            ));
-        }
-        if let Some(ep) = remote {
-            frida::parse_remote_endpoint(ep)
-                .map_err(|_| CoreError::Internal(format!("远程端点非法（host:port）: {ep}")))?;
-        }
-        let script_str = script_abs.to_string_lossy().into_owned();
-        let runner_str = runner.to_string_lossy().into_owned();
-        // attach + 目标留空 = 附加设备当前前台（frida -UF 的 -F）。这里不拦也不报错：
-        // 前台是谁由 runner 在设备上问 frida-server，ready 行会把解析出的包名带回来。
-        let target = frida::resolve_target(args.spawn, &args.target);
-        let spec_args = frida::build_runner_args(&runner_str, usb, remote, &target, &script_str)?;
-
-        let spec = CommandSpec {
-            // frida 会话不留宿主临时文件，回收点恒为空
-            cleanup_paths: Vec::new(),
-            executable: python.clone(),
-            args: spec_args,
-            cwd: Some(workdir.clone()),
-            timeout: None, // 会话由用户停止（task_cancel → SIGTERM → runner detach）
-            env_extra: HashMap::new(),
-            hide_window: true, // Windows 防黑窗（§6.2）
-        };
-        // 可读会话名（§5.4）：spawn com.x · hook.js / attach 1234 · hook.js
-        // 可读会话名（§5.4）。前台模式在启动那一刻还不知道是谁，写 frontmost 而不是
-        // 留个空位——任务列表里一个空目标看起来像出了错。
-        let (mode, who) = match &target {
-            frida::FridaTarget::Frontmost => ("attach", "frontmost".to_string()),
-            frida::FridaTarget::Attach(t) => ("attach", t.clone()),
-            frida::FridaTarget::Spawn(t) => ("spawn", t.clone()),
-        };
-        let name = format!("frida {mode} {who} · {script_name}");
-        let task_id = self.tasks.start_with_kind_named("frida", &name, spec)?;
-        tracing::info!(
-            task_id = %task_id,
-            mode,
-            target = %args.target,
-            script = %script_str,
-            usb = ?usb,
-            remote = ?remote,
-            "frida 会话启动"
-        );
-        Ok(task_id)
-    }
-
-    /// runner 路径解析：① 随包资源（打包态）② workspace scripts/（dev 态）。
-    /// 两处都不可得返回 None（preflight 标红）。
-    fn runner_path(&self) -> Option<PathBuf> {
-        if let Ok(resolved) = self
-            .app
-            .path()
-            .resolve(RUNNER_RESOURCE, tauri::path::BaseDirectory::Resource)
-        {
-            if resolved.is_file() {
-                return Some(resolved);
-            }
-        }
-        let dev = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .map(|root| root.join("scripts").join("frida_runner.py"));
-        dev.filter(|p| p.is_file())
-    }
+    // ===== 会话启动 =====
+    //
+    // 这里原来有 `start_session`（组 CommandSpec 起 frida_runner.py 任务）与 `runner_path`。
+    // 结构化终端整体退役后，起会话统一走真终端页里的官方 frida REPL
+    // （前端 `lib/fridaSession` 一处判环境、拼参数，PTY 起进程）——
+    // 本服务不再有任何"起会话"入口，也不再解析 NDJSON 输出。
 }
 
 /// 扫描规则（纯函数，单测覆盖）：一层目录、普通文件、.js 结尾、
@@ -505,6 +381,127 @@ fn scan_js_dir(dir: &Path) -> CoreResult<Vec<JsFileDto>> {
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out.truncate(JS_LIST_CAP);
     Ok(out)
+}
+
+// ===== 工作目录里的脚本读写（IDE 编辑用） =====
+//
+// 与 `save_export` 同一套写法：模块级自由函数、不依赖 AppHandle，路径把关与
+// "写完回读自证"都能脱离 tauri 单测。安全边界三条，与列表/启动同源：
+// 名字白名单（`is_safe_js_script_name`）、canonicalize 后必须在工作目录一层内、
+// 必须/保持普通文件（符号链接一律拒绝——那是写到工作目录外面去的口子）。
+
+/// 名字 → 工作目录内的绝对路径。三道闸：名字白名单、**链接本身**不是符号链接、
+/// canonicalize 后仍是目录一层的普通文件（逃逸防线，与扫描/启动同源）。
+fn resolve_script_path_in(workdir_abs: &Path, name: &str) -> CoreResult<PathBuf> {
+    let name = name.trim();
+    if !frida::is_safe_js_script_name(name) {
+        return Err(CoreError::InvalidInput(format!(
+            "脚本文件名非法（仅字母数字与 _.-、不以 . 或 - 开头、.js 结尾）：{name}"
+        )));
+    }
+    let path = workdir_abs.join(name);
+    // 先看链接本身：`link.js -> hook.js` 若只做 canonicalize 会解析成目录内的合法路径，
+    // 那种"看着在一层里"的链接正是规则要挡的（列表也忽略它们，三处同源）。
+    let meta = std::fs::symlink_metadata(&path)
+        .map_err(|_| CoreError::InvalidInput(format!("脚本不存在: {}", path.display())))?;
+    if meta.file_type().is_symlink() {
+        return Err(CoreError::InvalidInput(
+            "脚本必须是所选工作目录下的普通 .js 文件（符号链接已拒绝）".into(),
+        ));
+    }
+    let path = path
+        .canonicalize()
+        .map_err(|_| CoreError::InvalidInput(format!("脚本不存在: {}", path.display())))?;
+    if path.parent() != Some(workdir_abs) || !path.is_file() {
+        return Err(CoreError::InvalidInput(
+            "脚本必须是所选工作目录下的普通 .js 文件（符号链接已拒绝）".into(),
+        ));
+    }
+    Ok(path)
+}
+
+/// 读一个脚本正文（IDE 打开时用）。
+pub fn read_script_in(workdir_abs: &Path, name: &str) -> CoreResult<String> {
+    let path = resolve_script_path_in(workdir_abs, name)?;
+    let meta = std::fs::metadata(&path)
+        .map_err(|e| CoreError::InvalidInput(format!("读不到脚本 {}: {e}", path.display())))?;
+    if meta.len() as usize > MAX_SCRIPT_BYTES {
+        return Err(CoreError::InvalidInput(format!(
+            "脚本有 {} 字节，超过单次读取上限 {} 字节（这不像 hook 脚本，读不了）",
+            meta.len(),
+            MAX_SCRIPT_BYTES
+        )));
+    }
+    std::fs::read_to_string(&path)
+        .map_err(|e| CoreError::Internal(format!("读取 {} 失败：{e}", path.display())))
+}
+
+/// 写一个脚本正文（IDE 保存；覆盖与新建两种形状，新建同样过白名单）。
+/// 判据是磁盘上真有这份文件：写完**回读比对字节数**，对不上就报错——
+/// "我调用过 write"不是完成（与用户主动导出那条落盘纪律同源）。
+/// `create_only` = true 时目标必须**不存在**（IDE「新建」：名字撞车必须拒，不静默覆盖）。
+pub fn write_script_in(
+    workdir_abs: &Path,
+    name: &str,
+    content: &str,
+    create_only: bool,
+) -> CoreResult<u64> {
+    if content.len() > MAX_SCRIPT_BYTES {
+        return Err(CoreError::InvalidInput(format!(
+            "内容 {} 字节，超过单次写入上限 {} 字节；hook 脚本不该这么大",
+            content.len(),
+            MAX_SCRIPT_BYTES
+        )));
+    }
+    let name = name.trim();
+    if !frida::is_safe_js_script_name(name) {
+        return Err(CoreError::InvalidInput(format!(
+            "脚本文件名非法（仅字母数字与 _.-、不以 . 或 - 开头、.js 结尾）：{name}"
+        )));
+    }
+    let path = workdir_abs.join(name);
+    // 目标已存在且是符号链接 ⇒ 拒绝（否则"写一个链接"就能写到工作目录外面去）。
+    // 用 symlink_metadata 而不是 metadata：要判的就是链接本身，不是它指向谁。
+    // 这一条在 create_only 与非 create_only 下同样成立：链接绝不能成为写入目标。
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            return Err(CoreError::InvalidInput(
+                "目标是符号链接，拒绝写入（工作目录里只写普通文件）".into(),
+            ));
+        }
+        if create_only {
+            return Err(CoreError::InvalidInput(format!(
+                "已经有一个叫 {name} 的脚本了；换个名字，别把它盖了"
+            )));
+        }
+    }
+    std::fs::write(&path, content.as_bytes())
+        .map_err(|e| CoreError::Internal(format!("写入 {} 失败：{e}", path.display())))?;
+    let written = std::fs::metadata(&path)
+        .map_err(|e| {
+            CoreError::Internal(format!(
+                "写完读不回来，不能确认文件真的在（{}）：{e}",
+                path.display()
+            ))
+        })?
+        .len();
+    if written as usize != content.len() {
+        return Err(CoreError::Internal(format!(
+            "文件大小对不上：界面交给我的是 {} 字节，磁盘上是 {written} 字节",
+            content.len()
+        )));
+    }
+    tracing::info!(path = %path.display(), bytes = written, "脚本已保存（内容不进应用日志）");
+    Ok(written)
+}
+
+/// 删除一个脚本（IDE 的「删除」）。只删工作目录里的普通 .js 文件，符号链接拒绝。
+pub fn delete_script_in(workdir_abs: &Path, name: &str) -> CoreResult<()> {
+    let path = resolve_script_path_in(workdir_abs, name)?;
+    std::fs::remove_file(&path)
+        .map_err(|e| CoreError::Internal(format!("删除 {} 失败：{e}", path.display())))?;
+    tracing::info!(path = %path.display(), "脚本已删除（内容不进应用日志）");
+    Ok(())
 }
 
 // ===== 用户主动导出的文本落本机盘（第七十四轮：控制台「保存日志」） =====
@@ -619,26 +616,25 @@ mod tests {
         }
     }
 
-    /// 四种组合都钉住。**只有绑定包在**才放行结构化会话：今天那句"任一即通过"
-    /// 会在这台机器上显示绿灯，然后 runner 报 `ModuleNotFoundError: frida`。
+    /// 四种组合都钉住。判据是 **frida-tools 在不在**——官方 REPL 本体就在它里面；
+    /// 反过来，只装了绑定包的机器前置显示绿灯、一点起会话就收到
+    /// `No module named frida_tools`，那是我们造的假现场。
     #[test]
-    fn frida_requirement_for_structured_session_is_the_python_binding() {
-        // ① 绑定包在（不管 tools 在不在）⇒ 放行，且不给原因
-        assert!(frida_binding_requirement(&frida_env(true, Some("16.5.1"), None)).0);
-        let both = frida_binding_requirement(&frida_env(true, Some("16.5.1"), Some("12.5.3")));
-        assert_eq!((both.0, both.1.as_deref()), (true, None));
+    fn frida_requirement_for_the_repl_is_frida_tools() {
+        // ① tools 在（不管绑定包在不在）⇒ 放行，且不给原因
+        assert!(frida_repl_requirement(&frida_env(true, Some("16.5.1"), Some("12.5.3"))).0);
+        let only_tools = frida_repl_requirement(&frida_env(true, None, Some("12.5.3")));
+        assert_eq!((only_tools.0, only_tools.1.as_deref()), (true, None));
 
-        // ② 只有 frida-tools ⇒ 不许放行，并且要说清"缺的是绑定包"
-        let only_tools = frida_binding_requirement(&frida_env(true, None, Some("12.5.3")));
-        assert!(!only_tools.0, "只有 frida-tools 时结构化会话必须判不通过");
-        let reason = only_tools.1.expect("得给出原因，不能只亮红灯");
+        // ② 只有绑定包 ⇒ 不许放行，并且要说清"缺的是 frida-tools"、给 pip 命令
+        let binding_only = frida_repl_requirement(&frida_env(true, Some("16.5.1"), None));
+        assert!(!binding_only.0, "只有绑定包时官方 REPL 必须判不通过");
+        let reason = binding_only.1.expect("得给出原因，不能只亮红灯");
         assert!(reason.contains("frida-tools"), "{reason}");
-        assert!(reason.contains("绑定包"), "{reason}");
-        // 顺带点明终端那条路没坏——否则她会把整个 frida 能力当成坏了
-        assert!(reason.contains("REPL"), "{reason}");
+        assert!(reason.contains("pip install"), "{reason}");
 
         // ③ 两个都没有 ⇒ 沿用 EnvService 那句原文，不在这里改写它
-        let none = frida_binding_requirement(&frida_env(true, None, None));
+        let none = frida_repl_requirement(&frida_env(true, None, None));
         assert!(!none.0);
         assert_eq!(
             none.1.as_deref(),
@@ -646,7 +642,7 @@ mod tests {
         );
 
         // ④ Python 压根没就绪 ⇒ 也沿用原文那句（此时谈装哪个包是误导）
-        let no_python = frida_binding_requirement(&FridaEnv {
+        let no_python = frida_repl_requirement(&FridaEnv {
             python_ready: false,
             installed: false,
             frida_version: None,
@@ -660,18 +656,28 @@ mod tests {
         );
     }
 
-    /// 这条扫描钉的是**调用点**：结构体的 ok 必须来自那个分开判断，
-    /// 一旦被改回 `frida_env.installed`（任一即通过），这里就会红。
+    /// 这条扫描钉的是**判据来源**：preflight 里 frida_ok 必须来自 `frida_repl_requirement`
+    /// （按 frida-tools 判），一旦被改回 `frida_env.installed`（任一即通过），这里就会红。
     #[test]
-    fn preflight_no_longer_uses_the_any_one_passes_aggregate() {
+    fn preflight_judges_frida_by_the_repl_requirement_not_the_aggregate() {
         let source = include_str!("hook_service.rs");
+        // 找**赋值行**（`frida_ok: binding.0,`），不是结构体里的字段声明
         let at = source
-            .find("frida_ok:")
-            .expect("preflight 里必须还在报这一项");
-        let line = source[at..].lines().next().unwrap_or_default();
+            .find("frida_ok: binding")
+            .expect("preflight 里 frida_ok 必须来自 frida_repl_requirement 的结论");
         assert!(
-            !line.contains("frida_env.installed"),
-            "frida_ok 又用回聚合位了：{line}"
+            !source[at..]
+                .lines()
+                .take(2)
+                .any(|l| l.contains("frida_env.installed")),
+            "frida_ok 又用回聚合位了"
+        );
+        // 另一条腿：不许再出现该判据的**定义**（结构化会话的绑定包判据已退役）。
+        // 针拆成两截拼，免得这句断言自己的字面量把 needle 命中（自匹配会让断言永远红）
+        let retired = ["fn frida_binding", "_requirement"].concat();
+        assert!(
+            !source.contains(&retired),
+            "结构化会话的绑定包判据已退役，不应残留定义"
         );
     }
 
@@ -777,6 +783,101 @@ mod tests {
         }
         let files = scan_js_dir(tmp.path()).unwrap();
         assert_eq!(files.len(), JS_LIST_CAP);
+    }
+
+    /// 读：正常脚本读回原文；名字非法、不存在、符号链接全部拒绝（与列表同源三闸）。
+    #[test]
+    fn read_script_reads_plain_file_and_rejects_escapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        touch(&dir, "hook.js", "send('hi');\n");
+        assert_eq!(read_script_in(&dir, " hook.js ").unwrap(), "send('hi');\n");
+
+        // 名字非法 / 不存在
+        assert!(read_script_in(&dir, "run.sh").is_err());
+        assert!(read_script_in(&dir, "nope.js").is_err());
+
+        // 符号链接：即便指向目录内的合法 .js，也拒绝（canonicalize 后的 parent 不是它自己那条）
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("hook.js"), dir.join("link.js")).unwrap();
+            let err = read_script_in(&dir, "link.js").unwrap_err();
+            assert!(
+                err.to_string().contains("符号链接") || err.to_string().contains("普通"),
+                "{err}"
+            );
+        }
+    }
+
+    /// 写：覆盖原有、新建；写完回读比对（"调用过 write"不是完成）。
+    /// create_only 形状必须拒绝撞名（IDE 新建不许静默覆盖已有脚本）。
+    #[test]
+    fn write_script_covers_and_creates_with_readback_proof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        touch(&dir, "hook.js", "old");
+        let written = write_script_in(&dir, "hook.js", "new content\n", false).unwrap();
+        assert_eq!(written as usize, "new content\n".len());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("hook.js")).unwrap(),
+            "new content\n"
+        );
+        // 新建
+        write_script_in(&dir, "fresh.js", "// fresh", false).unwrap();
+        assert!(dir.join("fresh.js").is_file());
+        // create_only 撞名 ⇒ 拒，且原文件一个字节都没动
+        let err = write_script_in(&dir, "hook.js", "clobber", true).unwrap_err();
+        assert!(err.to_string().contains("换个名字"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("hook.js")).unwrap(),
+            "new content\n"
+        );
+        // create_only 也不许把"改名"当成新建的借口去写链接目标（复用同一条符号链接闸）
+    }
+
+    /// 写：符号链接目标是逃逸口子（写到工作目录外面去），必须拒绝；
+    /// 名字非法/体积超限也要在碰盘之前被拦。
+    #[test]
+    fn write_script_refuses_symlink_target_and_bad_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let outside = tmp.path().join("outside.js");
+        std::fs::write(&outside, "victim").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, dir.join("alias.js")).unwrap();
+            let err = write_script_in(&dir, "alias.js", "hack", false).unwrap_err();
+            assert!(err.to_string().contains("符号链接"), "{err}");
+            // 外面那份必须没被动过
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "victim");
+        }
+        assert!(write_script_in(&dir, "../escape.js", "x", false).is_err());
+        assert!(write_script_in(&dir, "-x.js", "x", false).is_err());
+        assert!(
+            write_script_in(&dir, "ok.js", &"x".repeat(MAX_SCRIPT_BYTES + 1), false).is_err(),
+            "超限必须在写盘前被拒"
+        );
+        assert!(!dir.join("ok.js").exists(), "被拒时不该留下半个文件");
+    }
+
+    /// 删：普通文件删掉；符号链接/非法名字拒绝（不跟随链接删目标）。
+    #[test]
+    fn delete_script_removes_plain_file_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        touch(&dir, "bye.js", "// bye");
+        delete_script_in(&dir, "bye.js").unwrap();
+        assert!(!dir.join("bye.js").exists());
+
+        let outside = tmp.path().join("survivor.js");
+        std::fs::write(&outside, "alive").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, dir.join("alias.js")).unwrap();
+            assert!(delete_script_in(&dir, "alias.js").is_err());
+            assert!(outside.is_file(), "跟随链接删目标是个 bug，不是功能");
+        }
+        assert!(delete_script_in(&dir, "ghost.js").is_err());
     }
     #[test]
     fn channel_probe_only_trusts_its_own_output_shapes() {

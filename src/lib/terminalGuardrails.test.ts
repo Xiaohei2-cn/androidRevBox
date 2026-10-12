@@ -68,12 +68,13 @@ function signaturesOf(rel: string): string[] {
 /**
  * 允许仍在解析/自研渲染的文件 = **FT4 退役队列**。每条都写清它在干什么，
  * 因为下一条测试会检查"它是不是真的还在干"：不改代码就想把条目留着，会红。
+ *
+ * 第九十六轮更新：结构化控制台与它的 AnsiText 渲染器已整体退役（连同
+ * `FridaConsole.tsx` 与 `frida/types.ts` 的过滤/导出解析），所以那两条从白名单删了；
+ * `ansiRuns`（SGR 翻样式）也没了，`ansi.ts` 只剩 stripAnsi 给二进制托管页洗 help 文本。
  */
 const ALLOWED_PARSER_FILES: Record<string, string> = {
-  "src/lib/ansi.ts": "解析本体（stripAnsi / ansiRuns），FT4 退役对象",
-  "src/components/ui/AnsiText.tsx": "自研 ANSI 渲染器，FT4 用真终端替掉它",
-  "src/features/hook/frida/FridaConsole.tsx": "轨道视图目前仍用 AnsiText 渲染 + stripAnsi 复制",
-  "src/features/hook/frida/types.ts": "复制/过滤时洗掉转义（不是渲染），随控制台一起退役",
+  "src/lib/ansi.ts": "解析本体（stripAnsi），服务二进制托管页的 help 文本清洗",
   "src/features/binary/BinaryHosting.tsx": "把 help 文本洗成可读段落，不参与终端渲染",
 };
 

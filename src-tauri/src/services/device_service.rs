@@ -20,10 +20,10 @@ use agent_protocol::method::{
     PACKAGE_UNINSTALL, PROCESS_BY_PORT, PROCESS_KILL, PROCESS_PORTS, PROCESS_PROC_READ,
 };
 use agent_protocol::{
-    ActivityForceStopParams, ActivityLaunchParams, DeviceInfoParams, DeviceInfoResult,
-    DeviceRootCheckParams, DeviceRootCheckResult, FileKind, FilesystemChmodParams,
-    FilesystemChmodResult, FilesystemListParams, FilesystemListResult, FilesystemMkdirParams,
-    FilesystemMkdirResult, FilesystemPreviewParams, FilesystemPreviewResult,
+    ActivityForceStopParams, ActivityLaunchParams, DEFAULT_PREVIEW_BYTES, DeviceInfoParams,
+    DeviceInfoResult, DeviceRootCheckParams, DeviceRootCheckResult, FileKind,
+    FilesystemChmodParams, FilesystemChmodResult, FilesystemListParams, FilesystemListResult,
+    FilesystemMkdirParams, FilesystemMkdirResult, FilesystemPreviewParams, FilesystemPreviewResult,
     FilesystemRemoveParams, FilesystemRemoveResult, FilesystemRenameParams, FilesystemRenameResult,
     FilesystemStatParams, FilesystemStatResult, FridaServerStartParams, FridaServerStartResult,
     FridaServerStatusParams, FridaServerStatusResult, FridaServerStopParams, FridaServerStopResult,
@@ -31,12 +31,12 @@ use agent_protocol::{
     HostedListParams, HostedListResult, HostedProbeParams, HostedProbeResult, HostedRunRecord,
     HostedRunState, HostedStartParams, HostedStartResult, HostedStatusParams, HostedStatusResult,
     HostedStopParams, HostedStopResult, HostedWriteParams, HostedWriteResult, KillSignal,
-    ListeningPort, PackageListParams, PackageListResult, PackageNativeLibDirParams,
-    PackageNativeLibDirResult, PackageScope, PackageUninstallParams, PackageUninstallResult,
-    PackageWriteResult, PortHoldingProcess, PreviewEncoding, ProcFile, ProcessByPortParams,
-    ProcessByPortResult, ProcessKillParams, ProcessKillResult, ProcessPortsParams,
-    ProcessPortsResult, ProcessProcReadParams, ProcessProcReadResult, ReplaceNativeLibraryParams,
-    ReplaceNativeLibraryResult, SO_STAGED_ROOT, SocketFamily,
+    ListeningPort, MAX_PREVIEW_BYTES, PackageListParams, PackageListResult,
+    PackageNativeLibDirParams, PackageNativeLibDirResult, PackageScope, PackageUninstallParams,
+    PackageUninstallResult, PackageWriteResult, PortHoldingProcess, PreviewEncoding, ProcFile,
+    ProcessByPortParams, ProcessByPortResult, ProcessKillParams, ProcessKillResult,
+    ProcessPortsParams, ProcessPortsResult, ProcessProcReadParams, ProcessProcReadResult,
+    ReplaceNativeLibraryParams, ReplaceNativeLibraryResult, SO_STAGED_ROOT, SocketFamily,
 };
 
 use async_trait::async_trait;
@@ -53,6 +53,7 @@ use crate::models::agent::AndroidBackendSource;
 use crate::services::android_backend::{CapabilityRouter, OperationKind, RouteError};
 use crate::services::apk_bundle;
 use crate::services::config_service::ConfigService;
+use crate::services::fs_policy;
 use crate::services::process_service::CommandSpec;
 use crate::services::task_service::TaskService;
 
@@ -482,6 +483,75 @@ fn pick_already_running(
     our_running_pid.map(|pid| (pid, false))
 }
 
+/// 一次目录列举的结果：条目 + 「这份清单是不是这个目录的全部」。
+///
+/// 为什么必须把 `unreadable`/`truncated` 一路带到界面：Agent 以 shell 身份跑，`/data` 这类目录
+/// 它连 `opendir` 都进不去，此时**条目是空的、原因不是空的**。只回一个数组，界面就必然把
+/// "读不到"画成"这个目录是空的"——用户报的"/data 下面是空的"就是这么来的（§3.7 同一条纪律）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileListing {
+    pub path: String,
+    pub entries: Vec<FileEntry>,
+    /// 设备明确说"读不到"的条目/目录（这里非空 ⇒ 空列表不等于空目录）
+    pub unreadable: Vec<String>,
+    /// 设备端为了自保护截断了结果：这份不是全貌
+    pub truncated: bool,
+    /// `agent` = 设备端 typed 通道（shell 身份）；`root` = 桌面代发 `su -c`
+    pub source: String,
+}
+
+/// `device_binaries` 的界面视图：清单 + 「这份清单是不是目录全貌」。
+///
+/// 为什么要把这两个信号带到界面：设备端扫描有条数上限（Agent 侧 2000 个 ELF），
+/// 也可能有个别文件读不出内容。那种时候清单**不是**目录的全部，界面就不能再说
+/// "这台手机上已经没有这个文件了"。本机按设备号存的备注/启动参数是**用户的数据**，
+/// 拿一份不完整的清单去删它们就是毁数据（用户要的是"这台手机自己把文件删了才删记录"）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostedListView {
+    pub binaries: Vec<adb::HostedBinary>,
+    /// 设备端扫到条数上限就断了：清单不完整
+    pub truncated: bool,
+    /// 扫到但读不出来的条目：清单同样不完整
+    pub unreadable: Vec<String>,
+    /// `agent` = 设备端逐文件读头（字段最全）；`adb` = 回退腿（依赖设备上有 `file` 命令）
+    pub source: String,
+}
+
+/// 交互终端那次启动的**认领结果**（不是启动结果：进程早已起来，这里只补登记）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostedClaimView {
+    /// 已写进设备侧托管运行表
+    pub claimed: bool,
+    /// 认领到的 pid（claimed=false 时为 None）
+    pub pid: Option<u32>,
+    /// 没登记上的原因：设备侧的拒绝理由，或"根本没出现新进程"
+    pub detail: Option<String>,
+}
+
+/// 终端起进程 = 本地 adb → adbd → `sh` → exec，落地要 0.3~1s（首连更久），
+/// 而设备侧认领窗口是 120s，宽裕得很。8 次 × 600ms ≈ 5s 的耐心足够覆盖
+/// adb 建连 + Agent `hosted.list` 扫目录，又不至于让用户干等。
+const CLAIM_ATTEMPTS: u32 = 8;
+const CLAIM_INTERVAL: Duration = Duration::from_millis(600);
+
+/// 本次启动之后**新出现**的同名 pid，最新的排前面。
+///
+/// 为什么要 `known` 过滤：启动前就已经在跑的同名进程不是这次起的，认领它等于
+/// 把别人的进程登记成自己的，之后「终止」就会去杀它。
+/// 为什么按 pid 倒序：Android 的 pid 递增分配，数最大的那个最可能是刚 exec 出来的。
+fn claim_candidate_pids(procs: &[adb::ExternalProcView], known: &[u32]) -> Vec<u32> {
+    let mut pids: Vec<u32> = procs
+        .iter()
+        .map(|proc| proc.pid)
+        .filter(|pid| *pid != 0 && !known.contains(pid))
+        .collect();
+    pids.sort_unstable_by(|a, b| b.cmp(a));
+    pids
+}
+
 impl DeviceService {
     pub fn new(
         runner: Arc<dyn AdbRunner>,
@@ -524,9 +594,20 @@ impl DeviceService {
         self.run_adb_with(args, LIST_TIMEOUT).await
     }
 
-    /// 带自定义超时的 adb 短命令（大文件 push 等慢操作用长档）
+    /// 带自定义超时的 adb 短命令（大文件 push 等慢操作用长档）。
+    ///
+    /// 这里也是"设备已经不在这台 adb 眼前"的统一出口：adb 自己的 stderr 就是最准的事实，
+    /// 拦下来换成 `DEVICE_OFFLINE`，界面才谈得上"切回在线的那台"，而不是顶着一句内部错误。
+    /// 只拦这一类措辞（见 `adb::device_missing_hint`），别把 `/system/bin/sh: x: not found`
+    /// 那种"命令/文件不存在"也误判成设备掉了。
     async fn run_adb_with(&self, args: &[String], timeout: Duration) -> CoreResult<AdbRunOutput> {
-        self.android.legacy().run(args, timeout).await
+        let out = self.android.legacy().run(args, timeout).await?;
+        if out.exit_code != Some(0) {
+            if let Some(hint) = adb::device_missing_hint(&out.stderr) {
+                return Err(CoreError::DeviceOffline(hint));
+            }
+        }
+        Ok(out)
     }
 
     async fn run_transport_adb(&self, args: &[String]) -> CoreResult<AdbRunOutput> {
@@ -620,7 +701,22 @@ impl DeviceService {
     /// 之后设备上线即自动接回 Agent，所以 agent_unavailable 这个触发源本身也缩掉了。
     /// 顺带消失的一个坑：Legacy 对符号链接目录只吐链接自身那一行，旧解析把名字读成 `sdcard`，
     /// 界面拼一层就成了不存在的 `/sdcard/sdcard`（看着像程序坏了，其实是假条目）。
-    pub async fn list_files(&self, serial: &str, path: &str) -> CoreResult<Vec<FileEntry>> {
+    pub async fn list_files(
+        &self,
+        serial: &str,
+        path: &str,
+        root: bool,
+    ) -> CoreResult<FileListing> {
+        if root {
+            // root 腿失败就是失败（`cd` 进不去会直接报错），不会给出"空目录"这种半截结论
+            return Ok(FileListing {
+                path: path.to_string(),
+                entries: self.list_files_rooted(serial, path).await?,
+                unreadable: Vec::new(),
+                truncated: false,
+                source: "root".to_string(),
+            });
+        }
         // 空目录和「读不到」必须是两件事（§3.7）：Agent 不在就给一句能照着做的话，不给空列表
         self.require_agent_route(serial, FILESYSTEM_LIST)?;
         let result = self
@@ -647,7 +743,13 @@ impl DeviceService {
                 "filesystem.list 有不可读或被截断的条目：空/短列表不等于空目录"
             );
         }
-        Ok(map_agent_file_entries(&result))
+        Ok(FileListing {
+            path: result.path.clone(),
+            entries: map_agent_file_entries(&result),
+            unreadable: result.unreadable.clone(),
+            truncated: result.truncated,
+            source: "agent".to_string(),
+        })
     }
 
     /// 单路径元数据（Agent only）：Legacy 侧没有等价能力（`ls -l` 文本不算），
@@ -657,7 +759,11 @@ impl DeviceService {
         serial: &str,
         path: &str,
         follow_symlink: bool,
+        root: bool,
     ) -> CoreResult<FilesystemStatResult> {
+        if root {
+            return self.file_stat_rooted(serial, path, follow_symlink).await;
+        }
         let route = self
             .android
             .select(serial, FILESYSTEM_STAT, OperationKind::ReadOnlyIdempotent)
@@ -682,7 +788,13 @@ impl DeviceService {
         path: &str,
         max_bytes: Option<u32>,
         from_end: bool,
+        root: bool,
     ) -> CoreResult<FilesystemPreviewResult> {
+        if root {
+            return self
+                .file_preview_rooted(serial, path, max_bytes, from_end)
+                .await;
+        }
         let route = self
             .android
             .select(
@@ -829,13 +941,15 @@ impl DeviceService {
     /// 列出托管目录下的 ELF 可执行文件。AR7.2 起默认走 Agent `hosted.list`：
     /// ELF 由文件头 magic 判定（不再依赖设备端有没有 `file` 命令），权限/大小/uid/mtime
     /// 一次取回；Legacy 的 `ls -l` + `file` 两串 shell 保留为回退腿（删除条件见能力表）。
-    pub async fn hosted_binaries(&self, serial: &str) -> CoreResult<Vec<adb::HostedBinary>> {
+    pub async fn hosted_binaries(&self, serial: &str) -> CoreResult<HostedListView> {
         let route = self
             .android
             .select(serial, HOSTED_LIST, OperationKind::ReadOnlyIdempotent)
             .map_err(CapabilityRouter::core_error)?;
         if route.backend == AndroidBackendSource::LegacyAdb {
-            return self.hosted_binaries_legacy(serial).await;
+            return Ok(legacy_hosted_listing(
+                self.hosted_binaries_legacy(serial).await?,
+            ));
         }
         let params = HostedListParams {};
         let agent_request = self.android.agent().request::<_, HostedListResult>(
@@ -866,7 +980,12 @@ impl DeviceService {
                 if let Some(Ok(legacy)) = legacy_result {
                     log_hosted_list_shadow_diff(serial, &binaries, &legacy);
                 }
-                Ok(binaries)
+                Ok(HostedListView {
+                    binaries,
+                    truncated: result.truncated,
+                    unreadable: result.unreadable,
+                    source: "agent".to_string(),
+                })
             }
             Err(error) => {
                 let fallback = self
@@ -881,8 +1000,10 @@ impl DeviceService {
                 debug_assert_eq!(fallback.backend, AndroidBackendSource::LegacyAdb);
                 tracing::warn!(serial, "hosted.list 回退 Legacy ADB");
                 match legacy_result {
-                    Some(result) => result,
-                    None => self.hosted_binaries_legacy(serial).await,
+                    Some(result) => result.map(legacy_hosted_listing),
+                    None => Ok(legacy_hosted_listing(
+                        self.hosted_binaries_legacy(serial).await?,
+                    )),
                 }
             }
         }
@@ -1776,6 +1897,68 @@ impl DeviceService {
         }
     }
 
+    /// 把「交互终端刚起的那个进程」认领进设备侧托管运行表。
+    ///
+    /// 为什么需要这条腿：托管页的启动入口现在是「终端启动」，那次 exec 走的是
+    /// `adb shell -tt`，**不经过 Agent**，运行表里自然没有记录。于是界面只能说
+    /// "它在跑，可它不在托管表里"，用户看到的是"明明是你起的，你却不认账"。
+    /// 桌面在这里只负责交出候选 pid（本次启动之后新出现的同名进程），
+    /// 认领成不成立仍由设备侧按 /proc 实证判（comm/argv0/exe/属主/启动时刻），
+    /// 桌面说了不算——认错一个 pid 等于把别人的进程登记成自己的来杀。
+    ///
+    /// 失败**不报成错误**：进程确实在跑，只是这张表没记上。界面据此改口说
+    /// "没登记上"，而不是假装一切正常，也不是把成功启动说成失败。
+    pub async fn hosted_claim_terminal(
+        &self,
+        serial: &str,
+        name: &str,
+        args: &[String],
+        root: bool,
+        known_pids: &[u32],
+    ) -> CoreResult<HostedClaimView> {
+        if let Err(error) = self.require_agent_write_route(serial, HOSTED_ADOPT) {
+            return Ok(HostedClaimView {
+                claimed: false,
+                pid: None,
+                detail: Some(error.to_string()),
+            });
+        }
+        let mut refusal: Option<String> = None;
+        for attempt in 0..CLAIM_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(CLAIM_INTERVAL).await;
+            }
+            let listing = self.hosted_binaries(serial).await?;
+            let binaries = listing.binaries;
+            let candidates = match binaries.iter().find(|binary| binary.name == name) {
+                Some(binary) => claim_candidate_pids(&binary.external_procs, known_pids),
+                // 文件不在托管目录里（或这一轮还没扫到）：下一轮再看
+                None => Vec::new(),
+            };
+            for pid in candidates {
+                match self.hosted_adopt(serial, name, pid, args, root).await {
+                    None => {
+                        return Ok(HostedClaimView {
+                            claimed: true,
+                            pid: Some(pid),
+                            detail: None,
+                        });
+                    }
+                    Some(reason) => refusal = Some(reason),
+                }
+            }
+        }
+        Ok(HostedClaimView {
+            claimed: false,
+            pid: None,
+            detail: Some(refusal.unwrap_or_else(|| {
+                format!(
+                    "设备端这几秒没有新出现的 {name} 进程：它可能起来就退了（看右侧那块屏的输出）"
+                )
+            })),
+        })
+    }
+
     /// 读托管启动日志尾部（截 2KB 防日志爆炸）。
     ///
     /// AR7.1：Agent 可用时走 `filesystem.preview{from_end:true}`——设备端 seek 后只读
@@ -2509,11 +2692,432 @@ impl DeviceService {
             .await
     }
 
-    /// 设备侧新建目录（Agent only）。
+    /// Root (su) 的**只读**腿：`adb shell su -c '...'`，回传 stdout。
     ///
-    /// 写操作一律不给 Legacy 回退腿：桌面端拼 `adb shell mkdir` 既没有范围守卫也没有复核，
-    /// 与 Agent typed 不是同一种东西（D035/D038 的口径）。Agent 不在就明确失败。
-    pub async fn fs_mkdir(&self, serial: &str, path: &str) -> CoreResult<FilesystemMkdirResult> {
+    /// 为什么读也要 root：`/data` 这类目录 shell 连 `opendir` 的权限都没有，Agent 只能如实回
+    /// "读不到"——而界面上看起来就是"这个目录是空的"（用户报的就是这个）。既然这一页默认给了
+    /// root，就要连读一起给，否则那个开关只是半个功能。
+    /// **读不受写侧那两棵树的限制**：逆向分析要看得到东西，管住的是"改"，不是"看"。
+    async fn fs_read_rooted(&self, serial: &str, inner: &str) -> CoreResult<String> {
+        let args = adb::build_args(Some(serial), &adb::cmd_shell(&adb::su_c(inner)));
+        let out = self.run_adb_with(&args, LIST_TIMEOUT).await?;
+        if out.exit_code == Some(0) {
+            return Ok(out.stdout);
+        }
+        Err(CoreError::Internal(format!(
+            "root 读取失败（退出码 {:?}）：{}",
+            out.exit_code,
+            out.stderr.trim().lines().next().unwrap_or("").trim()
+        )))
+    }
+
+    /// 一条命令拿全一个路径的事实：`stat` 字段 + 当前身份能否读 + 符号链接目标。
+    ///
+    /// 合成一条而不是三次往返：这一页每翻一个目录就要问一次，拆开就是三倍延迟。
+    async fn stat_rooted(
+        &self,
+        serial: &str,
+        path: &str,
+        follow_symlink: bool,
+    ) -> CoreResult<RootedStat> {
+        let q = adb::sh_quote(path);
+        let flag = if follow_symlink { "-L " } else { "" };
+        // 末尾多问一句 `readlink -f`：协议里 `path` 的语义是"符号链接已解析后的真实路径"
+        // （Agent 腿就是 canonicalize 过的），root 腿不报同一个东西，界面就会出现
+        // "同一行换个身份显示成两个路径"。`-L` 时 stat 已跟链，这里仍要拿真实路径给用户看。
+        let fmt = agent_protocol::STAT_ROOT_FORMAT;
+        let inner = format!(
+            "stat {flag}-c '{fmt}' {q}; if test -r {q}; then echo @R; else echo @N; fi; \
+             if test -L {q}; then echo @L; readlink {q}; fi; echo @P; readlink -f {q} 2>/dev/null || echo {q}",
+            flag = flag,
+        );
+        let text = self.fs_read_rooted(serial, &inner).await?;
+        parse_rooted_stat(&text).ok_or_else(|| {
+            CoreError::Internal(format!(
+                "设备上的 stat 输出解不出来，无法确认 {path} 是什么：{text}"
+            ))
+        })
+    }
+
+    /// Root 腿列目录：`cd 目录 && ls -lA -- .`
+    ///
+    /// 为什么绕一步 `cd` 而不是直接 `ls -lA <目录>`：`/sdcard` 这类**符号链接目录**，
+    /// 直接列会只列出链接自身那一行，旧 Legacy 腿就是这么造出 `/sdcard/sdcard` 假条目的
+    /// （第七十一轮删那条腿的原因之一）。`cd` 进去以后列的是真目录。
+    /// `-A` 含隐藏项但不含 `.`/`..`，与 Agent 的 `include_hidden: true` 同口径。
+    async fn list_files_rooted(&self, serial: &str, path: &str) -> CoreResult<Vec<FileEntry>> {
+        // 一条命令里把三种情况问清：是目录才列；存在但不是目录（点了个指向文件的链接、或普通文件）
+        // 回 @NOTDIR；压根没有回 @NOENT。不这么做的话 `cd` 的报错会被包成
+        // "root 读取失败（退出码 …）"，用户分不出"是我点错了"还是"设备出事了"。
+        let q = adb::sh_quote(path);
+        let inner = format!(
+            "if test -d {q}; then cd -- {q} && ls -lA -- .; \
+             elif test -e {q}; then echo @NOTDIR; else echo @NOENT; fi"
+        );
+        let text = self.fs_read_rooted(serial, &inner).await?;
+        match text.trim() {
+            "@NOTDIR" => {
+                return Err(CoreError::InvalidInput(format!(
+                    "这不是一个目录（普通文件，或指向文件的链接）：{path}"
+                )));
+            }
+            "@NOENT" => {
+                return Err(CoreError::NotFound(format!(
+                    "设备上已经没有这个路径（链接可能已失效）：{path}"
+                )));
+            }
+            _ => {}
+        }
+        let mut entries: Vec<FileEntry> = text
+            .lines()
+            .filter_map(adb::parse_ls_long)
+            .filter(|entry| entry.name != "." && entry.name != "..")
+            .collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
+    }
+
+    async fn file_stat_rooted(
+        &self,
+        serial: &str,
+        path: &str,
+        follow_symlink: bool,
+    ) -> CoreResult<FilesystemStatResult> {
+        let stat = self.stat_rooted(serial, path, follow_symlink).await?;
+        let kind = stat.fields.kind();
+        let name = path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(path)
+            .to_string();
+        // 协议里 `path` = "符号链接已解析后的真实路径"（Agent 腿就是 canonicalize 过的），
+        // root 腿不报同一个东西，用户换身份就会看到"同一行两个路径"
+        Ok(FilesystemStatResult {
+            requested_path: path.to_string(),
+            path: stat
+                .resolved_path
+                .clone()
+                .unwrap_or_else(|| path.to_string()),
+            stat: agent_protocol::FileStat {
+                name,
+                kind,
+                mode: stat.fields.mode,
+                mode_text: agent_protocol::render_mode_text(kind, stat.fields.mode),
+                uid: stat.fields.uid,
+                gid: stat.fields.gid,
+                size: stat.fields.size,
+                mtime_unix: stat.fields.mtime_unix,
+                symlink_target: stat.symlink_target,
+                readable: stat.readable,
+            },
+        })
+    }
+
+    /// Root 腿的受限预览：在设备上取窗口内的字节并转成十六进制回传。
+    ///
+    /// 为什么先转 hex：桌面这条 adb 通道的 stdout 是 `String`，扛不住任意字节；
+    /// 而 `adb exec-out` 不在这条 runner 的能力里。`od -An -tx1 -v` 全是 ASCII，
+    /// `-v` 关掉"重复行折叠"（否则一大片 00 会被它合成一行，读回来的内容就是假的）。
+    /// 是文本还是 hex 由**桌面**判，判据与 Agent 那条一模一样（合法 UTF-8 且不含 NUL 才算文本）。
+    async fn file_preview_rooted(
+        &self,
+        serial: &str,
+        path: &str,
+        max_bytes: Option<u32>,
+        from_end: bool,
+    ) -> CoreResult<FilesystemPreviewResult> {
+        let stat = self.stat_rooted(serial, path, true).await?;
+        if stat.fields.kind() == agent_protocol::FileKind::Dir {
+            return Err(CoreError::InvalidInput(format!("目录没有预览：{path}")));
+        }
+        let limit = max_bytes
+            .unwrap_or(DEFAULT_PREVIEW_BYTES)
+            .min(MAX_PREVIEW_BYTES);
+        let size = stat.fields.size;
+        let offset = if from_end {
+            size.saturating_sub(u64::from(limit))
+        } else {
+            0
+        };
+        let count = size.saturating_sub(offset).min(u64::from(limit));
+        let q = adb::sh_quote(path);
+        let bytes = if count == 0 {
+            Vec::new()
+        } else {
+            let inner = format!(
+                "test -r {q} && tail -c +{} -- {q} | head -c {} | od -An -tx1 -v",
+                offset + 1,
+                count
+            );
+            let text = self.fs_read_rooted(serial, &inner).await?;
+            adb::parse_hex_dump(&text)
+        };
+        let returned_bytes = u32::try_from(bytes.len()).unwrap_or(MAX_PREVIEW_BYTES);
+        let (encoding, text, hex) = match std::str::from_utf8(&bytes) {
+            Ok(text) if !bytes.contains(&0) => {
+                (PreviewEncoding::Utf8, Some(text.to_string()), None)
+            }
+            _ => (
+                PreviewEncoding::Hex,
+                None,
+                Some(
+                    bytes
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                ),
+            ),
+        };
+        Ok(FilesystemPreviewResult {
+            path: path.to_string(),
+            size,
+            offset,
+            returned_bytes,
+            encoding,
+            text,
+            hex,
+            truncated: size > u64::from(returned_bytes),
+            // root 腿没有"夹上限"这一步的说法：窗口是按 size 算出来的，直说身份就好
+            detail: Some("root-branch".to_string()),
+        })
+    }
+
+    /// Root (su) 腿：以 root 执行**一条**已经过路径守卫的设备命令，并回传 stdout。
+    ///
+    /// 与 D035/D038 禁掉的那种"静默回退 `adb shell mkdir`"不是一回事，三点差别都在这里：
+    /// ① 只有用户开了 Root (su) 才走这条路（默认开，但那是他给这台设备的授权，不是我们偷偷降级）；
+    /// ② 目标路径先过 `fs_policy::check_writable`——只允许 `/data/local/tmp` 与 `/sdcard` 两棵树，
+    ///    root + 任意路径等于把这个工具变成"随手删 /data/data"，那条绝对不能开；
+    /// ③ 干完必须**回设备复核**（`fs_probe`），复核读不到就不说"成功了"。
+    /// 命令里的每个路径都单独做 POSIX 单引号引用，外面再整体引用一层交给 `su -c`，
+    /// 文件名里的空格/引号/分号都不会变成第二条命令。
+    async fn fs_run_rooted(&self, serial: &str, inner: &str) -> CoreResult<String> {
+        let args = adb::build_args(Some(serial), &adb::cmd_shell(&adb::su_c(inner)));
+        let out = self.run_adb_with(&args, WRITE_TIMEOUT).await?;
+        if out.exit_code == Some(0) {
+            return Ok(out.stdout.trim().to_string());
+        }
+        Err(CoreError::Internal(format!(
+            "root 执行失败（退出码 {:?}）：{}",
+            out.exit_code,
+            out.stderr.trim().lines().next().unwrap_or("").trim()
+        )))
+    }
+
+    /// 复核一次路径现状。`Ok(None)` = 设备上确实没有这个条目；
+    /// 其它错误原样抛出去——**"本工具读不到"绝不能当成"设备上不存在"**，
+    /// 否则一次权限问题就会被说成"删除成功"。
+    async fn fs_probe(
+        &self,
+        serial: &str,
+        path: &str,
+        root: bool,
+    ) -> CoreResult<Option<FilesystemStatResult>> {
+        // 复核要用**干活的那个身份**：root 建的 0700 目录 shell 连 stat 都可能读不到，
+        // 拿 shell 的读法去核 root 干的活，会把一次成功说成失败。
+        // 非 root 腿仍走 Agent 只读通道（Agent 不在就直说"去设备页安装并连接"，
+        // 不拿一次注定读不到的复核冒充成功）。
+        if !root {
+            self.require_agent_route(serial, FILESYSTEM_STAT)?;
+        }
+        match self.file_stat(serial, path, false, root).await {
+            Ok(result) => Ok(Some(result)),
+            Err(error) if error.code() == "NOT_FOUND" => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn fs_mkdir_rooted(
+        &self,
+        serial: &str,
+        target: &str,
+    ) -> CoreResult<FilesystemMkdirResult> {
+        let before = self.fs_probe(serial, target, true).await?;
+        self.fs_run_rooted(serial, &format!("mkdir -- {}", adb::sh_quote(target)))
+            .await?;
+        let after = self.fs_probe(serial, target, true).await?.ok_or_else(|| {
+            CoreError::Internal(format!("root 说建好了，设备上却查不到这个目录：{target}"))
+        })?;
+        audit_filesystem_write(
+            serial,
+            FILESYSTEM_MKDIR,
+            target,
+            &Ok::<String, CoreError>(format!("root created={}", before.is_none())),
+        );
+        Ok(FilesystemMkdirResult {
+            path: target.to_string(),
+            created: before.is_none(),
+            mode: after.stat.mode,
+            mode_text: after.stat.mode_text.clone(),
+        })
+    }
+
+    async fn fs_rename_rooted(
+        &self,
+        serial: &str,
+        from: &str,
+        to: &str,
+    ) -> CoreResult<FilesystemRenameResult> {
+        let before = self
+            .fs_probe(serial, from, true)
+            .await?
+            .ok_or_else(|| CoreError::NotFound(format!("要改名的东西不在设备上：{from}")))?;
+        if from == to {
+            return Ok(FilesystemRenameResult {
+                from: from.to_string(),
+                to: to.to_string(),
+                kind: before.stat.kind,
+                mode: before.stat.mode,
+                mode_text: before.stat.mode_text,
+                no_op: true,
+            });
+        }
+        // Agent 的语义是"目标已存在就拒，不覆盖"：root 腿不能悄悄变成覆盖式移动
+        if self.fs_probe(serial, to, true).await?.is_some() {
+            return Err(CoreError::Conflict(format!("目标已经存在，不会覆盖：{to}")));
+        }
+        self.fs_run_rooted(
+            serial,
+            &format!("mv -- {} {}", adb::sh_quote(from), adb::sh_quote(to)),
+        )
+        .await?;
+        let after = self
+            .fs_probe(serial, to, true)
+            .await?
+            .ok_or_else(|| CoreError::Internal(format!("root 说改好了，目标却查不到：{to}")))?;
+        if self.fs_probe(serial, from, true).await?.is_some() {
+            return Err(CoreError::Internal(format!(
+                "目标已出现但原路径还在设备上（移动没走完）：{from} -> {to}"
+            )));
+        }
+        audit_filesystem_write(
+            serial,
+            FILESYSTEM_RENAME,
+            from,
+            &Ok::<String, CoreError>(format!("root -> {to}")),
+        );
+        Ok(FilesystemRenameResult {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: after.stat.kind,
+            mode: after.stat.mode,
+            mode_text: after.stat.mode_text,
+            no_op: false,
+        })
+    }
+
+    async fn fs_remove_rooted(
+        &self,
+        serial: &str,
+        target: &str,
+        recursive: bool,
+    ) -> CoreResult<FilesystemRemoveResult> {
+        let before = match self.fs_probe(serial, target, true).await? {
+            Some(stat) => stat,
+            // 已经没有就是达成了（幂等），不去伪造一次删除
+            None => {
+                return Ok(FilesystemRemoveResult {
+                    path: target.to_string(),
+                    removed: true,
+                    was_dir: false,
+                    was_recursive: recursive,
+                    freed_bytes: 0,
+                });
+            }
+        };
+        let was_dir = before.stat.kind == FileKind::Dir;
+        if was_dir && !recursive {
+            // 与 Agent 同一判据：空目录可以直接删，非空必须显式 recursive
+            let listing = self
+                .fs_run_rooted(serial, &format!("ls -A -- {}", adb::sh_quote(target)))
+                .await?;
+            if !listing.is_empty() {
+                return Err(CoreError::Conflict(format!(
+                    "{target} 是目录且非空：删除要显式选择递归"
+                )));
+            }
+        }
+        self.fs_run_rooted(serial, &format!("rm -rf -- {}", adb::sh_quote(target)))
+            .await?;
+        if self.fs_probe(serial, target, true).await?.is_some() {
+            return Err(CoreError::Internal(format!(
+                "已发信号但设备上还在：{target}（复核没通过，不算删除成功）"
+            )));
+        }
+        audit_filesystem_write(
+            serial,
+            FILESYSTEM_REMOVE,
+            target,
+            &Ok::<String, CoreError>("root removed=true".to_string()),
+        );
+        Ok(FilesystemRemoveResult {
+            path: target.to_string(),
+            removed: true,
+            was_dir,
+            was_recursive: recursive,
+            // 目录的递归总量这一腿没有逐字节累计（要复核总数得再走一遍全树），
+            // 所以宁可信报 0，界面遇到 0 就只说"设备上已不存在"，不说"释放了多少"
+            freed_bytes: if was_dir { 0 } else { before.stat.size as u64 },
+        })
+    }
+
+    async fn fs_chmod_rooted(
+        &self,
+        serial: &str,
+        target: &str,
+        mode: u32,
+    ) -> CoreResult<FilesystemChmodResult> {
+        let before = self
+            .fs_probe(serial, target, true)
+            .await?
+            .ok_or_else(|| CoreError::NotFound(format!("要改权限的东西不在设备上：{target}")))?;
+        self.fs_run_rooted(
+            serial,
+            &format!("chmod {mode:o} -- {}", adb::sh_quote(target)),
+        )
+        .await?;
+        let after = self
+            .fs_probe(serial, target, true)
+            .await?
+            .ok_or_else(|| CoreError::Internal(format!("改完之后再查就没有了：{target}")))?;
+        audit_filesystem_write(
+            serial,
+            FILESYSTEM_CHMOD,
+            target,
+            &Ok::<String, CoreError>(format!(
+                "root mode={:o} verified={}",
+                after.stat.mode,
+                after.stat.mode == mode
+            )),
+        );
+        Ok(FilesystemChmodResult {
+            path: target.to_string(),
+            verified: after.stat.mode == mode,
+            mode: after.stat.mode,
+            mode_text: after.stat.mode_text,
+            previous_mode: before.stat.mode,
+            previous_mode_text: before.stat.mode_text,
+        })
+    }
+
+    /// 设备侧新建目录。两条腿：Agent（shell 身份）与 **Root (su)**（用户给这台设备的授权）。
+    ///
+    /// D035/D038 禁的是"静默回退 `adb shell mkdir`"——既没有范围守卫也没有复核。
+    /// root 腿站得住的三点差别见 `fs_run_rooted`：显式选择、先过 `fs_policy` 白名单、
+    /// 干完回设备复核。Agent 不在又没开 root 时依旧明确失败，不偷偷降级。
+    pub async fn fs_mkdir(
+        &self,
+        serial: &str,
+        path: &str,
+        root: bool,
+    ) -> CoreResult<FilesystemMkdirResult> {
+        let target = fs_policy::check_writable(path)
+            .map_err(|denied| CoreError::InvalidInput(denied.message(path)))?;
+        if root {
+            return self.fs_mkdir_rooted(serial, &target).await;
+        }
         self.require_agent_write_route(serial, FILESYSTEM_MKDIR)?;
         let result = self
             .android
@@ -2522,7 +3126,7 @@ impl DeviceService {
                 serial,
                 FILESYSTEM_MKDIR,
                 &FilesystemMkdirParams {
-                    path: path.to_owned(),
+                    path: target.clone(),
                 },
                 WRITE_TIMEOUT,
             )
@@ -2531,7 +3135,7 @@ impl DeviceService {
         audit_filesystem_write(
             serial,
             FILESYSTEM_MKDIR,
-            path,
+            &target,
             &result.as_ref().map(|r| format!("created={}", r.created)),
         );
         result
@@ -2543,7 +3147,16 @@ impl DeviceService {
         serial: &str,
         from: &str,
         to: &str,
+        root: bool,
     ) -> CoreResult<FilesystemRenameResult> {
+        // 两端都要过闸：只查一端等于允许"把东西从允许的树里搬出去"
+        let from_clean = fs_policy::check_writable(from)
+            .map_err(|denied| CoreError::InvalidInput(denied.message(from)))?;
+        let to_clean = fs_policy::check_writable(to)
+            .map_err(|denied| CoreError::InvalidInput(denied.message(to)))?;
+        if root {
+            return self.fs_rename_rooted(serial, &from_clean, &to_clean).await;
+        }
         self.require_agent_write_route(serial, FILESYSTEM_RENAME)?;
         let result = self
             .android
@@ -2552,8 +3165,8 @@ impl DeviceService {
                 serial,
                 FILESYSTEM_RENAME,
                 &FilesystemRenameParams {
-                    from: from.to_owned(),
-                    to: to.to_owned(),
+                    from: from_clean.clone(),
+                    to: to_clean.clone(),
                 },
                 WRITE_TIMEOUT,
             )
@@ -2562,7 +3175,7 @@ impl DeviceService {
         audit_filesystem_write(
             serial,
             FILESYSTEM_RENAME,
-            &format!("{from} -> {to}"),
+            &format!("{from_clean} -> {to_clean}"),
             &result.as_ref().map(|r| format!("no_op={}", r.no_op)),
         );
         result
@@ -2574,7 +3187,13 @@ impl DeviceService {
         serial: &str,
         path: &str,
         recursive: bool,
+        root: bool,
     ) -> CoreResult<FilesystemRemoveResult> {
+        let target = fs_policy::check_writable(path)
+            .map_err(|denied| CoreError::InvalidInput(denied.message(path)))?;
+        if root {
+            return self.fs_remove_rooted(serial, &target, recursive).await;
+        }
         self.require_agent_write_route(serial, FILESYSTEM_REMOVE)?;
         let result = self
             .android
@@ -2583,7 +3202,7 @@ impl DeviceService {
                 serial,
                 FILESYSTEM_REMOVE,
                 &FilesystemRemoveParams {
-                    path: path.to_owned(),
+                    path: target.clone(),
                     recursive,
                 },
                 WRITE_TIMEOUT,
@@ -2593,7 +3212,7 @@ impl DeviceService {
         audit_filesystem_write(
             serial,
             FILESYSTEM_REMOVE,
-            path,
+            &target,
             &result
                 .as_ref()
                 .map(|r| format!("recursive={} bytes={}", r.was_recursive, r.freed_bytes)),
@@ -2608,7 +3227,13 @@ impl DeviceService {
         serial: &str,
         path: &str,
         mode: u32,
+        root: bool,
     ) -> CoreResult<FilesystemChmodResult> {
+        let target = fs_policy::check_writable(path)
+            .map_err(|denied| CoreError::InvalidInput(denied.message(path)))?;
+        if root {
+            return self.fs_chmod_rooted(serial, &target, mode).await;
+        }
         self.require_agent_write_route(serial, FILESYSTEM_CHMOD)?;
         let result = self
             .android
@@ -2617,7 +3242,7 @@ impl DeviceService {
                 serial,
                 FILESYSTEM_CHMOD,
                 &FilesystemChmodParams {
-                    path: path.to_owned(),
+                    path: target.clone(),
                     mode,
                 },
                 WRITE_TIMEOUT,
@@ -2627,7 +3252,7 @@ impl DeviceService {
         audit_filesystem_write(
             serial,
             FILESYSTEM_CHMOD,
-            path,
+            &target,
             &result
                 .as_ref()
                 .map(|r| format!("mode={:o} verified={}", r.mode, r.verified)),
@@ -3356,7 +3981,70 @@ fn hosted_shadow_enabled() -> bool {
         .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "off"))
 }
 
+/// root 只读腿一次组合命令拿回的全部事实。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootedStat {
+    fields: adb::StatFields,
+    /// **当前身份**（这里是 root）能不能读内容/列举
+    readable: bool,
+    /// 只有符号链接才有：`readlink` 的原话（链接自己写向哪里，可能是相对的）
+    symlink_target: Option<String>,
+    /// `readlink -f` 的真实路径（协议里 `path` 字段的语义就是"已解析"）
+    resolved_path: Option<String>,
+}
+
+/// 解析组合命令的回包：首行是 `stat` 字段，之后是 `@R`/`@N` 两个标志与
+/// （只有符号链接才有）`@L` + 目标、`@P` + 真实路径。
+///
+/// 每个标记后面**只认一行值**，而且那行本身长得像标记时不当成值 ——
+/// 不然 `readlink` 万一空输出，就会把下一个 `@P` 吞成"链接目标"，一路错位下去。
+fn parse_rooted_stat(text: &str) -> Option<RootedStat> {
+    let mut lines = text.lines().map(|line| line.trim_end_matches('\r'));
+    let fields = adb::parse_stat_fields(lines.next()?)?;
+    let mut readable = false;
+    let mut symlink_target: Option<String> = None;
+    let mut resolved_path: Option<String> = None;
+    let mut pending: Option<char> = None;
+    for line in lines {
+        let value = line.trim();
+        if value.starts_with('@') {
+            match value {
+                "@R" => readable = true,
+                "@N" => readable = false,
+                "@L" => pending = Some('L'),
+                "@P" => pending = Some('P'),
+                // 内容里冒出来的其它 @ 开头行：不是我们的标记，忽略
+                _ => pending = None,
+            }
+            continue;
+        }
+        match pending.take() {
+            Some('L') if symlink_target.is_none() => symlink_target = Some(value.to_string()),
+            Some('P') => resolved_path = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    Some(RootedStat {
+        fields,
+        readable,
+        symlink_target: symlink_target.filter(|value| !value.is_empty()),
+        resolved_path: resolved_path.filter(|value| !value.is_empty()),
+    })
+}
+
 /// Agent `hosted.list` → 前端既有 `HostedBinary[]` 契约（name/path/size/perms/hasExec）。
+/// 回退腿的清单：`ls -l` + `file` 看不见"读不读得全"这种信号，所以只能声称
+/// "这份是 adb 给的、没被上限截断"。**清理本机记录这件事只认 Agent 那份完整清单**，
+/// 回退腿不参与（见 `HostedListView::source` 的用途）。
+fn legacy_hosted_listing(binaries: Vec<adb::HostedBinary>) -> HostedListView {
+    HostedListView {
+        binaries,
+        truncated: false,
+        unreadable: Vec::new(),
+        source: "adb".to_string(),
+    }
+}
+
 fn map_agent_hosted_binaries(binaries: &[HostedBinaryInfo]) -> Vec<adb::HostedBinary> {
     let mut out: Vec<adb::HostedBinary> = binaries
         .iter()
@@ -3635,6 +4323,34 @@ mod tests {
     }
 
     #[test]
+    fn rooted_stat_output_is_parsed_by_position_not_by_guessing() {
+        // 组合命令的回包：首行 stat 字段，之后是 @R/@N 与（只有符号链接才有）@L + 目标
+        let dir = parse_rooted_stat("700|3452|0|0|1700000000|directory\n@R\n@P\n/data\n").unwrap();
+        assert_eq!(dir.resolved_path.as_deref(), Some("/data"));
+        assert_eq!(dir.fields.mode, 0o700);
+        assert_eq!(dir.fields.size, 3452);
+        assert_eq!(dir.fields.kind(), FileKind::Dir);
+        assert!(dir.readable, "能读就该报能读");
+        assert_eq!(dir.symlink_target, None);
+        let link = parse_rooted_stat(
+            "777|11|0|0|1|symbolic link\n@R\n@L\n/storage/emulated/0\n@P\n/storage/emulated/0\n",
+        )
+        .unwrap();
+        assert_eq!(link.symlink_target.as_deref(), Some("/storage/emulated/0"));
+        assert_eq!(link.resolved_path.as_deref(), Some("/storage/emulated/0"));
+        assert_eq!(link.fields.kind(), FileKind::Symlink, "lstat 语义：链本身");
+        let noread = parse_rooted_stat("600|1|0|0|1|regular file\n@N\n").unwrap();
+        assert!(!noread.readable, "读不到就说读不到，别报成空文件");
+        // readlink 空输出时不能把下一个标记吞成目标（一路错位下去会把真实路径读丢）
+        let odd = parse_rooted_stat("644|1|0|0|1|symbolic link\n@R\n@L\n@P\n/sdcard\n").unwrap();
+        assert_eq!(odd.symlink_target, None, "@P 不是链接目标");
+        assert_eq!(odd.resolved_path.as_deref(), Some("/sdcard"));
+        // 首行解不出来 = 这台设备的 stat 不认这个格式：宁可不给结论，也不拿 0 凑一份"看起来正常"的元数据
+        assert!(parse_rooted_stat("@R\n").is_none());
+        assert!(parse_rooted_stat("").is_none());
+    }
+
+    #[test]
     fn preflight_prefers_the_external_instance_and_starts_only_when_both_are_empty() {
         // 外部在跑 → 报外部（界面给「停止进程」），哪怕我们自己也有一条在跑
         assert_eq!(
@@ -3652,6 +4368,27 @@ mod tests {
             pick_already_running(&[ext(40, 1, 0), ext(30, 25, 2000)], None),
             Some((40, true))
         );
+    }
+
+    #[test]
+    fn claim_candidates_drop_known_pids_and_prefer_the_newest() {
+        let proc = |pid: u32, ppid: u32| crate::adapters::adb::ExternalProcView {
+            pid,
+            ppid,
+            uid: 2000,
+        };
+        let procs = [proc(24208, 24206), proc(31337, 1), proc(0, 0)];
+        assert_eq!(
+            claim_candidate_pids(&procs, &[]),
+            vec![31337, 24208],
+            "最新的 pid 排前面，pid 0（内核线程的形状）不参与认领"
+        );
+        assert_eq!(
+            claim_candidate_pids(&procs, &[31337]),
+            vec![24208],
+            "启动前就在跑的那个不是这次起的，不能认领"
+        );
+        assert!(claim_candidate_pids(&[], &[24208]).is_empty());
     }
 
     #[test]

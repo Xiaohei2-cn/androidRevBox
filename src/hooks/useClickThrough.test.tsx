@@ -27,7 +27,7 @@ function solidStack() {
 
 const originalFromPoint = document.elementsFromPoint;
 
-describe("useClickThrough（透明区点击穿透的状态机）", () => {
+describe("useClickThrough（透明区点击穿透的状态机：默认能力，没有开关）", () => {
   beforeEach(() => {
     api.pointerState.mockReset();
     api.setClickThrough.mockReset();
@@ -42,15 +42,35 @@ describe("useClickThrough（透明区点击穿透的状态机）", () => {
     delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
   });
 
-  it("开关关着时不打扰窗口层", () => {
-    renderHook(() => useClickThrough(false));
+  it("没有窗口层（纯浏览器 / vite 预览）就一次都不打扰", () => {
+    // 穿透是默认能力，没有开关可关：唯一"不跑"的情形是这里根本没有窗口层可切
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+    renderHook(() => useClickThrough());
     expect(api.pointerState).not.toHaveBeenCalled();
+  });
+
+  it("页面看不见时不穿透（切去别的 App 还霸着点击就是锁死自己）", async () => {
+    document.elementsFromPoint = () => passableStack() as unknown as Element[];
+    api.pointerState.mockResolvedValue({ x: 100, y: 100, inside: true });
+    const { unmount } = renderHook(() => useClickThrough());
+    await act(async () => {
+      vi.advanceTimersByTime(0);
+    });
+    expect(api.setClickThrough).toHaveBeenLastCalledWith(true);
+    vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    api.setClickThrough.mockClear();
+    await act(async () => {
+      vi.advanceTimersByTime(160);
+    });
+    expect(api.setClickThrough).toHaveBeenCalledWith(false);
+    unmount();
+    vi.restoreAllMocks();
   });
 
   it("鼠标在声明可穿透的透明处 → 开穿透；回到实体上 → 收回", async () => {
     document.elementsFromPoint = () => passableStack() as unknown as Element[];
     api.pointerState.mockResolvedValue({ x: 100, y: 100, inside: true });
-    renderHook(() => useClickThrough(true));
+    renderHook(() => useClickThrough());
     await act(async () => {
       vi.advanceTimersByTime(0);
     });
@@ -72,7 +92,7 @@ describe("useClickThrough（透明区点击穿透的状态机）", () => {
     document.elementsFromPoint = () =>
       [card, host, document.querySelector(".app-surface") ?? document.createElement("div"), document.documentElement] as unknown as Element[];
     api.pointerState.mockResolvedValue({ x: 100, y: 100, inside: true });
-    renderHook(() => useClickThrough(true));
+    renderHook(() => useClickThrough());
     await act(async () => {
       vi.advanceTimersByTime(200);
     });
@@ -82,7 +102,7 @@ describe("useClickThrough（透明区点击穿透的状态机）", () => {
   it("光标不在窗口内时不改状态（不然状态会来回抖）", async () => {
     document.elementsFromPoint = () => passableStack() as unknown as Element[];
     api.pointerState.mockResolvedValue({ x: -5, y: 4000, inside: false });
-    renderHook(() => useClickThrough(true));
+    renderHook(() => useClickThrough());
     await act(async () => {
       vi.advanceTimersByTime(200);
     });
@@ -92,7 +112,7 @@ describe("useClickThrough（透明区点击穿透的状态机）", () => {
   it("问不到指针就按可点击处理，并立刻收回穿透", async () => {
     document.elementsFromPoint = () => passableStack() as unknown as Element[];
     api.pointerState.mockResolvedValue({ x: 100, y: 100, inside: true });
-    renderHook(() => useClickThrough(true));
+    renderHook(() => useClickThrough());
     await act(async () => {
       vi.advanceTimersByTime(0);
     });
@@ -106,10 +126,10 @@ describe("useClickThrough（透明区点击穿透的状态机）", () => {
     expect(api.setClickThrough).toHaveBeenCalledWith(false);
   });
 
-  it("卸载（关掉开关/切页）必须收回穿透状态", async () => {
+  it("卸载必须收回穿透状态（撂着不管的最坏形状是整个软件点不动）", async () => {
     document.elementsFromPoint = () => passableStack() as unknown as Element[];
     api.pointerState.mockResolvedValue({ x: 100, y: 100, inside: true });
-    const { unmount } = renderHook(() => useClickThrough(true));
+    const { unmount } = renderHook(() => useClickThrough());
     await act(async () => {
       vi.advanceTimersByTime(0);
     });

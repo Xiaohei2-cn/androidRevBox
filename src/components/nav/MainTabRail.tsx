@@ -69,7 +69,7 @@ export function MainTabRail() {
       // 顶部那 56px 仍然用 nav 自己的 padding 撑：它属于 nav、没有声明 → 接住点击。
       // （不写成一条 flex 子元素是有原因的：nav 的 gap 会在它与第一个 tab 之间多塞 6px，
       //  整条栏被往下推，与内容区顶边错位。）
-      className="flex w-32 shrink-0 flex-col gap-1.5 overflow-y-auto pt-14"
+      className="pane-scroll flex w-32 shrink-0 flex-col gap-1.5 overflow-y-auto pt-14"
     >
       {MAIN_TABS.map((item) => (
         <div key={item.id} className="flex w-full items-stretch justify-end">
@@ -127,13 +127,16 @@ function MainTabButton({
       onClick={onClick}
       className={cn(
         "app-surface group relative flex h-10 shrink-0 select-none items-center justify-center self-end rounded-l-xl border border-r-0 border-border/60",
+        // bg-none 是必须的：.app-surface 现在带 background-image（窗口渐变），
+        // 而 bg-primary / hover:bg-accent 只写 background-color——不清图像层的话，
+        // 渐变会盖在靛蓝上面，选中态就变成"白字压在近白底上"（对比度 1.0:1，读不出来）。
         active
-          ? "max-w-28 bg-primary px-3 text-primary-foreground"
-          : "w-9 text-muted-foreground hover:bg-accent hover:text-foreground",
+          ? "max-w-28 bg-none bg-primary px-3 text-primary-foreground"
+          : "w-9 text-muted-foreground hover:bg-none hover:bg-accent hover:text-foreground",
       )}
     >
       {active ? (
-        <span className="max-w-full truncate text-sm font-medium leading-none">
+        <span className="max-w-full truncate text-sm font-semibold leading-none">
           {label}
         </span>
       ) : (

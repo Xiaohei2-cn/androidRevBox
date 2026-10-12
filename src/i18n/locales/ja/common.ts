@@ -26,4 +26,5 @@ export default {
   "common.device": "デバイス",
   "common.updatedAt": "更新",
   "common.phasePlaceholder": "プレースホルダー · 予定",
+  "common.cancel": "キャンセル",
 } as const;

@@ -12,7 +12,7 @@ export default {
   "nav.binary": "二进制",
   "nav.unpack": "脱壳",
   "nav.kernel": "内核",
-  "nav.crypto": "算法工具",
+  "nav.crypto": "算法中心",
   "nav.plugins": "插件中心",
   "nav.tasks": "任务中心",
   "nav.market": "工具市场",

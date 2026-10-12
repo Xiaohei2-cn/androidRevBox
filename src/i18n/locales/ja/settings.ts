@@ -11,21 +11,11 @@ export default {
   "settings.theme.system": "システムに従う",
   "settings.theme.hint": "「システムに従う」は OS のテーマ切替にリアルタイムで追従します",
 
-  "settings.opacity.label": "背景の不透明度",
-  "settings.opacity.hint":
-    "ウィンドウ背景の不透明度を設定します。半透明の塗りだけなので、背後の内容はぼけません（WebKit は透明ウィンドウの外側をぼかせず、その実装は削除済み）。内容の可読性のため最低 20%。一番上のコントロールバー（ドラッグできる、ウィンドウボタン付き）は対象外で、常に不透明です。",
-
   "settings.agentAuto.label": "デバイス接続時に Agent を自動接続する",
   "settings.agentAuto.hint":
     "読み取り専用の探测はケーブルを接続する毎回行われます。デバイスへの書き込みと常駐プロセスの起動は、设备画面で一度だけ確認していただき、以降はそのデバイスは完全自動です。オフにすると手動接続のみになります。",
-  "settings.clickThrough.label": "透明部分をクリック透過",
-  "settings.clickThrough.hint":
-    "オンにしても後ろのアプリにクリックを渡すのは1箇所だけ：各タブの**左側**の透明な余白です。タブ本体、アイコン、タブ間の隙間、選択中のタブ、コンテンツ領域はすべてクリックを受け取ります。タブをクリックは基本操作なので、後ろに透過させてはいけません。ウィンドウ四辺の外側12pxは常にリサイズ用のつかみ領域です。現在の状態は下のライブ表示に出ます。",
 
-  "settings.clickThrough.status.solid": "現在：ポインターは実体上、本ツールがクリックを受け取ります",
-  "settings.clickThrough.status.passing": "現在：ポインターは透明部分上、クリックは後ろのアプリへ渡ります",
-  "settings.clickThrough.status.outside": "現在：ポインターはこのウィンドウ外です",
-  "settings.clickThrough.status.error": "現在：ポインター位置を取得できないため、クリック可能のままにしています",  "settings.language.label": "表示言語",
+  "settings.language.label": "表示言語",
   "settings.language.hint": "即時反映され、再起動後も保持されます。",
   "settings.language.restartHint":
     "一部のシステムメッセージ（adb／プロセスのエラーなど）は再起動後に完全に反映されます。",

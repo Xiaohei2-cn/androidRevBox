@@ -26,4 +26,5 @@ export default {
   "common.device": "Device",
   "common.updatedAt": "Updated",
   "common.phasePlaceholder": "Placeholder · planned",
+  "common.cancel": "Cancel",
 } as const;

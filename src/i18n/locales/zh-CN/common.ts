@@ -26,4 +26,5 @@ export default {
   "common.device": "设备",
   "common.updatedAt": "更新于",
   "common.phasePlaceholder": "占位 · 规划中",
+  "common.cancel": "取消",
 } as const;

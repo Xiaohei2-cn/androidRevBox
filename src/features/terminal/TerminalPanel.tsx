@@ -139,10 +139,6 @@ export type TerminalPanelHost = "local" | "device";
 
 interface TerminalPanelProps {
   fridaLaunch?: FridaLaunchRequest | null;
-  /**
-   * 这一页跑什么会话。`device` 那页的每一块屏都是 `adb -s … shell`，
-   * 并且**进去就有一块能敲的屏**（自动开第一个会话）；`local` 那页跑本机 shell 与官方 frida REPL。
-   */
   host?: TerminalPanelHost;
   /**
    * 这一块屏现在可见吗。自动开第一个会话**只在可见时**发生：
@@ -348,6 +344,27 @@ export function TerminalPanel({
     }
   }, [deviceSerial, ensureStore, t]);
 
+  /**
+   * ➕ / 菜单里的"新建终端"。**没有命令输入框了**：「终端」那页起系统告诉我们的默认程序
+   * （`pty_default_program`，也就是 $SHELL，不猜），「设备 shell」那页起 `adb -s … shell -tt`。
+   * 想跑别的东西，就在屏里直接敲——那才是终端该有的用法，而不是我们先替用户填一行命令。
+   *
+   * 分流按**页**，不按"上一次点过哪个入口"：她那两页里 ➕ 的意思各自是固定的。
+   */
+  /**
+   * ➕ / 菜单里的"新建终端"。**没有命令输入框了**：「终端」那页起系统告诉我们的默认程序
+   * （`pty_default_program`，也就是 $SHELL，不猜），「设备 shell」那页起 `adb -s … shell -tt`。
+   * 想跑别的东西，就在屏里直接敲——那才是终端该有的用法，而不是我们先替用户填一行命令。
+   *
+   * 分流按**页**，不按"上一次点过哪个入口"：她那两页里 ➕ 的意思各自是固定的。
+   */
+  /**
+   * ➕ / 菜单里的"新建终端"。**没有命令输入框了**：「终端」那页起系统告诉我们的默认程序
+   * （`pty_default_program`，也就是 $SHELL，不猜），「设备 shell」那页起 `adb -s … shell -tt`。
+   * 想跑别的东西，就在屏里直接敲——那才是终端该有的用法，而不是我们先替用户填一行命令。
+   *
+   * 分流按**页**，不按"上一次点过哪个入口"：她那两页里 ➕ 的意思各自是固定的。
+   */
   /**
    * ➕ / 菜单里的"新建终端"。**没有命令输入框了**：「终端」那页起系统告诉我们的默认程序
    * （`pty_default_program`，也就是 $SHELL，不猜），「设备 shell」那页起 `adb -s … shell -tt`。
@@ -709,7 +726,7 @@ export function TerminalPanel({
   };
 
   return (
-    <section className="flex h-full min-h-0 flex-col gap-2 rounded-xl border border-border/70 bg-card p-2.5 text-xs">
+    <section className="flex h-full min-h-0 flex-col gap-2 rounded-xl border border-border/70 bg-card shadow-card p-2.5 text-xs">
       {/* tab 条：常驻（0 个会话时也得有地方点 ➕）。
           默认名字是「会话 N」——序号由会话表给，句子由词典出，五语才不会分叉 */}
       <div className="flex shrink-0 flex-wrap items-center gap-1" role="tablist" data-testid="terminal-tabs">
