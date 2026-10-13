@@ -72,16 +72,23 @@ describe("类型库版本解耦：不许写死", () => {
    * `addExtraLib` 只推新 lib，**已算过的补全不保证重算**；加上 worker 工厂闭包挂在
    * `globalThis.MonacoEnvironment`（跨 HMR 存活），光改模块变量管不住它。
    */
-  it("类型库变更时重建 TS worker（否则提示不会跟着版本走）", () => {
+  it("worker 与类型库不同步时重建（否则提示不会跟着版本走）", () => {
     expect(setupSrc).toMatch(/function recycleTsWorker/);
     expect(setupSrc).toMatch(/w\.terminate\(\)/);
-    // 变更路径必须传"要重建"（首次注入不需要，那时还没 worker）
-    expect(setupSrc).toMatch(/injectFridaLibs\(libs, recreated\)/);
-    expect(setupSrc).toMatch(/recreated = appliedKey !== null/);
+    expect(setupSrc).toMatch(/injectFridaLibs\(libs, rebuildNow\)/);
     expect(setupSrc).toMatch(/injectFridaLibs\(BUNDLED_FRIDA_TYPES, false\)/);
-    // 首次注入**必须登记指纹**：否则 appliedKey 停在 null，真正注入用户那份时会被
-    // 判成"没注入过"→ 跳过 worker 重建 → 而 worker 早已按内置版算好了结果。
+    // 首次注入必须登记指纹
     expect(setupSrc).toMatch(/appliedKey = typeSetKey\(BUNDLED_FRIDA_TYPES\)/);
+    /*
+     * 判据必须是"**worker 现在这个库里建的吗**"，而不是"这一拍有没有变更"。
+     *
+     * 事故现场（落盘诊断抓到）：注入的明明是 18.8.2、内容也含 findBaseAddress，
+     * 但 `changed=false` → 走"没变，什么都不做" → `recycleTsWorker` 再也不触发，
+     * 而 worker 早按内置 19.x 算过并缓存 → 表现为"注入没生效"。
+     */
+    expect(setupSrc).toMatch(/workerLibKey/);
+    expect(setupSrc).toMatch(/const workerInSync = workerLibKey === key/);
+    expect(setupSrc).toMatch(/const rebuildNow = !workerInSync && workerRunning/);
   });
 
   it("Java 垫片按需注入（gum 自带 Java 时不再叠 java-bridge 的声明）", () => {

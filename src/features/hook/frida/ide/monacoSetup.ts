@@ -205,7 +205,11 @@ function injectFridaLibs(libs: FridaTypeSet, replaceWorker: boolean): void {
     }
     injectedLibs.push(defaults.addExtraLib(CONSOLE_SHIM, FRIDA_SHIMS_LIB));
   }
-  if (replaceWorker) recycleTsWorker();
+  if (replaceWorker) {
+    recycleTsWorker();
+    // 重建之后 worker 会在下次取用时按**新**库冷启，这里记下它是按哪套建的
+    workerLibKey = typeSetKey(libs);
+  }
 }
 
 /**
@@ -248,6 +252,16 @@ export const BUNDLED_FRIDA_TYPES: FridaTypeSet = {
 /** 已解析到的版本（同版本不重复解析；`Map` 做正文缓存，跨调用复用） */
 const typeCache = new Map<string, string>();
 let appliedKey: string | null = null;
+
+/**
+ * worker（以及它里面的语言服务）**当前是按哪套类型库建起来的**。
+ *
+ * 与 `appliedKey`（最后注入的那套）分开记：两者不一致就说明"注入了新的、
+ * 但 worker 还停在旧的"——那正是补全不跟着版本走的根因。`injectFridaLibs` 里
+ * 重建 worker 时把它同步成新指纹；不重建时保持不变（不能盲目同步，
+ * 否则就丢掉了"worker 落后了"这个事实）。
+ */
+let workerLibKey: string | null = null;
 
 /**
  * 解析并注入这个脚本该用的类型库。**来源优先级（为什么是这个顺序）**：
@@ -310,12 +324,35 @@ export async function applyFridaTypes(
 
   // 指纹只取**类型库本体**：note 里含路径/版本说明，拿它参与会因文案变化误判成"换了"
   const key = typeSetKey(libs);
-  const changed = key !== appliedKey;
-  let recreated = false;
-  if (changed) {
-    // 类型库真的变了：注入新的一套 + **重建 worker**（见 recycleTsWorker 的注释）
-    recreated = appliedKey !== null;
-    injectFridaLibs(libs, recreated);
+  const libsChanged = key !== appliedKey;
+  /**
+   * ⚠️ 判定"要不要重建 worker"，**不能只看这一拍是否检测到变更**。
+   *
+   * 事故现场（靠落盘诊断抓到的）：注入的内容明明是正确的 18.8.2
+   * （`injected_gum_len=243968 has_findBaseAddress=true`），但 `changed=false` ——
+   * 因为**更早那一次已经注入过 18.8.2**，于是此后每一拍都走"没变，什么都不做"，
+   * `recycleTsWorker` 再也不触发；而那次注入时 worker 早已按内置 19.x 算过并缓存了
+   * 结果 → 表现得像"注入没生效"。
+   *
+   * 所以判据要改成"**worker 现在还跟这套库一致吗**"：
+   * - 库变了 → 必须重建；
+   * - 库没变，但 worker 是在**别的库**上建起来的（workerLibKey 对不上）→ 也必须重建；
+   * - 两者一致 → 不动（避免每次打开文件都冷启一次 worker）。
+   */
+  /**
+   * 判据是"**worker 现在这个库里建的吗**"，而不是"这一拍有没有变"。
+   *
+   * `workerLibKey === null` 表示"worker 从没按这套逻辑重建过"——它要么还没建
+   * （无所谓，冷启时自然带上新库），要么是按**内置库**建好后我们再没管过它。
+   * 两种都以"必须对齐"处理：**只要 worker 已在运行且 key 对不上，就重建**。
+   * 唯一不重建的情形是 `workerLibKey === key`（已经一致）。
+   */
+  const workerInSync = workerLibKey === key;
+  // 有 worker 实例 = 它已经在按某套库算了；这种情况下不一致才需要重建
+  const workerRunning = workers.size > 0;
+  const rebuildNow = !workerInSync && workerRunning;
+  if (libsChanged || rebuildNow) {
+    injectFridaLibs(libs, rebuildNow);
     appliedKey = key;
   }
   return note;
