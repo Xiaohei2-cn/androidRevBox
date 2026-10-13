@@ -38,6 +38,27 @@ pub struct JsFileDto {
     pub mtime: i64,
 }
 
+/// 从用户指定的目录里找到的 frida 类型库（IDE 智能提示用）。
+/// `java_bridge` 为 None 是**正常**的：`frida-java-bridge` 从 7.0.0 起才发布 `.d.ts`，
+/// 且 frida-gum 的类型库在 18.x 及更早版本里自带 `Java`/`ObjC` 命名空间，
+/// 那种情况下根本不需要额外注 java-bridge（注了反而可能重复声明）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FridaTypesDto {
+    /// `@types/frida-gum/index.d.ts` 正文
+    pub gum: String,
+    /// 该 d.ts 里读到的包版本（读不到 None）
+    pub gum_version: Option<String>,
+    /// gum 类型库是否自带 `Java` 命名空间（自带就不该再注 java-bridge 的 Java）
+    pub gum_has_java: bool,
+    /// `frida-java-bridge/index.d.ts` 正文；该目录里没有则为 None
+    pub java_bridge: Option<String>,
+    pub java_bridge_version: Option<String>,
+    /// 实际读到的两个文件路径（给用户看"到底用了哪份"，用于与 PyCharm 对齐）
+    pub gum_path: String,
+    pub java_bridge_path: Option<String>,
+}
+
 /// 前置检查链聚合（§3）：adb → python → frida →（远程模式）TCP 可达。
 /// 前端按 ok 标红 + 按 hint 给修复跳转。
 ///
@@ -201,6 +222,19 @@ impl HookService {
     /// 删除一个脚本（IDE 的「删除」）。
     pub fn delete_script(&self, name: &str) -> CoreResult<()> {
         delete_script_in(&self.workdir_abs()?, name)
+    }
+
+    /// 从用户指定的项目/目录里找 frida 类型库（IDE 智能提示的"提示内容"来源）。
+    ///
+    /// 为什么是"给一个目录、我去里面找"而不是"给一个文件"：用户凭直觉给的是
+    /// **项目根**（PyCharm 认的就是项目里的 `node_modules/@types/frida-gum`），
+    /// 让他精确到 `index.d.ts` 是把我们的内部结构推给他。这里按 node 的模块解析规则
+    /// 依次找 `<dir>/node_modules/@types/frida-gum/index.d.ts` 与
+    /// `<dir>/node_modules/frida-java-bridge/index.d.ts`（后者可能不存在——那是正常的）。
+    ///
+    /// 返回 `(gum 正文, java-bridge 正文或 None, gum 版本号或 None)`。
+    pub fn read_frida_types(&self, dir: &str) -> CoreResult<FridaTypesDto> {
+        read_frida_types_in(Path::new(dir.trim()))
     }
 
     /// 已配置工作目录的 canonicalize 形态（读写文件的公共前置）。
@@ -502,6 +536,214 @@ pub fn delete_script_in(workdir_abs: &Path, name: &str) -> CoreResult<()> {
         .map_err(|e| CoreError::Internal(format!("删除 {} 失败：{e}", path.display())))?;
     tracing::info!(path = %path.display(), "脚本已删除（内容不进应用日志）");
     Ok(())
+}
+
+// ===== frida 类型库（IDE 智能提示的"提示内容"）=====
+//
+// 用户凭直觉给的是**项目根**（PyCharm 认的就是项目里的 node_modules/@types/frida-gum），
+// 所以这里按 node 的模块解析规则在给定目录下找。读的是纯文本，**只读不改**，
+// 与脚本读写那套"仅限工作目录"的边界互不相干（那条边界防的是写坏用户文件）。
+
+/// frida 类型库的读取上限（防呆：万一给了一个奇怪的 .d.ts，别把几 MB 塞进编辑器块）。
+const MAX_DTS_BYTES: u64 = 4 * 1024 * 1024;
+
+/// 在 `dir`（项目根，或它自己的 node_modules）下找到并读取 frida 类型库。
+///
+/// 接受两种给法（都常见）：直接给项目根，或直接把 `node_modules/@types/frida-gum` 那一层
+/// 复制进来。所以先试 `<dir>/node_modules/...`，再试 `<dir>` 本身。
+pub fn read_frida_types_in(dir: &Path) -> CoreResult<FridaTypesDto> {
+    if dir.as_os_str().is_empty() {
+        return Err(CoreError::InvalidInput("还没选择 frida 类型库目录".into()));
+    }
+    if !dir.is_dir() {
+        return Err(CoreError::InvalidInput(format!(
+            "目录不存在或不是目录：{}",
+            dir.display()
+        )));
+    }
+    let bases = [dir.join("node_modules"), dir.to_path_buf()];
+    let gum = bases
+        .iter()
+        .map(|b| b.join("@types").join("frida-gum").join("index.d.ts"))
+        .find(|p| p.is_file())
+        .ok_or_else(|| {
+            CoreError::InvalidInput(format!(
+                "在 {} 下找不到 @types/frida-gum/index.d.ts。\n\
+                 请把「frida 类型库目录」指到一个装了它的项目根（项目里执行过 \
+                 `npm i -D @types/frida-gum`），或指向 node_modules/@types/frida-gum 那一层。",
+                dir.display()
+            ))
+        })?;
+
+    let gum_text = read_text_capped(&gum)?;
+    // Java 命名空间判定：gum 18.x 及更早自带 `Java`/`ObjC` 桥声明（那样就不该再注
+    // java-bridge 的 Java——重复声明同一个命名空间可能让语言服务给出怪异结论）。
+    let gum_has_java = gum_text.contains("declare namespace Java");
+    let gum_version = read_crate_version(&gum);
+
+    let mut jb_candidates: Vec<PathBuf> = Vec::new();
+    // gum 的兄弟目录（<nm>/@types/frida-gum → <nm>/frida-java-bridge）
+    if let Some(nm) = gum.parent().and_then(Path::parent) {
+        jb_candidates.push(nm.join("frida-java-bridge").join("index.d.ts"));
+    }
+    jb_candidates.push(dir.join("node_modules/frida-java-bridge/index.d.ts"));
+    let jb_path = jb_candidates.into_iter().find(|p| p.is_file());
+    let (java_bridge, java_bridge_version) = match &jb_path {
+        Some(p) => {
+            let text = read_text_capped(p)?;
+            let v = read_crate_version(p);
+            (Some(text), v)
+        }
+        None => (None, None),
+    };
+
+    tracing::info!(
+        gum = %gum.display(),
+        gum_version = ?gum_version,
+        gum_has_java,
+        java_bridge = ?jb_path.as_ref().map(|p| p.display().to_string()),
+        "读到 frida 类型库（内容不进应用日志）"
+    );
+
+    Ok(FridaTypesDto {
+        gum: gum_text,
+        gum_version,
+        gum_has_java,
+        java_bridge,
+        java_bridge_version,
+        gum_path: gum.to_string_lossy().into_owned(),
+        java_bridge_path: jb_path.map(|p| p.to_string_lossy().into_owned()),
+    })
+}
+
+/// 读一个文本文件（带上限与可读错误）。上限做成常量而非参数：调用点没有"更大文件"的场景。
+fn read_text_capped(path: &Path) -> CoreResult<String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| CoreError::InvalidInput(format!("读不到 {}：{e}", path.display())))?;
+    if meta.len() > MAX_DTS_BYTES {
+        return Err(CoreError::InvalidInput(format!(
+            "{} 有 {} 字节，超过读取上限 {} 字节",
+            path.display(),
+            meta.len(),
+            MAX_DTS_BYTES
+        )));
+    }
+    std::fs::read_to_string(path)
+        .map_err(|e| CoreError::Internal(format!("读取 {} 失败：{e}", path.display())))
+}
+
+/// 从 `<...>/frida-gum/index.d.ts` 反查同目录 package.json 的 version。
+/// 读不到返回 None（不报错——版本号只用于显示"与 PyCharm 是否同源"）。
+fn read_crate_version(index_dts: &Path) -> Option<String> {
+    let pkg = index_dts.parent()?.join("package.json");
+    let text = std::fs::read_to_string(pkg).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("version").and_then(|x| x.as_str()).map(String::from)
+}
+
+/// `discover_frida_type_dirs` 的一行（给前端挑选用）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FridaTypeDirDto {
+    /// 项目根（设置里该填的就是它）
+    pub project_root: String,
+    /// 那份 `@types/frida-gum` 的版本
+    pub version: Option<String>,
+    /// index.d.ts 的 mtime（Unix 秒；排序用，不给人看）
+    pub mtime: i64,
+}
+
+/// 自动发现本机上装了 `@types/frida-gum` 的位置。
+///
+/// 为什么要有它：让用户手填项目路径是**把我们的内部结构推给他**——他 PyCharm 里
+/// 认的是"项目里的那份"，但机器上往往有多个 `frida-agent-example` 副本
+/// （实测这台机器就有两个），到底该填哪个不是他能答对的问题。这里主动扫几个
+/// **常见落点**，把找到的列出来让他挑（只有一份就直接用）。
+///
+/// 扫的范围刻意保守（深度只到"项目根"这一层、只认 `node_modules/@types/frida-gum`
+/// 这一种形状）：全盘扫描又慢又可能翻进无关目录，而 frida 项目只会在这些地方。
+pub fn discover_frida_type_dirs(home: &Path) -> Vec<FridaTypeDirDto> {
+    // 常见项目落点（都不存在就返回空，前端提示手填）
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for sub in [
+        "PycharmProjects",
+        "Projects",
+        "Developer",
+        "Documents",
+        "src",
+        "code",
+        "workspace",
+        "Desktop",
+    ] {
+        roots.push(home.join(sub));
+    }
+    // npm 全局根（brew 安装的 node 默认在 /opt/homebrew）
+    for p in [
+        "/opt/homebrew/lib/node_modules",
+        "/usr/local/lib/node_modules",
+        "/usr/lib/node_modules",
+    ] {
+        roots.push(PathBuf::from(p));
+    }
+
+    let mut found: Vec<FridaTypeDirDto> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    for root in &roots {
+        // ① 根下的每个子目录当作一个"项目"
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for project in entries.flatten() {
+                let base = project.path();
+                push_fridadir(
+                    &mut found,
+                    &mut seen,
+                    &base.join("node_modules/@types/frida-gum"),
+                    &base,
+                );
+            }
+        }
+        // ② 根本身也可能就是个项目
+        push_fridadir(
+            &mut found,
+            &mut seen,
+            &root.join("node_modules/@types/frida-gum"),
+            root,
+        );
+    }
+
+    // 近期改动的排前面（"她刚在用的那个项目"更可能是想要的）
+    found.sort_by_key(|d| std::cmp::Reverse(d.mtime));
+    found
+}
+
+/// 命中就收进结果（去重 + 记 mtime）。`project_root` 是"该给用户看的项目根"。
+fn push_fridadir(
+    out: &mut Vec<FridaTypeDirDto>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    gum_dir: &Path,
+    project_root: &Path,
+) {
+    let index = gum_dir.join("index.d.ts");
+    if !index.is_file() {
+        return;
+    }
+    let Ok(canon_root) = project_root.canonicalize() else {
+        return;
+    };
+    if !seen.insert(canon_root.clone()) {
+        return;
+    }
+    let mtime = std::fs::metadata(&index)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    out.push(FridaTypeDirDto {
+        project_root: canon_root.to_string_lossy().into_owned(),
+        version: read_crate_version(&index),
+        mtime,
+    });
 }
 
 // ===== 用户主动导出的文本落本机盘（第七十四轮：控制台「保存日志」） =====
@@ -879,6 +1121,175 @@ mod tests {
         }
         assert!(delete_script_in(&dir, "ghost.js").is_err());
     }
+
+    /// frida 类型库读取：从项目根按 node 解析规则找 gum，读出正文与版本；
+    /// `gum_has_java` 必须按正文判定（它决定要不要再注 java-bridge 的 Java 垫片）。
+    #[test]
+    fn frida_types_read_from_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let gum_dir = root.join("node_modules/@types/frida-gum");
+        std::fs::create_dir_all(&gum_dir).unwrap();
+        std::fs::write(
+            gum_dir.join("index.d.ts"),
+            "declare namespace Interceptor { function attach(): void; }\ndeclare namespace Java { const available: boolean; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            gum_dir.join("package.json"),
+            r#"{"name":"@types/frida-gum","version":"18.8.2"}"#,
+        )
+        .unwrap();
+
+        let dto = read_frida_types_in(&root).unwrap();
+        assert!(dto.gum.contains("function attach"));
+        assert_eq!(dto.gum_version.as_deref(), Some("18.8.2"));
+        // 这份自带 Java —— 有这个标记，注入时才不会再叠 java-bridge 的 Java
+        assert!(dto.gum_has_java);
+        // 该目录里没有 frida-java-bridge，正常（不是错误）
+        assert!(dto.java_bridge.is_none());
+        assert!(dto.gum_path.ends_with("frida-gum/index.d.ts"));
+    }
+
+    /// 也可以直接把 node_modules/@types/frida-gum 那一层指进来（两种给法都常见）。
+    #[test]
+    fn frida_types_accepts_the_types_package_dir_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // 造一个"gum 包目录自身"：<root>/@types/frida-gum/index.d.ts
+        let gum_dir = root.join("@types/frida-gum");
+        std::fs::create_dir_all(&gum_dir).unwrap();
+        std::fs::write(
+            gum_dir.join("index.d.ts"),
+            "declare namespace Interceptor {}\n",
+        )
+        .unwrap();
+
+        let dto = read_frida_types_in(&root).unwrap();
+        assert!(dto.gum.contains("namespace Interceptor"));
+        // 这份没有 Java 声明 —— 标记必须是 false（决定要注 java-bridge 垫片）
+        assert!(!dto.gum_has_java);
+        assert!(
+            dto.gum_version.is_none(),
+            "没 package.json 时版本是 None，不是报错"
+        );
+    }
+
+    /// 找不到 gum 要**说清怎么办**（用户手填的路径错了，静默回退会让人以为生效了）。
+    #[test]
+    fn frida_types_missing_is_actionable_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().canonicalize().unwrap();
+        let err = read_frida_types_in(&empty).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("frida-gum"), "{msg}");
+        assert!(msg.contains("npm"), "错误里要给出下一步：{msg}");
+
+        // 目录不存在 / 空路径也各有明确错（不是 Internal）
+        assert!(read_frida_types_in(&empty.join("nope")).is_err());
+        assert!(read_frida_types_in(Path::new("")).is_err());
+        assert_eq!(err.code(), "INVALID_INPUT");
+    }
+
+    /// 带 java-bridge 的目录：两个都读出来，且版本分别带上。
+    #[test]
+    fn frida_types_reads_java_bridge_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let nm = root.join("node_modules");
+        std::fs::create_dir_all(nm.join("@types/frida-gum")).unwrap();
+        std::fs::create_dir_all(nm.join("frida-java-bridge")).unwrap();
+        std::fs::write(
+            nm.join("@types/frida-gum/index.d.ts"),
+            "declare namespace Interceptor {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            nm.join("frida-java-bridge/index.d.ts"),
+            "declare module \"frida-java-bridge\" {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            nm.join("frida-java-bridge/package.json"),
+            r#"{"name":"frida-java-bridge","version":"7.0.13"}"#,
+        )
+        .unwrap();
+
+        let dto = read_frida_types_in(&root).unwrap();
+        assert_eq!(dto.java_bridge_version.as_deref(), Some("7.0.13"));
+        assert!(
+            dto.java_bridge
+                .as_deref()
+                .unwrap()
+                .contains("frida-java-bridge")
+        );
+        assert!(
+            dto.java_bridge_path
+                .as_deref()
+                .unwrap()
+                .ends_with("frida-java-bridge/index.d.ts")
+        );
+    }
+
+    /// 自动发现：在受控的 home 下造两个项目，应都找到且按 mtime 倒序；
+    /// 没有 frida-gum 的目录不该混进来。
+    #[test]
+    fn discover_finds_projects_with_frida_gum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let py = home.join("PycharmProjects");
+        std::fs::create_dir_all(&py).unwrap();
+
+        let mk = |name: &str, version: &str| {
+            let gum = py.join(name).join("node_modules/@types/frida-gum");
+            std::fs::create_dir_all(&gum).unwrap();
+            std::fs::write(gum.join("index.d.ts"), "declare namespace Interceptor {}\n").unwrap();
+            std::fs::write(
+                gum.join("package.json"),
+                format!(r#"{{"name":"@types/frida-gum","version":"{version}"}}"#),
+            )
+            .unwrap();
+        };
+        mk("proj_a", "18.8.2");
+        mk("proj_b", "19.12.0");
+        // 干扰项：有 node_modules 但没有 frida-gum
+        std::fs::create_dir_all(py.join("other/node_modules/@types/node")).unwrap();
+
+        let found = discover_frida_type_dirs(&home);
+        let names: Vec<String> = found
+            .iter()
+            .map(|d| {
+                std::path::Path::new(&d.project_root)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(names.contains(&"proj_a".to_string()), "{names:?}");
+        assert!(names.contains(&"proj_b".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"other".to_string()),
+            "没有 frida-gum 的不该收：{names:?}"
+        );
+        // 版本读对
+        let b = found
+            .iter()
+            .find(|d| d.project_root.ends_with("proj_b"))
+            .unwrap();
+        assert_eq!(b.version.as_deref(), Some("19.12.0"));
+        // 去重（同一个项目不该出现两次）
+        assert_eq!(found.len(), 2, "{names:?}");
+    }
+
+    /// 一份都没有时返回空（前端据此提示手填，而不是报错）。
+    #[test]
+    fn discover_returns_empty_when_nothing_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        assert!(discover_frida_type_dirs(&home).is_empty());
+    }
+
     #[test]
     fn channel_probe_only_trusts_its_own_output_shapes() {
         // 成功：脚本问出了进程数

@@ -5,6 +5,15 @@ import { AppProviders } from "@/app/providers";
 import { SettingsPage } from "./SettingsPage";
 
 const systemMocks = vi.hoisted(() => ({ ping: vi.fn() }));
+const dialogMocks = vi.hoisted(() => ({
+  pickFile: vi.fn(async () => null),
+  pickDirectory: vi.fn(async () => null),
+}));
+
+vi.mock("@/api/dialog", () => ({
+  pickFile: dialogMocks.pickFile,
+  pickDirectory: dialogMocks.pickDirectory,
+}));
 const configMocks = vi.hoisted(() => ({ snapshot: vi.fn(), set: vi.fn() }));
 
 vi.mock("@/api/system", async (importOriginal) => {
@@ -101,5 +110,41 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("config-app.node.path")).toBeInTheDocument();
     expect(screen.getByTestId("config-app.tools.ida_mcp_port")).toBeInTheDocument();
     expect(screen.getByTestId("config-app.tools.jadx_mcp_port")).toBeInTheDocument();
+  });
+
+  /**
+   * 「选择目录」按钮必须真的弹**目录**选择器。
+   *
+   * 这里钉的是一次真实事故：原来的实现两个分支写的是同一件事（都调 pickFile），
+   * 于是 kind="directory" 的「frida 类型库目录」弹的其实是选文件对话框——
+   * 用户一个目录都选不中，且不报错、看起来像"点了没反应"。
+   */
+  describe("路径行的选择器按 kind 分派", () => {
+    beforeEach(() => {
+      dialogMocks.pickFile.mockClear().mockResolvedValue(null);
+      dialogMocks.pickDirectory.mockClear().mockResolvedValue(null);
+    });
+
+    it("kind=directory（frida 类型库目录）→ 调 pickDirectory，不调 pickFile", async () => {
+      render(
+        <AppProviders>
+          <SettingsPage />
+        </AppProviders>,
+      );
+      await userEvent.click(screen.getByTestId("browse-app.hook.frida_types_dir"));
+      await waitFor(() => expect(dialogMocks.pickDirectory).toHaveBeenCalledTimes(1));
+      expect(dialogMocks.pickFile).not.toHaveBeenCalled();
+    });
+
+    it("kind=file（Python 解释器）→ 调 pickFile，不调 pickDirectory", async () => {
+      render(
+        <AppProviders>
+          <SettingsPage />
+        </AppProviders>,
+      );
+      await userEvent.click(screen.getByTestId("browse-app.python.path"));
+      await waitFor(() => expect(dialogMocks.pickFile).toHaveBeenCalledTimes(1));
+      expect(dialogMocks.pickDirectory).not.toHaveBeenCalled();
+    });
   });
 });

@@ -12,6 +12,13 @@ import { pickDirectory } from "@/api/dialog";
 export const KEY_HOOK_WORKDIR = "app.hook.workdir";
 
 /**
+ * frida 类型库目录（设置 → 工具环境 可填；与 Rust KEY_FRIDA_TYPES_DIR 一致）。
+ * 指向一个装了 `@types/frida-gum` 的项目根，IDE 的智能提示就从那里读——
+ * 这是"与 PyCharm 逐字节同源"的途径（PyCharm 认的也是项目里的 node_modules）。
+ */
+export const KEY_FRIDA_TYPES_DIR = "app.hook.frida_types_dir";
+
+/**
  * 弹目录选择器并持久化。返回选中的目录；**用户取消返回 null**（取消不是错误）。
  * 写 config 失败会把错误抛出去，由调用方按自己面板的语言说给用户。
  */

@@ -29,7 +29,7 @@ import { useAppNav } from "@/app/nav";
 import { deviceApi, type AdbEnvironment } from "@/api/device";
 import { systemApi } from "@/api/system";
 import { configApi } from "@/api/config";
-import { pickFile } from "@/api/dialog";
+import { pickDirectory, pickFile } from "@/api/dialog";
 import { LOCALES, LOCALE_LABELS, useI18n } from "@/i18n";
 import type { Locale } from "@/i18n/dictionaries";
 import { cn } from "@/lib/utils";
@@ -352,6 +352,20 @@ function EnvironmentTab() {
             kind="file"
             onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
           />
+          {/*
+            frida 类型库目录：**编辑器智能提示的来源**。用户凭直觉给的是项目根
+            （PyCharm 认的就是项目里的 node_modules/@types/frida-gum），所以是选目录，
+            不是选文件。留空则按 frida 版本自动取（见 ide/monacoSetup.ts）。
+          */}
+          <ConfigInputRow
+            label={t("settings.tools.fridaTypesDir")}
+            configKey="app.hook.frida_types_dir"
+            placeholder={t("settings.tools.fridaTypesDir.placeholder")}
+            mono
+            kind="directory"
+            onSaved={() => void queryClient.invalidateQueries({ queryKey: ["env"] })}
+          />
+          <p className="text-11px text-muted-foreground">{t("settings.tools.fridaTypesHint")}</p>
           <ConfigInputRow
             label={t("settings.tools.idaPort")}
             configKey="app.tools.ida_mcp_port"
@@ -548,11 +562,12 @@ function ConfigInputRow({
     try {
       const isPython = configKey === "app.python.path";
       const defaultPath = isPython ? await guessPythonStartDir() : undefined;
-      const picked = await pickFile(
-        kind === "file"
-          ? { title: label, defaultPath }
-          : { title: label, defaultPath },
-      );
+      // ⚠️ 这里原来两个分支写的是同一件事（都调 pickFile），于是"选目录"按钮弹的
+      // 其实是**选文件**对话框——用户点「选择目录」选不到目录。按 kind 真正分派。
+      const picked =
+        kind === "directory"
+          ? await pickDirectory(label)
+          : await pickFile({ title: label, defaultPath });
       if (picked && isPython) {
         // pyenv shim / .app 包入口 → 后端解析成真解释器路径并回填输入框
         try {

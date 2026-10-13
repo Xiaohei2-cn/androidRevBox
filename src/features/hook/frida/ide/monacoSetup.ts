@@ -20,6 +20,30 @@
 import * as monaco from "monaco-editor/editor/editor.api";
 /** Monaco 模块类型（editor.api 的模块身份）——ScriptIde 的 ref 用它，别用 monaco-editor 主入口 */
 export type MonacoModule = typeof monaco;
+
+// ⚠️ `editor.api` 是**纯 API 工厂**（只 6 个 import，不含任何编辑器功能）。补全菜单、
+// 折叠、查找、括号配对…全都是"贡献点（contrib）"，必须自己引——不引的后果不是报错，
+// 而是**静默失效**：TS worker 明明算得出补全（实测 `Interceptor.` 回 8 项），
+// 但屏上永远不弹建议控件，因为订阅/显示它的 suggestController 根本没进包。
+// 下面这一组是"轻量 IDE"真正要用的最小值（每个都对着界面上一个可见能力）。
+import "monaco-editor/editor/browser/coreCommands"; // 光标/选择等核心命令
+import "monaco-editor/editor/contrib/suggest/browser/suggestController"; // **补全菜单本体**
+import "monaco-editor/editor/contrib/suggest/browser/suggestInlineCompletions";
+import "monaco-editor/editor/contrib/hover/browser/hoverContribution"; // 悬停文档（类型说明）
+import "monaco-editor/editor/contrib/parameterHints/browser/parameterHints"; // 参数提示
+import "monaco-editor/editor/contrib/folding/browser/folding"; // 代码折叠
+import "monaco-editor/editor/contrib/bracketMatching/browser/bracketMatching"; // 括号配对
+import "monaco-editor/editor/contrib/find/browser/findController"; // Ctrl+F 查找
+import "monaco-editor/editor/contrib/comment/browser/comment"; // Ctrl+/ 注释
+import "monaco-editor/editor/contrib/wordOperations/browser/wordOperations"; // 按词移动/删除
+import "monaco-editor/editor/contrib/linesOperations/browser/linesOperations"; // 行操作
+import "monaco-editor/editor/contrib/indentation/browser/indentation"; // 缩进
+import "monaco-editor/editor/contrib/clipboard/browser/clipboard"; // 复制/粘贴
+import "monaco-editor/editor/contrib/multicursor/browser/multicursor"; // 多光标
+import "monaco-editor/editor/contrib/cursorUndo/browser/cursorUndo";
+import "monaco-editor/editor/contrib/contextmenu/browser/contextmenu"; // 右键菜单
+import "monaco-editor/editor/contrib/format/browser/formatActions";
+// js 基础高亮（语法着色）——只这一个语言，别把 81 种全拖进来
 import "monaco-editor/languages/definitions/javascript/register";
 // TS/JS 语言服务（0.57 的顶层命名空间；`languages.typescript` 已弃用）
 import {
@@ -45,17 +69,14 @@ import fridaJavaBridgeDts from "@frida-types/java-bridge?raw";
 const FRIDA_GUM_LIB = "file:///frida/@types/frida-gum/index.d.ts";
 const FRIDA_JAVA_LIB = "file:///frida/frida-java-bridge/index.d.ts";
 const FRIDA_SHIMS_LIB = "file:///frida/frida-shims.d.ts";
+const FRIDA_JAVA_SHIM_LIB = "file:///frida/frida-java-global.d.ts";
 
 /**
- * 两件 frida 脚本里天天用、但不在上面两份 d.ts 里的东西，补一个小垫片：
- * - **全局 `Java`**：`frida-java-bridge/index.d.ts` 只提供
- *   `declare module "frida-java-bridge"`，而 REPL 里用的是全局 `Java`。
- *   从模块声明的 default 导出把类型引出来，不手抄第二份（抄的那份必然跟版本漂移）。
- * - **`console`**：它本来在 `lib.dom.d.ts` 里，而我们的 lib 集合**故意不含 DOM**
- *   （frida-gum 自己声明了 `Worker`/`File`，加 DOM 会撞 duplicate identifier）。
+ * `console` 的垫片（**恒注**）：它本来在 `lib.dom.d.ts` 里，而我们的 lib 集合
+ * **故意不含 DOM**（frida-gum 自己声明了 `Worker`/`File`，加 DOM 会撞 duplicate
+ * identifier）。frida 脚本天天 `console.log`，所以这一条任何情况下都要有。
  */
-const fridaShims = `
-declare const Java: typeof import("frida-java-bridge").default;
+const CONSOLE_SHIM = `
 declare const console: {
   log(...args: unknown[]): void;
   warn(...args: unknown[]): void;
@@ -64,6 +85,28 @@ declare const console: {
   info(...args: unknown[]): void;
 };
 `;
+
+/**
+ * 全局 `Java` 的垫片（**按需注入**，见 `injectFridaLibs`）。
+ *
+ * 为什么要按需：`Java` 命名空间有两个可能的来源——
+ * - **@types/frida-gum 18.x 及更早自带** `declare namespace Java`（用户 PyCharm 那份
+ *   18.8.2 就是这样，第 5376 行），那种情况下它就是"正统"，再注一份等于重复声明；
+ * - gum 19.x **删掉了**它，此后 `Java` 只能从 `frida-java-bridge` 的类型库来。
+ * 两边都注会出现同一命名空间声明两次——语言服务不一定报错，但结论可能诡异
+ * （这正是"提示看着不太一样"的一种来源）。所以：**谁有就听谁的，不叠加**。
+ */
+const JAVA_FROM_JB_SHIM = `
+declare const Java: typeof import("frida-java-bridge").default;
+`;
+
+/** 一份类型库的来源描述（决定垫片怎么注） */
+interface FridaTypeSet {
+  gum: string;
+  javaBridge: string | null;
+  /** gum 是否自带 Java 命名空间（自带则不再注 java-bridge 的 Java） */
+  gumHasJava: boolean;
+}
 
 let configured = false;
 
@@ -120,14 +163,175 @@ export function setupMonaco(): typeof monaco {
     noSyntaxValidation: false,
   });
 
-  // frida 全量 API 与 Java 桥的类型声明（这就是"提示能提示 frida 代码"的来源）
-  for (const defaults of [typescriptDefaults, javascriptDefaults]) {
-    defaults.addExtraLib(fridaGumDts, FRIDA_GUM_LIB);
-    defaults.addExtraLib(fridaJavaBridgeDts, FRIDA_JAVA_LIB);
-    defaults.addExtraLib(fridaShims, FRIDA_SHIMS_LIB);
-  }
+  // frida 全量 API 与 Java 桥的类型声明（这就是"提示能提示 frida 代码"的来源）。
+  // 默认先注**内置版本**，保证"打开就有提示"；选定环境解析到别的版本后，
+  // 由 applyFridaTypes() 覆盖（见下）。
+  //
+  // ⚠️ 这里**必须同时登记 appliedKey**：否则 appliedKey 停在 null，后面真正注入
+  // 用户那份时会被判成"还没注入过"→ 跳过 worker 重建 → 而 worker 早已按内置版
+  // 算好了结果（这就是"状态条说 18.8.2、提示却还是 19.x"的最后一道口子）。
+  injectFridaLibs(BUNDLED_FRIDA_TYPES, false);
+  appliedKey = typeSetKey(BUNDLED_FRIDA_TYPES);
 
   return monaco;
+}
+
+/** 一份类型库的指纹（判断"是不是换了"） */
+function typeSetKey(libs: FridaTypeSet): string {
+  return `${libs.gum.length}|${libs.javaBridge?.length ?? 0}|${libs.gumHasJava}`;
+}
+
+/** 已注入的类型库句柄（重复注入时先 dispose 旧的，避免 extraLib 叠加出重复声明） */
+let injectedLibs: { dispose(): void }[] = [];
+
+/**
+ * 注入一套类型库 + 必要的垫片。**垫片按来源决定**（这是修"重复声明"的关键）：
+ * - `console`：恒注（frida 脚本天天用，且我们的 lib 不含 DOM）。
+ * - 全局 `Java`：只有当 **gum 不自带**、且**给了 java-bridge** 时才注 java-bridge 版；
+ *   否则交给 gum 自带的 `declare namespace Java`（18.x 及更早），不叠加。
+ */
+function injectFridaLibs(libs: FridaTypeSet, replaceWorker: boolean): void {
+  for (const d of injectedLibs) d.dispose();
+  injectedLibs = [];
+  const javaFromGum = libs.gumHasJava;
+  const canBridgeJava = !javaFromGum && !!libs.javaBridge;
+  for (const defaults of [typescriptDefaults, javascriptDefaults]) {
+    injectedLibs.push(defaults.addExtraLib(libs.gum, FRIDA_GUM_LIB));
+    if (libs.javaBridge) {
+      injectedLibs.push(defaults.addExtraLib(libs.javaBridge, FRIDA_JAVA_LIB));
+    }
+    if (canBridgeJava) {
+      injectedLibs.push(defaults.addExtraLib(JAVA_FROM_JB_SHIM, FRIDA_JAVA_SHIM_LIB));
+    }
+    injectedLibs.push(defaults.addExtraLib(CONSOLE_SHIM, FRIDA_SHIMS_LIB));
+  }
+  if (replaceWorker) recycleTsWorker();
+}
+
+/**
+ * 丢掉已启动的 TS worker，让语言服务**从干净状态重新加载**（含新注的 extraLib）。
+ *
+ * 为什么必须这么做（真实事故）：语言服务会把已解析的 lib 与文件 ScriptInfo 缓存在
+ * **worker 进程**里；`addExtraLib` 只把新 lib 推过去，**已算过的补全不保证重算**。
+ * 于是"后到的正确类型库"进不了已经算出的提示——现场就是状态条写着 18.8.2、
+ * 提示却仍是内置 19.x 的 `getGlobalExportByName`。
+ *
+ * 另一层原因：worker 工厂闭包挂在 `globalThis.MonacoEnvironment` 上（跨 HMR 存活），
+ * 开发热更新后新旧模块会各自持有一份缓存，光靠模块变量管不住它。重建 worker 是
+ * 唯一确定的"清干净"手段——代价只是一次 worker 冷启（毫秒级，只在类型库真变了时发生）。
+ */
+function recycleTsWorker(): void {
+  for (const label of ["javascript", "typescript"]) {
+    const w = workers.get(label);
+    if (w) {
+      w.terminate();
+      workers.delete(label);
+    }
+  }
+}
+
+/**
+ * 内置（构建期打进产物）的类型库正文——所有解析路径都失败时的兜底，
+ * 也是"打开就有提示"的首次默认值。
+ *
+ * `gumHasJava` 由正文判定：内置的 gum 19.12.0 已不含 `Java` 命名空间，
+ * 所以内置组合需要靠 java-bridge 补 `Java`（垫片会注）。这里是构建期常量，
+ * 判一次即可，不必每次运行都扫字符串。
+ */
+const BUNDLED_GUM_HAS_JAVA = fridaGumDts.includes("declare namespace Java");
+export const BUNDLED_FRIDA_TYPES: FridaTypeSet = {
+  gum: fridaGumDts,
+  javaBridge: fridaJavaBridgeDts,
+  gumHasJava: BUNDLED_GUM_HAS_JAVA,
+};
+
+/** 已解析到的版本（同版本不重复解析；`Map` 做正文缓存，跨调用复用） */
+const typeCache = new Map<string, string>();
+let appliedKey: string | null = null;
+
+/**
+ * 解析并注入这个脚本该用的类型库。**来源优先级（为什么是这个顺序）**：
+ *
+ * 1. **用户指定的项目目录**（设置 → 工具环境 → frida 类型库目录）：这是"与 PyCharm
+ *    逐字节同源"的唯一途径——PyCharm 认的就是项目里 `node_modules/@types/frida-gum`，
+ *    用户在那里 `npm i` 哪个版本，这里就该是哪个版本。**优先级最高**。
+ * 2. **按选定环境的 frida 版本从 CDN 取**：没指定目录时的自动跟随（离线会失败）。
+ * 3. **内置**：前两条都不成时的兜底——提示绝不因此消失，只可能滞后一版。
+ *
+ * 返回给人看的说明（IDE 状态条显示）。同参数重复调用廉价（有缓存与幂等守卫）。
+ */
+export async function applyFridaTypes(
+  fridaVersion: string | null | undefined,
+  typesDir: string | null | undefined,
+): Promise<string> {
+  const dir = typesDir?.trim() ?? "";
+  let libs: FridaTypeSet;
+  let note: string;
+
+  if (dir) {
+    // ① 项目目录（用户明确指定的那份）
+    try {
+      const { hookApi } = await import("@/api/hook");
+      const dto = await hookApi.fridaTypes(dir);
+      libs = {
+        gum: dto.gum,
+        javaBridge: dto.javaBridge ?? null,
+        gumHasJava: dto.gumHasJava,
+      };
+      const gumVer = dto.gumVersion ? `@${dto.gumVersion}` : "";
+      const jbVer = dto.javaBridgeVersion ? `@${dto.javaBridgeVersion}` : "";
+      note =
+        `类型库：@types/frida-gum${gumVer}` +
+        (dto.javaBridge ? ` + frida-java-bridge${jbVer}` : "（内含 Java 声明）") +
+        `  ← ${dto.gumPath}`;
+    } catch (e) {
+      // 目录错了要**说出来**（这是用户手动选的，静默回退会让人以为生效了）
+      const { resolveFridaTypes } = await import("./fridaTypeVersions");
+      const resolved = await resolveFridaTypes(fridaVersion, BUNDLED_FRIDA_TYPES, typeCache);
+      libs = {
+        gum: resolved.gum.content,
+        javaBridge: resolved.javaBridge.content,
+        gumHasJava: BUNDLED_GUM_HAS_JAVA,
+      };
+      note = `指定的类型库目录读不到（${String((e as Error)?.message ?? e)}）：${resolved.note}`;
+    }
+  } else {
+    // ②③ 按 frida 版本解析（内部已含"回退内置"）
+    const { resolveFridaTypes } = await import("./fridaTypeVersions");
+    const resolved = await resolveFridaTypes(fridaVersion, BUNDLED_FRIDA_TYPES, typeCache);
+    const gumHasJava = resolved.gum.content.includes("declare namespace Java");
+    libs = {
+      gum: resolved.gum.content,
+      javaBridge: resolved.javaBridge.content,
+      gumHasJava,
+    };
+    note = resolved.note;
+  }
+
+  // 指纹只取**类型库本体**：note 里含路径/版本说明，拿它参与会因文案变化误判成"换了"
+  const key = typeSetKey(libs);
+  const changed = key !== appliedKey;
+  let recreated = false;
+  if (changed) {
+    // 类型库真的变了：注入新的一套 + **重建 worker**（见 recycleTsWorker 的注释）
+    recreated = appliedKey !== null;
+    injectFridaLibs(libs, recreated);
+    appliedKey = key;
+  }
+  return note;
+}
+
+/**
+ * 类型库是否已按"选定环境/项目"解析并注入过。
+ *
+ * 为什么需要这个查询：`setupMonaco()` 会**先注入内置版本**（保证打开就有提示），
+ * 而正确的那份要等一个异步 effect 解析完才覆盖。**模型若在这中间建立**，语言服务
+ * 就按内置版本算出了结果（那些结果会被缓存下来），此后 extraLib 虽被更新，
+ * 已算过的补全不一定会重算——现场表现就是"状态条说用了 18.8.2，但提示还是 19.x 的
+ * `getGlobalExportByName`"。所以建模型前要问一句：解析好了吗？
+ */
+export function fridaTypesApplied(): boolean {
+  return appliedKey !== null;
 }
 
 /** Monaco 主题 id 前缀（defineTheme/editor.create 都用它） */

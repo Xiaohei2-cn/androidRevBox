@@ -39,6 +39,8 @@ pub const KEY_JADX_MCP_PORT: &str = "app.tools.jadx_mcp_port";
 pub const KEY_LOCALE: &str = "app.settings.locale";
 /// Hook 脚本工作目录（P10 Frida 工作台）；空 = 未选择
 pub const KEY_HOOK_WORKDIR: &str = "app.hook.workdir";
+/// frida 类型库目录（IDE 智能提示来源；空 = 用内置/按版本解析）
+pub const KEY_FRIDA_TYPES_DIR: &str = "app.hook.frida_types_dir";
 /// 翻译接口（UI-6 第二层的可选环节）。
 ///
 /// ⚠️ `KEY_AI_API_KEY` 只存在桌面本机库里：不下发设备、不进 adb 命令行、不上日志、
@@ -169,6 +171,7 @@ const ALLOWED_KEYS: &[(&str, ValueValidator)] = &[
     (KEY_JADX_MCP_PORT, is_valid_port),
     (KEY_LOCALE, is_valid_locale),
     (KEY_HOOK_WORKDIR, is_valid_path),
+    (KEY_FRIDA_TYPES_DIR, is_valid_path),
     // 翻译接口（UI-6 第二层）。这三个键的值都不敏感：地址、模型名、开关。
     (KEY_AI_BASE_URL, is_valid_ai_base_url),
     (KEY_AI_MODEL, is_valid_ai_model),

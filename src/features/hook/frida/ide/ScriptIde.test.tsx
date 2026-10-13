@@ -102,26 +102,53 @@ function makeFakeMonaco() {
 
 const fake = makeFakeMonaco();
 
+const applyMock = vi.hoisted(() => ({
+  applyFridaTypes: vi.fn(async (_v: unknown, dir: string) =>
+    dir ? `类型库：@types/frida-gum@18.8.2  ← ${dir}` : "类型库：按 frida 版本解析（内置兜底）",
+  ),
+}));
 vi.mock("@/features/hook/frida/ide/monacoSetup", () => ({
   setupMonaco: () => fake.monaco,
   ensureIdeTheme: () => "test-theme",
+  applyFridaTypes: applyMock.applyFridaTypes,
 }));
 
 const hookApiMock = vi.hoisted(() => ({
   scriptRead: vi.fn(),
   scriptWrite: vi.fn(),
   scriptDelete: vi.fn(),
+  fridaTypes: vi.fn(async () => ({
+    gum: "// env gum",
+    gumVersion: "18.8.2",
+    gumHasJava: true,
+    javaBridge: null,
+    javaBridgeVersion: null,
+    gumPath: "/proj/node_modules/@types/frida-gum/index.d.ts",
+    javaBridgePath: null,
+  })),
+  fridaTypesDirs: vi.fn(async () => [
+    { projectRoot: "/proj", version: "18.8.2", mtime: 1700000000 },
+  ]),
 }));
 
 vi.mock("@/api/hook", () => ({ hookApi: hookApiMock }));
+
+// envApi.frida：类型库解析会读它（拿 frida 版本）
+const envMock = vi.hoisted(() => ({ frida: vi.fn(async () => ({ fridaVersion: "17.17.0" })) }));
+vi.mock("@/api/env", () => ({ envApi: envMock }));
 
 // 空态里的「选择目录」走 workdir.ts（dialog + config），测试里都不该真弹/真写
 const dialogMock = vi.hoisted(() => ({
   pickDirectory: vi.fn<() => Promise<string | null>>(async () => null),
 }));
 vi.mock("@/api/dialog", () => ({ pickDirectory: dialogMock.pickDirectory }));
-const configMock = vi.hoisted(() => ({ set: vi.fn(async () => null) }));
-vi.mock("@/api/config", () => ({ configApi: { set: configMock.set } }));
+const configMock = vi.hoisted(() => ({
+  set: vi.fn(async () => null),
+  get: vi.fn(async () => ""),
+}));
+vi.mock("@/api/config", () => ({
+  configApi: { set: configMock.set, get: configMock.get },
+}));
 
 // useSettings 需要 AppProviders；这里给个最小 provider 替身
 vi.mock("@/app/providers", () => ({ useSettings: () => ({ effectiveTheme: "dark" }) }));
@@ -222,6 +249,55 @@ describe("编辑器单例与宿主自愈（双实例事故的回归）", () => {
       const h = fake.hosts().at(-1);
       expect(h).toBeTruthy();
       expect(h!.querySelectorAll(".monaco-editor").length).toBe(1);
+    });
+  });
+});
+
+describe("类型库来源：单一可选读取失败不许拖垮整条链路", () => {
+  /**
+   * 事故现场（真实）：原来写成 `await Promise.all([envApi.frida(), configApi.get(KEY,"")])`，
+   * 而 `configApi.get` 对**未注册的配置键**会抛错（Rust 白名单校验）——于是"读一个可选
+   * 配置项失败"把整条链路带崩，类型库根本没换成用户那份，而面板上看不出任何异常
+   * （只有提示内容不对）。这条钉住：即使读配置抛错，自动发现仍必须继续走到底。
+   */
+  it("configApi.get 抛错时，仍会走自动发现并注入项目那份类型库", async () => {
+    configMock.get.mockRejectedValueOnce(new Error("未注册的配置键: app.hook.frida_types_dir"));
+    hookApiMock.fridaTypesDirs.mockClear();
+    applyMock.applyFridaTypes.mockClear();
+
+    render(
+      <I18nProvider>
+        <ScriptIde workdir="/w" request={null} onRun={vi.fn()} />
+      </I18nProvider>,
+    );
+
+    // 自动发现必须仍被调用（说明没被前面那个异常短路）
+    await waitFor(() => expect(hookApiMock.fridaTypesDirs).toHaveBeenCalled());
+    // 关键：最终交给注入的目录是**发现到的那份**（而不是空 → 回退内置）
+    await waitFor(() => expect(applyMock.applyFridaTypes).toHaveBeenCalledWith("17.17.0", "/proj"));
+    await waitFor(() => {
+      const note = screen.queryByTestId("ide-types-note");
+      expect(note?.textContent ?? "").toContain("18.8.2");
+    });
+  });
+
+  it("自动发现也失败（旧后端无此命令）时，回退按 frida 版本解析——不静默用内置", async () => {
+    configMock.get.mockResolvedValue("");
+    hookApiMock.fridaTypesDirs.mockRejectedValueOnce(new Error("unknown command"));
+    applyMock.applyFridaTypes.mockClear();
+
+    render(
+      <I18nProvider>
+        <ScriptIde workdir="/w" request={null} onRun={vi.fn()} />
+      </I18nProvider>,
+    );
+
+    // 发现失败 → 目录为空，交给注入的是空串（由它走"按 frida 版本解析"）
+    await waitFor(() => expect(applyMock.applyFridaTypes).toHaveBeenCalledWith("17.17.0", ""));
+    // 仍要有结论（回退说明），而不是空着
+    await waitFor(() => {
+      const note = screen.queryByTestId("ide-types-note");
+      expect(note?.textContent ?? "").toBeTruthy();
     });
   });
 });

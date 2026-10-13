@@ -282,6 +282,8 @@ pub fn run() {
             commands::hook::hook_script_read,
             commands::hook::hook_script_write,
             commands::hook::hook_script_delete,
+            commands::hook::hook_frida_types,
+            commands::hook::hook_frida_types_dirs,
             commands::hook::hook_export_save,
             commands::pty::pty_open,
             commands::pty::pty_write,
@@ -298,12 +300,28 @@ pub fn run() {
                 // 桌面抢着 kill 它就把「重启工具」变成「打断正在分析的目标进程」。
                 // 退出路径上不能无限等：adb 卡住时给 2 s 预算，超时就放弃（规则留着，
                 // 下一次启动的清扫会收掉——那才是它的归宿）。
+                //
+                // ⚠️ `RunEvent::Exit` 里**没有** Tokio 运行时上下文（那条报错是
+                // "there is no reactor running"）：这个回调由 Tauri 的运行时收尾流程调用，
+                // 此时 `tauri::async_runtime::block_on` 会 panic。所以这里自建一个临时
+                // runtime 来跑这段收尾——退出路径必须是**独立可跑**的，不能依赖当时的线程状态。
                 if let Some(state) = app.try_state::<AppState>() {
                     let manager = state.agent.clone();
-                    let _ = tauri::async_runtime::block_on(tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        manager.release_forwards(),
-                    ));
+                    let cleanup = async move {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            manager.release_forwards(),
+                        )
+                        .await;
+                    };
+                    // 建 runtime 失败也不许把退出流程带崩：收尾是"尽力而为"，
+                    // 没做成的规则留给下次启动的清扫（那才是它的归宿）。
+                    if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        rt.block_on(cleanup);
+                    }
                 }
                 // 插件 shutdown 先于动态库关闭（loaded 表随 state drop 也兜底）
                 if let Some(state) = app.try_state::<AppState>() {

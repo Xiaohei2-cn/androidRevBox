@@ -14,6 +14,9 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { hookApi } from "@/api/hook";
+import { envApi } from "@/api/env";
+import { configApi } from "@/api/config";
+import { KEY_FRIDA_TYPES_DIR } from "../workdir";
 import { useI18n } from "@/i18n";
 import { useSettings } from "@/app/providers";
 import { isSafeJsName } from "../types";
@@ -209,6 +212,69 @@ export function ScriptIde({
     monaco.editor.setTheme(ensureIdeTheme(effectiveTheme === "dark"));
   }, [effectiveTheme]);
 
+  /**
+   * 类型库跟随**选定环境里的 frida 版本**。
+   *
+   * 内置的类型库只对某一个 frida 主线正确；用户换版本后内置版给的提示就是错的用法。
+   * 这里探一次 frida 版本 → 按版本解析对应类型库 → 覆盖注入。失败/离线就回退内置，
+   * 并把结论写到状态条（`ide-types-note`），让人知道现在提示的是哪一版。
+   */
+  const [typesNote, setTypesNote] = useState<string | null>(null);
+  /**
+   * 类型库解析的**共享 promise**：打开文件前必须等它落地。
+   *
+   * 为什么必须等（真实事故）：`setupMonaco()` 会先注**内置版本**保证"打开就有提示"，
+   * 正确那份要异步解析完才覆盖。如果模型在这中间建立，语言服务就按内置版本算好了
+   * 结果（并被缓存），此后 extraLib 虽更新，已算过的补全不重算——现场就是
+   * "状态条写着 18.8.2，提示却仍是 19.x 的 getGlobalExportByName"。
+   * 与其在事后补救（重建模型/强制重算都不稳），不如**先备好再建**。
+   */
+  const typesReadyRef = useRef<Promise<unknown> | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const task = (async () => {
+      /**
+       * ⚠️ 三个来源**各自容错**，谁也不许拖垮谁。
+       *
+       * 事故现场：原来写成 `await Promise.all([envApi.frida(), configApi.get(KEY, "")])`，
+       * 而 `configApi.get` 对**未注册的配置键**会抛错（Rust 白名单校验）——
+       * 于是"读一个可选配置项失败"把整条链路带崩，类型库根本没被换成用户那份，
+       * 而面板上一切正常（只有提示内容不对）。这类"可选读取失败"必须降级成本地默认值，
+       * 不能中断主线。
+       */
+      const read = async <T,>(p: Promise<T>, fallback: T): Promise<T> => {
+        try {
+          return await p;
+        } catch {
+          return fallback;
+        }
+      };
+
+      const frida = await read(envApi.frida(), null);
+      // 手填的目录（读不到就当没填——旧后端不认识这个键时正是这一条会抛）
+      const configuredDir = await read(configApi.get(KEY_FRIDA_TYPES_DIR, ""), "");
+      // 没手填目录时**自动发现**：扫常见位置，取最近改动的那个。这样什么都不用配
+      // 就能对上 PyCharm 那份（机器上常有多份 frida-agent-example 副本，手填答不对）。
+      let dir = configuredDir.trim();
+      if (!dir) {
+        const found = await read(hookApi.fridaTypesDirs(), [] as Awaited<ReturnType<typeof hookApi.fridaTypesDirs>>);
+        dir = found[0]?.projectRoot ?? "";
+      }
+      try {
+        const { applyFridaTypes } = await import("./monacoSetup");
+        const note = await applyFridaTypes(frida?.fridaVersion ?? null, dir);
+        if (alive) setTypesNote(note);
+      } catch (e) {
+        // 注入本身失败才落到这里：写清楚（不静默）——用内置版本兜底
+        if (alive) setTypesNote(`类型库注入失败，用内置版本：${String((e as Error)?.message ?? e)}`);
+      }
+    })();
+    typesReadyRef.current = task;
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   /** 把 editor 切到某个已缓存的模型上（保存/恢复视图状态） */
   const activate = useCallback((name: string) => {
     const editor = editorRef.current;
@@ -258,6 +324,17 @@ export function ScriptIde({
       setState({ kind: "loading" });
       setNotice(null);
       try {
+        /**
+         * **先等类型库就绪，再建编辑器与模型**（顺序不能反）。
+         *
+         * 真实事故：模型若在"内置类型库还在生效"的窗口里建立，语言服务就按内置
+         * （19.x）算出了 Module 的补全并缓存；此后 extraLib 虽被换成 18.8.2，
+         * 已算过的结果不重算——现场就是"状态条写着 18.8.2，提示却仍是
+         * getGlobalExportByName"。等一下就彻底没有这个窗口。
+         * 等的是**共享 promise**（见 typesReadyRef），不会重复解析；它自带容错，
+         * 最坏情况等价于"用内置版本"（老行为），不会把 IDE 卡住。
+         */
+        await typesReadyRef.current;
         // 同步建壳：守卫与创建必须同一拍完成，中间不许有 await（无竞态窗口）
         ensureEditor();
         const content = await hookApi.scriptRead(name);
@@ -653,6 +730,16 @@ export function ScriptIde({
           </div>
         )}
       </div>
+
+      {typesNote && (
+        <p
+          className="shrink-0 truncate text-10px text-muted-foreground"
+          title={typesNote}
+          data-testid="ide-types-note"
+        >
+          {typesNote}
+        </p>
+      )}
 
       {notice && (
         <p

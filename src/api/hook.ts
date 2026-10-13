@@ -35,6 +35,27 @@ export interface PreflightDto {
   channelHint?: string | null;
 }
 
+/** 从用户指定的项目目录里读到的 frida 类型库（智能提示来源） */
+export interface FridaTypesDto {
+  /** @types/frida-gum/index.d.ts 正文 */
+  gum: string;
+  gumVersion?: string | null;
+  /** gum 类型库是否自带 `Java` 命名空间（18.x 及更早自带；自带就不该再注 java-bridge） */
+  gumHasJava: boolean;
+  /** frida-java-bridge/index.d.ts 正文；该目录里没有则为 null */
+  javaBridge?: string | null;
+  javaBridgeVersion?: string | null;
+  gumPath: string;
+  javaBridgePath?: string | null;
+}
+
+/** 自动发现到的一个 frida 类型库位置（设置里的候选） */
+export interface FridaTypeDir {
+  projectRoot: string;
+  version?: string | null;
+  mtime: number;
+}
+
 export const hookApi = {
   /** 扫工作目录一层 *.js；dir 缺省用配置键 app.hook.workdir */
   jsList(dir?: string): Promise<JsFileDto[]> {
@@ -65,6 +86,21 @@ export const hookApi = {
   /** 删一个脚本（IDE 的「删除」；只删工作目录里的普通 .js） */
   scriptDelete(name: string): Promise<void> {
     return invokeCommand<void>("hook_script_delete", { name });
+  },
+  /**
+   * 读用户指定的**项目目录**里的 frida 类型库（IDE 智能提示的"提示内容"来源）。
+   * dir 缺省用配置键 app.hook.frida_types_dir。找不到那份 @types/frida-gum 会抛错，
+   * 由调用方回退到"按 frida 版本从 CDN 取"。
+   */
+  fridaTypes(dir?: string): Promise<FridaTypesDto> {
+    return invokeCommand<FridaTypesDto>("hook_frida_types", { dir: dir ?? null });
+  },
+  /**
+   * 自动发现本机上装了 @types/frida-gum 的项目。IDE 打开时用它挑默认来源：
+   * 只有一份就直接用（用户什么都不用填），多份取最近改动的那个。
+   */
+  fridaTypesDirs(): Promise<FridaTypeDir[]> {
+    return invokeCommand<FridaTypeDir[]>("hook_frida_types_dirs", {});
   },
   /**
    * 「保存日志」：把**用户在对话框里亲自选中的本机路径**交给桌面端写盘（真终端页在用），
