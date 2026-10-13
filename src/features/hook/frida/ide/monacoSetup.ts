@@ -54,6 +54,8 @@ import {
   ScriptTarget,
 } from "monaco-editor/languages/features/typescript/register";
 
+import { registerFridaCallbackCompletions } from "./fridaCallbacks";
+
 // 通用 editor worker（单词建议、链接检测等基础能力）
 import EditorWorker from "monaco-editor/editor/editor.worker?worker";
 // TS/JS 语言服务 worker（补全、悬停、诊断的运算都在这里面）
@@ -167,11 +169,25 @@ export function setupMonaco(): typeof monaco {
   // 默认先注**内置版本**，保证"打开就有提示"；选定环境解析到别的版本后，
   // 由 applyFridaTypes() 覆盖（见下）。
   //
-  // ⚠️ 这里**必须同时登记 appliedKey**：否则 appliedKey 停在 null，后面真正注入
-  // 用户那份时会被判成"还没注入过"→ 跳过 worker 重建 → 而 worker 早已按内置版
-  // 算好了结果（这就是"状态条说 18.8.2、提示却还是 19.x"的最后一道口子）。
-  injectFridaLibs(BUNDLED_FRIDA_TYPES, false);
-  appliedKey = typeSetKey(BUNDLED_FRIDA_TYPES);
+  /*
+   * ⚠️ 只在"还没有更好的"时注内置兜底——**绝不许覆盖已经注入好的那份**。
+   *
+   * 真实事故（app 里才复现，预览里因为时序不同而掩盖了）：
+   * `ScriptIde` 的 effect 先跑 `applyFridaTypes()` 注入了用户的 18.8.2；
+   * 用户随后点开编辑器 → `setupMonaco()` 首次执行 → 这里无条件注内置 →
+   * **把 18.8.2 覆盖回内置 19.x**，连 appliedKey 也被改回内置指纹。
+   * 于是"状态条说 18.8.2、补全却是 19.x 的 getGlobalExportByName"。
+   *
+   * 判据用 appliedKey：它非 null 就说明**已有一份按环境解析过的库**在生效，
+   * 内置兜底此时既不该注入、更不该改指纹。
+   */
+  if (appliedKey === null) {
+    injectFridaLibs(BUNDLED_FRIDA_TYPES, false);
+    appliedKey = typeSetKey(BUNDLED_FRIDA_TYPES);
+  }
+
+  // 补 TS 语言服务不做的那些 union 回调成员补全（详见 fridaCallbacks.ts 的文件头）
+  registerFridaCallbackCompletions(monaco);
 
   return monaco;
 }

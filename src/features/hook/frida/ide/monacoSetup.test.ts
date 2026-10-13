@@ -91,6 +91,21 @@ describe("类型库版本解耦：不许写死", () => {
     expect(setupSrc).toMatch(/const rebuildNow = !workerInSync && workerRunning/);
   });
 
+  /**
+   * `setupMonaco()` 里的内置兜底**不许覆盖已注入的那份**。
+   *
+   * 真实事故（只在 app 里复现）：ScriptIde 的 effect 先注入了用户的 18.8.2；
+   * 用户点开编辑器时 setupMonaco 首次执行，此前无条件注内置 → **把它覆盖回 19.x**，
+   * 连指纹也改回去，于是此后 applyFridaTypes 即便再跑也认为"没变"。
+   */
+  it("setupMonaco 的兜底注入不得覆盖已解析的库（app 里才暴露的时序 bug）", () => {
+    // 必须带 appliedKey === null 的守卫
+    expect(setupSrc).toMatch(/if \(appliedKey === null\)/);
+    // 且守卫必须紧挨着那次兜底注入（同一分支内）
+    const guarded = /if \(appliedKey === null\) \{[\s\S]{0,200}injectFridaLibs\(BUNDLED_FRIDA_TYPES, false\)/;
+    expect(setupSrc).toMatch(guarded);
+  });
+
   it("Java 垫片按需注入（gum 自带 Java 时不再叠 java-bridge 的声明）", () => {
     // 修的是"同一命名空间声明两次"：gum 18.x 及更早自带 `declare namespace Java`，
     // 那种情况下必须只留 gum 那份。判定标志是 gumHasJava。
