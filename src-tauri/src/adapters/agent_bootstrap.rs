@@ -195,6 +195,30 @@ impl AgentBootstrap {
         Ok(output.stdout.lines().any(|line| line.trim() == "running"))
     }
 
+    /// 强制让下一次 `install_artifact` 真的推送一次。
+    ///
+    /// `install_artifact` 按**哈希**判断"设备上那份是不是这次要的那份"，哈希相同就跳过推送。
+    /// 正常情况下这是对的，但它推不出"设备上那份的**行为**还是不是我们要的版本"：
+    /// 版本号由 `env!("CARGO_PKG_VERSION")` 编译期写死，只改 workspace 版本号而源码没动时，
+    /// 可能出现"哈希没变、版本号仍是旧值"的产物。真机踩过：
+    /// 升级到 0.2.3 后自动连接报 `Agent version 0.2.2 does not match selected artifact version 0.2.3`，
+    /// 而设备上的二进制与本地**哈希完全一致**，于是没有任何一步会去修它。
+    ///
+    /// 握手已经明确说"版本不对"时，调用方先用这个清掉设备侧副本，让重试时真的推一次。
+    pub async fn invalidate_remote_artifact(
+        &self,
+        serial: &str,
+    ) -> Result<(), AgentBootstrapError> {
+        self.run_checked(
+            serial,
+            &adb::cmd_shell(&format!("rm -f {AGENT_REMOTE_BINARY}")),
+            SHORT_TIMEOUT,
+            "invalidate_artifact",
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub async fn install_artifact(
         &self,
         serial: &str,

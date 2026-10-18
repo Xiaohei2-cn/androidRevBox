@@ -43,6 +43,10 @@ pub enum AgentManagerError {
         cause: Box<AgentManagerError>,
         rollback: String,
     },
+    /// 内部信号：握手说"版本不对"，需要清掉设备侧副本再装一次。
+    /// **不会**原样到达用户——`connect_artifact` 收到它就转成一次真实重试。
+    #[error("{cause}")]
+    StaleArtifactNeedsReinstall { cause: Box<AgentManagerError> },
 }
 
 /// 连上之后留着这两样，只为一件事：**传输被打断时能轻量重连**（AR10.4）。
@@ -152,6 +156,25 @@ impl AgentManager {
         &self,
         serial: &str,
         artifact: AgentArtifact,
+    ) -> Result<AgentSessionStatus, AgentManagerError> {
+        match Box::pin(self.connect_artifact_inner(serial, artifact.clone(), true)).await {
+            // 走到这里锁已经释放：可以安全地清掉设备侧副本并完整重来一次
+            Err(AgentManagerError::StaleArtifactNeedsReinstall { cause }) => {
+                tracing::warn!(serial, cause = %cause, "清掉设备侧 Agent 副本后重装重连");
+                self.bootstrap.invalidate_remote_artifact(serial).await?;
+                Box::pin(self.connect_artifact_inner(serial, artifact, false)).await
+            }
+            other => other,
+        }
+    }
+
+    /// `allow_version_retry=false` 时不会再触发第二轮重装：重试只允许一次，
+    /// 否则两个版本互相不认就会在这里无限来回。
+    async fn connect_artifact_inner(
+        &self,
+        serial: &str,
+        artifact: AgentArtifact,
+        allow_version_retry: bool,
     ) -> Result<AgentSessionStatus, AgentManagerError> {
         validate_serial(serial)?;
         let session = self.session_for(serial);
@@ -276,6 +299,41 @@ impl AgentManager {
             .await;
         let status = match result {
             Ok(status) => status,
+            /*
+             * 版本不匹配 = "设备上那份不是我们要的那份"，而**这一条判断只可能在握手时拿到**：
+             * 安装前的比较只有哈希，而版本号是编译期写死的，两者不一致时哈希仍然可能相同
+             * （真机踩过：0.2.3 的桌面对着 0.2.2 的 Agent，哈希一模一样，于是推都不推）。
+             *
+             * 所以这里补一次自愈：把设备侧副本清掉再完整走一遍安装+启动。
+             * 只重试一次——第二次还不对就是产物本身有问题，再循环只是把同一句话重复给用户。
+             */
+            /*
+             * ⚠️ 这里**不能**直接递归重连：`connect_artifact_inner` 一进来就持有
+             * `session.operation` 这把锁（整个连接过程互斥），持锁再进一次就是自己等自己。
+             * 所以只把"需要重装"这个意图记下来，先把锁和现场都收拾干净，
+             * 回到 `connect_artifact` 那一层（锁已释放）再真正重试。
+             */
+            Err(error @ AgentManagerError::IncompatibleAgentVersion { .. }) if allow_version_retry => {
+                let failure_state = session.status().state;
+                let attempt = self
+                    .recover_failed_start(
+                        serial,
+                        &session,
+                        &install,
+                        Some(&launch),
+                        error,
+                        failure_state,
+                    )
+                    .await;
+                tracing::warn!(
+                    serial,
+                    error = %attempt,
+                    "Agent 版本不匹配：清掉设备侧副本后按本次产物重装一次"
+                );
+                return Err(AgentManagerError::StaleArtifactNeedsReinstall {
+                    cause: Box::new(attempt),
+                });
+            }
             Err(error) => {
                 let failure_state = session.status().state;
                 let error = self
@@ -952,6 +1010,12 @@ mod tests {
         /// 里 adbd 随 framework 一起重启、`adb forward` 规则消失的那个现场。
         /// 第二条连接起完全正常，于是"只重连不重放"这件事可以被数出来。
         DropFirstRequestThenReady,
+        /// hello **成功**但自报的版本号是旧的（`0.0.1-stale`）。
+        ///
+        /// 这是真机上发生过的形态，与 `Incompatible` 不是一回事：协议一致、能力齐全，
+        /// 只是产物内容对不上。安装前的哈希比较发现不了它（哈希可以相同），
+        /// 所以只能靠握手后的版本核对兜住。
+        StaleVersion,
     }
 
     async fn spawn_fake_agent(mode: FakeAgentMode) -> (u16, JoinHandle<()>) {
@@ -1010,6 +1074,11 @@ mod tests {
                         request.request_id,
                         AgentError::new(ErrorCode::IncompatibleVersion, "test mismatch"),
                     )
+                }
+                (FakeAgentMode::StaleVersion, agent_protocol::method::SYSTEM_HELLO) => {
+                    let mut stale = hello(ProviderHealth::Ready, true);
+                    stale.agent_version = "0.0.1-stale".into();
+                    ResponseEnvelope::success(request.request_id, serde_json::to_value(stale).unwrap())
                 }
                 (_, agent_protocol::method::SYSTEM_HELLO) => ResponseEnvelope::success(
                     request.request_id,
@@ -1346,6 +1415,52 @@ mod tests {
         );
         server.abort();
         manager.disconnect("serial-a").await.unwrap();
+    }
+
+    /// 版本号对不上时**必须自愈一次**，而不是把错误原样丢给用户。
+    ///
+    /// 真机现场（0.2.2 → 0.2.3）：安装前的比较只看哈希，而版本号是编译期写死的，
+    /// 升级时完全可能"哈希没变、版本号还是旧的"。若不在这里补一脚，
+    /// 用户看到的就是"已允许自动连接，这次没连上"，且重试永远同一个结果。
+    #[tokio::test]
+    async fn stale_agent_version_triggers_one_reinstall_attempt() {
+        let (port, server) = spawn_fake_agent(FakeAgentMode::StaleVersion).await;
+        let runner = Arc::new(SessionAdbRunner::new(
+            [("serial-a".into(), port)],
+            Duration::ZERO,
+        ));
+        let manager = manager_with_runner(runner.clone());
+        let artifact = test_artifact();
+
+        let _ = manager
+            .connect("serial-a", &artifact.path().join("android-agent"))
+            .await;
+
+        // 关键证据：设备侧那份被精确清掉了，下一次安装才会真的推送。
+        // 用完整命令而不是子串：`stop` 脚本里也有 `rm -f <同一个路径>` 的片段，
+        // 拿子串数会把"普通的停止清理"也算进来，断言就失去意义了。
+        let invalidations = runner
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, args)| {
+                args.iter().any(|a| {
+                    a.trim() == "rm -f /data/local/tmp/app_reverse_tools_agent"
+                })
+            })
+            .count();
+        assert_eq!(
+            invalidations, 1,
+            "版本不匹配时必须清掉设备侧副本（且只清一次），否则重装会走哈希短路"
+        );
+        // 只重试一次：第二次仍不匹配就如实失败，不能来回刷
+        assert_eq!(
+            runner.count_command("--localabstract"),
+            2,
+            "应当恰好重装重连一次（初次 + 自愈），不能无限循环"
+        );
+        server.abort();
     }
 
     #[tokio::test]

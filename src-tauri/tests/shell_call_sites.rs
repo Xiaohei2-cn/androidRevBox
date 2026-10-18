@@ -86,6 +86,15 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
         Category::Bootstrap,
         None,
     ),
+    (
+        // 版本对不上时清掉设备侧副本，让下一次 `install_artifact` 真的推一遍。
+        // 归 Bootstrap 而不是 Legacy 回退：它不属于任何业务能力，只在"握手说版本不对"
+        // 这一条自愈路径上删一个文件；Agent 没连上时根本没有别的通道能做这件事。
+        "src/adapters/agent_bootstrap.rs",
+        "invalidate_remote_artifact",
+        Category::Bootstrap,
+        None,
+    ),
     // Transport：push/pull/install 与 SO 替换的暂存件收尾
     (
         "src/services/device_service.rs",
@@ -117,6 +126,30 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
     (
         "src/services/device_service.rs",
         "replace_native_library",
+        Category::Transport,
+        None,
+    ),
+    // 工具市场的一键安装（P13）：push 之后的三条 shell —— `chmod 0755`、读设备 ABI、
+    // 安装后复核（`stat` + `test -x`）。三条都是幂等或只读的，归 Transport 而不是
+    // Legacy fallback：它们不是"Agent 能力的旧回退腿"，而是 adb 的本职——把本机下好的
+    // 文件送进 /data/local/tmp 并让它能跑。没走 TaskService 长任务，是因为安装是一条
+    // **带校验的链**（下载 → 摘要 → 推送 → chmod → 回读），中途失败要说清断在哪一步，
+    // 而不是丢一个任务 id 让人自己去日志里找。
+    (
+        "src/services/tool_market.rs",
+        "install",
+        Category::Transport,
+        None,
+    ),
+    (
+        "src/services/tool_market.rs",
+        "device_abi",
+        Category::Transport,
+        None,
+    ),
+    (
+        "src/services/tool_market.rs",
+        "verify",
         Category::Transport,
         None,
     ),
@@ -236,8 +269,12 @@ const EXPECTED_SITES_PER_CATEGORY: &[(Category, usize)] = &[
     // 11 → 12（AR12.5）：新增的是 `agent_bootstrap::is_running` 这条**只读**探测，
     // 用来在动手之前问清"设备上有没有在跑的 Agent"。多一个 shell 调用点必须在这里
     // 留一句话——和当年 AR7.6 少一个点要改数字是同一条纪律。
-    (Category::Bootstrap, 12),
-    (Category::Transport, 5),
+    // 12 → 13：新增 `invalidate_remote_artifact`（握手报版本不符时清掉设备侧副本再重装）。
+    // 它只在自愈路径上出现，属于 Agent 自己的装机生命周期，所以记在 Bootstrap 里。
+    (Category::Bootstrap, 13),
+    // 5 → 6（P13）：新增 `tool_market::run_checked`——工具市场的一键安装（push + chmod +
+    // 只读复核）。它是 adb 的文件传输本职，不是 Agent 能力的回退腿，所以归 Transport。
+    (Category::Transport, 8),
     // 2 → 1（提交本次）：`raw_shell_task` 整条删掉了，剩下 `raw_logcat_task` 一条。
     // 数字往下走也要在这里说一句，别让"少了一个回退点"悄悄发生。
     (Category::RawTool, 1),
