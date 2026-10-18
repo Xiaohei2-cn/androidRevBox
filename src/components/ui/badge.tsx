@@ -7,11 +7,15 @@ import { cn } from "@/lib/utils";
  */
 export type BadgeVariant = "muted" | "outline" | "primary" | "mono";
 
+/**
+ * 形状统一为真椭圆（`rounded-full`）——与 Pill / StatusBadge 一致。
+ * 原来是小圆角方块：表格行里已经有圆角按钮，方块状的徽章会与按钮抢"可点"的暗示。
+ */
 const VARIANT_CLASS: Record<BadgeVariant, string> = {
   muted: "bg-muted text-muted-foreground",
   outline: "border border-border/70 text-muted-foreground",
   primary: "bg-primary/10 text-primary",
-  mono: "bg-muted/70 font-mono text-muted-foreground",
+  mono: "bg-muted/70 font-mono tabular-nums text-muted-foreground",
 };
 
 export function Badge({
@@ -29,7 +33,7 @@ export function Badge({
     <span
       title={title}
       className={cn(
-        "inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium leading-4",
+        "inline-flex h-5 shrink-0 items-center gap-1 rounded-full px-2 text-[10px] font-medium leading-none",
         VARIANT_CLASS[variant],
         className,
       )}

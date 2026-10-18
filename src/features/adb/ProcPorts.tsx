@@ -7,6 +7,7 @@ import { AdbNotReadyState } from "@/components/ui/adb-gate";
 import { deviceApi, type PortHolder } from "@/api/device";
 import { DeviceBar } from "@/components/ui/device-bar";
 import { InfoChip } from "@/components/ui/info-chip";
+import { List, ListRow } from "@/components/ui/list";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
 
@@ -231,9 +232,14 @@ export function ProcPorts() {
             ) : portHit.holders.length === 0 ? (
               <p className="text-muted-foreground">{t("adb.proc.noHolder", { port: portHit.port })}</p>
             ) : (
-              <ul className="divide-y">
+              <List>
                 {portHit.holders.map((h) => (
-                  <li key={h.pid} className="flex items-center gap-2 py-1.5" data-testid={`proc-holder-${h.pid}`}>
+                  <ListRow
+                    key={h.pid}
+                    testId={`proc-holder-${h.pid}`}
+                    interactive={false}
+                    className="text-xs"
+                  >
                     <InfoChip
                       label={`pid ${h.pid}`}
                       title={t("adb.binary.copyPid")}
@@ -254,9 +260,9 @@ export function ProcPorts() {
                       )}
                       {armedPid === h.pid ? t("adb.proc.confirmKill") : t("adb.proc.kill")}
                     </Button>
-                  </li>
+                  </ListRow>
                 ))}
-              </ul>
+              </List>
             )}
           </div>
         </section>

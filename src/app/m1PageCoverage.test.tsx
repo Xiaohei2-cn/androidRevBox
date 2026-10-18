@@ -391,8 +391,11 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
   it("托管页用协议 DTO 对账：运行中的 pid 与可停止状态来自 hosted.runs", async () => {
     renderPage(<BinaryHosting />);
     await waitFor(() => expect(device.binaries).toHaveBeenCalled());
-    // 本地模型（camelCase）：权限串决定绿/红与能否双击入区
-    expect(await screen.findByText("-rwxr-xr-x")).toBeTruthy();
+    // 本地模型（camelCase）：权限串决定绿/红与能否双击入区。
+    // 权限现在渲染成分色胶囊（类型字符 + 权限段两个 span），整串仍要能在行里读到：
+    // `screen.getByText` 的默认匹配不跨元素，这里按容器取文本再比。
+    const permsCell = await screen.findByTestId("bin-perms-frida-server");
+    expect(permsCell.textContent).toBe("-rwxr-xr-x");
     // 协议 DTO（snake_case：start_time_ticks / started_at_unix / handle / state）
     // 决定托管区里这一行是不是「在跑、pid 多少、能不能按句柄停止」。
     // 曾经这里读的是 startedAtUnix → undefined，行就永远显示未运行。

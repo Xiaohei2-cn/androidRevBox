@@ -1,5 +1,8 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.files.colName": "Имя",
+  "devices.files.colPerms": "Права",
+  "devices.files.colSize": "Размер",
   "devices.files.upload": "Загрузить сюда",
   "devices.files.mkdirInto": "Новая папка внутри {path}",
   "devices.files.mkdir": "Новая папка",
@@ -252,6 +255,9 @@ export default {
   "adb.binary.argsToggleTip": "Аргументы запуска (помнятся для каждого устройства и файла)",
   "adb.binary.argsLabel": "Параметры запуска {name}",
   "adb.binary.argsPlaceholder": "Только аргументы, напр. -p 2345 --log /dev/null",
+  "adb.binary.colName": "Имя",
+  "adb.binary.colPerms": "Права",
+  "adb.binary.colSize": "Размер",
   "adb.binary.argsHint": "Пишите как на устройстве: сохраняйте - и --, разделяйте пробелами, имя программы не повторяйте (это уже текущая строка)",
   "adb.binary.argsPreview": "Будет отправлено: {argv}",
   "adb.binary.deviceArgs": "Этот запуск был начат с аргументами: {args}",

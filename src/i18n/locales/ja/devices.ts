@@ -1,5 +1,8 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.files.colName": "名前",
+  "devices.files.colPerms": "権限",
+  "devices.files.colSize": "サイズ",
   "devices.files.upload": "ここにアップロード",
   "devices.files.mkdirInto": "{path} の中に新しいフォルダ",
   "devices.files.mkdir": "新しいフォルダ",
@@ -252,6 +255,9 @@ export default {
   "adb.binary.argsToggleTip": "起動引数（デバイスとファイルごとに記憶）",
   "adb.binary.argsLabel": "{name} の起動引数",
   "adb.binary.argsPlaceholder": "引数のみ記入、例: -p 2345 --log /dev/null",
+  "adb.binary.colName": "名前",
+  "adb.binary.colPerms": "権限",
+  "adb.binary.colSize": "サイズ",
   "adb.binary.argsHint": "デバイスで打つままに書きます：- と -- はそのまま、スペース区切り、プログラム名は書かない（この行がそれです）",
   "adb.binary.argsPreview": "送信内容：{argv}",
   "adb.binary.deviceArgs": "今回の起動引数：{args}",

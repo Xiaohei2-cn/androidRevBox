@@ -1,5 +1,8 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.files.colName": "Name",
+  "devices.files.colPerms": "Perms",
+  "devices.files.colSize": "Size",
   "devices.files.upload": "Upload here",
   "devices.files.mkdirInto": "New folder inside {path}",
   "devices.files.mkdir": "New folder",
@@ -252,6 +255,9 @@ export default {
   "adb.binary.argsToggleTip": "Launch args (remembered per device and file)",
   "adb.binary.argsLabel": "Launch args for {name}",
   "adb.binary.argsPlaceholder": "Arguments only, e.g. -p 2345 --log /dev/null",
+  "adb.binary.colName": "Name",
+  "adb.binary.colPerms": "Perms",
+  "adb.binary.colSize": "Size",
   "adb.binary.argsHint": "Write it exactly as you would type it on the device: keep - and --, separate with spaces, and skip the program name (this row already is it)",
   "adb.binary.argsPreview": "Will send: {argv}",
   "adb.binary.deviceArgs": "This run started with these args: {args}",

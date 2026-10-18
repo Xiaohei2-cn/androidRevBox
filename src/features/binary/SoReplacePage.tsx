@@ -3,6 +3,7 @@ import { Select } from "@/components/ui/select";
 import { useQuery } from "@tanstack/react-query";
 import { FolderInput, Play, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { List, ListRow } from "@/components/ui/list";
 import { AdbNotReadyState } from "@/components/ui/adb-gate";
 import { deviceApi, type DeviceEntry, type ReplaceNativeLibraryResult } from "@/api/device";
 import { envApi } from "@/api/env";
@@ -273,12 +274,14 @@ export function SoReplacePage({ active = true }: { active?: boolean }) {
               {t("binary.so.rolledBack")}
             </p>
           )}
-          <ul className="mt-1 space-y-0.5">
+          <List className="mt-1 gap-1 p-0">
             {result.steps.map((step, index) => (
-              <li
+              <ListRow
                 key={`${step.name}-${index}`}
-                className="flex items-start gap-1.5 font-mono text-11px leading-relaxed"
-                data-testid={`so-replace-step-${step.name}`}
+                testId={`so-replace-step-${step.name}`}
+                interactive={false}
+                multiline
+                className="gap-1.5 font-mono text-[11px] leading-relaxed"
               >
                 <span className={step.ok ? "text-emerald-600" : "text-destructive"}>
                   {step.ok ? "\u2713" : "\u2715"}
@@ -287,9 +290,9 @@ export function SoReplacePage({ active = true }: { active?: boolean }) {
                 {step.detail && (
                   <span className="min-w-0 break-all text-muted-foreground">{step.detail}</span>
                 )}
-              </li>
+              </ListRow>
             ))}
-          </ul>
+          </List>
           {result.backup_path && (
             <p className="mt-1 break-all text-11px text-muted-foreground">
               {t("binary.so.backupKept", { path: result.backup_path })}

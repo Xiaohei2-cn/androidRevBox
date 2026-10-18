@@ -64,6 +64,8 @@ import {
 } from "./hostedLaunch";
 import { DeviceBar } from "@/components/ui/device-bar";
 import { InfoChip } from "@/components/ui/info-chip";
+import { List, ListHeader, ListRow } from "@/components/ui/list";
+import { PermissionPill } from "@/components/ui/pill";
 import { useI18n, type TranslateFn } from "@/i18n";
 import { useAppNav } from "@/app/nav";
 import {
@@ -1271,135 +1273,141 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
             {!isLoading && !isError && binaries.length === 0 && (
               <p className="p-3 text-xs text-muted-foreground">{t("adb.binary.empty")}</p>
             )}
-            <ul className="divide-y divide-border/60">
+            <ListHeader testId="bin-list-head" className="pt-1">
+              <span className="min-w-0 flex-1">{t("adb.binary.colName")}</span>
+              <span className="hidden w-col-perms shrink-0 sm:inline">
+                {t("adb.binary.colPerms")}
+              </span>
+              <span className="w-col-size shrink-0 text-right">{t("adb.binary.colSize")}</span>
+              <span className="w-col-actions shrink-0" />
+            </ListHeader>
+            <List testId="bin-list">
               {binaries.map((b) => (
-                <li key={b.name} data-testid={`bin-${b.name}`}>
+                <ListRow key={b.name} testId={`bin-${b.name}`} interactive={false}>
                   {/*
-                    一行两栏（shadcn Table 的路子）：左边一条竖线扫到底 —— 第一行是文件名与状态，
-                    第二行是备注（平时只是文字，点铅笔才变输入框）；右边三列固定宽度右对齐。
-                    备注跟着**文件**走，所以填在这里而不是等它进了托管区才看得到。
+                    单行三列（与文件列表同一刻度）：名字 → 权限 → 大小 → 动作。
+
+                    以前这里是「名字 + 备注」纵向两行，再和权限/大小/动作横排。
+                    备注一旦有内容，左边那块变高，右边三个固定宽度的格子仍按单行算——
+                    权限 `-rwxr-xr-x` 在 74px 里放不下就折成两行，大小也被拆成 `139`/`B`，
+                    整行看着像散架。备注是次要信息，挪到名字下面作为第二行、
+                    并且**不参与**右侧列的对齐（它跟着名字列走）。
                   */}
                   <div
                     data-testid={`bin-row-${b.name}`}
                     className={cn(
-                      "group flex items-center gap-4 px-4 py-2.5 transition-colors hover:bg-muted/50",
-                      !b.hasExec && "bg-muted/20",
+                      "group flex w-full min-w-0 items-center gap-2 text-xs",
+                      !b.hasExec && "opacity-70",
                     )}
                     onDoubleClick={() => addHosted(b)}
                     title={b.hasExec ? t("adb.binary.dblClickAdd") : undefined}
                   >
+                    {/* 名字列：名字 + 备注（备注只在有内容/编辑时才占第二行） */}
                     <div className="min-w-0 flex-1">
-                    {/* 第一行：名字本身承担可执行状态（绿=可执行，红=不可执行），不再另立标签 */}
-                    <div className="flex min-w-0 items-center gap-2">
-                    <span
-                      className={cn(
-                        "path-selectable min-w-0 max-w-[26rem] shrink truncate font-mono text-sm font-medium leading-tight",
-                        b.hasExec ? "text-emerald-600 dark:text-emerald-400" : "text-red-500",
-                      )}
-                      title={b.name}
-                    >
-                      {b.name}
-                    </span>
-                    {(b.externalProcs?.length ?? 0) > 0 && (
-                      <span
-                        className="shrink-0 rounded bg-amber-500/10 px-1 text-10px text-amber-500"
-                        title={t("adb.binary.externalRunningTip")}
-                        data-testid={`external-${b.name}`}
-                      >
-                        {t("adb.binary.externalRunning", { pids: describeProcs(b.externalProcs) })}
-                      </span>
-                    )}
-                    </div>
-                        {/* 备注：平时是文字，点铅笔才变输入框；没备注时是一个"加备注"小按钮 */}
-                        <div className="mt-0.5 flex min-w-0 items-center gap-1.5 pl-3.5 text-xs text-muted-foreground">
-                          {editingNote === b.name ? (
-                            <span
-                              data-note-editor
-                              className="contents"
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span
+                          className={cn(
+                            "path-selectable min-w-0 truncate font-mono text-sm font-medium leading-tight",
+                            b.hasExec ? "text-emerald-600 dark:text-emerald-400" : "text-red-500",
+                          )}
+                          title={b.name}
+                        >
+                          {b.name}
+                        </span>
+                        {(b.externalProcs?.length ?? 0) > 0 && (
+                          <span
+                            title={t("adb.binary.externalRunningTip")}
+                            data-testid={`external-${b.name}`}
+                            className="inline-flex h-5 shrink-0 items-center rounded-full bg-amber-500/10 px-2 text-[10px] font-medium leading-none text-amber-500"
+                          >
+                            {t("adb.binary.externalRunning", { pids: describeProcs(b.externalProcs) })}
+                          </span>
+                        )}
+                      </div>
+                      {/* 备注：一行文字或一个"加备注"入口，绝不换行撑高整行 */}
+                      <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px] leading-4 text-muted-foreground">
+                        {editingNote === b.name ? (
+                          <span data-note-editor className="contents">
+                            <input
+                              autoFocus
+                              aria-label={t("adb.binary.noteLabel", { name: b.name })}
+                              data-testid={`note-${b.name}`}
+                              className="h-6 min-w-0 max-w-[20rem] flex-1 rounded-md border border-input bg-background px-1.5 text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                              placeholder={t("adb.binary.notePlaceholder")}
+                              value={noteOf(b.name)}
+                              onChange={(e) => writeNote(b.name, e.target.value)}
+                              onBlur={(event) => {
+                                const next = event.relatedTarget as HTMLElement | null;
+                                if (next?.closest("[data-note-editor]")) return;
+                                setEditingNote(null);
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" || e.key === "Escape") setEditingNote(null);
+                              }}
+                            />
+                            <Select
+                              aria-label={t("adb.binary.noteQuick")}
+                              data-testid={`note-quick-${b.name}`}
+                              className="h-6 w-20 shrink-0 text-[11px] text-muted-foreground"
+                              value=""
+                              onChange={(e) => {
+                                if (!e.target.value) return;
+                                writeNote(b.name, e.target.value);
+                                setEditingNote(null);
+                              }}
                             >
-                              <input
-                                autoFocus
-                                aria-label={t("adb.binary.noteLabel", { name: b.name })}
-                                data-testid={`note-${b.name}`}
-                                className="h-6 min-w-0 max-w-[20rem] flex-1 rounded-md border border-input bg-background px-1.5 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                                placeholder={t("adb.binary.notePlaceholder")}
-                                value={noteOf(b.name)}
-                                onChange={(e) => writeNote(b.name, e.target.value)}
-                                // 焦点真的离开这个编辑器才收起。以前是无条件 onBlur 就关：
-                                // 从输入框移去点「快捷备注」下拉时先触发 blur，整行当场退出编辑态，
-                                // 下拉在鼠标按下那一刻已经不在 DOM 里了 —— 表现就是"快捷备注点了没反应"。
-                                onBlur={(event) => {
-                                  const next = event.relatedTarget as HTMLElement | null;
-                                  if (next?.closest("[data-note-editor]")) return;
-                                  setEditingNote(null);
-                                }}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter" || e.key === "Escape") setEditingNote(null);
-                                }}
-                              />
-                              <Select
-                                aria-label={t("adb.binary.noteQuick")}
-                                data-testid={`note-quick-${b.name}`}
-                                className="h-6 w-24 shrink-0 text-[11px] text-muted-foreground"
-                                value=""
-                                onChange={(e) => {
-                                  if (!e.target.value) return;
-                                  writeNote(b.name, e.target.value);
-                                  setEditingNote(null);
-                                }}
-                              >
-                                <option value="">{t("adb.binary.noteQuick")}</option>
-                                {NOTE_PRESETS.map((p) => (
-                                  <option key={p} value={p}>
-                                    {p}
-                                  </option>
-                                ))}
-                              </Select>
-                                                      </span>
-                          ) : noteOf(b.name) ? (
-                            <>
-                              <span className="min-w-0 truncate">{noteOf(b.name)}</span>
-                              <button
-                                type="button"
-                                className="shrink-0 rounded p-0.5 hover:bg-accent hover:text-foreground"
-                                aria-label={t("adb.binary.noteEdit")}
-                                data-testid={`note-edit-${b.name}`}
-                                onClick={() => setEditingNote(b.name)}
-                              >
-                                <Pencil className="h-3 w-3" />
-                              </button>
-                            </>
-                          ) : (
+                              <option value="">{t("adb.binary.noteQuick")}</option>
+                              {NOTE_PRESETS.map((preset) => (
+                                <option key={preset} value={preset}>
+                                  {preset}
+                                </option>
+                              ))}
+                            </Select>
+                          </span>
+                        ) : noteOf(b.name) ? (
+                          <>
+                            <span className="min-w-0 truncate" title={noteOf(b.name)}>
+                              {noteOf(b.name)}
+                            </span>
                             <button
                               type="button"
-                              className="flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-[11px] hover:bg-accent hover:text-foreground"
-                              aria-label={t("adb.binary.noteAdd")}
-                              data-testid={`note-add-${b.name}`}
+                              className="shrink-0 rounded p-0.5 hover:bg-accent hover:text-foreground"
+                              aria-label={t("adb.binary.noteEdit")}
+                              data-testid={`note-edit-${b.name}`}
                               onClick={() => setEditingNote(b.name)}
                             >
-                              <Plus className="h-3 w-3" />
-                              {t("adb.binary.noteAdd")}
+                              <Pencil className="h-3 w-3" />
                             </button>
-                          )}
-                        </div>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            className="flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-[11px] hover:bg-accent hover:text-foreground"
+                            aria-label={t("adb.binary.noteAdd")}
+                            data-testid={`note-add-${b.name}`}
+                            onClick={() => setEditingNote(b.name)}
+                          >
+                            <Plus className="h-3 w-3" />
+                            {t("adb.binary.noteAdd")}
+                          </button>
+                        )}
+                      </div>
                     </div>
-                    <span
-                      className="w-[74px] shrink-0 text-right font-mono text-xs leading-tight text-muted-foreground"
-                      title={b.perms}
-                    >
-                      {b.perms}
+                    {/* 权限列：与文件列表同一个胶囊、同一个列宽刻度，绝不折行 */}
+                    <span className="hidden w-col-perms shrink-0 sm:inline-flex">
+                      <PermissionPill perms={b.perms} testId={`bin-perms-${b.name}`} />
                     </span>
-                    <span className="w-[72px] shrink-0 text-right text-xs tabular-nums leading-tight text-muted-foreground">
+                    {/* 大小列：右对齐 + 等宽数字，单位不换行 */}
+                    <span className="w-col-size shrink-0 whitespace-nowrap text-right font-mono text-[10px] tabular-nums text-muted-foreground">
                       {b.size}
-                      <span className="opacity-70"> B</span>
                     </span>
-                    {/* 动作列：只用图标 + 悬停说明，文字留给名字那栏（一行里三种字号就脏了） */}
-                    <span className="flex w-[92px] shrink-0 items-center justify-end gap-0.5">
+                    {/* 动作列：只用图标 + 悬停说明 */}
+                    <span className="flex w-col-actions shrink-0 items-center justify-end gap-0.5">
                       {!b.hasExec && (
                         <Button
-                          size="icon"
+                          size="sm"
                           variant="ghost"
-                          className="h-6 w-6 text-muted-foreground hover:text-primary"
+                          className="h-6 w-6 px-0 text-muted-foreground hover:text-primary"
                           aria-label={t("adb.binary.chmod")}
                           title={t("adb.binary.chmod")}
                           onClick={(event) => {
@@ -1411,9 +1419,9 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                         </Button>
                       )}
                       <Button
-                        size="icon"
+                        size="sm"
                         variant="ghost"
-                        className="h-6 w-6 text-muted-foreground hover:text-foreground"
+                        className="h-6 w-6 px-0 text-muted-foreground hover:text-foreground"
                         aria-label={t("adb.binary.addToHost")}
                         title={t("adb.binary.dblClickAdd")}
                         data-testid={`add-${b.name}`}
@@ -1427,9 +1435,9 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                       </Button>
                     </span>
                   </div>
-                </li>
+                </ListRow>
               ))}
-            </ul>
+            </List>
           </div>
         </section>
 
@@ -1473,7 +1481,7 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
             {hosted.length === 0 ? (
               <p className="p-3 text-xs text-muted-foreground">{t("adb.binary.hostEmpty")}</p>
             ) : (
-              <ul className="divide-y text-xs">
+              <List className="text-xs">
                 {hosted.map((row) => {
                   const bin = binaries.find((b) => b.name === row.name);
                   // "已经在跑"有两种：我们起的（有句柄，用既有「终止」）与别人起的（无句柄，
@@ -1486,7 +1494,13 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                         参数就是下面「参数」栏里存的同一份，两处不再各说各话。
                       */}
                   return (
-                    <li key={row.name} className="px-3 py-2" data-testid={`hosted-${row.name}`}>
+                    <ListRow
+                      key={row.name}
+                      testId={`hosted-${row.name}`}
+                      interactive={false}
+                      // 这一行是「名字一行 + 动作一行」的纵向结构，必须顶部对齐
+                      multiline
+                    >
                       {/* 第一行只有文件名：以前它跟 pid 和四五个按钮挤在一行，
                           长名字被截断、按钮也挤成一坨（用户要的"名字一行、动作一行"） */}
                       <div className="flex min-w-0 items-center gap-2">
@@ -1834,10 +1848,10 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                           )}
                         </div>
                       )}
-                    </li>
+                    </ListRow>
                   );
                 })}
-              </ul>
+              </List>
             )}
           </div>
         </section>

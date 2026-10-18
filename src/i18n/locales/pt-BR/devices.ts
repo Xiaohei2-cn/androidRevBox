@@ -1,5 +1,8 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.files.colName": "Nome",
+  "devices.files.colPerms": "Permissoes",
+  "devices.files.colSize": "Tamanho",
   "devices.files.upload": "Enviar para cá",
   "devices.files.mkdirInto": "Nova pasta dentro de {path}",
   "devices.files.mkdir": "Nova pasta",
@@ -252,6 +255,9 @@ export default {
   "adb.binary.argsToggleTip": "Argumentos de execução (lembrados por dispositivo e arquivo)",
   "adb.binary.argsLabel": "Argumentos de execução de {name}",
   "adb.binary.argsPlaceholder": "So os argumentos, ex.: -p 2345 --log /dev/null",
+  "adb.binary.colName": "Nome",
+  "adb.binary.colPerms": "Permissoes",
+  "adb.binary.colSize": "Tamanho",
   "adb.binary.argsHint": "Escreva como digitaria no aparelho: mantenha - e --, separe com espacos e nao repita o nome do programa (essa linha ja e o programa)",
   "adb.binary.argsPreview": "Sera enviado: {argv}",
   "adb.binary.deviceArgs": "Esta execução foi iniciada com estes argumentos: {args}",

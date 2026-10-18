@@ -1,5 +1,8 @@
 /** 设备页：列表导航、设备信息、前台应用 */
 export default {
+  "devices.files.colName": "名称",
+  "devices.files.colPerms": "权限",
+  "devices.files.colSize": "大小",
   "devices.files.upload": "上传到此处",
   "devices.files.mkdirInto": "在 {path} 下新建目录",
   "devices.files.mkdir": "新建目录",
@@ -252,6 +255,9 @@ export default {
   "adb.binary.argsToggleTip": "启动参数（按设备与文件记住）",
   "adb.binary.argsLabel": "{name} 的启动参数",
   "adb.binary.argsPlaceholder": "只写参数，例：-p 2345 --log /dev/null",
+  "adb.binary.colName": "名称",
+  "adb.binary.colPerms": "权限",
+  "adb.binary.colSize": "大小",
   "adb.binary.argsHint": "写法与在设备上手敲一致：保留 - 与 --，空格分隔，程序名不要重复写（就是当前这一行）",
   "adb.binary.argsPreview": "实际发出：{argv}",
   "adb.binary.deviceArgs": "这一次是用这些参数起的：{args}",

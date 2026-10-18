@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { PageHeader } from "@/components/ui/page-header";
+import { List, ListRow } from "@/components/ui/list";
 import { StatusBadge as SharedStatusBadge, type BadgeTone } from "@/components/ui/status-badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { taskApi, tokenizeCommand, type TaskDto, type TaskLogDto } from "@/api/task";
@@ -186,7 +187,7 @@ export function TasksPage() {
                 暂无任务，输入命令开始第一个
               </p>
             )}
-            <ul className="divide-y">
+            <List>
               {tasks.map((t) => (
                 <TaskListItem
                   key={t.id}
@@ -195,7 +196,7 @@ export function TasksPage() {
                   onClick={() => setSelectedId(t.id)}
                 />
               ))}
-            </ul>
+            </List>
           </div>
         </Card>
       </section>
@@ -272,22 +273,18 @@ function TaskListItem({
   onClick: () => void;
 }) {
   return (
-    <li>
-      <button
-        type="button"
-        onClick={onClick}
-        className={cn(
-          "flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs transition-colors hover:bg-accent",
-          selected && "bg-accent",
-        )}
-      >
-        <StatusDot status={task.status} />
-        <span className="min-w-0 flex-1 truncate">{task.name}</span>
-        <span className="shrink-0 text-muted-foreground">
-          {formatTime(task.createdAt)}
-        </span>
-      </button>
-    </li>
+    <ListRow
+      testId={`task-row-${task.id}`}
+      selected={selected}
+      onClick={onClick}
+      className="text-xs"
+    >
+      <StatusDot status={task.status} />
+      <span className="min-w-0 flex-1 truncate">{task.name}</span>
+      <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+        {formatTime(task.createdAt)}
+      </span>
+    </ListRow>
   );
 }
 

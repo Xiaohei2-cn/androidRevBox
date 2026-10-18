@@ -12,6 +12,7 @@ import { BrandIcon } from "@/components/ui/BrandIcon";
 import { PathText } from "@/components/ui/PathText";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { StatusBadge } from "@/components/ui/status-badge";
+import { List, ListRow } from "@/components/ui/list";
 
 /**
  * 仪表盘 adb 卡片：环境指示（含未配置提示）、版本查看、设备连接轮询。
@@ -117,9 +118,9 @@ export function AdbCard() {
             <p className="mt-1 text-xs text-destructive">{t("dashboard.adb.listFailed")}</p>
           )}
           {ready.length > 0 && (
-            <ul className="mt-2 space-y-1">
+            <List className="mt-2 gap-1 p-0">
               {ready.slice(0, 4).map((d) => (
-                <li key={d.serial} className="flex items-center gap-2 text-xs">
+                <ListRow key={d.serial} testId={`adb-device-${d.serial}`} interactive={false} className="text-xs">
                   <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
                   <span className="font-mono">{d.model || d.serial}</span>
                   <span className="text-muted-foreground">
@@ -138,9 +139,9 @@ export function AdbCard() {
                   >
                     <ChevronRight className="h-3.5 w-3.5" />
                   </button>
-                </li>
+                </ListRow>
               ))}
-            </ul>
+            </List>
           )}
         </div>
       </CardContent>

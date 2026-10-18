@@ -121,7 +121,9 @@ export function Recipe({
                 data-testid="chef-step"
                 data-failed={failed ? "true" : undefined}
                 className={cn(
-                  "overflow-hidden rounded-xl border bg-card/70 transition-colors",
+                  // 与全站列表同一刻度：rounded-xl + 极淡外阴影（这里不用 ListRow：
+                  // 算法中心有独立的防闪烁闸门，且这些行支持拖放排序，结构不能换）
+                  "overflow-hidden rounded-xl border bg-card/70 shadow-row transition-colors",
                   failed
                     ? "border-destructive/60 bg-destructive/5"
                     : "border-border/70 hover:border-primary/40",

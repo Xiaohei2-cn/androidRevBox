@@ -5,6 +5,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { StatusBadge } from "@/components/ui/status-badge";
+import { PermissionPill } from "@/components/ui/pill";
+import { List, ListHeader, ListRow } from "@/components/ui/list";
 import { PageHeader } from "@/components/ui/page-header";
 import { PathBar } from "@/features/files/PathBar";
 import { usePathHistory } from "@/features/files/usePathHistory";
@@ -266,17 +268,15 @@ function DeviceListView({
     );
   }
   return (
-    <ul className="space-y-3">
+    <List className="gap-2">
       {devices.map((d) => (
-        <li key={d.serial}>
-          <button
-            type="button"
-            onClick={() => onSelect(d.serial)}
-            className={cn(
-              "flex w-full items-center gap-3 rounded-xl border bg-card px-4 py-3 text-left shadow-card transition-colors hover:bg-accent/50",
-              d.serial === selected && "border-primary ring-1 ring-primary",
-            )}
-          >
+        <ListRow
+          key={d.serial}
+          testId={`device-row-${d.serial}`}
+          selected={d.serial === selected}
+          onClick={() => onSelect(d.serial)}
+          className="gap-3 py-3"
+        >
             <span
               className={cn(
                 "h-2 w-2 shrink-0 rounded-full",
@@ -310,10 +310,9 @@ function DeviceListView({
             >
               {t("devices.gotoInfo")}
             </Button>
-          </button>
-        </li>
+        </ListRow>
       ))}
-    </ul>
+    </List>
   );
 }
 
@@ -1210,7 +1209,18 @@ export function FilesView({ serial }: { serial: string | null }) {
           </p>
         )}
         {data && (
-          <ul className="divide-y text-xs">
+          <>
+            {/* 列名行：没有表头时"权限/大小"两列只是两串灰字，读者得自己猜哪列是什么。
+                宽度用 tailwind 里的 col-* 刻度，与下面每一行同源，逐行对齐 */}
+            <ListHeader testId="fs-table-head">
+              <span className="min-w-0 flex-1">{t("devices.files.colName")}</span>
+              <span className="hidden w-col-perms shrink-0 sm:inline">
+                {t("devices.files.colPerms")}
+              </span>
+              <span className="w-col-size shrink-0 text-right">{t("devices.files.colSize")}</span>
+              <span className="w-col-actions shrink-0" />
+            </ListHeader>
+            <List testId="fs-list" className="text-xs">
             {data.map((f) => {
               const entryPath = joinRemote(path, f.name);
               /*
@@ -1225,49 +1235,61 @@ export function FilesView({ serial }: { serial: string | null }) {
                 ? t("devices.files.enterDir", { name: f.name })
                 : t("devices.files.enterLink", { target: f.symlink ?? "" });
               return (
-                <li key={f.name} className="group flex items-center gap-2 px-3 py-1.5">
-                  {openable ? (
-                    <button
-                      type="button"
-                      className="flex min-w-0 flex-1 items-center gap-2 text-left hover:underline"
-                      title={openTitle}
-                      onClick={() => {
-                        setSelected(null);
-                        nav.go(entryPath);
-                      }}
-                    >
-                      <span className="break-all font-medium">{f.isDir ? `${f.name}/` : f.name}</span>
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      className={cn(
-                        "min-w-0 flex-1 break-all text-left hover:underline",
-                        selected === f.name && "font-medium text-foreground underline",
-                      )}
-                      title={t("devices.files.selectHint")}
-                      onClick={() => setSelected(selected === f.name ? null : f.name)}
-                    >
-                      {f.name}
-                    </button>
-                  )}
-                  {f.symlink && <span className="text-muted-foreground">→ {f.symlink}</span>}
-                  {f.perms && (
-                    <span className="hidden shrink-0 font-mono text-muted-foreground sm:inline">
-                      {f.perms}
+                <ListRow
+                  key={f.name}
+                  testId={`fs-row-${f.name}`}
+                  selected={selected === f.name}
+                  title={openable ? openTitle : t("devices.files.selectHint")}
+                  onClick={() => {
+                    // 目录/链接：双击进去；普通文件：单击选中。
+                    // 单击就跳转会让"只想看一眼属性"变成一次误操作。
+                    if (openable) {
+                      setSelected(null);
+                      nav.go(entryPath);
+                    } else {
+                      setSelected(selected === f.name ? null : f.name);
+                    }
+                  }}
+                  className="text-xs"
+                >
+                  {/* 名字本身必须可点：整行 button 会吞掉"点名字进目录"这个直觉动作，
+                      而且屏幕阅读器只会读到一整行文字，读不出"这是链接/目录" */}
+                  <span
+                    role="presentation"
+                    className={cn(
+                      "min-w-0 flex-1 truncate font-medium hover:underline",
+                      selected === f.name && "text-foreground",
+                    )}
+                  >
+                    {f.isDir ? `${f.name}/` : f.name}
+                  </span>
+                  {f.symlink && (
+                    <span className="min-w-0 max-w-[10rem] shrink-0 truncate text-muted-foreground">
+                      → {f.symlink}
                     </span>
                   )}
-                  <span className="w-16 shrink-0 text-right tabular-nums text-muted-foreground">
-                    {f.isDir ? "-" : formatSize(f.size)}
+                  {/* 权限单独成列：固定宽度 + 等宽内凹胶囊，逐行必须对齐 */}
+                  <span className="hidden w-col-perms shrink-0 sm:inline-flex">
+                    <PermissionPill perms={f.perms} testId={`fs-perms-${f.name}`} />
+                  </span>
+                  {/* 大小右对齐 + tabular-nums：`1.2 KB` 与 `512 B` 的数字位对齐 */}
+                  <span className="w-col-size shrink-0 text-right font-mono text-[10px] tabular-nums text-muted-foreground">
+                    {f.isDir ? "—" : formatSize(f.size)}
                   </span>
                   {/*
                     动作按钮**默认就要看得见**。上一版写成 `opacity-0` + 悬停才显示，
                     jsdom 不看 CSS，测试全绿而用户在界面上根本找不到"删除/取回"——
-                    "看不见"和"没有这个功能"对用户是同一件事。
+                   "看不见"和"没有这个功能"对用户是同一件事。
+                   宽度固定成动作列刻度：不固定时每行按钮数不同，右边缘会参差。
                   */}
+                  {/* 动作区必须**拦住冒泡**：整行是 button（点名字进目录/选中文件），
+                      行内按钮若让事件冒上去，就会顺带触发一次"进目录"或"取消选中"——
+                      用户点的是 ⓘ，结果目录被打开了 */}
                   <span
                     data-testid="fs-row-actions"
-                    className="flex shrink-0 items-center gap-0.5 opacity-70 transition-opacity group-hover:opacity-100 focus-within:opacity-100"
+                    className="flex w-col-actions shrink-0 items-center justify-end gap-0.5"
+                    onClick={(e) => e.stopPropagation()}
+                    onDoubleClick={(e) => e.stopPropagation()}
                   >
                     {openable && (
                       <Button
@@ -1331,10 +1353,11 @@ export function FilesView({ serial }: { serial: string | null }) {
                       <Trash2 className="h-3 w-3" />
                     </Button>
                   </span>
-                </li>
+                </ListRow>
               );
             })}
-          </ul>
+            </List>
+          </>
         )}
       </div>
       {selectedPath && (
@@ -1747,28 +1770,27 @@ export function AppsView({ serial }: { serial: string | null }) {
             ) : (
               <Empty text={t('apps.empty')} />
             ))}
-          <ul className="text-xs">
+          <List className="text-xs">
             {visibleApps.map((app) => (
-            <li
+            <ListRow
               key={app.packageName}
-              onContextMenu={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
+              testId={`app-row-${app.packageName}`}
+              selected={app.packageName === selectedApp?.packageName}
+              // 右键菜单要拿原始事件，所以这两处不能走 ListRow 的 onClick 包装
+              onClick={() => {
                 setSelectedApp(app);
-                setContext({ x: event.clientX, y: event.clientY, app });
+                setContext(null);
               }}
+              multiline
             >
-              <button
-                type="button"
-                onClick={(event) => {
+              <div
+                className="min-w-0 flex-1"
+                onContextMenu={(event) => {
+                  event.preventDefault();
                   event.stopPropagation();
                   setSelectedApp(app);
-                  setContext(null);
+                  setContext({ x: event.clientX, y: event.clientY, app });
                 }}
-                className={cn(
-                  "block w-full px-3 py-2 text-left hover:bg-accent",
-                  app.packageName === selectedApp?.packageName && "bg-accent font-medium",
-                )}
               >
                 <span className="flex items-center gap-1.5">
                   <span className="min-w-0 flex-1 truncate">{app.label || app.packageName}</span>
@@ -1786,13 +1808,13 @@ export function AppsView({ serial }: { serial: string | null }) {
                     </StatusBadge>
                   )}
                 </span>
-                <span className="mt-0.5 block truncate font-mono text-xs text-muted-foreground">
+                <span className="mt-0.5 block truncate font-mono text-[11px] text-muted-foreground">
                   {app.packageName}
                 </span>
-              </button>
-            </li>
+              </div>
+            </ListRow>
           ))}
-          </ul>
+          </List>
         </div>
       </div>
       <div className="flex min-w-0 flex-1 flex-col gap-3">
@@ -1964,12 +1986,14 @@ export function AppsView({ serial }: { serial: string | null }) {
                 </p>
               )}
               {writeResult.steps.length > 0 && (
-                <ul className="mt-1 space-y-0.5">
+                <List className="mt-1 gap-1 p-0">
                   {writeResult.steps.map((step, index) => (
-                    <li
+                    <ListRow
                       key={`${step.name}-${index}`}
-                      className="flex items-start gap-1.5 font-mono text-11px"
-                      data-testid={`package-write-step-${step.name}`}
+                      testId={`package-write-step-${step.name}`}
+                      interactive={false}
+                      multiline
+                      className="gap-1.5 font-mono text-[11px]"
                     >
                       <span className={step.ok ? "text-emerald-600" : "text-destructive"}>
                         {step.ok ? "\u2713" : "\u2715"}
@@ -1980,9 +2004,9 @@ export function AppsView({ serial }: { serial: string | null }) {
                           {step.detail}
                         </span>
                       )}
-                    </li>
+                    </ListRow>
                   ))}
-                </ul>
+                </List>
               )}
             </div>
           ) : (
