@@ -9,9 +9,6 @@ import {
   judgeProbe,
   compareStamp,
   decodeStamp,
-  drillVerdict,
-  extractOptionCandidates,
-  MAX_NEXT_LEVEL_PREFIXES,
   emptyLaunchPrefs,
   encodeStamp,
   loadLaunchPrefs,
@@ -166,6 +163,38 @@ describe("splitArgs 的引号规则", () => {
   });
 });
 
+/**
+ * 参数栏是**透传**：切分不改写任何字符。
+ *
+ * 曾经在这里做过"排版字符 → ASCII"的归一化，是错的方向——它会把输入法把两个 `-`
+ * 合成一个 `—` 这件事替用户"修好"，用户看到的反而是"打第二个横杠时横杠被吞了"，
+ * 而真因被一句"已替换"盖住。字符问题在输入框解决（关智能替换），不在下游猜。
+ */
+describe("splitArgs 原样透传", () => {
+  it("排版字符不做任何替换，原样进 argv", () => {
+    const input = "-p 11881 \u2014\u2014bak 0x7eee8c6000:r -\u2014bro-len 4 \u2014\u2014stack";
+    expect(splitArgs(input)).toEqual([
+      "-p",
+      "11881",
+      "\u2014\u2014bak",
+      "0x7eee8c6000:r",
+      "-\u2014bro-len",
+      "4",
+      "\u2014\u2014stack",
+    ]);
+  });
+
+  it("引号内的空格仍然是一个参数", () => {
+    expect(splitArgs("-p 13425 --b")).toEqual(["-p", "13425", "--b"]);
+    expect(splitArgs('--title "a b" -x')).toEqual(["--title", "a b", "-x"]);
+  });
+
+  it("两个连续横杠不会被合并", () => {
+    expect(splitArgs("-p 13425 --b")).toEqual(["-p", "13425", "--b"]);
+    expect(splitArgs("--").join(" ")).toBe("--");
+  });
+});
+
 describe("argsProblem 的预检", () => {
   it("个数与单长度上限与协议同值", () => {
     expect(argsProblem(Array.from({ length: MAX_ARGS }, () => "x"), false)).toBeNull();
@@ -271,76 +300,5 @@ describe("探测前的预检（把「点了没反应」说成一句人话）", (
     expect(repeatedError(["a", "b"])).toBeNull();
     expect(repeatedError(["只剩一条", undefined])).toBeNull();
     expect(repeatedError([undefined, undefined])).toBeNull();
-  });
-});
-
-describe("多级 help：下一层的入口来自它自己打出来的文本", () => {
-  // 真机取的回执（Pixel 6 上改名过的 frida 服务端）：不编样本，编样本等于自证
-  const REAL_HELP = [
-    "Usage:",
-    "  com.xh.service [OPTION?]",
-    "",
-    "Help Options:",
-    "  -h, --help                            Show help options",
-    "  --usage                               Show brief usage",
-    "",
-    "Application Options:",
-    "  --version                             Output version information and exit",
-    "  -l, --listen=ADDRESS                  Listen on ADDRESS",
-    "  --certificate=CERTIFICATE             Enable TLS using CERTIFICATE",
-    "  -d, --directory=DIRECTORY             Store binaries in DIRECTORY",
-    "  -D, --daemonize                       Detach and become a daemon",
-    "  --policy-softener=system|internal     Select policy softener",
-    "  -P, --disable-preload                 Disable preload optimization",
-    "  -v, --verbose                         Be verbose",
-  ].join("\n");
-
-  it("只取声明位的选项，带值的不当前缀", () => {
-    const picks = extractOptionCandidates(REAL_HELP, ["-h", "--help"]);
-    expect(picks).toEqual([
-      "--usage",
-      "--version",
-      "-D",
-      "--daemonize",
-      "-P",
-      "--disable-preload",
-      "-v",
-      "--verbose",
-    ]);
-    // `-l`/`-d` 这种带值的不该出现：拿它去起一次只会因缺参数报错，是一条噪音
-    for (const skipped of ["--listen", "-l", "--certificate", "-d", "--directory", "--policy-softener"]) {
-      expect(picks).not.toContain(skipped);
-    }
-    // 已经试过的候选不能又变成"下一层入口"
-    expect(picks).not.toContain("-h");
-    expect(picks).not.toContain("--help");
-  });
-
-  it("整台机器只有一个无值选项时不硬凑入口（它没有下一层可挖）", () => {
-    // 真机上的 frida 改名二进制就是这个形状：除了 -h/--help，其余全带值或成对出现
-    expect(extractOptionCandidates("Application Options:\n  --version   Only version\n", ["-h", "--help"])).toEqual([
-      "--version",
-    ]);
-  });
-
-  it("描述句里提到的选项不算入口", () => {
-    expect(extractOptionCandidates("Enables TLS using CERTIFICATE (see --certificate)", [])).toEqual(
-      [],
-    );
-    expect(extractOptionCandidates("", [])).toEqual([]);
-  });
-
-  it("有上限：一张长帮助不该变成一串进程", () => {
-    const many = Array.from({ length: 40 }, (_, i) => `  -a${i}x  explain`).join("\n");
-    expect(extractOptionCandidates(many, []).length).toBe(MAX_NEXT_LEVEL_PREFIXES);
-  });
-
-  it("判词分三种：没内容 / 与父层同一份 / 真的深一层", () => {
-    expect(drillVerdict("", "", false)).toBe("none");
-    expect(drillVerdict("  \n", "  ", false)).toBe("none");
-    expect(drillVerdict(REAL_HELP, `  ${REAL_HELP}  `, true)).toBe("same");
-    expect(drillVerdict("spawn 用法：…", REAL_HELP, true)).toBe("deeper");
-    // 父层还没拿到东西时不能判 same（那等于把"没比较"说成"比较过且一样"）
-    expect(drillVerdict(REAL_HELP, "", true)).toBe("deeper");
   });
 });

@@ -133,7 +133,11 @@ pub(crate) fn validate_comm(comm: &str) -> Result<(), AgentError> {
 /// ```
 /// 用 `awk END{print NR}` 而不是 `wc -l` 数行：`cmdline` 结尾没有换行，`wc -l` 会数成 0
 /// （真机实测），而"0 行却有内容"会变成一个说不清的自相矛盾。
-pub(crate) fn proc_read_script(pid: u32, file: &str, max_lines: u32) -> String {
+///
+/// 正文读取**先按字节截再按行截**（`head -c` 后接 `sed -n`）：行数上限放到 20000 之后，
+/// 正文本身可能到几十 MB，`su` 通道是整段回传的；先限字节保证"一次点击"不会拖回一个
+/// 超大文件，截断状态由行数/字节双重判断如实带回去。
+pub(crate) fn proc_read_script(pid: u32, file: &str, max_lines: u32, max_bytes: u64) -> String {
     let path = format!("/proc/{pid}/{file}");
     // 三个分支都必须以哨兵收尾：`run_privileged` 是拿哨兵判断"脚本走完了"，
     // 早退时不带哨兵就会被当成"应答形状不对"，把一句本来说得清的"进程不在了"
@@ -142,7 +146,7 @@ pub(crate) fn proc_read_script(pid: u32, file: &str, max_lines: u32) -> String {
         "if [ ! -d /proc/{pid} ]; then echo ARTPROC_TOTAL; echo ARTPROC_GONE; echo ARTPROC_END; exit 0; fi; \
          if [ ! -e {path} ]; then echo ARTPROC_TOTAL; echo ARTPROC_MISSING; echo ARTPROC_END; exit 0; fi; \
          echo ARTPROC_TOTAL; awk 'END{{print NR}}' {path} 2>/dev/null || echo -1; \
-         echo ARTPROC_BODY; sed -n '1,{max_lines}p' {path} 2>/dev/null; printf '\n'; \
+         echo ARTPROC_BODY; head -c {max_bytes} {path} 2>/dev/null | sed -n '1,{max_lines}p'; printf '\n'; \
          echo ARTPROC_END"
     )
 }

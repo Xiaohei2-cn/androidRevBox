@@ -47,11 +47,9 @@ import {
   HELP_CANDIDATES,
   PROBE_TIMEOUT_MS,
   argsProblem,
-  drillVerdict,
   encodeStamp,
   loadLaunchPrefs,
   looksLikeMissingCommand,
-  probeHasOutput,
   probePreflight,
   repeatedError,
   probeLooksLikeHelp,
@@ -60,10 +58,8 @@ import {
   stampOf,
   compareStamp,
   decodeStamp,
-  extractOptionCandidates,
   judgeProbe,
   probeHiddenBytes,
-  type DrillVerdict,
   type LaunchPrefs,
 } from "./hostedLaunch";
 import { DeviceBar } from "@/components/ui/device-bar";
@@ -193,7 +189,7 @@ interface HostedRow {
  */
 interface ProbeNode {
   running: boolean;
-  /** 这一层的路径：[] = 直接探二进制；["-U"] = 探 `xxx -U --help` */
+  /** 这一层的路径。探测只做一层，正常恒为 []（保留字段是因为状态机按层级组织） */
   path: string[];
   results: ProbeRow[];
   children: Record<string, ProbeNode>;
@@ -202,11 +198,6 @@ interface ProbeNode {
    * 同一句重复九遍不叫九条信息，叫一条信息重复了九遍。
    */
   banner?: string;
-  /**
-   * 只有下钻层才有：与父层比对后的判词。
-   * `same` 必须明说——把同一份总帮助摆在 `-D` 底下，用户会以为那就是 `-D` 的说明。
-   */
-  verdict?: DrillVerdict;
   /**
    * 这一层结论的译文。
    *
@@ -275,10 +266,6 @@ function newHostedRow(
     ...over,
   };
 }
-
-/** 下钻最多几层、每层最多给几个入口（再多就没人会在这一屏里读了） */
-const MAX_DRILL_DEPTH = 2;
-const MAX_DRILL_CHIPS = 6;
 
 /**
  * 界面语言 → 给接口看的语言名。
@@ -634,16 +621,22 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
   /**
    * 一层探测：把候选表按顺序各起一次。
    *
-   * 三条口径：
+   * 四条口径：
    * ① 一次只问一个候选，中断 = 不再发下一条（不需要取消协议）；
    * ② **过程中界面只给进度**（用户要求：不要一路刷中间信息），结束才出结果；
    * ③ 命中即停，但文案只说"打完东西就自己退了"，不宣称这是官方用法；
    *    全落空也只说"我试过这些都不像"。
+   * ④ **只用探测路径，不拼参数框里的参数**。探的是"这个程序认哪些选项"，
+   *    与用户这次打算怎么跑它无关。把参数框垫在前面有两个真后果：
+   *    - 结论会错：`stackplz -p 11881 --b -h` 里 `--b` 本身就是坏的，
+   *      程序报"未知参数 --b"，我们却会把它记在 `-h` 头上，得出"不支持 -h"；
+   *    - 探测是**真的起进程**：带上 `-p <pid>` 这类参数可能真的去挂别人的进程，
+   *      一个只想问一句 usage 的操作不该有这种副作用。
    */
   const probeLevel = async (row: HostedRow, path: string[]) => {
     if (!deviceSerial) return;
     const name = row.name;
-    const prefix = [...splitArgs(row.launch.argsText), ...path];
+    const prefix = [...path];
     const key = probeKey(name, path);
     patchNode(name, path, (node) => ({ ...node, running: true, banner: undefined }));
     probeAbort.current[key] = false;
@@ -787,63 +780,6 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
     } finally {
       setProbing(false);
     }
-  };
-
-  /**
-   * 下钻一层：前缀来自**上一层它自己打出来的帮助文本**。
-   *
-   * 这就是多级 help（`xxx -U --help` 还有下一层）的做法——不给任何程序写模板，
-   * 也不扫二进制里的字符串：程序愿意写进帮助里的选项，就是它承认的入口。
-   * 每个前缀最多起 9 次进程、每次都有超时与杀进程组兜底，所以再深也不会失控；
-   * 界面只允许向下钻 MAX_DRILL_DEPTH 层，防止点出一棵没法看的树。
-   */
-  const drillInto = async (
-    row: HostedRow,
-    path: string[],
-    token: string,
-    parentText: string,
-  ) => {
-    if (!deviceSerial) return;
-    const next = [...path, token];
-    if (next.length > MAX_DRILL_DEPTH) return;
-    ensureLevel(row.name, next);
-    const argv = [...splitArgs(row.launch.argsText), ...next];
-    const ask = async (flag: string) => {
-      try {
-        return await deviceApi.binaryProbe(
-          deviceSerial,
-          row.name,
-          [...argv, flag],
-          PROBE_TIMEOUT_MS,
-        );
-      } catch (e) {
-        return { error: String((e as Error)?.message ?? e) } as const;
-      }
-    };
-    const rows: ProbeRow[] = [];
-    let best = "";
-    const first = await ask("--help");
-    if ("error" in first) {
-      rows.push({ candidate: "--help", error: first.error, translating: false });
-    } else {
-      rows.push({ candidate: "--help", result: first, translating: false });
-      if (probeHasOutput(first)) best = first.stdout + first.stderr;
-    }
-    // 长写法没有内容时才试短写法：有的程序只认 `-h`，反过来也一样
-    if (!best) {
-      const second = await ask("-h");
-      if ("error" in second) {
-        rows.push({ candidate: "-h", error: second.error, translating: false });
-      } else {
-        rows.push({ candidate: "-h", result: second, translating: false });
-        if (probeHasOutput(second)) best = second.stdout + second.stderr;
-      }
-    }
-    patchNode(row.name, next, (node) => ({
-      ...node,
-      results: rows,
-      verdict: drillVerdict(stripAnsi(best), parentText, best.trim().length > 0),
-    }));
   };
 
   /**
@@ -1765,8 +1701,28 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                             className="path-selectable h-6 rounded-md border border-input bg-transparent px-2 font-mono text-xs"
                             placeholder={t("adb.binary.argsPlaceholder")}
                             value={row.launch.argsText}
+                            /*
+                             * 全关智能替换：页面是 `lang="zh-CN"`，WebKit 在中文语境下会把连续两个
+                             * ASCII `-` 当排版连字符合成 `—`，用户看到的就是"打第二个横杠时吞掉一个"。
+                             * 参数栏里每个字符都是字面量，任何"智能"都是错。
+                             */
+                            spellCheck={false}
+                            autoCorrect="off"
+                            autoCapitalize="off"
+                            autoComplete="off"
                             onChange={(e) => patchLaunch(row, { argsText: e.target.value })}
                           />
+                          {/* 原样回显实际会发出去的 argv：看得见的才可信 */}
+                          {row.launch.argsText.trim() ? (
+                            <p
+                              className="break-all font-mono text-10px text-muted-foreground"
+                              data-testid={`args-preview-${row.name}`}
+                            >
+                              {t("adb.binary.argsPreview", {
+                                argv: splitArgs(row.launch.argsText).join(" "),
+                              })}
+                            </p>
+                          ) : null}
                           {(() => {
                             const problem = argsProblem(splitArgs(row.launch.argsText), root);
                             return problem ? (
@@ -1830,9 +1786,6 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                           onRetry={async (path) => {
                             const fresh: HostedRow = { ...row, probe: null };
                             await runProbeAt(fresh, path);
-                          }}
-                          onDrill={async (path, token, parentText) => {
-                            await drillInto(row, path, token, parentText);
                           }}
                           onTranslate={(path) => void translateProbe(row, path)}
                           aiBaseUrl={aiConfig?.baseUrl ?? ""}
@@ -1931,7 +1884,6 @@ function ProbeLevelView(props: {
   t: TranslateFn;
   onAbort: (path: string[]) => void;
   onRetry: (path: string[]) => void;
-  onDrill: (path: string[], token: string, parentText: string) => void;
   onTranslate: (path: string[]) => void;
   onConfig: () => void;
   onClose: (name: string) => void;
@@ -1948,7 +1900,6 @@ function ProbeLevelView(props: {
     t,
     onAbort,
     onRetry,
-    onDrill,
     onTranslate,
     onConfig,
     onClose,
@@ -1956,38 +1907,14 @@ function ProbeLevelView(props: {
     onReconnect,
   } = props;
   const path = node.path;
-  const depth = path.length;
   const done = node.results.length;
   const pct = Math.min(100, Math.round((done / HELP_CANDIDATES.length) * 100));
   const next = HELP_CANDIDATES[Math.min(done, HELP_CANDIDATES.length - 1)];
   return (
     <div
-      className={depth === 0 ? "flex flex-col gap-1.5" : "ml-3 flex flex-col gap-1.5 border-l pl-2"}
-      data-testid={depth === 0 ? `probe-panel-${name}` : `probe-drill-${name}-${path.join("_")}`}
+      className="flex flex-col gap-1.5"
+      data-testid={`probe-panel-${name}`}
     >
-      {depth > 0 && (
-        <div className="flex flex-col gap-1">
-          <p className="font-mono text-10px text-muted-foreground">
-            {t("adb.binary.probeDrillTitle", { args: path.join(" ") })}
-          </p>
-          {/* 判词只在跑完之后说；same 与 none 必须明说，否则用户会把总帮助当成这个参数的说明 */}
-          {!node.running && node.verdict && node.verdict !== "deeper" && (
-            <p
-              className={cn(
-                "text-10px leading-relaxed",
-                node.verdict === "same" ? "text-muted-foreground" : "text-amber-500",
-              )}
-              data-testid={`probe-verdict-${name}-${path.join("_")}`}
-            >
-              {t(
-                node.verdict === "same"
-                  ? "adb.binary.probeDrillSame"
-                  : "adb.binary.probeDrillNone",
-              )}
-            </p>
-          )}
-        </div>
-      )}
       {node.running ? (
         <div className="flex items-center gap-2" data-testid={`probe-progress-${name}`}>
           <div className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-muted">
@@ -2020,7 +1947,7 @@ function ProbeLevelView(props: {
               <span className="min-w-0 flex-1 break-all text-10px leading-relaxed text-amber-500">
                 {node.banner}
               </span>
-              {canReconnect && depth === 0 && (
+              {canReconnect && (
                 <Button
                   size="sm"
                   variant="outline"
@@ -2038,14 +1965,6 @@ function ProbeLevelView(props: {
             const verdict = judgeProbe(node.results);
             const help = verdict.kind === "help";
             const text = help ? stripAnsi(verdict.text) : "";
-            // 下一层的入口只从这份**它自己打出来的文本**里取（声明位、排除带值的选项）
-            const chips =
-              help && depth < MAX_DRILL_DEPTH
-                ? extractOptionCandidates(text, [...HELP_CANDIDATES, ...path]).slice(
-                    0,
-                    MAX_DRILL_CHIPS,
-                  )
-                : [];
             return (
               <>
                 <div className="flex flex-wrap items-center gap-1.5 text-10px">
@@ -2147,29 +2066,6 @@ function ProbeLevelView(props: {
                         {node.translateNote}
                       </p>
                     )}
-                    {chips.length > 0 && (
-                      <div
-                        className="flex flex-wrap items-center gap-1"
-                        data-testid={`probe-chips-${name}`}
-                      >
-                        <span className="text-10px text-muted-foreground">
-                          {t("adb.binary.probeDrillHint")}
-                        </span>
-                        {chips.map((token) => (
-                          <button
-                            key={token}
-                            type="button"
-                            className="shrink-0 rounded border border-input px-1 font-mono text-10px hover:bg-accent disabled:opacity-50"
-                            data-testid={`probe-drill-${name}-${token}`}
-                            disabled={Boolean(node.children[token]?.running)}
-                            title={t("adb.binary.probeDrillTip")}
-                            onClick={() => void onDrill(path, token, text)}
-                          >
-                            {token}
-                          </button>
-                        ))}
-                      </div>
-                    )}
                   </>
                 ) : (
                   <>
@@ -2181,11 +2077,9 @@ function ProbeLevelView(props: {
                         {verdict.detail}
                       </p>
                     ) : (
-                      depth === 0 && (
-                        <p className="text-10px leading-relaxed text-muted-foreground">
-                          {t("adb.binary.probeNotFoundHint")}
-                        </p>
-                      )
+                      <p className="text-10px leading-relaxed text-muted-foreground">
+                        {t("adb.binary.probeNotFoundHint")}
+                      </p>
                     )}
                     {node.translateNote && (
                       <p className="break-all text-10px text-muted-foreground">
@@ -2197,13 +2091,6 @@ function ProbeLevelView(props: {
               </>
             );
           })()}
-          {Object.entries(node.children).map(([token, child]) => (
-            <ProbeLevelView
-              key={token}
-              {...props}
-              node={child}
-            />
-          ))}
         </div>
       )}
     </div>

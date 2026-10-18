@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agent-protocol"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "android-agent"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "agent-protocol",
  "libc",
@@ -106,7 +106,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app-reverse-tools"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "at-plugin-sdk"
-version = "0.2.2"
+version = "0.2.3"
 
 [[package]]
 name = "atk"
@@ -2758,7 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-crypto-base64"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "at-plugin-sdk",
  "base64 0.22.1",

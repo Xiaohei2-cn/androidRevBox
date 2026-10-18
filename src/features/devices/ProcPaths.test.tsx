@@ -77,7 +77,8 @@ describe("ProcPaths（按需读取）", () => {
     renderSelf();
     fireEvent.click(screen.getByTestId("fg-proc-open-SERIAL-1-maps"));
     await waitFor(() => expect(procRead).toHaveBeenCalledTimes(1));
-    expect(procRead).toHaveBeenCalledWith("SERIAL-1", 30417, "maps", 400);
+    // 20000 与 Agent 的默认行数对齐：400 会让 maps 只剩开头一段
+    expect(procRead).toHaveBeenCalledWith("SERIAL-1", 30417, "maps", 20_000);
     const meta = await screen.findByTestId("fg-proc-detail-meta");
     expect(meta.textContent ?? "").toContain("2566");
     expect(meta.textContent ?? "").toContain("以 root 读取");
@@ -106,5 +107,73 @@ describe("ProcPaths（按需读取）", () => {
     const disabled = screen.getByTestId("fg-proc-open-SERIAL-2-maps") as HTMLButtonElement;
     expect(disabled.disabled).toBe(true);
     expect(procRead).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * 搜索这一层的行为契约：
+ * ① 不点"搜索"不出现输入框，正文一字不改；
+ * ② 命中要有 `<mark>`，且默认忽略大小写；
+ * ③ 正则开关打开后，查询按正则解释；非法正则给提示而不是把界面搞崩；
+ * ④ "仅命中行"只留命中的行，清空查询要立刻恢复全文。
+ */
+describe("ProcPaths 详情搜索", () => {
+  async function openSearch() {
+    renderSelf();
+    fireEvent.click(screen.getByTestId("fg-proc-open-SERIAL-1-maps"));
+    await screen.findByTestId("fg-proc-detail-body");
+    fireEvent.click(screen.getByTestId("fg-proc-detail-search-toggle"));
+    return screen.getByTestId("fg-proc-search-input") as HTMLInputElement;
+  }
+
+  it("默认不显示搜索框，点搜索才出现", async () => {
+    renderSelf();
+    fireEvent.click(screen.getByTestId("fg-proc-open-SERIAL-1-maps"));
+    await screen.findByTestId("fg-proc-detail-body");
+    expect(screen.queryByTestId("fg-proc-search-input")).toBeNull();
+    fireEvent.click(screen.getByTestId("fg-proc-detail-search-toggle"));
+    expect(screen.getByTestId("fg-proc-search-input")).toBeTruthy();
+  });
+
+  it("高亮命中并忽略大小写", async () => {
+    const input = await openSearch();
+    fireEvent.change(input, { target: { value: "RW-P" } });
+    const marks = await screen.findAllByText("rw-p");
+    expect(marks.length).toBe(2);
+    expect(marks.every((el) => el.tagName === "MARK")).toBe(true);
+    expect(screen.getByTestId("fg-proc-search-status").textContent).toContain("2");
+  });
+
+  it("区分大小写后不再命中", async () => {
+    const input = await openSearch();
+    fireEvent.change(input, { target: { value: "RW-P" } });
+    await waitFor(() => expect(screen.getByTestId("fg-proc-search-status").textContent).toContain("2"));
+    fireEvent.click(screen.getByTestId("fg-proc-search-case"));
+    expect(screen.getByTestId("fg-proc-search-status").textContent).toContain("没有匹配");
+    expect(screen.queryAllByText("rw-p", { selector: "mark" }).length).toBe(0);
+  });
+
+  it("正则模式按正则解释，非法正则只给提示", async () => {
+    const input = await openSearch();
+    fireEvent.click(screen.getByTestId("fg-proc-search-regex"));
+    fireEvent.change(input, { target: { value: "0x|\\brw" } });
+    await waitFor(() =>
+      expect(screen.queryAllByText("rw", { selector: "mark" }).length).toBe(2),
+    );
+    fireEvent.change(input, { target: { value: "a([" } });
+    expect(screen.getByTestId("fg-proc-search-status").textContent).toContain("无效");
+  });
+
+  it("仅命中行过滤，清空后恢复全文", async () => {
+    const input = await openSearch();
+    fireEvent.click(screen.getByTestId("fg-proc-search-only"));
+    fireEvent.change(input, { target: { value: "32c0" } });
+    await waitFor(() =>
+      expect(screen.getAllByTestId("fg-proc-detail-line").length).toBe(1),
+    );
+    fireEvent.change(input, { target: { value: "" } });
+    await waitFor(() =>
+      expect(screen.getAllByTestId("fg-proc-detail-line").length).toBe(2),
+    );
   });
 });

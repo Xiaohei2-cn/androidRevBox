@@ -37,9 +37,14 @@ const NET_FILES: [(&str, SocketFamily); 2] = [
 const PROC: &str = "/proc";
 /// 按需读取的默认/上限行数与字节数：宁可标 `truncated`，也不把一次界面点击变成
 /// 无界的大文件传输（maps 上万行很常见）。
-const DEFAULT_PROC_LINES: u32 = 400;
-const MAX_PROC_LINES: u32 = 5_000;
-const MAX_PROC_BYTES: u64 = 4 * 1024 * 1024;
+///
+/// 默认值原来只有 400：`maps` 一万行是常态，400 行等于界面上只看得到第一段大块分配，
+/// 用户在终端里 `cat` 出来的东西永远对不上。现在默认 20000、单次上限 100000；
+/// 字节上限 32 MiB 也要同步放宽——单行（`/memfd:jit-cache (deleted)` 这类）
+/// 就能到几 KB，原来 4 MiB 会在行数远没到上限时就先被字节数砍掉。
+const DEFAULT_PROC_LINES: u32 = 20_000;
+const MAX_PROC_LINES: u32 = 100_000;
+const MAX_PROC_BYTES: u64 = 32 * 1024 * 1024;
 /// 行数与扫描进程数上限：极端设备上宁可标 truncated，也不无界扫描。
 const MAX_SOCKET_ROWS: usize = 200_000;
 const MAX_SCANNED_PIDS: usize = 4_000;
@@ -268,7 +273,12 @@ impl ProcessesProvider {
         }
         // shell 读不到才提权。脚本里没有一个是外部给的路径：pid 校验过是数字、
         // 文件名来自协议枚举、行数是夹紧过的整数（D038）。
-        let script = privileged::proc_read_script(params.pid, params.file.as_str(), max_lines);
+        let script = privileged::proc_read_script(
+            params.pid,
+            params.file.as_str(),
+            max_lines,
+            MAX_PROC_BYTES,
+        );
         let output =
             privileged::run_privileged("读取 /proc 详情", &script, privileged::PROC_READ_SENTINEL)
                 .await?;
@@ -1014,10 +1024,12 @@ mod tests {
 
     #[test]
     fn proc_read_script_shape_has_the_markers_the_parser_expects() {
-        let script = privileged::proc_read_script(4321, "maps", 400);
+        let script = privileged::proc_read_script(4321, "maps", 400, 1024);
         // 数字与白名单值拼出来的路径，脚本里不存在任何外部字符串
         assert!(script.contains("/proc/4321/maps"), "{script}");
         assert!(script.contains("sed -n '1,400p'"), "{script}");
+        // 先限字节再限行：大文件不会整段穿过 su 通道
+        assert!(script.contains("head -c 1024"), "{script}");
         assert!(script.contains("ARTPROC_TOTAL") && script.contains("ARTPROC_BODY"));
         assert!(script.contains("ARTPROC_GONE") && script.contains("ARTPROC_MISSING"));
         // 早退分支也必须以哨兵收尾，否则 run_privileged 会把"进程不在了"报成 Internal
