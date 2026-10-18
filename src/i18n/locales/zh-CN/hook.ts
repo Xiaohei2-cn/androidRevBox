@@ -132,4 +132,6 @@ export default {
   "hook.frida.metaPath": "路径",
   "hook.frida.metaSize": "大小",
   "hook.frida.metaMtime": "修改时间",
+  "hook.frida.ide.newFileHint": "改完保存（Ctrl/Cmd+S），点「运行」把当前文件注入到 A 区选定的目标",
+  "hook.frida.ide.typesInjectFailed": "类型库注入失败，已改用内置版本：{error}",
 } as const;

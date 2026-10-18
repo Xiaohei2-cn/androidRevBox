@@ -69,8 +69,14 @@ interface OpenFile {
   saved: string;
 }
 
-/** 新建脚本的模板正文（头注释点明下一步，比一张白纸友好） */
-const NEW_FILE_TEMPLATE = `/* frida 脚本：改完保存（Ctrl/Cmd+S），点「运行」把当前文件注入到 A 区选定的目标 */
+/**
+ * 新建脚本的模板正文（头注释点明下一步，比一张白纸友好）。
+ *
+ * 写成函数而不是模块级常量：模板里那句话是**界面文案**，必须随语言走。
+ * 之前是常量，等于把一句中文钉进代码——`i18n:check` 的硬编码棘轮正是撞在这里。
+ */
+const newFileTemplate = (t: (key: string) => string) =>
+  `/* ${t("hook.frida.ide.newFileHint")} */
 `;
 
 export function ScriptIde({
@@ -266,7 +272,12 @@ export function ScriptIde({
         if (alive) setTypesNote(note);
       } catch (e) {
         // 注入本身失败才落到这里：写清楚（不静默）——用内置版本兜底
-        if (alive) setTypesNote(`类型库注入失败，用内置版本：${String((e as Error)?.message ?? e)}`);
+        if (alive)
+          setTypesNote(
+            t("hook.frida.ide.typesInjectFailed", {
+              error: String((e as Error)?.message ?? e),
+            }),
+          );
       }
     })();
     typesReadyRef.current = task;
@@ -459,7 +470,7 @@ export function ScriptIde({
       setNotice({ ok: false, text: t("hook.frida.ide.badName") });
       return;
     }
-    if (await write(name, NEW_FILE_TEMPLATE, true)) {
+    if (await write(name, newFileTemplate(t), true)) {
       setNewName(null);
       await openFile(name);
     }

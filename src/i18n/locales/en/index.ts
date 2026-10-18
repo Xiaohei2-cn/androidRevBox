@@ -6,6 +6,7 @@ import hook from "./hook";
 import nav from "./nav";
 import chef from "./chef";
 import settings from "./settings";
+import tools from "./tools";
 
 /** English (fallback target after zh-CN) */
 export default {
@@ -17,4 +18,5 @@ export default {
   ...devices,
   ...settings,
   ...hook,
+  ...tools,
 } as Record<string, string>;

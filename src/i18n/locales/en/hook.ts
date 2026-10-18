@@ -132,4 +132,6 @@ export default {
   "hook.frida.metaPath": "Path",
   "hook.frida.metaSize": "Size",
   "hook.frida.metaMtime": "Modified",
+  "hook.frida.ide.newFileHint": "Save when done (Ctrl/Cmd+S), then press Run to inject this file into the target selected in section A",
+  "hook.frida.ide.typesInjectFailed": "Failed to inject the type library, falling back to the built-in one: {error}",
 } as const;

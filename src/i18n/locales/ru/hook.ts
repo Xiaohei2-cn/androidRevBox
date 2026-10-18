@@ -132,4 +132,6 @@ export default {
   "hook.frida.metaPath": "Путь",
   "hook.frida.metaSize": "Размер",
   "hook.frida.metaMtime": "Изменён",
+  "hook.frida.ide.newFileHint": "Сохраните изменения (Ctrl/Cmd+S), затем нажмите «Запустить», чтобы внедрить файл в цель из блока A",
+  "hook.frida.ide.typesInjectFailed": "Не удалось внедрить библиотеку типов, используется встроенная: {error}",
 } as const;

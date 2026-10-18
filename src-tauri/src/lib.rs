@@ -10,10 +10,13 @@
 mod adapters;
 mod commands;
 mod core;
-mod db;
+// `db` / `services` 也要能被集成测试直接构造：工具市场真机腿要自己拼
+// ConfigService + RealAdbRunner，不能指望一个跑起来的 Tauri App 来驱动。
+// 与 `plugins` 的先例同一条口径：只放开 crate 外可见，不改模块内部边界。
+pub mod db;
 mod models;
 pub mod plugins; // pub 供集成测试（tests/plugin_abi_e2e.rs）访问
-mod services;
+pub mod services;
 
 pub use adapters::agent_transport;
 pub use models::agent;
@@ -62,6 +65,8 @@ pub struct AppState {
     pub ai: Arc<ai_service::AiService>,
     /// 算法中心（CyberChef 移植）：内置算法注册表 + 配方执行，无状态
     pub chef: Arc<ChefService>,
+    /// 工具市场（P13）：内置工具目录 + 下载校验 + 一键推送到 /data/local/tmp
+    pub tool_market: Arc<services::tool_market::ToolMarketService>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -153,6 +158,13 @@ pub fn run() {
                 Err(e) => tracing::error!(error = %e, "插件扫描异常"),
             }
 
+            // 4.7) ToolMarket：工具市场（P13）。缓存目录与 plugins/ 同级——
+            // 都是 app data 下的可再生缓存，卸载 App 一起走。
+            let tool_market = Arc::new(services::tool_market::ToolMarketService::new(
+                runner.clone(),
+                data_dir.join("tools"),
+            ));
+
             let pty = Arc::new(PtyService::new());
 
             // 陈旧 adb forward 清扫（AR12.3 补齐 + AR12.7 配套）：adb server 比 App 活得久，
@@ -183,6 +195,7 @@ pub fn run() {
                 zygisk_applist,
                 ai,
                 chef: Arc::new(ChefService),
+                tool_market,
             });
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -277,6 +290,9 @@ pub fn run() {
             commands::plugins::plugins_rollback,
             commands::plugins::plugins_uninstall,
             commands::plugins::plugins_set_enabled,
+            commands::market::market_tools,
+            commands::market::market_device_abi,
+            commands::market::market_install_tool,
             commands::hook::hook_js_list,
             commands::hook::hook_preflight,
             commands::hook::hook_script_read,

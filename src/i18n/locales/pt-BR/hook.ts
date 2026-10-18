@@ -132,4 +132,6 @@ export default {
   "hook.frida.metaPath": "Caminho",
   "hook.frida.metaSize": "Tamanho",
   "hook.frida.metaMtime": "Modificado",
+  "hook.frida.ide.newFileHint": "Salve ao terminar (Ctrl/Cmd+S) e clique em Executar para injetar este arquivo no alvo escolhido na área A",
+  "hook.frida.ide.typesInjectFailed": "Falha ao injetar a biblioteca de tipos, usando a embutida: {error}",
 } as const;

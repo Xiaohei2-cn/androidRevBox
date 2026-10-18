@@ -19,4 +19,5 @@ pub mod plugin_service;
 pub mod process_service;
 pub mod pty_service;
 pub mod task_service;
+pub mod tool_market;
 pub mod zygisk_applist;

@@ -132,4 +132,6 @@ export default {
   "hook.frida.metaPath": "パス",
   "hook.frida.metaSize": "サイズ",
   "hook.frida.metaMtime": "更新日時",
+  "hook.frida.ide.newFileHint": "編集後は保存（Ctrl/Cmd+S）し、「実行」でこのファイルを A エリアで選んだ対象に注入します",
+  "hook.frida.ide.typesInjectFailed": "型ライブラリの注入に失敗したため、組み込み版を使用します：{error}",
 } as const;

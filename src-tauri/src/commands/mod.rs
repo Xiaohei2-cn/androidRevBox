@@ -7,6 +7,7 @@ pub mod config;
 pub mod device;
 pub mod env;
 pub mod hook;
+pub mod market;
 pub mod plugins;
 pub mod pty;
 pub mod system;

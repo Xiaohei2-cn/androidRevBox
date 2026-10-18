@@ -32,6 +32,10 @@ crc32fast = "1.5"
 getrandom = "0.3"
 tauri-plugin-dialog = "2.7.3"
 portable-pty = "0.9.0"
+# 工具市场下载二进制：reqwest 本来就在依赖图里（tauri → reqwest），显式声明只多一条边。
+# 只开 rustls，不带 native-tls——不必依赖宿主 OpenSSL，三平台行为一致。
+# `stream` 让文件按块落盘，不在内存里攒一份完整的 9 MB 再写。
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 
 # ===== 算法中心（CyberChef 移植：内置算法注册表 + 配方执行）=====
 # 版本一律锁在 digest 0.10 / cipher 0.4 这一代：混用 0.11/0.5 会让
