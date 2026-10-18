@@ -292,10 +292,12 @@ struct RootFacts {
     pro: ModuleFacts,
     demo: ModuleFacts,
     /// 已知的 Zygisk 实现**运行时目录**存在（`/data/adb/zygisksu` 等）。
-    /// 它只能证明"这台机器装过某种 Zygisk 实现"，**证明不了它现在开着**——
-    /// AR10.5 最后那一格就是把这个字段当结论，于是整机 Zygisk 被关掉时判成了 `loaded`。
+    /// 它只能证明"这台机器装过某种 Zygisk 实现"，**证明不了它现在开着**，
+    /// 甚至证明不了它还装着——卸载实现模块后这个目录会留下（Pixel 4 实测现状）。
+    /// 因此它**不能**当"实现存在"的判据，只用于下面识别实现模块目录。
     zygisk_impl: Option<String>,
-    /// Zygisk 实现本身通常也是一个模块（本机是 Zygisk Next 的 `zygisksu`）。
+    /// Zygisk 实现是一个模块，且能证明它**装着**（有 `disable` 标记，或有 zygisk 模块格式）。
+    /// 这是"实现存在"的唯一证据来源：只看运行期目录会把"根本没装实现"说成"装着但没开"。
     zygisk_impl_module: Option<String>,
     /// 那个实现模块带着 `disable` 标记：整机 Zygisk 这一轮启动就没开。
     zygisk_impl_disabled_module: Option<String>,
@@ -1908,17 +1910,35 @@ const ROOT_PROBE_SCRIPT: &str = concat!(
     " if [ -f \"/data/adb/modules/$m/remove\" ]; then echo \"REMOVING $m\"; fi;",
     " if [ -f \"/data/adb/modules/$m/module.prop\" ]; then echo \"PROP_BEGIN $m\";",
     " cat \"/data/adb/modules/$m/module.prop\"; echo \"PROP_END\"; fi;",
-    // helper.dex 只有 v2 模块用（v1 demo 没有，所以别对 applist 报缺）
-    " if [ \"$m\" = applistpro ] && [ ! -f \"/data/adb/modules/$m/helper.dex\" ]; then",
+    // helper.dex 只有 v2 模块用（v1 demo 没有，所以别对 applist 报缺）。
+    // 但必须只在**模块装着**时才报：以前只看 `! -f helper.dex`，模块目录根本不存在时
+    // 也成立，于是"没装 v2"会被说成"v2 装着但 helper.dex 缺失"——Pixel 4 上就是这样，
+    // 两个安装状态各报各的，用户看到的是互相矛盾的两句话。
+    " if [ \"$m\" = applistpro ] && [ -d \"/data/adb/modules/$m\" ] && [ ! -f \"/data/adb/modules/$m/helper.dex\" ]; then",
     "   echo \"NOHELPER $m\"; fi;",
     " done;",
     "for d in /data/adb/zygisksu /data/adb/zygisk /data/adb/ap/zygisk /data/adb/kzygisk; do",
     " if [ -e \"$d\" ]; then echo \"ZYGIMPL=$(basename \"$d\")\"; fi; done;",
-    // Zygisk 实现自己也是个模块：它被禁用 == 整机 Zygisk 关着（等价于 KernelSU 里的总开关）。
-    // 只列已知的实现模块名；认不出来的实现交给下面"没有守护进程 + 端口无人监听"这条实时证据。
-    "for i in zygisksu zygisk-next zygisknext ZygiskNext; do",
-    " if [ -d \"/data/adb/modules/$i\" ]; then echo \"ZYGIMPLMOD $i\";",
-    "  if [ -f \"/data/adb/modules/$i/disable\" ]; then echo \"ZYGIMPL_OFF $i\"; fi; fi; done;",
+    // Zygisk 实现自己也是个模块，它被禁用 == 整机 Zygisk 关着（等价于 KernelSU 里的总开关）。
+    //
+    // 判据刻意**不认名字**：以前的名单只有 Zygisk Next 的四个拼写，装了别的实现
+    // （或用的是 KernelSU 新版的内置 Zygisk / 别的 fork）时这一整段什么都答不出来，
+    // 于是"整机没开 Zygisk"被归成"我们的模块有问题"——换一台机器就要再加一个名字，
+    // 这正是要避免的。改成两条与实现无关的证据：
+    //   ① 模块目录里有 `zygisk/` 子目录：Zygisk 模块格式本身，与本模块完全一样；
+    //   ② 模块目录里有 zygisk 运行期目录（`/data/adb/zygisksu` 等，见上一条循环）：
+    //      当前正提供 Zygisk 的那个模块在自己的模块目录里也有同名目录。
+    // 两条都按"是 Zygisk 实现"处理，再看它有没有 `disable` 标记。
+    "for m in /data/adb/modules/*; do",
+    " [ -d \"$m\" ] || continue;",
+    " n=${m##*/};",
+    " case \"$n\" in applist|applistpro) continue;; esac;",
+    " own=0;",
+    " [ -d \"$m/zygisk\" ] && own=1;",
+    " for d in /data/adb/zygisksu /data/adb/zygisk /data/adb/ap/zygisk /data/adb/kzygisk; do",
+    "  [ -d \"$m/$(basename \"$d\")\" ] && own=1; done;",
+    " if [ \"$own\" = 1 ]; then echo \"ZYGIMPLMOD $n\";",
+    "  if [ -f \"$m/disable\" ]; then echo \"ZYGIMPL_OFF $n\"; fi; fi; done;",
     // 实时证据：Zygisk Next 会有 zygiskd64 与每个模块各自的 zn-zygisk-companion 进程。
     // ps 拿不到内容时**什么都不报**（未知），别把"看不见"写成"没在跑"。
     "COMMS=$(ps -A -o COMM= 2>/dev/null);",
@@ -2028,15 +2048,18 @@ fn push_detail_hint(detail: &mut Option<String>, hint: &str) {
 impl RootFacts {
     /// "整机 Zygisk 没在跑"的确凿证据。返回一句**带恢复动作**的话；证据不足时 None，
     /// 让调用方退回原来的推断口径——绝不在没证据时说"被禁用"。
+    ///
+    /// 两条分支都要求「实现模块**装着**」（`zygisk_impl_module`），而不是运行期目录在：
+    /// 目录是谁都能留下的残留，拿它当判据就是在说一句没法验证的话。
     fn zygisk_impl_off_evidence(&self) -> Option<String> {
         if let Some(name) = self.zygisk_impl_disabled_module.as_deref() {
             return Some(format!(
                 "Zygisk 实现模块 {name} 当前被禁用：整机 Zygisk 没有运行，在 KernelSU/Magisk 里重新启用它（或打开 Zygisk 总开关）后重启才会生效，不需要重装 applistpro"
             ));
         }
-        // 只有**认得**这个实现时才敢用"看不见守护进程"这条负证据：Magisk/KernelSU 自带的
-        // Zygisk 本来就跑在 zygote 里、没有独立进程，那边 ZYGRUN=0 是正常的，
-        // 拿它说"整机 Zygisk 没开"就是一句假话。
+        // 只有实现模块**装着**时才敢用"看不见守护进程"这条负证据。反过来说：
+        // 装着却看不到进程，就是这一轮没开——Magisk 内置 Zygisk 的模块没有这个
+        // `zygisk/` 目录形状，走不到这里，所以不存在"内置实现没有独立进程"的误判。
         if let Some(name) = self.zygisk_impl_module.as_deref()
             && self.zygisk_daemon_running == Some(false)
         {
@@ -2131,6 +2154,19 @@ fn classify_lifecycle(
                 );
             }
             if !facts.pro.installed && !facts.demo.installed {
+                // 我们的模块没装时，"实现也缺"比"模块没装"更该先说：两件事的恢复动作
+                // 顺序不同，先装 ZIP 再发现没实现的人会白重启一次。
+                if facts.zygisk_impl_module.is_none() {
+                    return (
+                        ZygiskLifecycle::NotInstalled,
+                        Some(match facts.zygisk_impl.as_deref() {
+                            Some(residue) => format!(
+                                "整台设备没有在运行的 Zygisk 实现（/data/adb/{residue} 只是残留目录，不代表实现还装着），我们的模块也还没装：先装并启用一个 Zygisk 实现（例如 Zygisk Next），再装本模块 ZIP"
+                            ),
+                            None => "整台设备没有在运行的 Zygisk 实现，我们的模块也还没装：先装并启用一个 Zygisk 实现（例如 Zygisk Next），再装本模块 ZIP".to_owned(),
+                        }),
+                    );
+                }
                 return (
                     ZygiskLifecycle::NotInstalled,
                     Some("applistpro/applist 均未安装，需要推送并安装模块 ZIP".to_owned()),
@@ -2151,13 +2187,28 @@ fn classify_lifecycle(
                     ),
                 );
             }
-            if facts.zygisk_impl.is_none() {
+            // 实现不存在有两种：装过又被卸载（运行期目录留下），或者从来没装。
+            // 以前这里用 `zygisk_impl`（运行期目录）当"实现装着"的证据，于是 Pixel 4
+            // 这种"只剩残留目录"的现场被判成"装着一个没开的实现"，报的话倒不算错，
+            // 依据却是错的：`zygisk_impl_module` 才是唯一能证明"装着"的东西。
+            // 判据里不能出现机器名或实现名——用户下一步该看清的是"有没有实现"，
+            // 而不是"我们的名单里有没有这台机器的实现"。
+            if facts.zygisk_impl_module.is_none() {
+                let install_hint = if facts.pro.installed {
+                    format!(
+                        "我们的模块 {PRO_MODULE_ID} 装着，但整台设备没有在运行的 Zygisk 实现：先装并启用一个 Zygisk 实现（例如 Zygisk Next），在它的开关里启用后再重启。KernelSU/Magisk 自带的 Zygisk 与本模块不兼容，不能替代"
+                    )
+                } else {
+                    "整台设备没有在运行的 Zygisk 实现：先装并启用一个 Zygisk 实现（例如 Zygisk Next）再装本模块。KernelSU/Magisk 自带的 Zygisk 与本模块不兼容，不能替代".to_owned()
+                };
+                let residue = facts
+                    .zygisk_impl
+                    .as_deref()
+                    .map(|name| format!("（/data/adb/{name} 只是残留目录，不代表实现还装着）"))
+                    .unwrap_or_default();
                 return (
                     ZygiskLifecycle::ZygiskDisabled,
-                    Some(
-                        "没探测到已知的 Zygisk 实现（可能被全局关闭，也可能是本工具还没认出的实现）：先确认 KernelSU/Magisk 的 Zygisk 开关"
-                            .to_owned(),
-                    ),
+                    Some(format!("{install_hint}{residue}")),
                 );
             }
             if facts.pro.pending_update || facts.demo.pending_update {
@@ -2488,15 +2539,118 @@ mod tests {
 
         // 反过来：证据不足时**不许**编出"被禁用"。目录装着、没有 disable 标记、
         // ps 又读不到内容（未知）——只能老实说"模块已安装但 bridge 未监听"。
+        // 注意必须同时保留"实现模块装着"这条证据：连它都没有就不是"未知"，
+        // 而是确凿的"没有实现"（见 missing_zygisk_impl_is_reported_as_missing_not_as_disabled）。
         let mut unknown = facts.clone();
         unknown.zygisk_impl_disabled_module = None;
-        unknown.zygisk_impl_module = None;
         unknown.zygisk_daemon_running = None;
         assert_eq!(
             classify_lifecycle(Variant::Absent, Some(&unknown), false, None).0,
             ZygiskLifecycle::Loaded,
             "未知不等于没在跑"
         );
+    }
+
+    /// Pixel 4 / Android 13 / KernelSU 3.4.0 的真实探测输出（`ROOT_PROBE_SCRIPT` 原样跑出来的）。
+    ///
+    /// 这台机器上 `/data/adb/zygisksu` 是**残留目录**：KernelSU 装过、Zygisk Next 早就不在了，
+    /// `/data/adb/modules` 是空的。旧判据只看运行期目录在不在，于是这一现场被判成
+    /// "实现装着但没开"。被判成哪一档其实不重要，重要的是依据是错的——照这个依据，
+    /// 换一台机器（残留目录都没有）就会翻成另一种说法，永远要为一台机器加一句特例。
+    const PIXEL4_NO_IMPL_SAMPLE: &str = concat!(
+        "ROOT=1\n",
+        "ZYGRUN=0\n",
+        "PROBE_DONE=1\n",
+    );
+
+    #[test]
+    fn missing_zygisk_impl_is_reported_as_missing_not_as_disabled() {
+        let facts = classify_root_output(PIXEL4_NO_IMPL_SAMPLE);
+        assert!(facts.zygisk_impl.is_none(), "fixture 里没有运行期目录");
+        let (lifecycle, detail) =
+            classify_lifecycle(Variant::Absent, Some(&facts), false, None);
+        assert_eq!(lifecycle, ZygiskLifecycle::NotInstalled);
+        let detail = detail.unwrap();
+        assert!(
+            detail.contains("没有在运行的 Zygisk 实现"),
+            "要说出缺的是实现: {detail}"
+        );
+
+        // 同一个现场，但我们的模块装着（这次要区分"实现缺"与"模块缺"）：
+        // 恢复动作必须是"先装实现"，不能支去重装我们的 ZIP。
+        let mut with_module = facts.clone();
+        with_module.pro.installed = true;
+        let (lifecycle, detail) =
+            classify_lifecycle(Variant::Absent, Some(&with_module), false, None);
+        assert_eq!(lifecycle, ZygiskLifecycle::ZygiskDisabled);
+        let detail = detail.unwrap();
+        assert!(detail.contains("Zygisk 实现"), "{detail}");
+        assert!(!detail.contains("重装"), "不该支去重装我们的模块: {detail}");
+    }
+
+    /// 残留运行期目录 + 空模块目录：判据必须仍落在"没有实现"。
+    /// 这是 Pixel 4 的完整现场（比上面多一条 `ZYGIMPL`）：目录在、实现不在。
+    #[test]
+    fn leftover_runtime_dir_alone_never_proves_an_impl_is_installed() {
+        let facts = classify_root_output(concat!(
+            "ROOT=1\n",
+            "ZYGIMPL=zygisksu\n",
+            "ZYGRUN=0\n",
+            "PROBE_DONE=1\n",
+        ));
+        assert_eq!(facts.zygisk_impl.as_deref(), Some("zygisksu"));
+        assert!(facts.zygisk_impl_module.is_none());
+        let (lifecycle, detail) =
+            classify_lifecycle(Variant::Absent, Some(&facts), false, None);
+        assert_eq!(lifecycle, ZygiskLifecycle::NotInstalled);
+        let detail = detail.unwrap();
+        assert!(
+            detail.contains("没有在运行的 Zygisk 实现"),
+            "残留目录不能当成实现装着: {detail}"
+        );
+    }
+
+    /// 模块目录整个不存在时，探测**不能**报 `NOHELPER`。
+    /// Pixel 4 真机现场：这条 `NOHELPER` 与"未安装"同时出现在一份输出里，
+    /// 于是同一个包既被说成"没装"又被说成"装着但 helper.dex 缺失"——两句互相打脸，
+    /// 界面只能挑一句显示，另一句就永远没人看见。脚本已改成"装着才报"，这里把它钉住。
+    #[test]
+    fn nohelper_is_only_reported_when_the_module_directory_exists() {
+        // 真机采集：空模块目录（只有 NOHELPER 与 ZYGRUN）
+        let facts = classify_root_output(concat!(
+            "ROOT=1\n",
+            "NOHELPER applistpro\n",
+            "ZYGRUN=0\n",
+            "PROBE_DONE=1\n",
+        ));
+        assert!(
+            !facts.pro.installed,
+            "没有 INSTALLED 就是没装，NOHELPER 不能反过来暗示装着"
+        );
+    }
+
+    /// 实现模块按**形状**识别，不按名字：任何带 `zygisk/` 子目录（或有 zygisk 运行期目录
+    /// 同名子目录）的模块都算实现。这条锁住"换实现就要改名单"这个反复出现的补丁冲动。
+    #[test]
+    fn impl_detection_does_not_depend_on_a_hardcoded_name_list() {
+        let facts = classify_root_output(concat!(
+            "ROOT=1\n",
+            "INSTALLED applistpro\n",
+            "ZYGIMPLMOD some-fork-we-never-heard-of\n",
+            "ZYGIMPL_OFF some-fork-we-never-heard-of\n",
+            "ZYGRUN=0\n",
+            "PROBE_DONE=1\n",
+        ));
+        assert_eq!(
+            facts.zygisk_impl_module.as_deref(),
+            Some("some-fork-we-never-heard-of")
+        );
+        let (lifecycle, detail) =
+            classify_lifecycle(Variant::Absent, Some(&facts), false, None);
+        assert_eq!(lifecycle, ZygiskLifecycle::ZygiskDisabled);
+        let detail = detail.unwrap();
+        assert!(detail.contains("some-fork-we-never-heard-of"), "{detail}");
+        assert!(detail.contains("启用"), "恢复动作是启用实现: {detail}");
     }
 
     #[test]
@@ -2622,14 +2776,26 @@ mod tests {
             ZygiskLifecycle::ZygiskDisabled
         );
 
-        facts.demo.disabled_marker = false;
-        facts.pro.pending_update = false;
+        // `ROOT_SAMPLE` 里只有运行期目录，没有"实现模块装着"这条证据——那样无论怎么
+        // 调字段都会先命中"没有实现"。这里补上一行 `ZYGIMPLMOD`，才构成
+        // "实现装着、但没跑起来"这个现场；再同时让我们的模块处于装着状态。
+        let mut facts = classify_root_output(concat!(
+            "ROOT=1\n",
+            "INSTALLED applistpro\n",
+            "PROP_BEGIN applistpro\n",
+            "id=applistpro\nversion=v2.2\nversionCode=4\n",
+            "PROP_END\n",
+            "ZYGIMPL=zygisksu\n",
+            "ZYGIMPLMOD zygisksu\n",
+            "PROBE_DONE=1\n",
+        ));
         assert_eq!(
             classify_lifecycle(Variant::Absent, Some(&facts), false, None).0,
             ZygiskLifecycle::Loaded
         );
 
-        facts.zygisk_impl = None;
+        // 实现模块本身没了才是确凿的"没有实现"：与上面"实现装着但没监听"必须分档。
+        facts.zygisk_impl_module = None;
         assert_eq!(
             classify_lifecycle(Variant::Absent, Some(&facts), false, None).0,
             ZygiskLifecycle::ZygiskDisabled

@@ -595,26 +595,45 @@ fn agent_core_error(error: AgentBackendError) -> CoreError {
 
 fn route_error(method: &str, error: crate::services::android_backend::RouteError) -> CoreError {
     use crate::services::android_backend::RouteError;
-    let core = CapabilityRouter::core_error(error.clone());
-    let detail = match error {
-        RouteError::AgentUnavailable { reason, .. } => format!(
-            "Android Agent 未连接或能力未就绪（{reason}）：请先在设备页「安装并连接」Agent，\
+    // 这两类错误必须分开说，因为恢复动作不同，而它们原来共用了一句"Agent 未连接"：
+    //
+    // - AgentUnavailable：会话没连上。动作是去设备页「安装并连接」。
+    // - ProviderUnavailable：**Agent 连得好好的**，是它里面的 ZygiskProvider 不可用
+    //   （模块没装、Zygisk 实现没开、helper.dex 缺失……）。这句话本身就是 Agent 探出来的
+    //   原因，已经带恢复动作（例如"先装并启用一个 Zygisk 实现"）。
+    //
+    // 把后者裹进"请先安装并连接 Agent"，用户会真的去点「安装并连接」——那一步会成功，
+    // 然后同一条清单继续失败，于是看起来像"连了也没用"。Pixel 4 现场就是这样：
+    // Agent 明明连着、detail 也早就写对了，界面上却只让人去连 Agent。
+    match error {
+        RouteError::AgentUnavailable { reason, .. } => CoreError::AgentUnavailable(format!(
+            "Android Agent 未连接（{reason}）：请先在设备页「安装并连接」Agent，\
              Zygisk 应用清单必须经 Agent 的 ZygiskProvider 获取"
-        ),
-        RouteError::ProviderUnavailable { reason, .. } => reason,
-        RouteError::UnsupportedMethod(_) => format!("Agent 未实现 {method}，请重新安装 Agent"),
-        RouteError::LegacyFallbackNotRegistered(_) => {
-            format!("{method} 只允许由 Zygisk Framework 提供，禁止用 pm/Shell 结果伪装成功")
+        )),
+        RouteError::ProviderUnavailable { reason, .. } => CoreError::AgentUnavailable(reason),
+        other => {
+            let kind = CapabilityRouter::core_error(other.clone());
+            let detail = match other {
+                RouteError::UnsupportedMethod(_) => {
+                    format!("Agent 未实现 {method}，请重新安装 Agent")
+                }
+                RouteError::LegacyFallbackNotRegistered(_) => format!(
+                    "{method} 只允许由 Zygisk Framework 提供，禁止用 pm/Shell 结果伪装成功"
+                ),
+                RouteError::Incompatible(reason) => reason,
+                RouteError::MutatingFallbackForbidden(method) => method,
+                RouteError::AgentFailure(inner) => inner.to_string(),
+                // 上面已各自处理；这一支只为让 match 完整（新增变体时编译器会提醒）
+                RouteError::AgentUnavailable { reason, .. }
+                | RouteError::ProviderUnavailable { reason, .. } => reason,
+            };
+            match kind {
+                CoreError::AgentUnavailable(_) | CoreError::AgentIncompatible(_) => {
+                    CoreError::AgentUnavailable(detail)
+                }
+                kept => kept,
+            }
         }
-        RouteError::Incompatible(reason) => reason,
-        RouteError::MutatingFallbackForbidden(method) => method,
-        RouteError::AgentFailure(inner) => inner.to_string(),
-    };
-    match core {
-        CoreError::AgentUnavailable(_) | CoreError::AgentIncompatible(_) => {
-            CoreError::AgentUnavailable(detail)
-        }
-        other => other,
     }
 }
 
@@ -952,6 +971,45 @@ mod tests {
             crate::services::android_backend::default_legacy_capabilities(),
         ));
         (router, agent)
+    }
+
+    #[test]
+    fn provider_unavailable_does_not_claim_the_agent_is_disconnected() {
+        use crate::services::android_backend::RouteError;
+
+        // Agent 连着、ZygiskProvider 不可用（Pixel 4 现场：整机没有 Zygisk 实现）
+        let agent_side_reason =
+            "整台设备没有在运行的 Zygisk 实现：先装并启用一个 Zygisk 实现（例如 Zygisk Next）再装本模块";
+        let error = route_error(
+            "package.list_localized",
+            RouteError::ProviderUnavailable {
+                method: "package.list_localized".into(),
+                reason: agent_side_reason.into(),
+            },
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(agent_side_reason),
+            "Agent 探出来的原因必须原样到界面: {message}"
+        );
+        assert!(
+            !message.contains("安装并连接"),
+            "连都没断，却让人去点「安装并连接」——那一步会成功，然后同一条清单继续失败: {message}"
+        );
+
+        // 真·会话断开：这句必须留着动作，否则用户不知道该去哪
+        let error = route_error(
+            "package.list_localized",
+            RouteError::AgentUnavailable {
+                method: "package.list_localized".into(),
+                reason: "session state is disconnected".into(),
+            },
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("安装并连接") && message.contains("disconnected"),
+            "会话断开时要说清动作与原因: {message}"
+        );
     }
 
     #[tokio::test]
