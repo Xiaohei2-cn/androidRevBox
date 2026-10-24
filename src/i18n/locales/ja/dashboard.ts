@@ -20,7 +20,7 @@ export default {
   "dashboard.node.globalRoot": "グローバルモジュール",
   "dashboard.node.nodeLabel": "node",
   "dashboard.node.missing":
-    "Node が見つかりません：Node.js をインストールして PATH に追加するか、設定 → ツール環境 でパスを指定してください。",
+    "node が見つかりません。インストールして PATH に追加するか、設定で指定してください",
   "dashboard.node.execFailed": "指定された node を実行できません: {path}",
   "dashboard.node.unparsable": "node --version の出力を解析できません: {output}",
 
@@ -35,7 +35,7 @@ export default {
   "dashboard.jadx.title": "jadx-gui MCP",
   "dashboard.mcp.online": "オンライン · {port}",
   "dashboard.mcp.unreachable":
-    "{name} を検出できません（{addr} への接続に失敗: {error}）。ツールを起動して更新してください。",
+    "{name} 未接続（{addr}）",
   "dashboard.mcp.timeout": "{name} を検出できません（{addr} への接続がタイムアウト）。",
   "dashboard.tool.appMissing": "{name} が未インストール",
   "dashboard.tool.mcpLabel": "MCP",

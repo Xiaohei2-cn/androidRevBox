@@ -20,7 +20,7 @@ export default {
   "dashboard.node.globalRoot": "глобальные модули",
   "dashboard.node.nodeLabel": "node",
   "dashboard.node.missing":
-    "Node не найден: установите Node.js и добавьте в PATH либо укажите путь в Настройки → Инструменты.",
+    "node не найден: установите и добавьте в PATH либо укажите в настройках",
   "dashboard.node.execFailed": "Указанный node не запускается: {path}",
   "dashboard.node.unparsable": "Вывод node --version не распознан: {output}",
 
@@ -35,7 +35,7 @@ export default {
   "dashboard.jadx.title": "jadx-gui MCP",
   "dashboard.mcp.online": "В сети · {port}",
   "dashboard.mcp.unreachable":
-    "{name} не обнаружен (подключение к {addr} не удалось: {error}). Запустите инструмент и обновите.",
+    "{name} не подключён ({addr})",
   "dashboard.mcp.timeout": "{name} не обнаружен (тайм-аут подключения к {addr}).",
   "dashboard.tool.appMissing": "{name} не установлен",
   "dashboard.tool.mcpLabel": "MCP",

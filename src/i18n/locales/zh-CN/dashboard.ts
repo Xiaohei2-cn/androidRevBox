@@ -18,7 +18,7 @@ export default {
   "dashboard.node.version": "Node {version}",
   "dashboard.node.globalRoot": "全局包",
   "dashboard.node.nodeLabel": "node",
-  "dashboard.node.missing": "未检测到 node：请安装 Node.js 并加入 PATH，或在 设置 → 工具环境 指定路径。",
+  "dashboard.node.missing": "未检测到 node：安装后加入 PATH，或去设置指定",
   "dashboard.node.execFailed": "配置的 node 无法执行: {path}",
   "dashboard.node.unparsable": "node --version 输出无法解析: {output}",
 
@@ -31,7 +31,7 @@ export default {
   "dashboard.ida.title": "IDA MCP",
   "dashboard.jadx.title": "jadx-gui MCP",
   "dashboard.mcp.online": "在线 · {port}",
-  "dashboard.mcp.unreachable": "{name} 未检测到（{addr} 连接失败: {error}）。启动工具后点刷新。",
+  "dashboard.mcp.unreachable": "{name} 未连接（{addr}）",
   "dashboard.mcp.timeout": "{name} 未检测到（{addr} 连接超时）。",
   "dashboard.tool.appMissing": "{name} 未安装",
   "dashboard.tool.mcpLabel": "MCP",

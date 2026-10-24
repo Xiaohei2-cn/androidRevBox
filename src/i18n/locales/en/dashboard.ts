@@ -20,7 +20,7 @@ export default {
   "dashboard.node.globalRoot": "global modules",
   "dashboard.node.nodeLabel": "node",
   "dashboard.node.missing":
-    "Node not found: install Node.js and add it to PATH, or set the path in Settings → Toolchain.",
+    "node not found: install it and add to PATH, or set it in Settings",
   "dashboard.node.execFailed": "Configured node is not executable: {path}",
   "dashboard.node.unparsable": "node --version output could not be parsed: {output}",
 
@@ -35,7 +35,7 @@ export default {
   "dashboard.jadx.title": "jadx-gui MCP",
   "dashboard.mcp.online": "Online · {port}",
   "dashboard.mcp.unreachable":
-    "{name} not detected (connect to {addr} failed: {error}). Start the tool, then refresh.",
+    "{name} not connected ({addr})",
   "dashboard.mcp.timeout": "{name} not detected (connect to {addr} timed out).",
   "dashboard.tool.appMissing": "{name} not installed",
   "dashboard.tool.mcpLabel": "MCP",

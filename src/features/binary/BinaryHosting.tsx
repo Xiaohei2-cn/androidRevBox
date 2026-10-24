@@ -1771,13 +1771,9 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                                 </div>
                               );
                             }
-                            if (verdict === "unknown") {
-                              return (
-                                <p className="text-10px text-muted-foreground" data-testid={`stamp-unknown-${row.name}`}>
-                                  {t("adb.binary.stampUnknown")}
-                                </p>
-                              );
-                            }
+                            // "未知"（老记录没有修改时间）不提示：那是参数来源的元信息，
+                            // 对用户没有动作可做。原来这里印一句"没做版本核对…（Legacy 来源）"，
+                            // 属于调试信息出现在界面上。
                             return null;
                           })()}
                         </div>

@@ -297,7 +297,7 @@ describe("frida-server 状态：认不出名字时不许谎报未运行", () => 
       channelHint: null,
     });
     renderPanel();
-    expect(await screen.findByText(/握手已通（端口 27042）/)).toBeInTheDocument();
+    expect(await screen.findByText(/端口 27042 已通/)).toBeInTheDocument();
     expect(screen.queryByText("未运行：远程模式会连不上；点右侧箭头去托管页启动")).toBeNull();
   });
 
