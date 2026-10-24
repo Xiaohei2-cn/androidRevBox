@@ -402,6 +402,16 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     await waitFor(() => expect(device.hostedRuns).toHaveBeenCalled());
     expect(await screen.findByText(/25265/)).toBeTruthy();
     expect(await screen.findByText("终止")).toBeTruthy();
+    /*
+     * 托管执行那一行是**纵向堆叠**：文件名 / 动作 / 参数回执 / 端口各占一行。
+     *
+     * 这条断言防的是一个真实炸过的回归：换成气泡行时用了 `multiline`，而它只做顶部对齐、
+     * 容器仍是横向 flex，于是每个块变成一个 row 子项、被压到最小宽度，中文逐字换行成
+     * 竖排（「这一次是用这些参数起的：…」整列竖着，用户截图报的严重显示问题）。
+     * jsdom 不编译 Tailwind，只能断言类名——但它正是"排布方向"的唯一来源，够用。
+     */
+    const hostedRow = screen.getByTestId("hosted-frida-server");
+    expect(hostedRow.firstElementChild?.className).toContain("flex-col");
     // 关键：设备说"在跑"时「终止」必须是**可点**的。曾经 running 一个字段兼作两用
     // （设备在跑 / 我的指令在途），于是按钮 disabled={row.running} 把在跑的行的终止
     // 自己禁成灰色 —— 用户报的"发现托管进程在跑但停不掉"就是它。

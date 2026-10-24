@@ -42,11 +42,19 @@ export function List({
 const ROW_LAYOUT = "flex w-full min-w-0 items-center gap-2";
 
 /**
- * 单个气泡行。
+ * 单个气泡行。两种基本排布，别混用：
+ *
+ * - **一行**（默认）：子元素左右并排。`multiline` 只把纵向对齐从居中改成顶部对齐，
+ *   方向仍是横向——用于"同一行里某一段文字可能换行"（✓ + 步骤名 + 详情）。
+ * - **堆叠**（`stack`）：子元素上下排列，各自占满整行宽度。用于"这一行本身就是两三个
+ *   块"（文件名一行 → 动作一行 → 参数面板 → 端口）。
+ *
+ * 为什么必须分成两个开关：`multiline` 名字容易读成"这条内容有多行"，于是有人拿它装
+ * 多个纵向块，结果每个块变成一个**横向 flex 子项**、被压到最小宽度，中文逐字换行竖排。
+ * 二进制托管页就这么炸过一次（`这一次是用这些参数起的：…` 竖着排）。
  *
  * - `className` 里的**布局**类（flex/grid/gap/px/py）作用于内层内容容器；
- * - 外观类（bg/border/shadow）留在 `li` 上，作为气泡本体；
- * - 需要多行内容时传 `multiline`（改用 `items-start`），避免多行文字被强行垂直居中。
+ * - 外观类（bg/border/shadow）留在 `li` 上，作为气泡本体。
  */
 export function ListRow({
   className,
@@ -55,6 +63,7 @@ export function ListRow({
   selected = false,
   disabled = false,
   multiline = false,
+  stack = false,
   onClick,
   onDoubleClick,
   title,
@@ -65,8 +74,10 @@ export function ListRow({
   interactive?: boolean;
   selected?: boolean;
   disabled?: boolean;
-  /** 行内容需要多行（备注、参数）时用顶部对齐，而不是垂直居中 */
+  /** 横向行里有一段文字会换行：纵向顶部对齐，**方向不变** */
   multiline?: boolean;
+  /** 这一行是多个纵向块：改成 flex-col，子元素各自占满整行 */
+  stack?: boolean;
   onClick?: () => void;
   onDoubleClick?: () => void;
   title?: string;
@@ -87,7 +98,9 @@ export function ListRow({
   const content = cn(
     ROW_LAYOUT,
     "px-2.5 py-2",
-    multiline ? "items-start" : "items-center",
+    // 堆叠时 gap 归 0：各块自己带 mt-* 间距（旧结构就是这么排的），
+    // 再叠一层 gap 会把行高撑得比改动前更松。
+    stack ? "flex-col items-stretch gap-0" : multiline ? "items-start" : "items-center",
     className,
   );
 

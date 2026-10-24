@@ -1498,8 +1498,10 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                       key={row.name}
                       testId={`hosted-${row.name}`}
                       interactive={false}
-                      // 这一行是「名字一行 + 动作一行」的纵向结构，必须顶部对齐
-                      multiline
+                      // 这一行是纵向堆叠：文件名一行 → 动作一行 → 参数/回执/端口各一块。
+                      // 必须 `stack`（flex-col）而不是 `multiline`:后者只做顶部对齐、
+                      // 仍是横向容器，会把每个块压成一条竖排文字（真实炸过的形态）。
+                      stack
                     >
                       {/* 第一行只有文件名：以前它跟 pid 和四五个按钮挤在一行，
                           长名字被截断、按钮也挤成一坨（用户要的"名字一行、动作一行"） */}
