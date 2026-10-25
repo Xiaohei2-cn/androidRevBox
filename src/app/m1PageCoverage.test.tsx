@@ -522,6 +522,13 @@ describe("ADB 子页（转发 / 托管 / 端口）", () => {
     expect(device.binaryKill).not.toHaveBeenCalled();
     const note = await screen.findByTestId("external-note-frida-server");
     expect(note.textContent ?? "").toContain("31337");
+    /*
+     * 提示必须**单独成块**，确认动作另起一行。
+     * 以前两者挤在同一个 flex 行里，而"确认停止…"那句是 `shrink-0` 的长文案：
+     * 它按 max-content 占位，把左边 `flex-1` 的提示压到只剩一个字符宽，
+     * 中文于是逐字竖排（真机截图报的那个形态）。
+     */
+    expect(note.firstElementChild?.tagName).toBe("P");
     // 文案不能撒谎：无句柄 ≠ 停不掉（停止按钮走的就是按身份核验的终止通道）
     expect(note.textContent ?? "").not.toContain("停不掉");
     fireEvent.click(screen.getByTestId("confirm-stop-frida-server"));

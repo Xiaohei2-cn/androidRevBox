@@ -199,6 +199,7 @@ export default {
   "adb.binary.claimFail": "这次启动没能登记进托管表：{detail}",
   "adb.binary.claimRebuildHint": "这个功能需要新版 App，请重启或重新构建",
   "adb.binary.confirmCancel": "取消",
+  "adb.binary.externalBadge": "外部运行中",
   "adb.binary.alreadyRunning": "已在运行 {pids}",
   "adb.binary.stopProcess": "停止进程",
   "adb.binary.stopConfirm": "确认停止 pid {pid}？它不在本工具的托管表里，停了不能恢复",

@@ -199,6 +199,7 @@ export default {
   "adb.binary.claimFail": "今回の起動を実行テーブルに登録できませんでした：{detail}",
   "adb.binary.claimRebuildHint": "新しいビルドが必要です。再起動するか再ビルドしてください",
   "adb.binary.confirmCancel": "キャンセル",
+  "adb.binary.externalBadge": "外部で実行中",
   "adb.binary.alreadyRunning": "稼働中: {pids}",
   "adb.binary.stopProcess": "プロセスを停止",
   "adb.binary.stopConfirm": "pid {pid} を停止しますか？このプロセスは管理表に無く、停止は取り消せません",

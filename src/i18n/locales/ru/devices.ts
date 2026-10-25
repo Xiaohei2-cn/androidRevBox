@@ -199,6 +199,7 @@ export default {
   "adb.binary.claimFail": "Запуск не внесён в таблицу: {detail}",
   "adb.binary.claimRebuildHint": "Нужна более новая сборка приложения; перезапустите или пересоберите",
   "adb.binary.confirmCancel": "Отмена",
+  "adb.binary.externalBadge": "Внешний запуск",
   "adb.binary.alreadyRunning": "уже запущен: {pids}",
   "adb.binary.stopProcess": "Остановить процесс",
   "adb.binary.stopConfirm": "Остановить pid {pid}? Его нет в нашей таблице запуска, остановку не отменить",

@@ -199,6 +199,7 @@ export default {
   "adb.binary.claimFail": "Esta execução não foi registrada na tabela: {detail}",
   "adb.binary.claimRebuildHint": "Isso requer uma versão mais nova do app; reinicie ou recompile",
   "adb.binary.confirmCancel": "Cancelar",
+  "adb.binary.externalBadge": "Rodando fora",
   "adb.binary.alreadyRunning": "já em execução: {pids}",
   "adb.binary.stopProcess": "Parar processo",
   "adb.binary.stopConfirm": "Parar o pid {pid}? Ele não está na nossa tabela de execução e parar não tem volta",

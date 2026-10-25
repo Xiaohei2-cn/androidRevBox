@@ -199,6 +199,7 @@ export default {
   "adb.binary.claimFail": "This launch was not registered in the run table: {detail}",
   "adb.binary.claimRebuildHint": "This needs a newer app build; restart or rebuild",
   "adb.binary.confirmCancel": "Cancel",
+  "adb.binary.externalBadge": "Running outside",
   "adb.binary.alreadyRunning": "already running: {pids}",
   "adb.binary.stopProcess": "Stop process",
   "adb.binary.stopConfirm": "Stop pid {pid}? It is not in our run table, and stopping it cannot be undone",

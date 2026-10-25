@@ -1315,12 +1315,18 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                           {b.name}
                         </span>
                         {(b.externalProcs?.length ?? 0) > 0 && (
+                          /*
+                            徽章只写"外部运行中"，pid 收进悬停提示。
+                            以前把 `已在运行 pid … · 父进程 …` 整串塞进一个 `shrink-0` 徽章：
+                            文件名这一列是 `min-w-0 truncate`，会被它挤成省略号（窄栏里更明显）。
+                            这里是**列**，不是说明区——说明放在托管执行那一行。
+                          */
                           <span
-                            title={t("adb.binary.externalRunningTip")}
+                            title={`${t("adb.binary.alreadyRunning", { pids: describeProcs(b.externalProcs) })} · ${t("adb.binary.externalRunningTip")}`}
                             data-testid={`external-${b.name}`}
                             className="inline-flex h-5 shrink-0 items-center rounded-full bg-amber-500/10 px-2 text-[10px] font-medium leading-none text-amber-500"
                           >
-                            {t("adb.binary.externalRunning", { pids: describeProcs(b.externalProcs) })}
+                            {t("adb.binary.externalBadge")}
                           </span>
                         )}
                       </div>
@@ -1648,11 +1654,14 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                         </Button>
                       </div>
                       {outsiders.length > 0 && (
-                        <div
-                          className="mt-1.5 flex items-center gap-2 text-10px"
-                          data-testid={`external-note-${row.name}`}
-                        >
-                          <span className="min-w-0 flex-1 text-amber-500">
+                        <div className="mt-1.5 text-10px" data-testid={`external-note-${row.name}`}>
+                          {/*
+                            提示单独占一行（块级），确认动作放下一行。
+                            以前两者挤在同一个 `flex` 里，而确认那句话是 `shrink-0` 的长句：
+                            它按 max-content 占位，把左边 `flex-1` 的提示压到只剩一个字符宽，
+                            中文于是逐字竖排（真机上就是这个形态）。
+                          */}
+                          <p className="text-amber-500">
                             {t("adb.binary.alreadyRunning", { pids: describeProcs(outsiders) })}
                             {" · "}
                             <span className="text-muted-foreground">
@@ -1662,10 +1671,10 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                                   ? t("adb.binary.claimFail", { detail: row.claimDetail })
                                   : t("adb.binary.externalRunningTip")}
                             </span>
-                          </span>
+                          </p>
                           {pendingStop?.name === row.name && (
-                            <>
-                              <span className="shrink-0 text-muted-foreground">
+                            <div className="mt-1 flex flex-wrap items-center gap-2">
+                              <span className="min-w-0 text-muted-foreground">
                                 {t("adb.binary.stopConfirm", { pid: pendingStop.pid })}
                               </span>
                               <Button
@@ -1685,7 +1694,7 @@ export function BinaryHosting({ active = true }: { active?: boolean }) {
                               >
                                 {t("adb.binary.confirmCancel")}
                               </Button>
-                            </>
+                            </div>
                           )}
                         </div>
                       )}
