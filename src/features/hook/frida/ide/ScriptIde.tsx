@@ -20,6 +20,7 @@ import { KEY_FRIDA_TYPES_DIR } from "../workdir";
 import { useI18n } from "@/i18n";
 import { useSettings } from "@/app/providers";
 import { isSafeJsName } from "../types";
+import { ensureJsName, newScriptTemplate } from "../newScript";
 import { pickAndPersistWorkdir } from "../workdir";
 // **静态导入**是有意的：编辑器壳体的创建必须与守卫**同一拍**完成。
 // 之前用 `await import("./monacoSetup")`，await 前后两拍之间存在竞态窗口——
@@ -68,16 +69,6 @@ interface OpenFile {
   /** 最近一次读盘/成功写盘时的正文 */
   saved: string;
 }
-
-/**
- * 新建脚本的模板正文（头注释点明下一步，比一张白纸友好）。
- *
- * 写成函数而不是模块级常量：模板里那句话是**界面文案**，必须随语言走。
- * 之前是常量，等于把一句中文钉进代码——`i18n:check` 的硬编码棘轮正是撞在这里。
- */
-const newFileTemplate = (t: (key: string) => string) =>
-  `/* ${t("hook.frida.ide.newFileHint")} */
-`;
 
 export function ScriptIde({
   workdir,
@@ -465,12 +456,13 @@ export function ScriptIde({
 
   /** 新建：从模板建一个空脚本，成功后立刻打开 */
   const createFile = useCallback(async () => {
-    const name = (newName ?? "").trim();
+    // 与 B 区「新建」同一个口径：没写扩展名就默认补 .js
+    const name = ensureJsName(newName ?? "");
     if (!isSafeJsName(name)) {
       setNotice({ ok: false, text: t("hook.frida.ide.badName") });
       return;
     }
-    if (await write(name, newFileTemplate(t), true)) {
+    if (await write(name, newScriptTemplate(t), true)) {
       setNewName(null);
       await openFile(name);
     }

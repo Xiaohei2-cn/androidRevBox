@@ -296,6 +296,33 @@ describe("Hook 页：右侧 = 编辑器 + 终端，两个视图", () => {
   });
 
   /**
+   * 脚本条自己的「新建」：建完直接把新脚本交给编辑器（并切过去）。
+   * 用户点新建的下一步一定是写代码——让她再回列表里找一遍是多余的一步。
+   */
+  it("在脚本条新建脚本：写盘后交给编辑器打开，并切到编辑器视图", async () => {
+    const write = hookApi.scriptWrite as unknown as ReturnType<typeof vi.fn>;
+    write.mockClear();
+    renderHook();
+    await screen.findByTestId("script-row-hook.js");
+
+    fireEvent.click(screen.getByTestId("script-new"));
+    fireEvent.change(screen.getByTestId("script-new-name"), {
+      target: { value: "hook_new" },
+    });
+    fireEvent.click(screen.getByTestId("script-new-create"));
+
+    await waitFor(() => expect(write).toHaveBeenCalled());
+    // 默认只建 .js：名字只给了主体
+    expect(write).toHaveBeenCalledWith("hook_new.js", expect.any(String), true);
+    await waitFor(() =>
+      expect(screen.getByTestId("ide-stub").getAttribute("data-request")).toContain("hook_new.js"),
+    );
+    expect(screen.getByTestId("frida-ide-view").hasAttribute("hidden")).toBe(false);
+    // 新建不是"运行"：一个会话都不许起
+    expect(pty.openArgs.length).toBe(0);
+  });
+
+  /**
    * **A 区显示"frida-server 没在跑"也绝不许拦住起会话**（第八十六轮的教训，钉住我自己别再犯）。
    *
    * 我加过这道拦截，然后被自己的检查证伪了：server 明明在跑，但 `ps -A -o comm` 里

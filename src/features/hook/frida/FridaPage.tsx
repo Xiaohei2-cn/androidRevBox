@@ -138,6 +138,8 @@ export function FridaPage() {
           onWorkdirChange={setWorkdir}
           onStart={(f) => start(f.name)}
           onOpen={(f) => openInIde(f.name)}
+          // 新建成功 = 直接打开（她点新建的下一步一定是写代码，不该再回列表里点一次）
+          onCreated={openInIde}
           refreshSignal={listTick}
           dirtyNames={dirtyNames}
         />

@@ -1,11 +1,13 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { FolderOpen, Play, RefreshCw, ScrollText } from "lucide-react";
+import { FilePlus2, FolderOpen, Play, RefreshCw, ScrollText, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { PaneHeader } from "@/components/ui/pane-header";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { hookApi, type JsFileDto } from "@/api/hook";
 import { useI18n } from "@/i18n";
+import { ensureJsName, newScriptTemplate } from "./newScript";
+import { isSafeJsName } from "./types";
 import { pickAndPersistWorkdir } from "./workdir";
 
 export function formatSize(n: number): string {
@@ -27,7 +29,9 @@ export function formatMtime(sec: number): string {
  *
  * 交互（第九十六轮，编辑器落地后）：
  * - **单击一行 = 在右侧编辑器里打开**（编辑是这一层的主线）；
- * - 行内「▶」= 以当前 A 区设置起官方 REPL 会话（双击不再启动——它与"单击打开"打架）。
+ * - 行内「▶」= 以当前 A 区设置起官方 REPL 会话（双击不再启动——它与"单击打开"打架）；
+ * - 标题行「新建」= 就地敲名字建一个脚本（默认只建 .js），建完直接在编辑器打开。
+ *   名字只给主体也行（`hook_test` → `hook_test.js`），别的扩展名会被拒绝而不是改名。
  *
  * 显示口径不动（第九十二轮）：一行只有脚本名，大小 / 修改时间 / 完整路径收进 hover 气泡。
  */
@@ -36,6 +40,7 @@ export function ScriptList({
   onWorkdirChange,
   onStart,
   onOpen,
+  onCreated,
   refreshSignal,
   dirtyNames,
 }: {
@@ -47,6 +52,8 @@ export function ScriptList({
   onStart: (script: JsFileDto) => void;
   /** 单击一行：在编辑器打开 */
   onOpen: (script: JsFileDto) => void;
+  /** 「新建」成功：把新脚本名交给外层，让编辑器直接打开它 */
+  onCreated?: (name: string) => void;
   /** 外部（编辑器新建/删除后）要求刷新列表：数值一变就重新拉取 */
   refreshSignal: number;
   /** 编辑器里处于未保存状态的文件名（行上标出来，别让她不知情地切走丢改动） */
@@ -55,6 +62,10 @@ export function ScriptList({
   const { t } = useI18n();
   const [tick, setTick] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
+  /** 新建行的展开态与名字（null = 收起；"" = 展开待输入） */
+  const [newName, setNewName] = useState<string | null>(null);
+  /** 建盘中：按钮转圈/禁用，避免连点建出两个 */
+  const [creating, setCreating] = useState(false);
 
   const {
     data: files,
@@ -83,23 +94,70 @@ export function ScriptList({
 
   const items = useMemo(() => files ?? [], [files]);
 
+  /**
+   * 就地新建一个脚本：默认只建 `.js`（名字没写扩展名就补上），建完交给外层打开。
+   * 边界仍在宿主侧：撞名拒绝 / 非法名字的错误原样显示在下面那行——输入行不收起，
+   * 她可以就地改名字再按一次回车。
+   */
+  const createFile = async () => {
+    if (creating) return;
+    const name = ensureJsName(newName ?? "");
+    if (!isSafeJsName(name)) {
+      setNotice(t("hook.frida.ide.badName"));
+      return;
+    }
+    setCreating(true);
+    setNotice(null);
+    try {
+      await hookApi.scriptWrite(name, newScriptTemplate(t), true);
+      setNewName(null);
+      setTick((n) => n + 1);
+      onCreated?.(name);
+    } catch (e) {
+      setNotice(String((e as Error)?.message ?? e));
+    } finally {
+      setCreating(false);
+    }
+  };
+
   return (
     <section className="flex h-full min-h-0 flex-col gap-2 rounded-xl border border-border/70 bg-card shadow-card p-2.5 text-xs">
-      <div className="flex shrink-0 items-center gap-2">
-        <PaneHeader compact icon={ScrollText} title={t("hook.frida.scripts")} className="min-w-0 flex-1" />
-        {workdir && (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="h-6 gap-1 px-1.5 text-11px"
-            onClick={() => void setTick((n) => n + 1)}
-            disabled={isFetching}
-          >
-            <RefreshCw className={isFetching ? "h-3 w-3 animate-spin" : "h-3 w-3"} />
-            {t("common.refresh")}
-          </Button>
-        )}
-      </div>
+      <PaneHeader
+        compact
+        icon={ScrollText}
+        title={t("hook.frida.scripts")}
+        className="min-w-0"
+        actions={
+          workdir ? (
+            <>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 gap-1 px-1.5 text-11px"
+                onClick={() => {
+                  setNotice(null);
+                  setNewName("");
+                }}
+                disabled={creating}
+                data-testid="script-new"
+              >
+                <FilePlus2 className="h-3 w-3" />
+                {t("hook.frida.ide.new")}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 gap-1 px-1.5 text-11px"
+                onClick={() => void setTick((n) => n + 1)}
+                disabled={isFetching}
+              >
+                <RefreshCw className={isFetching ? "h-3 w-3 animate-spin" : "h-3 w-3"} />
+                {t("common.refresh")}
+              </Button>
+            </>
+          ) : undefined
+        }
+      />
 
       <div className="flex shrink-0 items-center gap-1.5">
         <span className="text-11px text-muted-foreground">{t("hook.frida.workdir")}</span>
@@ -114,6 +172,50 @@ export function ScriptList({
           {workdir ? t("hook.frida.changeDir") : t("hook.frida.pickDir")}
         </Button>
       </div>
+
+      {/* 新建行：名字输入 + 创建/取消（就在工作目录下面，不开对话框） */}
+      {newName !== null && (
+        <div className="flex shrink-0 items-center gap-1.5" data-testid="script-new-row">
+          <input
+            autoFocus
+            aria-label={t("hook.frida.ide.newName")}
+            className="h-6 min-w-0 flex-1 rounded-md border border-input bg-background/70 px-1.5 font-mono text-11px focus-visible:border-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+            placeholder="hook_xxx.js"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void createFile();
+              if (e.key === "Escape") {
+                setNewName(null);
+                setNotice(null);
+              }
+            }}
+            data-testid="script-new-name"
+          />
+          <Button
+            size="sm"
+            className="h-6 shrink-0 gap-1 px-2 text-11px"
+            disabled={creating}
+            onClick={() => void createFile()}
+            data-testid="script-new-create"
+          >
+            {t("hook.frida.ide.create")}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 shrink-0 px-1.5"
+            onClick={() => {
+              setNewName(null);
+              setNotice(null);
+            }}
+            aria-label={t("common.cancel")}
+            data-testid="script-new-cancel"
+          >
+            <X className="h-3 w-3" />
+          </Button>
+        </div>
+      )}
 
       <div className="pane-scroll min-h-0 flex-1 space-y-1 overflow-y-auto overflow-x-hidden">
         {!workdir ? (

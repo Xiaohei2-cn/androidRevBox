@@ -23,17 +23,18 @@ import { I18nProvider } from "@/i18n/I18nProvider";
 import type { JsFileDto } from "@/api/hook";
 import { ScriptList, ScriptMeta, formatMtime, formatSize } from "./ScriptList";
 
-const { SCRIPT } = vi.hoisted(() => ({
+const { SCRIPT, scriptWrite } = vi.hoisted(() => ({
   SCRIPT: {
     name: "hook_wechat_dexdump_and_rpc_bridge_v3.js",
     path: "/Users/me/hooks/hook_wechat_dexdump_and_rpc_bridge_v3.js",
     size: 2048,
     mtime: 1_700_000_000,
   } as JsFileDto,
+  scriptWrite: vi.fn(async () => 12),
 }));
 
 vi.mock("@/api/hook", () => ({
-  hookApi: { jsList: vi.fn(async () => [SCRIPT]) },
+  hookApi: { jsList: vi.fn(async () => [SCRIPT]), scriptWrite },
 }));
 
 // 选目录用原生对话框；测试里既不弹也不该弹
@@ -135,5 +136,82 @@ describe("交互：单击打开、▶ 启动、脏标可见", () => {
     list({ dirtyNames: new Set([SCRIPT.name]) });
     await screen.findByText(SCRIPT.name);
     expect(screen.getByTestId(`script-dirty-${SCRIPT.name}`)).toBeTruthy();
+  });
+});
+
+/**
+ * 「新建」：脚本条自己就能建文件（不必先切到编辑器）。
+ *
+ * 口径：**默认只落 .js**——名字只给主体时补 `.js`；别的扩展名不静默改名，直接拒绝。
+ * 建完把名字交给外层打开（onCreated），输入行收起。
+ */
+describe("新建：默认只落 .js", () => {
+  it("点「新建」展开输入行；没写扩展名 → 补 .js 后创建，并交给外层打开", async () => {
+    scriptWrite.mockClear();
+    const onCreated = vi.fn();
+    list({ onCreated });
+    await screen.findByText(SCRIPT.name);
+
+    fireEvent.click(screen.getByTestId("script-new"));
+    const input = screen.getByTestId("script-new-name");
+    fireEvent.change(input, { target: { value: "hook_new" } });
+    fireEvent.click(screen.getByTestId("script-new-create"));
+
+    await waitFor(() =>
+      expect(scriptWrite).toHaveBeenCalledWith("hook_new.js", expect.stringContaining("/*"), true),
+    );
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith("hook_new.js"));
+    // 建完收起输入行（成功之后再问"还要不要再建一个"没有意义）
+    expect(screen.queryByTestId("script-new-row")).toBeNull();
+  });
+
+  it("回车等价于「创建」；带 .js 的名字原样落盘", async () => {
+    scriptWrite.mockClear();
+    const onCreated = vi.fn();
+    list({ onCreated });
+    await screen.findByText(SCRIPT.name);
+
+    fireEvent.click(screen.getByTestId("script-new"));
+    const input = screen.getByTestId("script-new-name");
+    fireEvent.change(input, { target: { value: "  hook_enter.js  " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith("hook_enter.js"));
+    expect(scriptWrite).toHaveBeenCalledWith("hook_enter.js", expect.any(String), true);
+  });
+
+  it("别的扩展名不静默改名：报名字不合法，不写盘，输入行留着让她改", async () => {
+    scriptWrite.mockClear();
+    list();
+    await screen.findByText(SCRIPT.name);
+
+    fireEvent.click(screen.getByTestId("script-new"));
+    fireEvent.change(screen.getByTestId("script-new-name"), {
+      target: { value: "hook_new.txt" },
+    });
+    fireEvent.click(screen.getByTestId("script-new-create"));
+
+    await waitFor(() => expect(screen.getByText(/名字不合法/)).toBeTruthy());
+    expect(scriptWrite).not.toHaveBeenCalled();
+    expect(screen.getByTestId("script-new-row")).toBeTruthy();
+  });
+
+  it("Escape 收起输入行，什么都不建", async () => {
+    scriptWrite.mockClear();
+    list();
+    await screen.findByText(SCRIPT.name);
+
+    fireEvent.click(screen.getByTestId("script-new"));
+    const input = screen.getByTestId("script-new-name");
+    fireEvent.change(input, { target: { value: "hook_never" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(screen.queryByTestId("script-new-row")).toBeNull();
+    expect(scriptWrite).not.toHaveBeenCalled();
+  });
+
+  it("没选工作目录时没有「新建」（没有地方落文件，不给假按钮）", () => {
+    list({ workdir: "" });
+    expect(screen.queryByTestId("script-new")).toBeNull();
   });
 });
