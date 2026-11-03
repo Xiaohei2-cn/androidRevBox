@@ -122,4 +122,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
-        run: gh release edit "v${VERSION}" --draft=false
+        # 这个作业没有 checkout，必须显式给 --repo，否则 gh 推断不出仓库
+        run: gh release edit "v${VERSION}" --repo "$GITHUB_REPOSITORY" --draft=false
