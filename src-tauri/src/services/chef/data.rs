@@ -72,6 +72,10 @@ impl ChefData {
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
 }
 
 /// 算法参数：前端表单一律交字符串（复选框交 "true"/"false"，数字交十进制文本）。

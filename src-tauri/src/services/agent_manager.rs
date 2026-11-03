@@ -2377,7 +2377,7 @@ mod tests {
         assert!(
             !adb_shell_is_alive(&serial, &target).await,
             "设备上 {} 应已不在运行",
-            &target
+            target
         );
 
         // ④ 已经停了再停一次：no_op（幂等），不是错误
@@ -4774,7 +4774,7 @@ mod tests {
                 real.timed_out,
                 real.stdout_bytes,
                 real.stderr_bytes,
-                &real.stdout.chars().take(90).collect::<String>()
+                real.stdout.chars().take(90).collect::<String>()
             );
             assert!(
                 real.started && !real.timed_out && real.stdout_bytes > 0,

@@ -1367,7 +1367,7 @@ mod tests {
         .map(|reference| serde_json::json!({ "ref": reference }))
         .collect();
         let mut versions = parse_frida_refs(&items);
-        versions.sort_by(|a, b| release_key(b).cmp(&release_key(a)));
+        versions.sort_by_key(|a| std::cmp::Reverse(release_key(a)));
         assert_eq!(
             versions,
             vec!["17.24.10", "17.24.3", "17.2.2", "16.0.7", "16.0.0"],
