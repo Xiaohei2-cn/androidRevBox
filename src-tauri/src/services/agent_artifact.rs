@@ -61,10 +61,15 @@ pub struct AgentArtifactResolver {
 
 impl AgentArtifactResolver {
     pub fn new(config: Arc<ConfigService>, resource_arm64: Option<PathBuf>) -> Self {
+        // 开发期回退只编进 debug 包：release 产物不能带构建机的绝对路径
+        // （`/Users/<name>/.../appReverseTools/src-tauri` 会原样出现在二进制里）。
+        #[cfg(debug_assertions)]
         let development_arm64 = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("src-tauri must have a workspace parent")
             .join("target/aarch64-linux-android/release/android-agent");
+        #[cfg(not(debug_assertions))]
+        let development_arm64 = PathBuf::new();
         Self {
             config,
             resource_arm64,

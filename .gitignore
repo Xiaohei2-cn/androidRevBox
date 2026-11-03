@@ -43,6 +43,8 @@ Thumbs.db
 /docs/
 *.md
 !android-zygisk/**/*.md
+# Release 说明由发布工作流读取，必须入库
+!.github/release-notes.md
 
 # Zygisk module build outputs (the source/template stays tracked)
 android-zygisk/**/obj/

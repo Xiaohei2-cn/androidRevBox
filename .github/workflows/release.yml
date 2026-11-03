@@ -1,0 +1,125 @@
+name: Release
+
+# 推 v* tag（或手动触发）→ 构建 macOS 安装包 → 上传到 GitHub Release。
+# 版本号以 package.json 为准；发版前用 scripts/release.sh 同步四处版本。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_id: ${{ steps.create.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [[ "$REF_NAME" != "v${VERSION}" ]]; then
+            echo "error: tag ${REF_NAME} 与 package.json 版本 v${VERSION} 不一致；先跑 scripts/release.sh" >&2
+            exit 1
+          fi
+
+      - name: Create draft release
+        id: create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="v${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag 已存在，直接复用"
+          else
+            gh release create "$tag" \
+              --draft \
+              --title "AppReverseTools ${tag}" \
+              --notes-file .github/release-notes.md
+          fi
+          release_id="$(gh release view "$tag" --json databaseId --jq .databaseId)"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    needs: prepare
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+          - target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # 第二个 target 是给设备端 Agent 交叉编译用的
+          targets: ${{ matrix.target }},aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          key: ${{ matrix.target }}
+
+      # 产物里不留构建机的家目录（runner 的用户名/路径），只留 /cargo /rustup /build
+      - name: Configure reproducible paths
+        run: |
+          echo "RUSTFLAGS=--remap-path-prefix=${HOME}/.cargo=/cargo --remap-path-prefix=${HOME}/.rustup=/rustup --remap-path-prefix=${GITHUB_WORKSPACE}=/build" >> "$GITHUB_ENV"
+
+      - name: Show Android NDK
+        run: |
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-}"
+          ls "${ANDROID_HOME:-$HOME/Library/Android/sdk}/ndk" 2>/dev/null || true
+
+      # Agent 二进制被 .gitignore 排除，干净克隆里没有；漏了这一步安装包会缺核心资源
+      - name: Build Android agent resource
+        run: bash scripts/build_android_agent.sh aarch64
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          args: --target ${{ matrix.target }}
+
+  publish:
+    needs: [prepare, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: gh release edit "v${VERSION}" --draft=false

@@ -33,6 +33,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "category": "DeveloperTool",
+    "copyright": "Copyright © 2026 Xiaohei2-cn",
+    "shortDescription": "Android reverse engineering workbench",
     "resources": {
       "resources/android-agent/": ""
     },
@@ -42,6 +45,11 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "signingIdentity": "-",
+      "hardenedRuntime": true
+    }
   }
 }

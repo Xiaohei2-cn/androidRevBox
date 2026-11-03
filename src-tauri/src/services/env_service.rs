@@ -1753,15 +1753,17 @@ mod tests {
         // 刻意不钉死“哪一个 venv”：同一个 base 派生出多个项目 venv 时，任选其一都算
         // 达标（本机就有两个），钉死某个项目路径会让这条腿随用户的目录漂移而误红。
         // 真正要守住的是：结果必须落在“其 pyvenv.cfg 指回该 base”的 venv/bin 里。
-        let base = "/Users/citec/.pyenv/versions/3.13.5/bin/python3.13";
-        if !std::path::Path::new(base).exists() {
+        // 用 $HOME 拼，不把开发机的绝对路径写进源码（仓库要公开时也是个人路径泄漏）
+        let home = std::env::var("HOME").expect("HOME");
+        let base = format!("{home}/.pyenv/versions/3.13.5/bin/python3.13");
+        if !std::path::Path::new(&base).exists() {
             eprintln!("skip: 本机缺 pyenv base");
             return;
         }
         let db = Arc::new(crate::db::Db::in_memory().unwrap());
         let config = Arc::new(ConfigService::new(db));
         let svc = svc_with_config(config, Arc::new(ScriptedAdb::new(false)));
-        let r = svc.resolve_interpreter(base).await;
+        let r = svc.resolve_interpreter(&base).await;
         eprintln!(
             "picked={} resolved={} how={}",
             r.picked_path, r.resolved_path, r.how
@@ -1773,7 +1775,7 @@ mod tests {
         let cfg = std::fs::read_to_string(venv_root.join("pyvenv.cfg"))
             .expect("反查结果必须真的落在某个 venv 根目录下");
         assert!(
-            cfg.contains("/Users/citec/.pyenv/versions/3.13.5/"),
+            cfg.contains(format!("{home}/.pyenv/versions/3.13.5/").as_str()),
             "该 venv 的 pyvenv.cfg 没有指向这个 base: {cfg}"
         );
         assert!(
@@ -1786,7 +1788,8 @@ mod tests {
     async fn venv_python_is_returned_as_is() {
         // 回归（§10.5.1）：pyvenv.cfg 在 venv 根目录（bin 的上一级），不在 bin 同目录。
         // 选 venv/bin/python 必须原样返回，不得 canonicalize 成 pyenv 真身。
-        let venv_bin = "/Users/citec/PycharmProjects/android_reverse_study/.venv/bin";
+        let home = std::env::var("HOME").expect("HOME");
+        let venv_bin = format!("{home}/PycharmProjects/android_reverse_study/.venv/bin");
         if !std::path::Path::new(&format!("{venv_bin}/python")).exists() {
             eprintln!("skip: 本机无该 venv");
             return;
