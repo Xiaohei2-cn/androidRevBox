@@ -129,15 +129,16 @@ const REGISTRY: &[(&str, &str, Category, Option<&str>)] = &[
         Category::Transport,
         None,
     ),
-    // 工具市场的一键安装（P13）：push 之后的三条 shell —— `chmod 0755`、读设备 ABI、
-    // 安装后复核（`stat` + `test -x`）。三条都是幂等或只读的，归 Transport 而不是
+    // 工具市场的一键安装（P13）：push 之后的三条 shell —— `chmod 0755`（现在落在
+    // `push_and_verify()` 收尾）、读设备 ABI、安装后复核（`stat` + `test -x`）。
+    // 三条都是幂等或只读的，归 Transport 而不是
     // Legacy fallback：它们不是"Agent 能力的旧回退腿"，而是 adb 的本职——把本机下好的
     // 文件送进 /data/local/tmp 并让它能跑。没走 TaskService 长任务，是因为安装是一条
     // **带校验的链**（下载 → 摘要 → 推送 → chmod → 回读），中途失败要说清断在哪一步，
     // 而不是丢一个任务 id 让人自己去日志里找。
     (
         "src/services/tool_market.rs",
-        "install",
+        "push_and_verify",
         Category::Transport,
         None,
     ),
