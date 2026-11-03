@@ -39,6 +39,12 @@ export default {
   "settings.tools.jadxPort.placeholder": "default 8650",
   "settings.tools.savedReload": "Saved; re-checking environment cards",
 
+  "settings.proxy.label": "Network proxy",
+  "settings.proxy.hint": "Used when the tool market downloads binaries and looks up frida versions; empty = direct (TUN mode needs nothing here). Takes effect on the next request.",
+  "settings.proxy.url": "Proxy address",
+  "settings.proxy.placeholder": "http://127.0.0.1:7890",
+  "settings.proxy.schemes": "Supports http:// and socks5://; you can also write 127.0.0.1:7890 (treated as http).",
+
   "settings.log.label": "Log level",
   "settings.log.hint": "Persists across restarts",
   "settings.log.syncing": " Syncing configuration…",

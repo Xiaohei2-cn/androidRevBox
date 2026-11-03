@@ -162,6 +162,7 @@ pub fn run() {
             // 都是 app data 下的可再生缓存，卸载 App 一起走。
             let tool_market = Arc::new(services::tool_market::ToolMarketService::new(
                 runner.clone(),
+                config.clone(),
                 data_dir.join("tools"),
             ));
 
@@ -293,6 +294,8 @@ pub fn run() {
             commands::market::market_tools,
             commands::market::market_device_abi,
             commands::market::market_install_tool,
+            commands::market::market_frida_releases,
+            commands::market::market_install_frida,
             commands::hook::hook_js_list,
             commands::hook::hook_preflight,
             commands::hook::hook_script_read,

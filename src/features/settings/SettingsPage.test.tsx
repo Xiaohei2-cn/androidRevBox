@@ -110,6 +110,8 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("config-app.node.path")).toBeInTheDocument();
     expect(screen.getByTestId("config-app.tools.ida_mcp_port")).toBeInTheDocument();
     expect(screen.getByTestId("config-app.tools.jadx_mcp_port")).toBeInTheDocument();
+    // 下载走外网：代理是一个正经设置项，不是藏在文档里的环境变量
+    expect(screen.getByTestId("config-app.net.proxy")).toBeInTheDocument();
   });
 
   /**

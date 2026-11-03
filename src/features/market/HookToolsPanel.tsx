@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Copy, ExternalLink, Loader2, PackageCheck, Wrench } from "lucide-react";
+import { Copy, ExternalLink, Globe, Loader2, PackageCheck, RefreshCw, Wrench } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { IconTile } from "@/components/ui/icon-tile";
@@ -8,6 +8,7 @@ import { PageHeader } from "@/components/ui/page-header";
 import { Pill } from "@/components/ui/pill";
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
+import { useAppNav } from "@/app/nav";
 import { deviceApi, type DeviceEntry } from "@/api/device";
 import { formatBytes, marketApi, type MarketTool, type ToolInstallReport } from "@/api/market";
 import { pickTrackedDevice } from "@/features/binary/hostedRecords";
@@ -25,15 +26,24 @@ import { pickTrackedDevice } from "@/features/binary/hostedRecords";
  * 右侧只做三件事：说清它是什么（说明 + 官方地址 + 版本/体积/许可）、给用法示例、
  * 一键安装到设备。安装的每一步都在后端做完（下载 → SHA-256 → push → chmod → 回读），
  * 这里只负责把"装到哪、多大、验没验过"如实摆出来。
+ *
+ * **动态版本条目**（frida-server）：版本列表实时取自 frida 官方 release，所以这一项
+ * 没有固定版本/体积，选中它时安装区多一行版本选择；选好版本之后走的仍是同一条
+ * "下载 → 校验 → 推送 → 复核"的路。只提供 Android arm64（与目录里的 deviceAbi 一致）。
  */
 export function HookToolsPanel() {
   const { t } = useI18n();
+  const { gotoConfig } = useAppNav();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [deviceSerial, setDeviceSerial] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [report, setReport] = useState<ToolInstallReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  /** frida-server 选中的版本（动态条目；列表到达后默认最新） */
+  const [fridaVersion, setFridaVersion] = useState<string | null>(null);
+  /** 「重新获取」的计数：key 一变就重取，且要求后端跳过它自己的 10 分钟缓存 */
+  const [releasesTick, setReleasesTick] = useState(0);
 
   const { data: tools = [], isLoading } = useQuery({
     queryKey: ["market", "tools"],
@@ -77,13 +87,60 @@ export function HookToolsPanel() {
   const abiMismatch =
     !!selected && !!abi && selected.deviceAbi.length > 0 && !selected.deviceAbi.includes(abi);
 
+  /** 选中项是不是"版本实时取自上游"的条目（目前只有 frida-server） */
+  const dynamicVersion = selected?.versionSource === "github-releases";
+
+  // 动态条目的版本列表：面板选到它时才去问，10 分钟内不重取（GitHub 匿名限额 60 次/小时）。
+  const {
+    data: releases = [],
+    isLoading: releasesLoading,
+    isFetching: releasesFetching,
+    error: releasesError,
+  } = useQuery({
+    queryKey: ["market", "frida-releases", releasesTick],
+    // tick > 0 = 用户点了「重新获取」：要求后端跳过内存缓存
+    queryFn: () => marketApi.fridaReleases(releasesTick > 0),
+    enabled: dynamicVersion,
+    staleTime: 10 * 60_000,
+    // 重取时把上一份列表留在屏上：否则下拉框会先空一下，选中的版本看着像被甩掉了
+    placeholderData: (previous) => previous,
+    retry: false,
+  });
+
+  // 默认选最新；已经在列表里的选择不覆盖（别因为一次重取换掉她选的版本）
+  useEffect(() => {
+    if (!dynamicVersion || releases.length === 0) return;
+    if (fridaVersion && releases.some((release) => release.version === fridaVersion)) return;
+    setFridaVersion(releases[0].version);
+  }, [dynamicVersion, releases, fridaVersion]);
+
+  // 列表一直列到 16.x（约两百个版本）：按大版本分组，否则平铺的下拉根本翻不动。
+  // 后端已按版本从新到旧排好，顺序扫一遍就是 17.x → 16.x 的分组。
+  const versionGroups = useMemo(() => {
+    const groups: Array<{ major: string; versions: string[] }> = [];
+    for (const release of releases) {
+      const major = release.version.split(".")[0] ?? "";
+      const last = groups[groups.length - 1];
+      if (last?.major === major) last.versions.push(release.version);
+      else groups.push({ major, versions: [release.version] });
+    }
+    return groups;
+  }, [releases]);
+
   const install = async (tool: MarketTool) => {
     if (!deviceSerial) return;
+    const dynamic = tool.versionSource === "github-releases";
+    if (dynamic && !fridaVersion) {
+      setError(t("tools.needVersion"));
+      return;
+    }
     setBusyId(tool.id);
     setError(null);
     setReport(null);
     try {
-      const result = await marketApi.install(deviceSerial, tool.id);
+      const result = dynamic
+        ? await marketApi.installFrida(deviceSerial, fridaVersion as string)
+        : await marketApi.install(deviceSerial, tool.id);
       setReport(result);
     } catch (e) {
       setError(String((e as Error)?.message ?? e));
@@ -157,14 +214,20 @@ export function HookToolsPanel() {
                 </div>
               </header>
 
-              {/* 事实行：版本 / 体积 / 许可，全是目录里登记的值，不是猜的 */}
+              {/* 事实行：版本 / 体积 / 许可，全是目录里登记的值，不是猜的。
+                  动态条目没有固定版本与体积：用「实时版本」说清它为什么空着。 */}
               <div className="flex flex-wrap items-center gap-1.5">
-                <Pill tone="mono" title={t("tools.version")}>
-                  {selected.version}
-                </Pill>
-                <Pill tone="mono" title={t("tools.size")}>
-                  {formatBytes(selected.sizeBytes)}
-                </Pill>
+                {selected.version && (
+                  <Pill tone="mono" title={t("tools.version")}>
+                    {selected.version}
+                  </Pill>
+                )}
+                {selected.sizeBytes > 0 && (
+                  <Pill tone="mono" title={t("tools.size")}>
+                    {formatBytes(selected.sizeBytes)}
+                  </Pill>
+                )}
+                {dynamicVersion && <Pill tone="accent">{t("tools.liveVersions")}</Pill>}
                 <Pill tone="muted" title={t("tools.license")}>
                   {selected.license}
                 </Pill>
@@ -221,6 +284,57 @@ export function HookToolsPanel() {
 
               {/* 安装区 */}
               <section className="space-y-2 rounded-xl border border-border/60 bg-card p-3 shadow-card">
+                {/* 动态版本条目（frida-server）：版本实时取自上游，先选版本再装 */}
+                {dynamicVersion && (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <select
+                      className="h-8 min-w-0 flex-1 rounded-lg border border-input bg-background/60 px-2 font-mono text-[11px]"
+                      value={fridaVersion ?? ""}
+                      onChange={(event) => setFridaVersion(event.target.value || null)}
+                      aria-label={t("tools.pickVersion")}
+                      data-testid="market-version-select"
+                    >
+                      {releases.length === 0 && (
+                        <option value="">
+                          {releasesLoading ? t("tools.loadingVersions") : t("tools.noVersions")}
+                        </option>
+                      )}
+                      {versionGroups.map((group) => (
+                        <optgroup key={group.major} label={`${group.major}.x`}>
+                          {group.versions.map((version) => (
+                            <option key={version} value={version}>
+                              {version}
+                            </option>
+                          ))}
+                        </optgroup>
+                      ))}
+                    </select>
+                    <Button
+                      size="icon-sm"
+                      variant="ghost"
+                      title={t("tools.refreshVersions")}
+                      onClick={() => setReleasesTick((n) => n + 1)}
+                      disabled={releasesFetching}
+                      data-testid="market-refresh-versions"
+                    >
+                      <RefreshCw
+                        className={cn("h-3.5 w-3.5", releasesFetching && "animate-spin")}
+                      />
+                    </Button>
+                    <Pill tone="accent">{t("tools.liveVersions")}</Pill>
+                  </div>
+                )}
+                {dynamicVersion && releasesError && (
+                  <p
+                    className="break-all text-[10px] text-destructive"
+                    data-testid="market-versions-error"
+                  >
+                    {t("tools.versionsFailed", {
+                      error: String((releasesError as Error)?.message ?? releasesError),
+                    })}
+                  </p>
+                )}
+
                 <div className="flex flex-wrap items-center gap-2">
                   <select
                     className="h-8 min-w-0 flex-1 rounded-lg border border-input bg-background/60 px-2 text-[11px]"
@@ -238,7 +352,12 @@ export function HookToolsPanel() {
                   </select>
                   <Button
                     size="md"
-                    disabled={!deviceSerial || busyId !== null || abiMismatch}
+                    disabled={
+                      !deviceSerial ||
+                      busyId !== null ||
+                      abiMismatch ||
+                      (dynamicVersion && (!fridaVersion || releasesLoading))
+                    }
                     onClick={() => void install(selected)}
                     data-testid="market-install"
                     title={
@@ -247,9 +366,11 @@ export function HookToolsPanel() {
                             abi: abi ?? "",
                             toolAbi: selected.deviceAbi.join("/"),
                           })
-                        : !deviceSerial
-                          ? t("tools.needDeviceHint")
-                          : undefined
+                        : dynamicVersion && !fridaVersion
+                          ? t("tools.needVersion")
+                          : !deviceSerial
+                            ? t("tools.needDeviceHint")
+                            : undefined
                     }
                   >
                     {busyId === selected.id ? (
@@ -267,6 +388,11 @@ export function HookToolsPanel() {
                 {!deviceSerial && (
                   <p className="text-[10px] text-muted-foreground">{t("tools.needDevice")}</p>
                 )}
+                {dynamicVersion && (
+                  <p className="text-[10px] leading-relaxed text-muted-foreground">
+                    {t("tools.versionHint")}
+                  </p>
+                )}
                 {abiMismatch && (
                   <p className="text-[10px] text-destructive">
                     {t("tools.abiMismatch", {
@@ -275,9 +401,22 @@ export function HookToolsPanel() {
                     })}
                   </p>
                 )}
-                <p className="text-[10px] leading-relaxed text-muted-foreground">
-                  {t("tools.downloadNote")}
-                </p>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <p className="text-[10px] leading-relaxed text-muted-foreground">
+                    {t("tools.downloadNote")}
+                  </p>
+                  {/* 下载走的是外网：没有 TUN 的用户在这里一步跳到代理设置 */}
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-5 shrink-0 gap-1 px-1 text-10px"
+                    onClick={() => gotoConfig("app.net.proxy")}
+                    data-testid="market-goto-proxy"
+                  >
+                    <Globe className="h-3 w-3" />
+                    {t("tools.configureProxy")}
+                  </Button>
+                </div>
 
                 {error && (
                   <p className="rounded-lg bg-destructive/10 px-2 py-1.5 text-[11px] text-destructive" data-testid="market-error">
@@ -359,6 +498,7 @@ function ToolBubble({
   selected: boolean;
   onSelect: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <button
       type="button"
@@ -378,14 +518,25 @@ function ToolBubble({
         <span className={cn("truncate text-xs font-semibold", selected && "text-primary")}>
           {tool.name}
         </span>
-        <Pill tone={selected ? "accent" : "muted"}>{tool.version}</Pill>
+        {/* 动态版本条目没有固定版本：用「实时」说明它的版本要选了才有 */}
+        {tool.version ? (
+          <Pill tone={selected ? "accent" : "muted"}>{tool.version}</Pill>
+        ) : (
+          tool.versionSource === "github-releases" && (
+            <Pill tone={selected ? "accent" : "muted"}>{t("tools.liveVersions")}</Pill>
+          )
+        )}
       </div>
       <p className="mt-0.5 line-clamp-2 text-[10px] leading-snug text-muted-foreground">
         {tool.tagline}
       </p>
       <div className="mt-1.5 flex items-center gap-1 text-[10px] text-muted-foreground/80">
-        <span className="tabular-nums">{formatBytes(tool.sizeBytes)}</span>
-        <span className="opacity-40">·</span>
+        {tool.sizeBytes > 0 && (
+          <>
+            <span className="tabular-nums">{formatBytes(tool.sizeBytes)}</span>
+            <span className="opacity-40">·</span>
+          </>
+        )}
         <span className="truncate">{tool.license}</span>
       </div>
     </button>

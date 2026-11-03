@@ -50,6 +50,12 @@ pub const KEY_AI_BASE_URL: &str = "app.ai.base_url";
 pub const KEY_AI_API_KEY: &str = "app.ai.api_key";
 pub const KEY_AI_MODEL: &str = "app.ai.model";
 pub const KEY_AI_ENABLED: &str = "app.ai.enabled";
+/// 联网代理（工具市场下载二进制、查询 frida 版本用）。
+///
+/// 空 = 直连（TUN 模式不需要填）；支持 `http(s)://host:port`、`socks5(h)://host:port`，
+/// 也可以只写 `127.0.0.1:7890`（按 http 处理）。每次请求现读这个键，
+/// 改完设置不用重启应用，下一次下载就走新代理。
+pub const KEY_NET_PROXY: &str = "app.net.proxy";
 
 /// 界面语言白名单（与前端 i18n 词典文件一一对应；新增语种在此登记）
 pub const LOCALES: [&str; 5] = ["zh-CN", "en", "ru", "pt-BR", "ja"];
@@ -91,6 +97,37 @@ fn is_valid_ai_model(value: &str) -> bool {
 
 fn is_valid_bool(v: &str) -> bool {
     matches!(v, "true" | "false")
+}
+
+/// 代理地址：空（= 直连）、`http(s)://host:port`、`socks5(h)://host:port`，
+/// 也接受省略 scheme 的 `host:port`（按 http 处理）。
+///
+/// 只做"形状"校验：真正的可用性由下载前的连通性检查回答（`tool_market`），
+/// 这里挡住的是空白/控制字符、不认识的 scheme、以及把整段 URL 路径当代理贴进来。
+fn is_valid_proxy(v: &str) -> bool {
+    let value = v.trim();
+    if value.is_empty() {
+        return true;
+    }
+    if value.len() > 512 || value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let with_scheme = if value.contains("://") {
+        value.to_owned()
+    } else {
+        format!("http://{value}")
+    };
+    let Some((scheme, rest)) = with_scheme.split_once("://") else {
+        return false;
+    };
+    if !matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "socks5" | "socks5h"
+    ) {
+        return false;
+    }
+    // 代理地址只到 host[:port]（可带 user:pass@）；路径/查询/片段说明贴错了东西
+    !rest.is_empty() && !rest.contains('/') && !rest.contains('?') && !rest.contains('#')
 }
 /// 已授权 serial 列表：逗号分隔、去空白后每段只允许 adb serial 的合法字符。
 ///
@@ -172,6 +209,8 @@ const ALLOWED_KEYS: &[(&str, ValueValidator)] = &[
     (KEY_LOCALE, is_valid_locale),
     (KEY_HOOK_WORKDIR, is_valid_path),
     (KEY_FRIDA_TYPES_DIR, is_valid_path),
+    // 联网代理：工具市场下载 / frida 版本查询都按它走（见 tool_market::http_client）
+    (KEY_NET_PROXY, is_valid_proxy),
     // 翻译接口（UI-6 第二层）。这三个键的值都不敏感：地址、模型名、开关。
     (KEY_AI_BASE_URL, is_valid_ai_base_url),
     (KEY_AI_MODEL, is_valid_ai_model),
@@ -386,5 +425,34 @@ mod tests {
         let snap = s.snapshot().unwrap();
         assert_eq!(snap.len(), 2);
         assert!(snap.iter().all(|r| r.key != "rogue"));
+    }
+
+    /// 代理地址只认"代理"的形状：空串（直连）、http(s)、socks5(h)，可省略 scheme。
+    #[test]
+    fn proxy_setting_accepts_common_forms_and_rejects_url_paths() {
+        for good in [
+            "",
+            "127.0.0.1:7890",
+            "http://127.0.0.1:7890",
+            "https://proxy.example.com:8443",
+            "socks5://127.0.0.1:7891",
+            "socks5h://user:pass@10.0.0.2:1080",
+        ] {
+            assert!(is_valid_proxy(good), "{good} 应被接受");
+        }
+        for bad in [
+            "ftp://127.0.0.1:21",
+            "http://127.0.0.1:7890/path",
+            "http://127.0.0.1:7890?x=1",
+            "127.0.0.1:7890#frag",
+            "http://a b:1",
+            "http://",
+        ] {
+            assert!(!is_valid_proxy(bad), "{bad} 必须被拒绝");
+        }
+        // 白名单里真的接了它：设置页保存后，下载路径读得到
+        let s = svc();
+        s.set(KEY_NET_PROXY, "127.0.0.1:7890").unwrap();
+        assert_eq!(s.get(KEY_NET_PROXY, "").unwrap(), "127.0.0.1:7890");
     }
 }

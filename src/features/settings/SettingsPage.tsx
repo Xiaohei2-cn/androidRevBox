@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Bot,
   FolderOpen,
+  Globe,
   Info,
   Languages,
   Monitor,
@@ -65,7 +66,8 @@ export function SettingsPage() {
       pendingConfigKey?.startsWith("app.ai.") ||
       pendingConfigKey === "app.python.path" ||
       pendingConfigKey === "app.node.path" ||
-      pendingConfigKey === "app.adb.path"
+      pendingConfigKey === "app.adb.path" ||
+      pendingConfigKey === "app.net.proxy"
     ? "environment"
     : null;
 
@@ -380,6 +382,27 @@ function EnvironmentTab() {
           />
         </CardContent>
       </Card>
+
+      {/*
+        联网代理：工具市场下载二进制、frida 版本查询都走它。
+        留空 = 直连（TUN 模式不需要填）；每次请求现读，改完下一次下载就生效。
+      */}
+      <Card>
+        <CardHeader>
+          <IconTile icon={Globe} toneClass="bg-indigo-500/15 text-indigo-600 dark:text-indigo-400" size="sm" />
+          <CardTitle>{t("settings.proxy.label")}</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <p className="text-xs text-muted-foreground">{t("settings.proxy.hint")}</p>
+          <ConfigInputRow
+            label={t("settings.proxy.url")}
+            configKey="app.net.proxy"
+            placeholder={t("settings.proxy.placeholder")}
+            mono
+          />
+          <p className="text-11px text-muted-foreground">{t("settings.proxy.schemes")}</p>
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -544,7 +567,8 @@ function ConfigInputRow({
   mono?: boolean;
   /** 路径类输入显示「打开文件夹选择器」按钮：directory=选目录，file=选文件 */
   kind?: "directory" | "file";
-  onSaved: () => void;
+  /** 保存成功后的后续动作（重新探测环境等）；没有后续动作的键可以不传 */
+  onSaved?: () => void;
 }) {
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
@@ -625,7 +649,7 @@ function ConfigInputRow({
     try {
       await configApi.set(configKey, value.trim());
       setSaved(true);
-      onSaved();
+      onSaved?.();
       window.setTimeout(() => setSaved(false), 1500);
     } catch (e) {
       setError(String((e as { message?: string }).message ?? e));

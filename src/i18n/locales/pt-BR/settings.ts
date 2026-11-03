@@ -39,6 +39,12 @@ export default {
   "settings.tools.jadxPort.placeholder": "padrão 8650",
   "settings.tools.savedReload": "Salvo; verificando novamente os cartões de ambiente",
 
+  "settings.proxy.label": "Proxy de rede",
+  "settings.proxy.hint": "Usado quando o mercado baixa binários e consulta versões do frida; vazio = direto (modo TUN não precisa). Vale na próxima requisição.",
+  "settings.proxy.url": "Endereço do proxy",
+  "settings.proxy.placeholder": "http://127.0.0.1:7890",
+  "settings.proxy.schemes": "Aceita http:// e socks5://; pode escrever só 127.0.0.1:7890 (tratado como http).",
+
   "settings.log.label": "Nível de log",
   "settings.log.hint": "Persiste após reiniciar",
   "settings.log.syncing": " Sincronizando configuração…",

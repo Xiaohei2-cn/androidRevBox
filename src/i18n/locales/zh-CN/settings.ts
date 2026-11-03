@@ -38,6 +38,12 @@ export default {
   "settings.tools.jadxPort.placeholder": "默认 8650",
   "settings.tools.savedReload": "已保存，环境卡重新检测中",
 
+  "settings.proxy.label": "网络代理",
+  "settings.proxy.hint": "工具市场下载二进制、查询 frida 版本时走这里；留空 = 直连（TUN 模式不需要填）。改完下一次请求就生效。",
+  "settings.proxy.url": "代理地址",
+  "settings.proxy.placeholder": "http://127.0.0.1:7890",
+  "settings.proxy.schemes": "支持 http://、socks5://；也可以只写 127.0.0.1:7890（按 http 处理）。",
+
   "settings.log.label": "日志级别",
   "settings.log.hint": "重启后保留",
   "settings.log.syncing": " 配置同步中…",

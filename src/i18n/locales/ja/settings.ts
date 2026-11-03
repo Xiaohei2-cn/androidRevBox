@@ -39,6 +39,12 @@ export default {
   "settings.tools.jadxPort.placeholder": "既定 8650",
   "settings.tools.savedReload": "保存しました。環境カードを再検出しています",
 
+  "settings.proxy.label": "ネットワークプロキシ",
+  "settings.proxy.hint": "ツール市場のバイナリ取得と frida バージョン照会で使います。空 = 直接接続（TUN モードなら不要）。次のリクエストから有効です。",
+  "settings.proxy.url": "プロキシアドレス",
+  "settings.proxy.placeholder": "http://127.0.0.1:7890",
+  "settings.proxy.schemes": "http:// と socks5:// に対応。127.0.0.1:7890 だけでも可（http 扱い）。",
+
   "settings.log.label": "ログレベル",
   "settings.log.hint": "再起動後も保持されます",
   "settings.log.syncing": " 設定を同期中…",

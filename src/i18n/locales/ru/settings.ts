@@ -39,6 +39,12 @@ export default {
   "settings.tools.jadxPort.placeholder": "по умолчанию 8650",
   "settings.tools.savedReload": "Сохранено; карточки окружения перепроверяются",
 
+  "settings.proxy.label": "Сетевой прокси",
+  "settings.proxy.hint": "Используется при скачивании бинарников и запросе версий frida; пусто = напрямую (в режиме TUN не нужно). Действует со следующего запроса.",
+  "settings.proxy.url": "Адрес прокси",
+  "settings.proxy.placeholder": "http://127.0.0.1:7890",
+  "settings.proxy.schemes": "Поддерживаются http:// и socks5://; можно просто 127.0.0.1:7890 (считается http).",
+
   "settings.log.label": "Уровень журнала",
   "settings.log.hint": "Сохраняется между запусками",
   "settings.log.syncing": " Синхронизация настроек…",

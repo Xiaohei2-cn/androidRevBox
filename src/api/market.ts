@@ -22,6 +22,18 @@ export interface MarketTool {
   deviceFileName: string;
   deviceAbi: string[];
   usage: string[];
+  /**
+   * 版本从哪来：`""`（或缺失）= 目录里登记的固定版本；
+   * `"github-releases"` = 实时查上游 release（目前只有 frida-server）。
+   * 动态条目的 version / downloadUrl / sizeBytes / sha256 都是空的，
+   * 界面要等用户选好版本再走 `installFrida`。
+   */
+  versionSource?: "" | "github-releases" | null;
+}
+
+/** frida 官方 tags 里的一个版本（16.x 及以后）。资产信息在点安装时才按版本解析。 */
+export interface FridaVersion {
+  version: string;
 }
 
 export interface ToolInstallReport {
@@ -49,6 +61,20 @@ export const marketApi = {
   /** 设备主 ABI；`null` = 读不到（未知），不等于不兼容 */
   deviceAbi(serial: string): Promise<string | null> {
     return invokeCommand<string | null>("market_device_abi", { serial });
+  },
+  /**
+   * frida-server 的版本列表（实时取自 frida 官方 tags，16.x 及以后，从新到旧）。
+   * 后端有 10 分钟内存缓存；`refresh = true` 强制重取（界面上的「重新获取」）。
+   */
+  fridaReleases(refresh = false): Promise<FridaVersion[]> {
+    return invokeCommand<FridaVersion[]>("market_frida_releases", { refresh });
+  },
+  /**
+   * 安装指定版本的 frida-server：解析资产 → 下载并核对 GitHub 登记的摘要
+   * → 本机解压 .xz → 推送 `/data/local/tmp/frida-server` → chmod → 复核。
+   */
+  installFrida(serial: string, version: string): Promise<ToolInstallReport> {
+    return invokeCommand<ToolInstallReport>("market_install_frida", { serial, version });
   },
 };
 
