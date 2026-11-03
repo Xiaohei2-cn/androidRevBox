@@ -29,6 +29,13 @@ jobs:
             echo "error: 缺少 tag" >&2
             exit 1
           fi
-          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false
-          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,assets \
-            --jq '{draft: .isDraft, assets: [.assets[].name]}'
+          # 草稿 Release 在 GitHub 上挂在 untagged-… 下，按 tag 查不到，必须按 id PATCH
+          api="/repos/${GITHUB_REPOSITORY}/releases"
+          id="$(gh api "$api?per_page=100" --jq "[.[] | select(.tag_name == \"$tag\" and .draft) | .id][0]")"
+          if [[ -z "$id" || "$id" == "null" ]]; then
+            echo "找不到 $tag 的草稿 Release，现有 Release：" >&2
+            gh api "$api?per_page=100" --jq '.[] | [.id, .tag_name, .draft] | @tsv' >&2
+            exit 1
+          fi
+          echo '{"draft": false}' | gh api -X PATCH "$api/$id" --input - \
+            --jq '{draft: .draft, tag: .tag_name, assets: [.assets[].name]}'

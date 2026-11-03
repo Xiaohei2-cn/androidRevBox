@@ -122,5 +122,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
-        # 这个作业没有 checkout，必须显式给 --repo，否则 gh 推断不出仓库
-        run: gh release edit "v${VERSION}" --repo "$GITHUB_REPOSITORY" --draft=false
+        # 草稿 Release 在 GitHub 上挂在 untagged-… 下，按 tag 查不到，必须按 id PATCH
+        run: |
+          api="/repos/${GITHUB_REPOSITORY}/releases"
+          id="$(gh api "$api?per_page=100" --jq "[.[] | select(.tag_name == \"v${VERSION}\" and .draft) | .id][0]")"
+          if [[ -z "$id" || "$id" == "null" ]]; then
+            echo "找不到 v${VERSION} 的草稿 Release，现有 Release：" >&2
+            gh api "$api?per_page=100" --jq '.[] | [.id, .tag_name, .draft] | @tsv' >&2
+            exit 1
+          fi
+          echo '{"draft": false}' | gh api -X PATCH "$api/$id" --input - \
+            --jq '{draft: .draft, tag: .tag_name, assets: [.assets[].name]}'
