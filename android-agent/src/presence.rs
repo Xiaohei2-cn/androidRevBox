@@ -107,8 +107,10 @@ pub async fn wait_until_should_exit(presence: Arc<ClientPresence>, grace: Durati
 mod tests {
     use super::*;
 
-    fn at(ms: u64) -> Instant {
-        Instant::now() + Duration::from_millis(ms)
+    /// 相对**同一个起点**构造时刻。不能写成 `Instant::now() + ms`：
+    /// 两次调用之间的时间也会被算进去，慢的 CI runner 上会把 60ms 拖过 100ms 宽限期。
+    fn at(start: Instant, ms: u64) -> Instant {
+        start + Duration::from_millis(ms)
     }
 
     #[test]
@@ -135,10 +137,13 @@ mod tests {
         let mut machine = IdleExit::default();
         assert!(!machine.observe(0, grace, start), "刚开始还不该退");
         assert!(
-            !machine.observe(0, grace, at(60)),
+            !machine.observe(0, grace, at(start, 60)),
             "宽限期内（60ms<100ms）不许退——重启一次 App 就在这窗口里"
         );
-        assert!(machine.observe(0, grace, at(140)), "连续空过宽限期就该退");
+        assert!(
+            machine.observe(0, grace, at(start, 140)),
+            "连续空过宽限期就该退"
+        );
     }
 
     /// 这条是"误杀正在用的 Agent"的护栏：中途来过一个客户端，计时必须从零开始。
@@ -146,13 +151,20 @@ mod tests {
     fn a_client_arriving_resets_the_grace_window() {
         let grace = Duration::from_millis(100);
         let mut machine = IdleExit::default();
-        assert!(!machine.observe(0, grace, Instant::now()));
-        assert!(!machine.observe(1, grace, at(80)), "有人用就不算空闲");
-        assert!(!machine.observe(1, grace, at(300)), "有人用多久都不该退");
+        let start = Instant::now();
+        assert!(!machine.observe(0, grace, start));
+        assert!(
+            !machine.observe(1, grace, at(start, 80)),
+            "有人用就不算空闲"
+        );
+        assert!(
+            !machine.observe(1, grace, at(start, 300)),
+            "有人用多久都不该退"
+        );
         // 那个客户端走了：宽限期重新起算，不是把之前空过的 80ms 也累计进来
-        assert!(!machine.observe(0, grace, at(320)));
-        assert!(!machine.observe(0, grace, at(380)));
-        assert!(machine.observe(0, grace, at(430)));
+        assert!(!machine.observe(0, grace, at(start, 320)));
+        assert!(!machine.observe(0, grace, at(start, 380)));
+        assert!(machine.observe(0, grace, at(start, 430)));
     }
 
     #[test]
@@ -161,7 +173,7 @@ mod tests {
         let start = Instant::now();
         machine.observe(0, Duration::from_secs(30), start);
         let idle = machine
-            .idle_for(at(1000))
+            .idle_for(at(start, 1000))
             .expect("应该记得从什么时候开始空");
         assert!((0.9..1.2).contains(&idle.as_secs_f64()), "{idle:?}");
     }
