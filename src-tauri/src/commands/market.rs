@@ -6,9 +6,7 @@
 
 use crate::AppState;
 use crate::core::error::CoreResult;
-use crate::services::tool_market::{
-    FridaVersionDto, MarketToolDto, ToolInstallReport,
-};
+use crate::services::tool_market::{FridaVersionDto, MarketToolDto, ToolInstallReport};
 
 /// 工具目录：固定登记的工具 + 动态版本的 frida-server。
 /// 这里**不主动联网**——frida 的版本列表由界面按需拉（`market_frida_releases`），

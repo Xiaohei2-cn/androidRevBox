@@ -313,7 +313,9 @@ impl AgentManager {
              * 所以只把"需要重装"这个意图记下来，先把锁和现场都收拾干净，
              * 回到 `connect_artifact` 那一层（锁已释放）再真正重试。
              */
-            Err(error @ AgentManagerError::IncompatibleAgentVersion { .. }) if allow_version_retry => {
+            Err(error @ AgentManagerError::IncompatibleAgentVersion { .. })
+                if allow_version_retry =>
+            {
                 let failure_state = session.status().state;
                 let attempt = self
                     .recover_failed_start(
@@ -1078,7 +1080,10 @@ mod tests {
                 (FakeAgentMode::StaleVersion, agent_protocol::method::SYSTEM_HELLO) => {
                     let mut stale = hello(ProviderHealth::Ready, true);
                     stale.agent_version = "0.0.1-stale".into();
-                    ResponseEnvelope::success(request.request_id, serde_json::to_value(stale).unwrap())
+                    ResponseEnvelope::success(
+                        request.request_id,
+                        serde_json::to_value(stale).unwrap(),
+                    )
                 }
                 (_, agent_protocol::method::SYSTEM_HELLO) => ResponseEnvelope::success(
                     request.request_id,
@@ -1445,9 +1450,8 @@ mod tests {
             .unwrap()
             .iter()
             .filter(|(_, args)| {
-                args.iter().any(|a| {
-                    a.trim() == "rm -f /data/local/tmp/app_reverse_tools_agent"
-                })
+                args.iter()
+                    .any(|a| a.trim() == "rm -f /data/local/tmp/app_reverse_tools_agent")
             })
             .count();
         assert_eq!(

@@ -617,9 +617,9 @@ fn route_error(method: &str, error: crate::services::android_backend::RouteError
                 RouteError::UnsupportedMethod(_) => {
                     format!("Agent 未实现 {method}，请重新安装 Agent")
                 }
-                RouteError::LegacyFallbackNotRegistered(_) => format!(
-                    "{method} 只允许由 Zygisk Framework 提供，禁止用 pm/Shell 结果伪装成功"
-                ),
+                RouteError::LegacyFallbackNotRegistered(_) => {
+                    format!("{method} 只允许由 Zygisk Framework 提供，禁止用 pm/Shell 结果伪装成功")
+                }
                 RouteError::Incompatible(reason) => reason,
                 RouteError::MutatingFallbackForbidden(method) => method,
                 RouteError::AgentFailure(inner) => inner.to_string(),
@@ -978,8 +978,7 @@ mod tests {
         use crate::services::android_backend::RouteError;
 
         // Agent 连着、ZygiskProvider 不可用（Pixel 4 现场：整机没有 Zygisk 实现）
-        let agent_side_reason =
-            "整台设备没有在运行的 Zygisk 实现：先装并启用一个 Zygisk 实现（例如 Zygisk Next）再装本模块";
+        let agent_side_reason = "整台设备没有在运行的 Zygisk 实现：先装并启用一个 Zygisk 实现（例如 Zygisk Next）再装本模块";
         let error = route_error(
             "package.list_localized",
             RouteError::ProviderUnavailable {

@@ -2557,18 +2557,13 @@ mod tests {
     /// `/data/adb/modules` 是空的。旧判据只看运行期目录在不在，于是这一现场被判成
     /// "实现装着但没开"。被判成哪一档其实不重要，重要的是依据是错的——照这个依据，
     /// 换一台机器（残留目录都没有）就会翻成另一种说法，永远要为一台机器加一句特例。
-    const PIXEL4_NO_IMPL_SAMPLE: &str = concat!(
-        "ROOT=1\n",
-        "ZYGRUN=0\n",
-        "PROBE_DONE=1\n",
-    );
+    const PIXEL4_NO_IMPL_SAMPLE: &str = concat!("ROOT=1\n", "ZYGRUN=0\n", "PROBE_DONE=1\n",);
 
     #[test]
     fn missing_zygisk_impl_is_reported_as_missing_not_as_disabled() {
         let facts = classify_root_output(PIXEL4_NO_IMPL_SAMPLE);
         assert!(facts.zygisk_impl.is_none(), "fixture 里没有运行期目录");
-        let (lifecycle, detail) =
-            classify_lifecycle(Variant::Absent, Some(&facts), false, None);
+        let (lifecycle, detail) = classify_lifecycle(Variant::Absent, Some(&facts), false, None);
         assert_eq!(lifecycle, ZygiskLifecycle::NotInstalled);
         let detail = detail.unwrap();
         assert!(
@@ -2600,8 +2595,7 @@ mod tests {
         ));
         assert_eq!(facts.zygisk_impl.as_deref(), Some("zygisksu"));
         assert!(facts.zygisk_impl_module.is_none());
-        let (lifecycle, detail) =
-            classify_lifecycle(Variant::Absent, Some(&facts), false, None);
+        let (lifecycle, detail) = classify_lifecycle(Variant::Absent, Some(&facts), false, None);
         assert_eq!(lifecycle, ZygiskLifecycle::NotInstalled);
         let detail = detail.unwrap();
         assert!(
@@ -2645,8 +2639,7 @@ mod tests {
             facts.zygisk_impl_module.as_deref(),
             Some("some-fork-we-never-heard-of")
         );
-        let (lifecycle, detail) =
-            classify_lifecycle(Variant::Absent, Some(&facts), false, None);
+        let (lifecycle, detail) = classify_lifecycle(Variant::Absent, Some(&facts), false, None);
         assert_eq!(lifecycle, ZygiskLifecycle::ZygiskDisabled);
         let detail = detail.unwrap();
         assert!(detail.contains("some-fork-we-never-heard-of"), "{detail}");

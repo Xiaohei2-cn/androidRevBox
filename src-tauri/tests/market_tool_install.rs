@@ -13,8 +13,8 @@
 
 use std::sync::Arc;
 
-use app_reverse_tools_lib::services::config_service::ConfigService;
 use app_reverse_tools_lib::db::Db;
+use app_reverse_tools_lib::services::config_service::ConfigService;
 use app_reverse_tools_lib::services::device_service::{AdbRunner, RealAdbRunner};
 use app_reverse_tools_lib::services::tool_market::ToolMarketService;
 
@@ -26,7 +26,9 @@ async fn real_market_installs_stackplz_to_local_tmp() {
     // 集成测试不改 `Db::in_memory` 的可见性（那是 `#[cfg(test)]` 的库内单测件）：
     // 用一个临时目录开真库，与 App 启动时走同一条路径。
     let data_dir = std::env::temp_dir().join(format!("art-market-db-{}", std::process::id()));
-    let config = Arc::new(ConfigService::new(Arc::new(Db::connect(&data_dir).unwrap())));
+    let config = Arc::new(ConfigService::new(Arc::new(
+        Db::connect(&data_dir).unwrap(),
+    )));
     let runner: Arc<dyn AdbRunner> = Arc::new(RealAdbRunner::new(config.clone()));
     let cache = std::env::temp_dir().join("art-market-real-test");
     let service = ToolMarketService::new(runner, config, cache);

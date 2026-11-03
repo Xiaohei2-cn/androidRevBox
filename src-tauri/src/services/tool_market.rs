@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use crate::adapters::adb;
 use crate::core::error::{CoreError, CoreResult};
 use crate::services::config_service::{ConfigService, KEY_NET_PROXY};
-use crate::services::device_service::{AdbRunner, AdbRunOutput};
+use crate::services::device_service::{AdbRunOutput, AdbRunner};
 
 /// 设备侧目标目录：adb shell 可写、不需要 root、重启后仍在（`/data/local/tmp` 不清）。
 pub const DEVICE_TMP: &str = "/data/local/tmp";
@@ -132,7 +132,11 @@ impl From<&ToolEntry> for MarketToolDto {
             size_bytes: tool.size_bytes,
             sha256: tool.sha256.to_owned(),
             device_file_name: tool.device_file_name.to_owned(),
-            device_abi: tool.device_abi.iter().map(|abi| (*abi).to_owned()).collect(),
+            device_abi: tool
+                .device_abi
+                .iter()
+                .map(|abi| (*abi).to_owned())
+                .collect(),
             usage: tool.usage.iter().map(|line| (*line).to_owned()).collect(),
             version_source: String::new(),
         }
@@ -397,9 +401,9 @@ impl ToolMarketService {
                 tool.id, digest, tool.sha256
             )));
         }
-        tokio::fs::rename(&tmp, path)
-            .await
-            .map_err(|error| CoreError::Internal(format!("落盘 {} 失败: {error}", path.display())))?;
+        tokio::fs::rename(&tmp, path).await.map_err(|error| {
+            CoreError::Internal(format!("落盘 {} 失败: {error}", path.display()))
+        })?;
         tracing::info!(tool = tool.id, bytes = written, %digest, "工具下载完成");
         Ok(())
     }
@@ -408,23 +412,24 @@ impl ToolMarketService {
     ///
     /// 不在这里判"期望体积/摘要"：固定条目与动态条目的判据不同，由各自的调用点判，
     /// 这样错误话术能说清是"下载断了"还是"摘要对不上"。
-    async fn download_stream(&self, url: &str, label: &str, tmp: &Path) -> CoreResult<(u64, String)> {
+    async fn download_stream(
+        &self,
+        url: &str,
+        label: &str,
+        tmp: &Path,
+    ) -> CoreResult<(u64, String)> {
         if let Some(parent) = tmp.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|error| {
                 CoreError::Internal(format!("创建缓存目录 {} 失败: {error}", parent.display()))
             })?;
         }
         let client = self.http_client(DOWNLOAD_TIMEOUT)?;
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| {
-                CoreError::Internal(format!(
-                    "下载 {label} 失败: {}{PROXY_HINT}",
-                    error_chain(&error)
-                ))
-            })?;
+        let response = client.get(url).send().await.map_err(|error| {
+            CoreError::Internal(format!(
+                "下载 {label} 失败: {}{PROXY_HINT}",
+                error_chain(&error)
+            ))
+        })?;
         if !response.status().is_success() {
             return Err(CoreError::Internal(format!(
                 "下载 {label} 失败: HTTP {}",
@@ -438,9 +443,9 @@ impl ToolMarketService {
                 "{label} 的下载体积异常（{length} 字节），已中止"
             )));
         }
-        let mut file = tokio::fs::File::create(tmp)
-            .await
-            .map_err(|error| CoreError::Internal(format!("写入 {} 失败: {error}", tmp.display())))?;
+        let mut file = tokio::fs::File::create(tmp).await.map_err(|error| {
+            CoreError::Internal(format!("写入 {} 失败: {error}", tmp.display()))
+        })?;
         let mut hasher = Sha256::new();
         let mut written: u64 = 0;
         let mut stream = response;
@@ -544,10 +549,7 @@ impl ToolMarketService {
     /// 归档（.xz）是缓存单位：它在 HTTPS 下下载，且与 GitHub 登记的资产摘要核对过；
     /// 每次安装都**重新解压**（几秒钟）而不是缓存解压结果——解压是确定性的，
     /// 少一个"解压出来的文件被截断/替换后还当缓存用"的静默故障点。
-    async fn ensure_frida_binary(
-        &self,
-        asset: &FridaAsset,
-    ) -> CoreResult<(PathBuf, u64, String)> {
+    async fn ensure_frida_binary(&self, asset: &FridaAsset) -> CoreResult<(PathBuf, u64, String)> {
         let archive = self.cache_dir.join(format!(
             "frida-server-{}-android-arm64-{}.xz",
             asset.version, asset.size_bytes
@@ -602,11 +604,10 @@ impl ToolMarketService {
             .cache_dir
             .join(format!("frida-server-{}-android-arm64", asset.version));
         let (archive_for_task, binary_for_task) = (archive.clone(), binary.clone());
-        let bytes = tokio::task::spawn_blocking(move || {
-            extract_xz(&archive_for_task, &binary_for_task)
-        })
-        .await
-        .map_err(|error| CoreError::Internal(format!("解压任务被中断：{error}")))??;
+        let bytes =
+            tokio::task::spawn_blocking(move || extract_xz(&archive_for_task, &binary_for_task))
+                .await
+                .map_err(|error| CoreError::Internal(format!("解压任务被中断：{error}")))??;
         let sha256 = sha256_file(&binary).await?;
         Ok((binary, bytes, sha256))
     }
@@ -617,7 +618,11 @@ impl ToolMarketService {
     /// 设备侧文件固定叫 `frida-server`：设备页的启动/停止、Agent 的默认二进制名都按它走。
     /// 只支持 Android arm64——设备明确报了别的 ABI 就拦；读不到 ABI 视为未知（不拦，
     /// 与界面同一条口径）。
-    pub async fn install_frida(&self, serial: &str, version: &str) -> CoreResult<ToolInstallReport> {
+    pub async fn install_frida(
+        &self,
+        serial: &str,
+        version: &str,
+    ) -> CoreResult<ToolInstallReport> {
         validate_frida_version(version)?;
         if let Some(abi) = self.device_abi(serial).await
             && !abi.to_ascii_lowercase().starts_with("arm64")
@@ -626,7 +631,8 @@ impl ToolMarketService {
                 "frida-server 目前只提供 android-arm64：这台设备是 {abi}"
             )));
         }
-        let asset = self.resolve_frida_asset(version).await?;        let (local, bytes, sha256) = self.ensure_frida_binary(&asset).await?;
+        let asset = self.resolve_frida_asset(version).await?;
+        let (local, bytes, sha256) = self.ensure_frida_binary(&asset).await?;
         self.push_and_verify(
             serial,
             &local,
@@ -665,11 +671,7 @@ impl ToolMarketService {
     }
 
     /// 单次 GET。`Err((错误, 是否值得重试))`。
-    async fn github_get_once(
-        &self,
-        url: &str,
-        label: &str,
-    ) -> Result<Value, (CoreError, bool)> {
+    async fn github_get_once(&self, url: &str, label: &str) -> Result<Value, (CoreError, bool)> {
         let client = self
             .http_client(FRIDA_API_TIMEOUT)
             .map_err(|error| (error, false))?;
@@ -697,9 +699,12 @@ impl ToolMarketService {
         })?;
         if !status.is_success() {
             // GitHub 的错误 JSON 带 message；限流还额外说明一下配额，免得用户以为是网络坏了
-            let message = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|value| value.get("message").and_then(Value::as_str).map(str::to_owned));
+            let message = serde_json::from_str::<Value>(&body).ok().and_then(|value| {
+                value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
             let detail = message.map(|m| format!(" · {m}")).unwrap_or_default();
             if status.as_u16() == 404 {
                 return Err((
@@ -861,9 +866,9 @@ impl ToolMarketService {
         step: &'static str,
     ) -> CoreResult<AdbRunOutput> {
         let environment = self.runner.environment().await;
-        let adb_path = environment
-            .path
-            .ok_or_else(|| CoreError::Internal(environment.hint.unwrap_or_else(|| "adb 不可用".into())))?;
+        let adb_path = environment.path.ok_or_else(|| {
+            CoreError::Internal(environment.hint.unwrap_or_else(|| "adb 不可用".into()))
+        })?;
         let arguments = adb::build_args(Some(serial), command);
         let output = self
             .runner
@@ -900,7 +905,10 @@ fn normalize_proxy_url(raw: &str) -> String {
 /// （`frida-server-17.24.3-android-arm64`），`set_extension` 会把 `3-android-arm64`
 /// 当成扩展名一起换掉，落出一个叫 `frida-server-17.24.part` 的东西。
 fn part_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(".part");
     path.with_file_name(name)
 }
@@ -1029,8 +1037,9 @@ fn validate_frida_version(version: &str) -> CoreResult<()> {
 fn extract_xz(archive: &Path, out: &Path) -> CoreResult<u64> {
     use std::io::Write;
 
-    let input = std::fs::File::open(archive)
-        .map_err(|error| CoreError::Internal(format!("打开 {} 失败: {error}", archive.display())))?;
+    let input = std::fs::File::open(archive).map_err(|error| {
+        CoreError::Internal(format!("打开 {} 失败: {error}", archive.display()))
+    })?;
     let mut reader = std::io::BufReader::new(input);
     let tmp = part_path(out);
     let file = std::fs::File::create(&tmp)
@@ -1073,10 +1082,9 @@ async fn sha256_file(path: &Path) -> CoreResult<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
-        let read = file
-            .read(&mut buffer)
-            .await
-            .map_err(|error| CoreError::Internal(format!("读取 {} 失败: {error}", path.display())))?;
+        let read = file.read(&mut buffer).await.map_err(|error| {
+            CoreError::Internal(format!("读取 {} 失败: {error}", path.display()))
+        })?;
         if read == 0 {
             break;
         }
@@ -1111,15 +1119,26 @@ mod tests {
 
     /// 测试用的配置服务（内存库）：代理默认空 = 直连。
     fn test_config() -> Arc<ConfigService> {
-        Arc::new(ConfigService::new(Arc::new(crate::db::Db::in_memory().unwrap())))
+        Arc::new(ConfigService::new(Arc::new(
+            crate::db::Db::in_memory().unwrap(),
+        )))
     }
 
     /// 代理地址归一：设置页允许只写 `host:port`，按 http 处理；带 scheme 的原样。
     #[test]
     fn proxy_url_without_scheme_defaults_to_http() {
-        assert_eq!(normalize_proxy_url(" 127.0.0.1:7890 "), "http://127.0.0.1:7890");
-        assert_eq!(normalize_proxy_url("http://127.0.0.1:7890"), "http://127.0.0.1:7890");
-        assert_eq!(normalize_proxy_url("socks5://127.0.0.1:7891"), "socks5://127.0.0.1:7891");
+        assert_eq!(
+            normalize_proxy_url(" 127.0.0.1:7890 "),
+            "http://127.0.0.1:7890"
+        );
+        assert_eq!(
+            normalize_proxy_url("http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890"
+        );
+        assert_eq!(
+            normalize_proxy_url("socks5://127.0.0.1:7891"),
+            "socks5://127.0.0.1:7891"
+        );
     }
 
     /// 配置了代理之后，请求必须真的走代理：用一个本地假代理接住 CONNECT，
@@ -1196,12 +1215,7 @@ mod tests {
                 tool.id,
                 tool.download_url
             );
-            assert_eq!(
-                tool.sha256.len(),
-                64,
-                "{} 的摘要必须是 64 位 hex",
-                tool.id
-            );
+            assert_eq!(tool.sha256.len(), 64, "{} 的摘要必须是 64 位 hex", tool.id);
             assert!(
                 tool.sha256.chars().all(|c| c.is_ascii_hexdigit()),
                 "{} 的摘要里出现非 hex 字符",
@@ -1317,18 +1331,22 @@ mod tests {
         );
 
         // prerelease / 没有 arm64 资产 / 没有资产：都不认
-        assert!(parse_release(&release(
-            "18.0.0",
-            Some(("frida-server-18.0.0-android-arm64.xz", 1, None)),
-            true
-        ))
-        .is_none());
-        assert!(parse_release(&release(
-            "17.24.1",
-            Some(("frida-server-17.24.1-android-x86_64.xz", 2, None)),
-            false
-        ))
-        .is_none());
+        assert!(
+            parse_release(&release(
+                "18.0.0",
+                Some(("frida-server-18.0.0-android-arm64.xz", 1, None)),
+                true
+            ))
+            .is_none()
+        );
+        assert!(
+            parse_release(&release(
+                "17.24.1",
+                Some(("frida-server-17.24.1-android-x86_64.xz", 2, None)),
+                false
+            ))
+            .is_none()
+        );
         assert!(parse_release(&release("17.24.0", None, false)).is_none());
     }
 
@@ -1362,7 +1380,15 @@ mod tests {
         for good in ["17.24.3", "16.0.1", "1.2.3"] {
             assert!(validate_frida_version(good).is_ok(), "{good} 应被接受");
         }
-        for bad in ["latest", "17.24", "v17.24.3", "17.24.3-rc1", "../17.24.3", "17..3", ""] {
+        for bad in [
+            "latest",
+            "17.24",
+            "v17.24.3",
+            "17.24.3-rc1",
+            "../17.24.3",
+            "17..3",
+            "",
+        ] {
             assert!(validate_frida_version(bad).is_err(), "{bad} 必须被拒绝");
         }
     }
