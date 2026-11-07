@@ -178,7 +178,7 @@ impl RealAdbRunner {
         }
     }
 
-    /// 按优先级解析 adb：手动配置 → ANDROID_HOME → ANDROID_SDK_ROOT → PATH。
+    /// 按优先级解析 adb：手动配置 → ANDROID_HOME → ANDROID_SDK_ROOT → 默认 SDK 位置 → PATH。
     fn resolve(&self) -> Option<ResolvedAdb> {
         if let Ok(p) = self
             .config
@@ -221,7 +221,49 @@ impl RealAdbRunner {
     }
 }
 
-/// 候选路径 + 来源标注：ANDROID_HOME → ANDROID_SDK_ROOT → PATH（纯拼接逻辑在 adapter）。
+/// 各平台 Android SDK 的默认安装位置。
+///
+/// macOS 的 GUI 进程由 launchd 启动：既看不到 `~/.zshrc` 里导出的 `ANDROID_HOME`，
+/// 也看不到那个文件往 PATH 里加的 `platform-tools`。从 Finder/Dock 打开打包后的 App
+/// 时，「终端里明明有 adb」和「App 里找不到」就是这一条造成的。
+#[cfg(target_os = "macos")]
+fn default_sdk_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Library/Android/sdk"))
+}
+
+#[cfg(target_os = "linux")]
+fn default_sdk_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Android/Sdk"))
+}
+
+#[cfg(target_os = "windows")]
+fn default_sdk_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|local| std::path::PathBuf::from(local).join("Android").join("Sdk"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn default_sdk_root() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// 默认 SDK 位置下的 platform-tools 候选。
+fn standard_sdk_candidates(exe_names: &[&str]) -> Vec<String> {
+    default_sdk_root()
+        .map(|root| {
+            adb::build_adb_candidates(
+                exe_names,
+                Some(&root.to_string_lossy()),
+                None,
+                None,
+                std::path::MAIN_SEPARATOR,
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// 候选路径 + 来源标注：ANDROID_HOME → ANDROID_SDK_ROOT → 默认 SDK 位置 → PATH
+/// （纯拼接逻辑在 adapter）。
 fn build_candidates() -> Vec<ResolvedAdb> {
     let exe = adb::adb_exe_names();
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
@@ -237,6 +279,7 @@ fn build_candidates() -> Vec<ResolvedAdb> {
         .as_deref()
         .map(|h| adb::build_adb_candidates(&exe, Some(h), None, None, std::path::MAIN_SEPARATOR))
         .unwrap_or_default();
+    let standard_cands = standard_sdk_candidates(&exe);
     let path_cands =
         adb::build_adb_candidates(&exe, None, None, path.as_deref(), std::path::MAIN_SEPARATOR);
 
@@ -248,6 +291,10 @@ fn build_candidates() -> Vec<ResolvedAdb> {
     out.extend(root_cands.into_iter().map(|p| ResolvedAdb {
         path: p,
         source: "sdk_root",
+    }));
+    out.extend(standard_cands.into_iter().map(|p| ResolvedAdb {
+        path: p,
+        source: "standard_sdk",
     }));
     out.extend(path_cands.into_iter().map(|p| ResolvedAdb {
         path: p,
@@ -4996,6 +5043,28 @@ mod tests {
         }
         // 所有候选都带文件名
         assert!(cands.iter().all(|c| !c.path.is_empty()));
+    }
+
+    #[test]
+    fn standard_sdk_location_is_a_fallback_candidate() {
+        // GUI（Finder/Dock）启动时不继承 shell 的 ANDROID_HOME 与 PATH：
+        // 默认 SDK 位置必须出现在候选里，否则打包后的 App 找不到 adb。
+        let Some(root) = default_sdk_root() else {
+            return;
+        };
+        if cfg!(target_os = "macos") {
+            assert!(
+                root.to_string_lossy().ends_with("Library/Android/sdk"),
+                "{root:?}"
+            );
+        }
+        let cands = standard_sdk_candidates(&crate::adapters::adb::adb_exe_names());
+        assert!(
+            cands.iter().any(|p| {
+                p.ends_with("platform-tools/adb") || p.ends_with("platform-tools\\adb.exe")
+            }),
+            "{cands:?}"
+        );
     }
 
     /// 真机验证（#[ignore]，CI 不跑，开发机手动 `cargo test -- --ignored`）：

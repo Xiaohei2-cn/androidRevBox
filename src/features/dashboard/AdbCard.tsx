@@ -153,6 +153,7 @@ const SOURCE_LABEL: Record<string, string> = {
   config: "手动配置",
   android_home: "ANDROID_HOME",
   sdk_root: "ANDROID_SDK_ROOT",
+  standard_sdk: "SDK default",
   path_env: "PATH",
   mock: "mock",
 };

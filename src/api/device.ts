@@ -6,7 +6,7 @@ import type { TaskStatusPayload } from "./task";
 export interface AdbEnvironment {
   installed: boolean;
   path?: string;
-  source?: "config" | "android_home" | "sdk_root" | "path_env" | "mock";
+  source?: "config" | "android_home" | "sdk_root" | "standard_sdk" | "path_env" | "mock";
   version?: string;
   build?: string;
   hint?: string;

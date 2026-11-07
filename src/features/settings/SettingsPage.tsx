@@ -751,7 +751,7 @@ function AboutRow({
   );
 }
 
-/** ADB 路径设置：空=自动探测（ANDROID_HOME/SDK_ROOT/PATH），手动配置优先 */
+/** ADB 路径设置：空=自动探测（ANDROID_HOME/SDK_ROOT/默认 SDK 位置/PATH），手动配置优先 */
 function AdbPathSection({ onProbed }: { onProbed: () => void }) {
   const { t } = useI18n();
   const [env, setEnv] = useState<AdbEnvironment | null>(null);
